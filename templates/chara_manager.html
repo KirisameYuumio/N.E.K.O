@@ -416,28 +416,34 @@
                 const subscribedItems = subscribedResult.items;
                 console.log(`[工坊扫描] 找到 ${subscribedItems.length} 个订阅物品`);
                 
-                // 2. 遍历所有已安装的物品
-                for (const item of subscribedItems) {
-                    if (!item.installedFolder) continue;
+                // 2. 批量并发扫描所有已安装的物品（提高效率喵）
+                const scanPromises = subscribedItems.map(async (item) => {
+                    if (!item.installedFolder) return false;
                     
                     const itemId = item.publishedFileId;
                     const folderPath = item.installedFolder;
                     
-                    // 3. 扫描目录中的.chara.json文件
                     try {
                         const listResponse = await fetch(`/api/steam/workshop/list-chara-files?directory=${encodeURIComponent(folderPath)}`);
                         const listResult = await listResponse.json();
                         
                         if (listResult.success && listResult.files.length > 0) {
-                            for (const file of listResult.files) {
-                                const added = await importWorkshopCharaFile(file.path, itemId);
-                                if (added) hasNewCards = true;
-                            }
+                            let itemHasNew = false;
+                            // 对于单个物品内的多个角色卡，我们也尝试并行处理
+                            const importPromises = listResult.files.map(file => importWorkshopCharaFile(file.path, itemId));
+                            const results = await Promise.all(importPromises);
+                            if (results.some(r => r === true)) itemHasNew = true;
+                            return itemHasNew;
                         }
                     } catch (e) {
-                        // 静默处理错误
+                        // 静默处理单个物品的扫描错误
                     }
-                }
+                    return false;
+                });
+                
+                const scanResults = await Promise.all(scanPromises);
+                hasNewCards = scanResults.some(r => r === true);
+                
             } catch (error) {
                 console.log('[工坊扫描] Steam未运行或未初始化，跳过工坊角色卡扫描');
             }
@@ -1937,18 +1943,28 @@
 
 
 
-        // 页面加载时拉取数据，并在后台扫描工坊角色卡
+        // 页面加载时拉取数据，并在后台异步扫描工坊角色卡
         async function initPage() {
-            // 先快速加载已有的角色数据
+            // 1. 先快速加载已有的本地角色数据
+            // 我们不等待工坊扫描，先让页面呈现出来
             await loadCharacterData();
             
-            // 后台静默扫描工坊角色卡
-            autoScanWorkshopCharacterCards().then(async (hasNewCards) => {
-                if (hasNewCards) {
-                    console.log('[工坊扫描] 发现新角色卡，刷新数据');
-                    await loadCharacterData();
-                }
-            }).catch(() => {});
+            // 2. 延迟执行工坊角色卡扫描
+            // 使用 setTimeout 将其放到任务队列末尾，并等待几秒钟，让浏览器优先处理页面渲染和交互
+            setTimeout(() => {
+                console.log('[工坊扫描] 开始异步扫描工坊角色卡...');
+                autoScanWorkshopCharacterCards().then(async (hasNewCards) => {
+                    if (hasNewCards) {
+                        console.log('[工坊扫描] 发现新角色卡，正在更新列表...');
+                        // 发现新卡时才刷新数据
+                        await loadCharacterData();
+                    } else {
+                        console.log('[工坊扫描] 未发现新角色卡');
+                    }
+                }).catch(err => {
+                    console.error('[工坊扫描] 扫描过程中发生错误:', err);
+                });
+            }, 1000); // 延迟1秒开始扫描，确保页面交互流畅
         }
         
         if (document.readyState === 'loading') {

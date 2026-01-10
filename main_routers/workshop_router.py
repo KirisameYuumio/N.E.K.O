@@ -294,7 +294,7 @@ async def upload_preview_image(request: Request):
         }, status_code=500)
 
 @router.get('/subscribed-items')
-def get_subscribed_workshop_items():
+async def get_subscribed_workshop_items():
     """
     获取用户订阅的Steam创意工坊物品列表
     返回包含物品ID、基本信息和状态的JSON数据
@@ -329,197 +329,111 @@ def get_subscribed_workshop_items():
         # 存储处理后的物品信息
         items_info = []
         
-        # 为每个物品获取基本信息和状态
-        for item_id in subscribed_items:
-            try:
-                # 确保item_id是整数类型
-                if isinstance(item_id, str):
-                    try:
-                        item_id = int(item_id)
-                    except ValueError:
-                        logger.error(f"无效的物品ID: {item_id}")
-                        continue
-                
-                logger.info(f'正在处理物品ID: {item_id}')
-                
-                # 获取物品状态
-                item_state = steamworks.Workshop.GetItemState(item_id)
-                logger.debug(f'物品 {item_id} 状态: {item_state}')
-                
-                # 初始化基本物品信息（确保所有字段都有默认值）
-                # 确保publishedFileId始终为字符串类型，避免前端toString()错误
-                item_info = {
-                    "publishedFileId": str(item_id),
-                    "title": f"未知物品_{item_id}",
-                    "description": "无法获取详细描述",
-                    "tags": [],
-                    "state": {
-                        "subscribed": bool(item_state & 1),  # EItemState.SUBSCRIBED
-                        "legacyItem": bool(item_state & 2),
-                        "installed": False,
-                        "needsUpdate": bool(item_state & 8),  # EItemState.NEEDS_UPDATE
-                        "downloading": False,
-                        "downloadPending": bool(item_state & 32),  # EItemState.DOWNLOAD_PENDING
-                        "isWorkshopItem": bool(item_state & 128)  # EItemState.IS_WORKSHOP_ITEM
-                    },
-                    "installedFolder": None,
-                    "fileSizeOnDisk": 0,
-                    "downloadProgress": {
-                        "bytesDownloaded": 0,
-                        "bytesTotal": 0,
-                        "percentage": 0
-                    },
-                    # 添加额外的时间戳信息 - 使用datetime替代time模块避免命名冲突
-                    "timeAdded": int(datetime.now().timestamp()),
-                    "timeUpdated": int(datetime.now().timestamp())
-                }
-                
-                # 尝试获取物品安装信息（如果已安装）
-                try:
-                    logger.debug(f'获取物品 {item_id} 的安装信息')
-                    result = steamworks.Workshop.GetItemInstallInfo(item_id)
-                    
-                    # 检查返回值的结构 - 支持字典格式（根据日志显示）
-                    if isinstance(result, dict):
-                        logger.debug(f'物品 {item_id} 安装信息字典: {result}')
-                        
-                        # 从字典中提取信息
-                        item_info["state"]["installed"] = True  # 如果返回字典，假设已安装
-                        # 获取安装路径 - workshop.py中已经将folder解码为字符串
-                        folder_path = result.get('folder', '')
-                        item_info["installedFolder"] = str(folder_path) if folder_path else None
-                        logger.debug(f'物品 {item_id} 的安装路径: {item_info["installedFolder"]}')
-                        
-                        # 处理磁盘大小 - GetItemInstallInfo返回的disk_size是普通整数
-                        disk_size = result.get('disk_size', 0)
-                        item_info["fileSizeOnDisk"] = int(disk_size) if isinstance(disk_size, (int, float)) else 0
-                    # 也支持元组格式作为备选
-                    elif isinstance(result, tuple) and len(result) >= 3:
-                        installed, folder, size = result
-                        logger.debug(f'物品 {item_id} 安装状态: 已安装={installed}, 路径={folder}, 大小={size}')
-                        
-                        # 安全的类型转换
-                        item_info["state"]["installed"] = bool(installed)
-                        item_info["installedFolder"] = str(folder) if folder and isinstance(folder, (str, bytes)) else None
-                        
-                        # 处理大小值
-                        if isinstance(size, (int, float)):
-                            item_info["fileSizeOnDisk"] = int(size)
-                        else:
-                            item_info["fileSizeOnDisk"] = 0
-                    else:
-                        logger.warning(f'物品 {item_id} 的安装信息返回格式未知: {type(result)} - {result}')
-                        item_info["state"]["installed"] = False
-                except Exception as e:
-                    logger.warning(f'获取物品 {item_id} 安装信息失败: {e}')
-                    item_info["state"]["installed"] = False
-                
-                # 尝试获取物品下载信息（如果正在下载）
-                try:
-                    logger.debug(f'获取物品 {item_id} 的下载信息')
-                    result = steamworks.Workshop.GetItemDownloadInfo(item_id)
-                    
-                    # 检查返回值的结构 - 支持字典格式（与安装信息保持一致）
-                    if isinstance(result, dict):
-                        logger.debug(f'物品 {item_id} 下载信息字典: {result}')
-                        
-                        # 使用正确的键名获取下载信息
-                        downloaded = result.get('downloaded', 0)
-                        total = result.get('total', 0)
-                        progress = result.get('progress', 0.0)
-                        
-                        # 根据total和downloaded确定是否正在下载
-                        item_info["state"]["downloading"] = total > 0 and downloaded < total
-                        
-                        # 设置下载进度信息
-                        if downloaded > 0 or total > 0:
-                            item_info["downloadProgress"] = {
-                                "bytesDownloaded": int(downloaded),
-                                "bytesTotal": int(total),
-                                "percentage": progress * 100 if isinstance(progress, (int, float)) else 0
-                            }
-                    # 也支持元组格式作为备选
-                    elif isinstance(result, tuple) and len(result) >= 3:
-                        # 元组中应该包含下载状态、已下载字节数和总字节数
-                        downloaded, total, progress = result if len(result) >= 3 else (0, 0, 0.0)
-                        logger.debug(f'物品 {item_id} 下载状态: 已下载={downloaded}, 总计={total}, 进度={progress}')
-                        
-                        # 根据total和downloaded确定是否正在下载
-                        item_info["state"]["downloading"] = total > 0 and downloaded < total
-                        
-                        # 设置下载进度信息
-                        if downloaded > 0 or total > 0:
-                            # 处理可能的类型转换
-                            try:
-                                downloaded_value = int(downloaded.value) if hasattr(downloaded, 'value') else int(downloaded)
-                                total_value = int(total.value) if hasattr(total, 'value') else int(total)
-                                progress_value = float(progress.value) if hasattr(progress, 'value') else float(progress)
-                            except: # noqa
-                                downloaded_value, total_value, progress_value = 0, 0, 0.0
-                                
-                            item_info["downloadProgress"] = {
-                                "bytesDownloaded": downloaded_value,
-                                "bytesTotal": total_value,
-                                "percentage": progress_value * 100
-                            }
-                    else:
-                        logger.warning(f'物品 {item_id} 的下载信息返回格式未知: {type(result)} - {result}')
-                        item_info["state"]["downloading"] = False
-                except Exception as e:
-                    logger.warning(f'获取物品 {item_id} 下载信息失败: {e}')
-                    item_info["state"]["downloading"] = False
-                
                 # 尝试获取物品详细信息（标题、描述等）- 使用官方推荐的方式
                 try:
                     # 使用官方推荐的CreateQueryUGCDetailsRequest和SendQueryUGCRequest方法
-                    logger.debug(f'使用官方推荐方法获取物品 {item_id} 的详细信息')
+                    # 我们一次性查询所有订阅物品的详情，这样更高效
+                    logger.info(f'使用批量查询方式获取 {len(subscribed_items)} 个物品的详细信息')
                     
-                    # 创建UGC详情查询请求
-                    query_handle = steamworks.Workshop.CreateQueryUGCDetailsRequest([item_id])
-                    
-                    if query_handle:
-                        # 设置回调函数
-                        details_received = False
-                        
-                        def query_completed_callback(result):
-                            nonlocal details_received
-                            details_received = True
-                            # 回调结果会在主线程中通过GetQueryUGCResult获取
-                            pass
-                        
-                        # 发送查询请求
-                        steamworks.Workshop.SendQueryUGCRequest(query_handle, callback=query_completed_callback, override_callback=True)
-                        
-                        # 由于这是异步回调，我们简单地等待一小段时间让查询有机会完成
-                        time.sleep(0.5)  # 等待0.5秒
-                        
+                    # 转换所有ID为整数
+                    all_item_ids = []
+                    for sid in subscribed_items:
                         try:
-                            # 尝试获取查询结果
-                            result = steamworks.Workshop.GetQueryUGCResult(query_handle, 0)
-                            if result:
-                                # 从结果中提取信息
-                                if hasattr(result, 'title') and result.title:
-                                    item_info['title'] = result.title.decode('utf-8', errors='replace')
-                                if hasattr(result, 'description') and result.description:
-                                    item_info['description'] = result.description.decode('utf-8', errors='replace')
-                                # 获取创建和更新时间
-                                if hasattr(result, 'timeCreated'):
-                                    item_info['timeAdded'] = int(result.timeCreated)
-                                if hasattr(result, 'timeUpdated'):
-                                    item_info['timeUpdated'] = int(result.timeUpdated)
-                                # 获取作者信息
-                                if hasattr(result, 'steamIDOwner'):
-                                    item_info['steamIDOwner'] = str(result.steamIDOwner)
-                                # 获取文件大小信息
-                                if hasattr(result, 'fileSize'):
-                                    item_info['fileSizeOnDisk'] = int(result.fileSize)
-                                
-                                logger.info(f"成功获取物品 {item_id} 的详情信息")
-                        except Exception as query_error:
-                            logger.warning(f"获取查询结果时出错: {query_error}")
+                            all_item_ids.append(int(sid))
+                        except: continue
+                    
+                    if all_item_ids:
+                        # 创建批量详情查询请求
+                        query_handle = steamworks.Workshop.CreateQueryUGCDetailsRequest(all_item_ids)
+                        
+                        if query_handle:
+                            # 发送查询请求
+                            steamworks.Workshop.SendQueryUGCRequest(query_handle)
+                            
+                            # 异步回调，简单等待一下
+                            await asyncio.sleep(0.5)
+                            
+                            # 将查询结果存入字典，方便后续查找
+                            ugc_results = {}
+                            for i in range(len(all_item_ids)):
+                                res = steamworks.Workshop.GetQueryUGCResult(query_handle, i)
+                                if res:
+                                    ugc_results[all_item_ids[i]] = res
+                            
+                            logger.info(f"成功获取 {len(ugc_results)} 个物品的详情结果")
                 except Exception as api_error:
-                    logger.warning(f"使用官方API获取物品 {item_id} 详情时出错: {api_error}")
-                
+                    logger.warning(f"批量获取物品详情时出错: {api_error}")
+                    ugc_results = {}
+
+                # 为每个物品获取基本信息和状态
+                for item_id in subscribed_items:
+                    try:
+                        # 确保item_id是整数类型
+                        if isinstance(item_id, str):
+                            try:
+                                item_id = int(item_id)
+                            except ValueError:
+                                logger.error(f"无效的物品ID: {item_id}")
+                                continue
+                        
+                        logger.info(f'正在处理物品ID: {item_id}')
+                        
+                        # 获取物品状态
+                        item_state = steamworks.Workshop.GetItemState(item_id)
+                        logger.debug(f'物品 {item_id} 状态: {item_state}')
+                        
+                        # 初始化基本物品信息（确保所有字段都有默认值）
+                        # 确保publishedFileId始终为字符串类型，避免前端toString()错误
+                        item_info = {
+                            "publishedFileId": str(item_id),
+                            "title": f"未知物品_{item_id}",
+                            "description": "无法获取详细描述",
+                            "tags": [],
+                            "state": {
+                                "subscribed": bool(item_state & 1),  # EItemState.SUBSCRIBED
+                                "legacyItem": bool(item_state & 2),
+                                "installed": False,
+                                "needsUpdate": bool(item_state & 8),  # EItemState.NEEDS_UPDATE
+                                "downloading": False,
+                                "downloadPending": bool(item_state & 32),  # EItemState.DOWNLOAD_PENDING
+                                "isWorkshopItem": bool(item_state & 128)  # EItemState.IS_WORKSHOP_ITEM
+                            },
+                            "installedFolder": None,
+                            "fileSizeOnDisk": 0,
+                            "downloadProgress": {
+                                "bytesDownloaded": 0,
+                                "bytesTotal": 0,
+                                "percentage": 0
+                            },
+                            # 添加额外的时间戳信息 - 使用datetime替代time模块避免命名冲突
+                            "timeAdded": int(datetime.now().timestamp()),
+                            "timeUpdated": int(datetime.now().timestamp())
+                        }
+                        
+                        # 从批量查询结果中提取详情
+                        if item_id in ugc_results:
+                            result = ugc_results[item_id]
+                            # 从结果中提取信息
+                            if hasattr(result, 'title') and result.title:
+                                item_info['title'] = result.title.decode('utf-8', errors='replace')
+                            if hasattr(result, 'description') and result.description:
+                                item_info['description'] = result.description.decode('utf-8', errors='replace')
+                            # 获取创建和更新时间
+                            if hasattr(result, 'timeCreated'):
+                                item_info['timeAdded'] = int(result.timeCreated)
+                            if hasattr(result, 'timeUpdated'):
+                                item_info['timeUpdated'] = int(result.timeUpdated)
+                            # 获取作者信息
+                            if hasattr(result, 'steamIDOwner'):
+                                item_info['steamIDOwner'] = str(result.steamIDOwner)
+                            # 获取文件大小信息
+                            if hasattr(result, 'fileSize'):
+                                item_info['fileSizeOnDisk'] = int(result.fileSize)
+                            
+                            logger.info(f"使用批量查询结果填充物品 {item_id} 详情")
+                        
+                        # 尝试获取物品安装信息（如果已安装）
+
                 # 作为备选方案，如果本地有安装路径，尝试从本地文件获取信息
                 if item_info['title'].startswith('未知物品_') or not item_info['description']:
                     install_folder = item_info.get('installedFolder')
@@ -706,7 +620,7 @@ def get_workshop_item_path(item_id: str):
 
 
 @router.get('/item/{item_id}')
-def get_workshop_item_details(item_id: str):
+async def get_workshop_item_details(item_id: str):
     """
     获取单个Steam创意工坊物品的详细信息
     """
@@ -733,7 +647,7 @@ def get_workshop_item_details(item_id: str):
         # 发送查询请求
         # 注意：SendQueryUGCRequest返回None而不是布尔值
         steamworks.Workshop.SendQueryUGCRequest(query_handle)
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
         
         # 直接获取查询结果，不检查handle
         result = steamworks.Workshop.GetQueryUGCResult(query_handle, 0)
