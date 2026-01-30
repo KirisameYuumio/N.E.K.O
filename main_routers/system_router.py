@@ -229,6 +229,87 @@ async def set_achievement_status(name: str):
         return JSONResponse(content={"success": False, "error": "Steamworks未初始化"}, status_code=503)
 
 
+@router.post('/steam/update-playtime')
+async def update_playtime(request: Request):
+    """更新游戏时长统计（PLAY_TIME_SECONDS）"""
+    steamworks = get_steamworks()
+    if steamworks is not None:
+        try:
+            data = await request.json()
+            seconds_to_add = data.get('seconds', 10)
+
+            # 验证 seconds 参数
+            try:
+                seconds_to_add = int(seconds_to_add)
+                if seconds_to_add < 0:
+                    return JSONResponse(
+                        content={"success": False, "error": "seconds must be non-negative"},
+                        status_code=400
+                    )
+            except (ValueError, TypeError):
+                return JSONResponse(
+                    content={"success": False, "error": "seconds must be a valid integer"},
+                    status_code=400
+                )
+
+            # 请求当前统计数据
+            steamworks.UserStats.RequestCurrentStats()
+            for _ in range(5):
+                steamworks.run_callbacks()
+                await asyncio.sleep(0.05)
+
+            # 获取当前游戏时长（如果统计不存在，从 0 开始）
+            try:
+                current_playtime = steamworks.UserStats.GetStatInt('PLAY_TIME_SECONDS')
+            except Exception as e:
+                logger.warning(f"获取 PLAY_TIME_SECONDS 失败，从 0 开始: {e}")
+                current_playtime = 0
+
+            # 增加时长
+            new_playtime = current_playtime + seconds_to_add
+
+            # 设置新的时长
+            try:
+                result = steamworks.UserStats.SetStat('PLAY_TIME_SECONDS', new_playtime)
+
+                if result:
+                    # 存储统计数据
+                    steamworks.UserStats.StoreStats()
+                    steamworks.run_callbacks()
+
+                    logger.debug(f"游戏时长已更新: {current_playtime}s -> {new_playtime}s (+{seconds_to_add}s)")
+
+                    return JSONResponse(content={
+                        "success": True,
+                        "totalPlayTime": new_playtime,
+                        "added": seconds_to_add
+                    })
+                else:
+                    logger.warning("SetStat 返回 False - PLAY_TIME_SECONDS 统计可能未在 Steamworks 后台配置")
+                    # 即使失败也返回成功，避免前端报错
+                    return JSONResponse(content={
+                        "success": True,
+                        "totalPlayTime": new_playtime,
+                        "added": seconds_to_add,
+                        "warning": "Steam stat not configured"
+                    })
+            except Exception as stat_error:
+                logger.warning(f"设置 Steam 统计失败: {stat_error} - 统计可能未在 Steamworks 后台配置")
+                # 即使失败也返回成功，避免前端报错
+                return JSONResponse(content={
+                    "success": True,
+                    "totalPlayTime": new_playtime,
+                    "added": seconds_to_add,
+                    "warning": "Steam stat not configured"
+                })
+
+        except Exception as e:
+            logger.error(f"更新游戏时长失败: {e}")
+            return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+    else:
+        return JSONResponse(content={"success": False, "error": "Steamworks未初始化"}, status_code=503)
+
+
 @router.get('/steam/list-achievements')
 async def list_achievements():
     """列出Steam后台已配置的所有成就（调试用）"""
