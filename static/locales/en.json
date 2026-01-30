@@ -1062,6 +1062,7 @@
     "readyToSpeak": "Ready to speak!",
     "screenShareRequiresVoice": "Screen share is only for audio/video calls",
     "repetitionDetected": "High repetition detected. Suggest ending conversation to let {{name}} rest.",
+    "modelSwitched": "Model switched",
     "screenSource": {
       "notAvailable": "Screen source selection only available in desktop version",
       "loading": "Loading...",

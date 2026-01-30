@@ -3935,6 +3935,15 @@ document.addEventListener('DOMContentLoaded', async () => {
                 showStatus(t('live2d.persistentExpressionAdded', '常驻表情已添加'), 2000);
                 await loadPersistentExpressions();
                 persistentSelect.value = '';
+                // 立即应用常驻表情到预览模型
+                if (window.live2dManager) {
+                    try {
+                        await window.live2dManager.syncEmotionMappingWithServer({ replacePersistentOnly: true });
+                        await window.live2dManager.setupPersistentExpressions();
+                    } catch (e) {
+                        console.warn('应用常驻表情到预览模型失败:', e);
+                    }
+                }
             } else {
                 showStatus(t('live2d.persistentExpressionAddFailed', '添加常驻表情失败'), 2000);
                 persistentSelect.value = '';
@@ -3975,6 +3984,15 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (saveData.success) {
                         showStatus(t('live2d.persistentExpressionRemoved', '常驻表情已删除'), 2000);
                         await loadPersistentExpressions();
+                        // 立即应用常驻表情变化到预览模型
+                        if (window.live2dManager) {
+                            try {
+                                await window.live2dManager.syncEmotionMappingWithServer({ replacePersistentOnly: true });
+                                await window.live2dManager.setupPersistentExpressions();
+                            } catch (e) {
+                                console.warn('应用常驻表情变化到预览模型失败:', e);
+                            }
+                        }
                     } else {
                         showStatus(t('live2d.persistentExpressionRemoveFailed', '删除常驻表情失败'), 2000);
                     }

@@ -1122,6 +1122,7 @@
     "readyToSpeak": "可以说话了！",
     "screenShareRequiresVoice": "屏幕分享仅用于音视频通话",
     "repetitionDetected": "检测到高重复度对话。建议您终止对话，让{{name}}休息片刻。",
+    "modelSwitched": "模型已切换",
     "screenSource": {
       "notAvailable": "屏幕源选择仅在桌面版可用",
       "loading": "加载中...",

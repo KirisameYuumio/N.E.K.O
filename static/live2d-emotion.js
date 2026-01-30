@@ -127,7 +127,8 @@ Live2DManager.prototype.clearExpression = function() {
     }
 
     // 如存在常驻表情，清除后立即重放常驻，保证不被清掉
-    this.applyPersistentExpressionsNative();
+    // 注意：这里传入 skipBackup=true，因为我们只是重新应用已有的常驻表情，不需要再次备份
+    this.applyPersistentExpressionsNative(true);
 };
 
 // 播放表情（优先使用 EmotionMapping.expressions）
@@ -228,7 +229,8 @@ Live2DManager.prototype.playExpression = async function(emotion, specifiedExpres
     }
 
     // 重放常驻表情，确保不被覆盖
-    try { await this.applyPersistentExpressionsNative(); } catch (e) {}
+    // skipBackup=true 因为只是重新应用，不需要再次备份
+    try { await this.applyPersistentExpressionsNative(true); } catch (e) {}
 };
 
 // 播放动作
@@ -503,8 +505,9 @@ Live2DManager.prototype.clearEmotionEffects = function() {
     }
     
     // 重新应用常驻表情（保护常驻expression不被影响）
+    // skipBackup=true 因为只是重新应用，不需要再次备份
     try {
-        this.applyPersistentExpressionsNative();
+        this.applyPersistentExpressionsNative(true);
     } catch (e) {
         console.warn('重新应用常驻表情失败:', e);
     }
@@ -648,12 +651,12 @@ Live2DManager.prototype.collectPersistentExpressionFiles = function() {
 
 Live2DManager.prototype.setupPersistentExpressions = async function() {
     try {
-        this.persistentExpressionNames = [];
-        this.persistentExpressionParamsByName = {};
+        // 先清除之前的常驻表情效果
+        this.teardownPersistentExpressions();
+        
         const files = this.collectPersistentExpressionFiles();
         if (!files || files.length === 0) {
-            this.teardownPersistentExpressions();
-            console.log('未配置常驻表情');
+            console.log('[setupPersistent] 未配置常驻表情');
             return;
         }
 
@@ -688,13 +691,93 @@ Live2DManager.prototype.setupPersistentExpressions = async function() {
 };
 
 Live2DManager.prototype.teardownPersistentExpressions = function() {
+    // 先重置之前常驻表情应用的参数到保存的原始值
+    const hasBackup = this._persistentParamsBackup && Object.keys(this._persistentParamsBackup).length > 0;
+    console.log('[teardown] 开始清除常驻表情, 备份数据:', hasBackup ? Object.keys(this._persistentParamsBackup) : '无');
+    
+    if (this.currentModel && this.currentModel.internalModel) {
+        // 先停止 expression manager，防止它继续覆盖我们的参数
+        if (this.currentModel.internalModel.motionManager && 
+            this.currentModel.internalModel.motionManager.expressionManager) {
+            try {
+                this.currentModel.internalModel.motionManager.expressionManager.stopAllExpressions();
+                console.log('[teardown] 已停止所有表情');
+            } catch (e) {
+                console.warn('[teardown] 停止表情失败:', e);
+            }
+        }
+        
+        // 然后恢复参数
+        if (this.currentModel.internalModel.coreModel && hasBackup) {
+            const core = this.currentModel.internalModel.coreModel;
+            for (const [paramId, originalValue] of Object.entries(this._persistentParamsBackup)) {
+                try { 
+                    core.setParameterValueById(paramId, originalValue); 
+                    console.log(`[teardown] 恢复参数 ${paramId} = ${originalValue}`);
+                } catch (e) {
+                    console.warn(`[teardown] 恢复参数 ${paramId} 失败:`, e);
+                }
+            }
+            console.log('[teardown] 已清除常驻表情参数');
+        }
+    }
+    
+    if (!hasBackup) {
+        console.log('[teardown] 没有备份数据，跳过恢复');
+    }
     this.persistentExpressionNames = [];
     this.persistentExpressionParamsByName = {};
+    this._persistentParamsBackup = {};
 };
 
-Live2DManager.prototype.applyPersistentExpressionsNative = async function() {
-    if (!this.currentModel) return;
-    if (typeof this.currentModel.expression !== 'function') return;
+Live2DManager.prototype.applyPersistentExpressionsNative = async function(skipBackup = false) {
+    console.log('[applyPersistent] 开始应用常驻表情, skipBackup:', skipBackup);
+    console.log('[applyPersistent] persistentExpressionNames:', this.persistentExpressionNames);
+    
+    if (!this.currentModel) {
+        console.log('[applyPersistent] 退出: currentModel 不存在');
+        return;
+    }
+    if (typeof this.currentModel.expression !== 'function') {
+        console.log('[applyPersistent] 退出: expression 方法不存在');
+        return;
+    }
+    
+    const core = this.currentModel.internalModel && this.currentModel.internalModel.coreModel;
+    
+    // 在应用常驻表情前，备份将要修改的参数的当前值
+    // skipBackup=true 时跳过备份（用于 clearExpression 后重新应用常驻表情的场景）
+    if (!skipBackup && core) {
+        // 初始化参数备份对象
+        if (!this._persistentParamsBackup) {
+            this._persistentParamsBackup = {};
+        }
+        
+        console.log('[applyPersistent] 开始备份参数...');
+        for (const name of this.persistentExpressionNames || []) {
+            const params = this.persistentExpressionParamsByName[name];
+            console.log(`[applyPersistent] 处理表情 ${name}, 参数数量:`, params ? params.length : 0);
+            if (Array.isArray(params)) {
+                for (const p of params) {
+                    if (window.LIPSYNC_PARAMS && window.LIPSYNC_PARAMS.includes(p.Id)) continue;
+                    // 如果还没有备份过这个参数，保存其当前值
+                    if (this._persistentParamsBackup[p.Id] === undefined) {
+                        try {
+                            const currentValue = core.getParameterValueById(p.Id);
+                            this._persistentParamsBackup[p.Id] = currentValue;
+                            console.log(`[applyPersistent] 备份参数 ${p.Id} = ${currentValue}`);
+                        } catch (e) {
+                            console.warn(`[applyPersistent] 备份参数 ${p.Id} 失败:`, e);
+                        }
+                    }
+                }
+            }
+        }
+        console.log('[applyPersistent] 备份完成, 备份数据:', Object.keys(this._persistentParamsBackup));
+    } else {
+        console.log('[applyPersistent] 跳过备份, skipBackup:', skipBackup, 'core:', !!core);
+    }
+    
     for (const name of this.persistentExpressionNames || []) {
         try {
             const maybe = await this.currentModel.expression(name);
@@ -702,10 +785,9 @@ Live2DManager.prototype.applyPersistentExpressionsNative = async function() {
                 // 回退：手动设置参数（跳过口型参数以避免覆盖lipsync）
                 try {
                     const params = this.persistentExpressionParamsByName[name];
-                    const core = this.currentModel.internalModel && this.currentModel.internalModel.coreModel;
                     if (core) {
                         for (const p of params) {
-                            if (window.LIPSYNC_PARAMS.includes(p.Id)) continue;
+                            if (window.LIPSYNC_PARAMS && window.LIPSYNC_PARAMS.includes(p.Id)) continue;
                             try { core.setParameterValueById(p.Id, p.Value); } catch (_) {}
                         }
                     }
@@ -716,10 +798,9 @@ Live2DManager.prototype.applyPersistentExpressionsNative = async function() {
             try {
                 if (this.persistentExpressionParamsByName && Array.isArray(this.persistentExpressionParamsByName[name])) {
                     const params = this.persistentExpressionParamsByName[name];
-                    const core = this.currentModel.internalModel && this.currentModel.internalModel.coreModel;
                     if (core) {
                         for (const p of params) {
-                            if (window.LIPSYNC_PARAMS.includes(p.Id)) continue;
+                            if (window.LIPSYNC_PARAMS && window.LIPSYNC_PARAMS.includes(p.Id)) continue;
                             try { core.setParameterValueById(p.Id, p.Value); } catch (_) {}
                         }
                     }
