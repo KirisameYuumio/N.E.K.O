@@ -245,26 +245,94 @@ VRMManager.prototype._createSettingsPopupContent = function (popup) {
         const toggleItem = this._createSettingsToggleItem(toggle, popup);
         popup.appendChild(toggleItem);
 
-        // 为带有时间间隔的开关添加间隔控件（可折叠）
+        // 为带有时间间隔的开关添加侧边弹出控件
         if (toggle.hasInterval) {
-            const intervalControl = this._createIntervalControl(toggle);
-            popup.appendChild(intervalControl);
+            const sidePanel = this._createIntervalControl(toggle);
+            sidePanel._anchorElement = toggleItem;
+            sidePanel._popupElement = popup;
 
-            // 鼠标悬停时展开间隔控件
-            toggleItem.addEventListener('mouseenter', () => {
-                intervalControl._expand();
-            });
-            toggleItem.addEventListener('mouseleave', (e) => {
-                // 如果鼠标移动到间隔控件上，不收缩
-                if (!intervalControl.contains(e.relatedTarget)) {
-                    intervalControl._collapse();
+            // 对于主动搭话，在侧边面板中添加媒体凭证链接
+            if (toggle.id === 'proactive-chat') {
+                const AUTH_I18N_KEY = 'settings.menu.mediaCredentials';
+                const AUTH_FALLBACK_LABEL = '配置媒体凭证';
+                const authLink = document.createElement('div');
+                Object.assign(authLink.style, {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    padding: '4px 8px',
+                    marginLeft: '-6px',
+                    fontSize: '12px',
+                    color: 'var(--neko-popup-text-sub, #666)',
+                    cursor: 'pointer',
+                    borderRadius: '6px',
+                    transition: 'background 0.2s ease',
+                    width: '100%'
+                });
+
+                const authIcon = document.createElement('img');
+                authIcon.src = '/static/icons/cookies_icon.png';
+                authIcon.alt = '';
+                Object.assign(authIcon.style, {
+                    width: '16px', height: '16px', objectFit: 'contain', flexShrink: '0'
+                });
+                authLink.appendChild(authIcon);
+
+                const authLabel = document.createElement('span');
+                authLabel.textContent = window.t ? window.t(AUTH_I18N_KEY) : AUTH_FALLBACK_LABEL;
+                authLabel.setAttribute('data-i18n', AUTH_I18N_KEY);
+                Object.assign(authLabel.style, { fontSize: '12px', userSelect: 'none' });
+                authLink.appendChild(authLabel);
+
+                authLink.addEventListener('mouseenter', () => {
+                    authLink.style.background = 'var(--neko-popup-hover, rgba(68,183,254,0.1))';
+                });
+                authLink.addEventListener('mouseleave', () => {
+                    authLink.style.background = 'transparent';
+                });
+                let isOpening = false;
+                authLink.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (isOpening) return;
+                    isOpening = true;
+                    if (typeof window.openOrFocusWindow === 'function') {
+                        window.openOrFocusWindow('/api/auth/page', 'neko_auth-page');
+                    } else {
+                        window.open('/api/auth/page', 'neko_auth-page');
+                    }
+                    setTimeout(() => { isOpening = false; }, 500);
+                });
+                sidePanel.appendChild(authLink);
+            }
+
+            // 侧边面板悬停逻辑
+            const self = this;
+            const expandPanel = () => sidePanel._expand();
+            const collapsePanel = (e) => {
+                const target = e.relatedTarget;
+                if (!toggleItem.contains(target) && !sidePanel.contains(target)) {
+                    sidePanel._collapse();
+                }
+            };
+
+            toggleItem.addEventListener('mouseenter', expandPanel);
+            toggleItem.addEventListener('mouseleave', collapsePanel);
+            sidePanel.addEventListener('mouseenter', () => {
+                expandPanel();
+                // 通知浮动按钮系统：鼠标仍在 UI 上，不要自动隐藏
+                if (self.interaction) {
+                    self.interaction._isMouseOverButtons = true;
+                    if (self.interaction._hideButtonsTimer) {
+                        clearTimeout(self.interaction._hideButtonsTimer);
+                        self.interaction._hideButtonsTimer = null;
+                    }
                 }
             });
-            intervalControl.addEventListener('mouseenter', () => {
-                intervalControl._expand();
-            });
-            intervalControl.addEventListener('mouseleave', () => {
-                intervalControl._collapse();
+            sidePanel.addEventListener('mouseleave', (e) => {
+                collapsePanel(e);
+                if (self.interaction) {
+                    self.interaction._isMouseOverButtons = false;
+                }
             });
         }
     });
@@ -281,24 +349,48 @@ VRMManager.prototype._createSettingsPopupContent = function (popup) {
     }
 };
 
-// 创建时间间隔控件（可折叠的滑动条）
+// 创建时间间隔控件（侧边弹出面板）
 VRMManager.prototype._createIntervalControl = function (toggle) {
     const container = document.createElement('div');
     container.className = `vrm-interval-control-${toggle.id}`;
     Object.assign(container.style, {
-        display: 'none',  // 初始完全隐藏，不占用空间
+        position: 'fixed',
+        display: 'none',
         alignItems: 'center',
-        gap: '2px',
-        padding: '0 12px 0 44px',
+        gap: '6px',
+        padding: '6px 12px',
         fontSize: '12px',
         color: 'var(--neko-popup-text-sub, #666)',
-        height: '0',
-        overflow: 'hidden',
         opacity: '0',
-        transition: 'height 0.2s ease, opacity 0.2s ease, padding 0.2s ease'
+        zIndex: '100001',
+        background: 'var(--neko-popup-bg, rgba(255,255,255,0.65))',
+        backdropFilter: 'saturate(180%) blur(20px)',
+        border: 'var(--neko-popup-border, 1px solid rgba(255,255,255,0.18))',
+        borderRadius: '8px',
+        boxShadow: 'var(--neko-popup-shadow, 0 2px 4px rgba(0,0,0,0.04), 0 8px 16px rgba(0,0,0,0.08))',
+        transition: 'opacity 0.2s cubic-bezier(0.1, 0.9, 0.2, 1), transform 0.2s cubic-bezier(0.1, 0.9, 0.2, 1)',
+        transform: 'translateX(-6px)',
+        pointerEvents: 'auto',
+        flexWrap: 'wrap',
+        maxWidth: '300px'
     });
 
-    // 间隔标签（包含"基础"提示，主动搭话会指数退避）
+    // 阻止指针事件传播到底层
+    const stopEventPropagation = (e) => e.stopPropagation();
+    ['pointerdown', 'pointermove', 'pointerup', 'mousedown', 'mousemove', 'mouseup', 'touchstart', 'touchmove', 'touchend'].forEach(evt => {
+        container.addEventListener(evt, stopEventPropagation, true);
+    });
+
+    // 滑动条行容器
+    const sliderRow = document.createElement('div');
+    Object.assign(sliderRow.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '4px',
+        width: '100%'
+    });
+
+    // 间隔标签
     const labelText = document.createElement('span');
     const labelKey = toggle.id === 'proactive-chat' ? 'settings.interval.chatIntervalBase' : 'settings.interval.visionInterval';
     const defaultLabel = toggle.id === 'proactive-chat' ? '基础间隔' : '读取间隔';
@@ -306,16 +398,7 @@ VRMManager.prototype._createIntervalControl = function (toggle) {
     labelText.setAttribute('data-i18n', labelKey);
     Object.assign(labelText.style, {
         flexShrink: '0',
-        fontSize: '10px'
-    });
-
-    // 滑动条容器
-    const sliderWrapper = document.createElement('div');
-    Object.assign(sliderWrapper.style, {
-        display: 'flex',
-        alignItems: 'center',
-        gap: '1px',
-        flexShrink: '0'
+        fontSize: '12px'
     });
 
     // 滑动条
@@ -324,17 +407,15 @@ VRMManager.prototype._createIntervalControl = function (toggle) {
     slider.id = `vrm-${toggle.id}-interval`;
     const minVal = toggle.id === 'proactive-chat' ? 10 : 5;
     slider.min = minVal;
-    slider.max = '120';  // 最大120秒
+    slider.max = '120';
     slider.step = '5';
-    // 从 window 获取当前值
     let currentValue = typeof window[toggle.intervalKey] !== 'undefined'
         ? window[toggle.intervalKey]
         : toggle.defaultInterval;
-    // 限制在新的最大值范围内
     if (currentValue > 120) currentValue = 120;
     slider.value = currentValue;
     Object.assign(slider.style, {
-        width: '55px',
+        width: '60px',
         height: '4px',
         cursor: 'pointer',
         accentColor: 'var(--neko-popup-accent, #44b7fe)'
@@ -347,34 +428,29 @@ VRMManager.prototype._createIntervalControl = function (toggle) {
         minWidth: '26px',
         textAlign: 'right',
         fontFamily: 'monospace',
-        fontSize: '11px',
+        fontSize: '12px',
         flexShrink: '0'
     });
 
-    // 滑动条变化时更新显示和保存设置
+    // 滑动条事件
     slider.addEventListener('input', () => {
-        const value = parseInt(slider.value, 10);
-        valueDisplay.textContent = `${value}s`;
+        valueDisplay.textContent = `${parseInt(slider.value, 10)}s`;
     });
-
     slider.addEventListener('change', () => {
         const value = parseInt(slider.value, 10);
-        // 保存到 window 和 localStorage
         window[toggle.intervalKey] = value;
         if (typeof window.saveNEKOSettings === 'function') {
             window.saveNEKOSettings();
         }
         console.log(`${toggle.id} 间隔已设置为 ${value} 秒`);
     });
-
-    // 阻止事件冒泡
     slider.addEventListener('click', (e) => e.stopPropagation());
     slider.addEventListener('mousedown', (e) => e.stopPropagation());
 
-    sliderWrapper.appendChild(slider);
-    sliderWrapper.appendChild(valueDisplay);
-    container.appendChild(labelText);
-    container.appendChild(sliderWrapper);
+    sliderRow.appendChild(labelText);
+    sliderRow.appendChild(slider);
+    sliderRow.appendChild(valueDisplay);
+    container.appendChild(sliderRow);
 
     // 如果是主动搭话，在间隔控件内添加搭话方式选项
     if (toggle.id === 'proactive-chat') {
@@ -384,67 +460,72 @@ VRMManager.prototype._createIntervalControl = function (toggle) {
         }
     }
 
-    // 存储展开/收缩方法供外部调用
+    // 侧边弹出展开方法
     container._expand = () => {
-        // 已展开或正在展开中（opacity !== '0'），直接跳过避免高度闪烁
         if (container.style.display === 'flex' && container.style.opacity !== '0') return;
+
+        if (container._collapseTimeout) {
+            clearTimeout(container._collapseTimeout);
+            container._collapseTimeout = null;
+        }
+
         container.style.display = 'flex';
-        container.style.flexWrap = 'wrap';
-        // 先设置固定高度以触发动画
-        container.style.height = '0';
-        // 清除之前的展开超时（防止竞争条件）
-        if (container._expandTimeout) {
-            clearTimeout(container._expandTimeout);
-            container._expandTimeout = null;
+        container.style.left = '';
+        container.style.right = '';
+        container.style.transform = 'translateX(-6px)';
+
+        // 根据锚点元素和 popup 计算位置
+        const anchor = container._anchorElement;
+        const popupEl = container._popupElement;
+        if (anchor) {
+            const anchorRect = anchor.getBoundingClientRect();
+            const popupRect = popupEl ? popupEl.getBoundingClientRect() : anchorRect;
+            container.style.top = `${anchorRect.top}px`;
+            container.style.left = `${popupRect.right - 8}px`;
         }
-        // 清除待处理的折叠超时（防止折叠回调在展开后执行）
-        if (container._collapseTimeout) {
-            clearTimeout(container._collapseTimeout);
-            container._collapseTimeout = null;
-        }
-        // 使用 requestAnimationFrame 确保 display 变化后再触发动画
+
         requestAnimationFrame(() => {
-            // 使用 scrollHeight 获取实际高度
-            const targetHeight = container.scrollHeight;
-            container.style.height = targetHeight + 'px';
-            container.style.opacity = '1';
-            container.style.padding = '4px 12px 8px 44px';
-            // 动画完成后设置为 auto 以适应内容变化
-            container._expandTimeout = setTimeout(() => {
-                if (container.style.opacity === '1') {
-                    container.style.height = 'auto';
+            // 检测右侧是否溢出视口
+            const containerRect = container.getBoundingClientRect();
+            if (containerRect.right > window.innerWidth - 10) {
+                const popupEl2 = container._popupElement;
+                const popupRect = popupEl2 ? popupEl2.getBoundingClientRect() : null;
+                if (popupRect) {
+                    container.style.left = '';
+                    container.style.right = `${window.innerWidth - popupRect.left - 8}px`;
+                    container.style.transform = 'translateX(6px)';
                 }
-                container._expandTimeout = null;
-            }, VRM_POPUP_ANIMATION_DURATION_MS);
+            }
+            requestAnimationFrame(() => {
+                container.style.opacity = '1';
+                container.style.transform = 'translateX(0)';
+            });
         });
     };
+
+    // 侧边弹出收缩方法
     container._collapse = () => {
-        // 清除待处理的展开超时（防止展开回调在折叠后执行）
-        if (container._expandTimeout) {
-            clearTimeout(container._expandTimeout);
-            container._expandTimeout = null;
-        }
-        // 清除之前的折叠超时（防止竞争条件）
+        if (container.style.display === 'none') return;
         if (container._collapseTimeout) {
             clearTimeout(container._collapseTimeout);
             container._collapseTimeout = null;
         }
-        // 先设置为固定高度以触发动画
-        container.style.height = container.scrollHeight + 'px';
-        // 使用 requestAnimationFrame 确保高度设置后再触发动画
-        requestAnimationFrame(() => {
-            container.style.height = '0';
-            container.style.opacity = '0';
-            container.style.padding = '0 12px 0 44px';
-            // 动画结束后隐藏（在 requestAnimationFrame 内部启动计时）
-            container._collapseTimeout = setTimeout(() => {
-                if (container.style.opacity === '0') {
-                    container.style.display = 'none';
-                }
-                container._collapseTimeout = null;
-            }, VRM_POPUP_ANIMATION_DURATION_MS);
-        });
+        container.style.opacity = '0';
+        if (container.style.right && container.style.right !== '') {
+            container.style.transform = 'translateX(6px)';
+        } else {
+            container.style.transform = 'translateX(-6px)';
+        }
+        container._collapseTimeout = setTimeout(() => {
+            if (container.style.opacity === '0') {
+                container.style.display = 'none';
+            }
+            container._collapseTimeout = null;
+        }, VRM_POPUP_ANIMATION_DURATION_MS);
     };
+
+    // 附加到 body（不在 popup 流中，避免被 popup 的 overflow 裁剪）
+    document.body.appendChild(container);
 
     return container;
 };
@@ -582,7 +663,6 @@ VRMManager.prototype._createSettingsToggleItem = function (toggle, popup) {
     toggleItem.setAttribute('tabIndex', '0');
     toggleItem.setAttribute('aria-checked', 'false');
     toggleItem.style.padding = '8px 12px';
-    toggleItem.style.borderBottom = '1px solid var(--neko-popup-separator, rgba(0, 0, 0, 0.1))';
 
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
@@ -1009,6 +1089,8 @@ VRMManager.prototype.showPopup = function (buttonId, popup) {
 
     if (isVisible) {
         popup.style.opacity = '0'; popup.style.transform = 'translateX(-10px)';
+        const triggerIcon = document.querySelector(`.vrm-trigger-icon-${buttonId}`);
+        if (triggerIcon) triggerIcon.style.transform = 'rotate(0deg)';
         if (buttonId === 'agent') window.dispatchEvent(new CustomEvent('live2d-agent-popup-closed'));
 
         // 更新按钮状态为关闭
@@ -1052,6 +1134,11 @@ VRMManager.prototype.showPopup = function (buttonId, popup) {
                     const button = document.getElementById(`vrm-btn-${buttonId}`);
                     const buttonWidth = button ? button.offsetWidth : 48;
                     popup.style.left = 'auto'; popup.style.right = '0'; popup.style.marginLeft = '0'; popup.style.marginRight = `${buttonWidth + 8}px`;
+                    const triggerIcon = document.querySelector(`.vrm-trigger-icon-${buttonId}`);
+                    if (triggerIcon) triggerIcon.style.transform = 'rotate(180deg)';
+                } else {
+                    const triggerIcon = document.querySelector(`.vrm-trigger-icon-${buttonId}`);
+                    if (triggerIcon) triggerIcon.style.transform = 'rotate(0deg)';
                 }
                 if (buttonId === 'settings' || buttonId === 'agent') {
                     if (popupRect.bottom > screenHeight - 60) {

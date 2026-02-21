@@ -94,56 +94,64 @@ Live2DManager.prototype._createSettingsPopupContent = function (popup) {
         const toggleItem = this._createSettingsToggleItem(toggle, popup);
         popup.appendChild(toggleItem);
 
-        // 为带有时间间隔的开关添加间隔控件（可折叠）
+        // 为带有时间间隔的开关添加侧边弹出控件
         if (toggle.hasInterval) {
-            const intervalControl = this._createIntervalControl(toggle);
-            popup.appendChild(intervalControl);
-            
-            let authPageLink = null;
+            const sidePanel = this._createIntervalControl(toggle);
+            sidePanel._anchorElement = toggleItem;
+            sidePanel._popupElement = popup;
 
+            // 对于主动搭话，在侧边面板中添加媒体凭证链接
             if (toggle.id === 'proactive-chat') {
-                const AUTH_I18N_KEY = 'mediaCredentials';
+                const AUTH_I18N_KEY = 'settings.menu.mediaCredentials';
                 const AUTH_FALLBACK_LABEL = '配置媒体凭证';
 
-                authPageLink = this._createSettingsLinkItem({
+                const authPageLink = this._createSettingsLinkItem({
                     id: 'auth-page',
                     label: window.t ? window.t(AUTH_I18N_KEY) : AUTH_FALLBACK_LABEL,
                     labelKey: AUTH_I18N_KEY,
-                    icon: '/static/icons/cookies_icon.png', // 确保该图标文件存在
+                    icon: '/static/icons/cookies_icon.png',
                     action: 'navigate',
                     url: '/api/auth/page'
                 });
-                popup.appendChild(authPageLink);
+                // 在侧边面板内始终可见，无需单独展开/折叠
+                Object.assign(authPageLink.style, {
+                    display: 'flex',
+                    height: 'auto',
+                    opacity: '1',
+                    padding: '4px 8px',
+                    overflow: 'visible',
+                    marginLeft: '-6px'  // 补偿图标自带空白，与滑动条对齐
+                });
+                authPageLink._expand = () => {};
+                authPageLink._collapse = () => {};
+                sidePanel.appendChild(authPageLink);
             }
 
-            // 重写悬停逻辑，让 开关本身、滑动条、凭证按钮 三个元素同步展开和收缩
-            const expandAll = () => {
-                intervalControl._expand();
-                if (authPageLink) authPageLink._expand();
-            };
-
-            const collapseAll = (e) => {
+            // 侧边面板悬停逻辑
+            const self = this;
+            const expandPanel = () => sidePanel._expand();
+            const collapsePanel = (e) => {
                 const target = e.relatedTarget;
-                const isInsideToggle = toggleItem.contains(target);
-                const isInsideInterval = intervalControl.contains(target);
-                const isInsideAuth = authPageLink ? authPageLink.contains(target) : false;
-
-                // 只有当鼠标完全离开这三个元素的区域时，才收拢
-                if (!isInsideToggle && !isInsideInterval && !isInsideAuth) {
-                    intervalControl._collapse();
-                    if (authPageLink) authPageLink._collapse();
+                if (!toggleItem.contains(target) && !sidePanel.contains(target)) {
+                    sidePanel._collapse();
                 }
             };
 
-            // 绑定事件到所有相关元素
-            toggleItem.addEventListener('mouseenter', expandAll);
-            toggleItem.addEventListener('mouseleave', collapseAll);
-            intervalControl.addEventListener('mouseenter', expandAll);
-            intervalControl.addEventListener('mouseleave', collapseAll);
-            if (authPageLink) {
-                authPageLink.addEventListener('mouseenter', expandAll);
-                authPageLink.addEventListener('mouseleave', collapseAll);
-            }
+            toggleItem.addEventListener('mouseenter', expandPanel);
+            toggleItem.addEventListener('mouseleave', collapsePanel);
+            sidePanel.addEventListener('mouseenter', () => {
+                expandPanel();
+                // 通知浮动按钮系统：鼠标仍在 UI 上，不要自动隐藏
+                self._isMouseOverButtons = true;
+                if (self._hideButtonsTimer) {
+                    clearTimeout(self._hideButtonsTimer);
+                    self._hideButtonsTimer = null;
+                }
+            });
+            sidePanel.addEventListener('mouseleave', (e) => {
+                collapsePanel(e);
+                self._isMouseOverButtons = false;
+            });
         }
     });
 
@@ -163,24 +171,48 @@ Live2DManager.prototype._createSettingsPopupContent = function (popup) {
     }
 };
 
-// 创建时间间隔控件（可折叠的滑动条）
+// 创建时间间隔控件（侧边弹出面板）
 Live2DManager.prototype._createIntervalControl = function (toggle) {
     const container = document.createElement('div');
     container.className = `live2d-interval-control-${toggle.id}`;
     Object.assign(container.style, {
-        display: 'none',  // 初始完全隐藏，不占用空间
+        position: 'fixed',
+        display: 'none',
         alignItems: 'center',
-        gap: '2px',
-        padding: '0 12px 0 44px',
+        gap: '6px',
+        padding: '6px 12px',
         fontSize: '12px',
         color: 'var(--neko-popup-text-sub, #666)',
-        height: '0',
-        overflow: 'hidden',
         opacity: '0',
-        transition: 'height 0.2s ease, opacity 0.2s ease, padding 0.2s ease'
+        zIndex: '100001',
+        background: 'var(--neko-popup-bg, rgba(255,255,255,0.65))',
+        backdropFilter: 'saturate(180%) blur(20px)',
+        border: 'var(--neko-popup-border, 1px solid rgba(255,255,255,0.18))',
+        borderRadius: '8px',
+        boxShadow: 'var(--neko-popup-shadow, 0 2px 4px rgba(0,0,0,0.04), 0 8px 16px rgba(0,0,0,0.08))',
+        transition: 'opacity 0.2s cubic-bezier(0.1, 0.9, 0.2, 1), transform 0.2s cubic-bezier(0.1, 0.9, 0.2, 1)',
+        transform: 'translateX(-6px)',
+        pointerEvents: 'auto',
+        flexWrap: 'wrap',
+        maxWidth: '300px'
     });
 
-    // 间隔标签（包含"基础"提示，主动搭话会指数退避）
+    // 阻止指针事件传播到底层（避免触发live2d拖拽）
+    const stopEventPropagation = (e) => e.stopPropagation();
+    ['pointerdown', 'pointermove', 'pointerup', 'mousedown', 'mousemove', 'mouseup', 'touchstart', 'touchmove', 'touchend'].forEach(evt => {
+        container.addEventListener(evt, stopEventPropagation, true);
+    });
+
+    // 滑动条行容器
+    const sliderRow = document.createElement('div');
+    Object.assign(sliderRow.style, {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '4px',
+        width: '100%'
+    });
+
+    // 间隔标签
     const labelText = document.createElement('span');
     const labelKey = toggle.id === 'proactive-chat' ? 'settings.interval.chatIntervalBase' : 'settings.interval.visionInterval';
     const defaultLabel = toggle.id === 'proactive-chat' ? '基础间隔' : '读取间隔';
@@ -188,16 +220,7 @@ Live2DManager.prototype._createIntervalControl = function (toggle) {
     labelText.setAttribute('data-i18n', labelKey);
     Object.assign(labelText.style, {
         flexShrink: '0',
-        fontSize: '10px'
-    });
-
-    // 滑动条容器
-    const sliderWrapper = document.createElement('div');
-    Object.assign(sliderWrapper.style, {
-        display: 'flex',
-        alignItems: 'center',
-        gap: '1px',
-        flexShrink: '0'
+        fontSize: '12px'
     });
 
     // 滑动条
@@ -206,17 +229,15 @@ Live2DManager.prototype._createIntervalControl = function (toggle) {
     slider.id = `live2d-${toggle.id}-interval`;
     const minVal = toggle.id === 'proactive-chat' ? 10 : 5;
     slider.min = minVal;
-    slider.max = '120';  // 最大120秒
+    slider.max = '120';
     slider.step = '5';
-    // 从 window 获取当前值
     let currentValue = typeof window[toggle.intervalKey] !== 'undefined'
         ? window[toggle.intervalKey]
         : toggle.defaultInterval;
-    // 限制在新的最大值范围内
     if (currentValue > 120) currentValue = 120;
     slider.value = currentValue;
     Object.assign(slider.style, {
-        width: '55px',
+        width: '60px',
         height: '4px',
         cursor: 'pointer',
         accentColor: 'var(--neko-popup-accent, #44b7fe)'
@@ -229,34 +250,29 @@ Live2DManager.prototype._createIntervalControl = function (toggle) {
         minWidth: '26px',
         textAlign: 'right',
         fontFamily: 'monospace',
-        fontSize: '11px',
+        fontSize: '12px',
         flexShrink: '0'
     });
 
-    // 滑动条变化时更新显示和保存设置
+    // 滑动条事件
     slider.addEventListener('input', () => {
-        const value = parseInt(slider.value, 10);
-        valueDisplay.textContent = `${value}s`;
+        valueDisplay.textContent = `${parseInt(slider.value, 10)}s`;
     });
-
     slider.addEventListener('change', () => {
         const value = parseInt(slider.value, 10);
-        // 保存到 window 和 localStorage
         window[toggle.intervalKey] = value;
         if (typeof window.saveNEKOSettings === 'function') {
             window.saveNEKOSettings();
         }
         console.log(`${toggle.id} 间隔已设置为 ${value} 秒`);
     });
-
-    // 阻止事件冒泡
     slider.addEventListener('click', (e) => e.stopPropagation());
     slider.addEventListener('mousedown', (e) => e.stopPropagation());
 
-    sliderWrapper.appendChild(slider);
-    sliderWrapper.appendChild(valueDisplay);
-    container.appendChild(labelText);
-    container.appendChild(sliderWrapper);
+    sliderRow.appendChild(labelText);
+    sliderRow.appendChild(slider);
+    sliderRow.appendChild(valueDisplay);
+    container.appendChild(sliderRow);
 
     // 如果是主动搭话，在间隔控件内添加搭话方式选项
     if (toggle.id === 'proactive-chat') {
@@ -266,65 +282,72 @@ Live2DManager.prototype._createIntervalControl = function (toggle) {
         }
     }
 
-    // 存储展开/收缩方法供外部调用
+    // 侧边弹出展开方法
     container._expand = () => {
+        if (container.style.display === 'flex' && container.style.opacity !== '0') return;
+
+        if (container._collapseTimeout) {
+            clearTimeout(container._collapseTimeout);
+            container._collapseTimeout = null;
+        }
+
         container.style.display = 'flex';
-        container.style.flexWrap = 'wrap';
-        // 先设置固定高度以触发动画
-        container.style.height = '0';
-        // 清除之前的展开超时（防止竞争条件）
-        if (container._expandTimeout) {
-            clearTimeout(container._expandTimeout);
-            container._expandTimeout = null;
+        container.style.left = '';
+        container.style.right = '';
+        container.style.transform = 'translateX(-6px)';
+
+        // 根据锚点元素和 popup 计算位置
+        const anchor = container._anchorElement;
+        const popupEl = container._popupElement;
+        if (anchor) {
+            const anchorRect = anchor.getBoundingClientRect();
+            const popupRect = popupEl ? popupEl.getBoundingClientRect() : anchorRect;
+            container.style.top = `${anchorRect.top}px`;
+            container.style.left = `${popupRect.right - 8}px`;
         }
-        // 清除待处理的折叠超时（防止折叠回调在展开后执行）
-        if (container._collapseTimeout) {
-            clearTimeout(container._collapseTimeout);
-            container._collapseTimeout = null;
-        }
-        // 使用 requestAnimationFrame 确保 display 变化后再触发动画
+
         requestAnimationFrame(() => {
-            // 使用 scrollHeight 获取实际高度
-            const targetHeight = container.scrollHeight;
-            container.style.height = targetHeight + 'px';
-            container.style.opacity = '1';
-            container.style.padding = '4px 12px 8px 44px';
-            // 动画完成后设置为 auto 以适应内容变化
-            container._expandTimeout = setTimeout(() => {
-                if (container.style.opacity === '1') {
-                    container.style.height = 'auto';
+            // 检测右侧是否溢出视口
+            const containerRect = container.getBoundingClientRect();
+            if (containerRect.right > window.innerWidth - 10) {
+                const popupEl2 = container._popupElement;
+                const popupRect = popupEl2 ? popupEl2.getBoundingClientRect() : null;
+                if (popupRect) {
+                    container.style.left = '';
+                    container.style.right = `${window.innerWidth - popupRect.left - 8}px`;
+                    container.style.transform = 'translateX(6px)';
                 }
-                container._expandTimeout = null;
-            }, POPUP_ANIMATION_DURATION_MS);
+            }
+            requestAnimationFrame(() => {
+                container.style.opacity = '1';
+                container.style.transform = 'translateX(0)';
+            });
         });
     };
+
+    // 侧边弹出收缩方法
     container._collapse = () => {
-        // 清除待处理的展开超时（防止展开回调在折叠后执行）
-        if (container._expandTimeout) {
-            clearTimeout(container._expandTimeout);
-            container._expandTimeout = null;
-        }
-        // 清除之前的折叠超时（防止竞争条件）
+        if (container.style.display === 'none') return;
         if (container._collapseTimeout) {
             clearTimeout(container._collapseTimeout);
             container._collapseTimeout = null;
         }
-        // 先设置为固定高度以触发动画
-        container.style.height = container.scrollHeight + 'px';
-        // 使用 requestAnimationFrame 确保高度设置后再触发动画
-        requestAnimationFrame(() => {
-            container.style.height = '0';
-            container.style.opacity = '0';
-            container.style.padding = '0 12px 0 44px';
-            // 动画结束后隐藏（在 requestAnimationFrame 内部启动计时）
-            container._collapseTimeout = setTimeout(() => {
-                if (container.style.opacity === '0') {
-                    container.style.display = 'none';
-                }
-                container._collapseTimeout = null;
-            }, POPUP_ANIMATION_DURATION_MS);
-        });
+        container.style.opacity = '0';
+        if (container.style.right && container.style.right !== '') {
+            container.style.transform = 'translateX(6px)';
+        } else {
+            container.style.transform = 'translateX(-6px)';
+        }
+        container._collapseTimeout = setTimeout(() => {
+            if (container.style.opacity === '0') {
+                container.style.display = 'none';
+            }
+            container._collapseTimeout = null;
+        }, POPUP_ANIMATION_DURATION_MS);
     };
+
+    // 附加到 body（不在 popup 流中，避免被 popup 的 overflow 裁剪）
+    document.body.appendChild(container);
 
     return container;
 };

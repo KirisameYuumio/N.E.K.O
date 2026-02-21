@@ -386,7 +386,7 @@ window.createChatModeToggle = function(options) {
     label.setAttribute('data-i18n', labelKey);
     label.htmlFor = checkboxId;
     Object.assign(label.style, {
-        fontSize: '10px',
+        fontSize: '12px',
         color: '#666',
         cursor: 'pointer',
         whiteSpace: 'nowrap'
@@ -612,6 +612,8 @@ Live2DManager.prototype.showPopup = function (buttonId, popup) {
         // 如果已经显示，则隐藏
         popup.style.opacity = '0';
         popup.style.transform = 'translateX(-10px)';
+        const triggerIcon = document.querySelector(`.live2d-trigger-icon-${buttonId}`);
+        if (triggerIcon) triggerIcon.style.transform = 'rotate(0deg)';
 
         // 如果是 agent 弹窗关闭，派发关闭事件
         if (buttonId === 'agent') {
@@ -676,6 +678,7 @@ Live2DManager.prototype.showPopup = function (buttonId, popup) {
 
                 // 检查是否超出屏幕右侧
                 const popupRight = popupRect.right;
+                const triggerIcon = document.querySelector(`.live2d-trigger-icon-${buttonId}`);
                 if (popupRight > screenWidth - rightMargin) {
                     // 超出右边界，改为向左弹出
                     // 获取按钮的实际宽度来计算正确的偏移
@@ -689,6 +692,9 @@ Live2DManager.prototype.showPopup = function (buttonId, popup) {
                     popup.style.marginLeft = '0';
                     popup.style.marginRight = `${buttonWidth + gap}px`;
                     popup.style.transform = 'translateX(10px)'; // 反向动画
+                    if (triggerIcon) triggerIcon.style.transform = 'rotate(180deg)';
+                } else {
+                    if (triggerIcon) triggerIcon.style.transform = 'rotate(0deg)';
                 }
 
                 // 检查是否超出屏幕底部（设置弹出框或其他较高的弹出框）
@@ -715,6 +721,8 @@ Live2DManager.prototype.showPopup = function (buttonId, popup) {
             this._popupTimers[buttonId] = setTimeout(() => {
                 popup.style.opacity = '0';
                 popup.style.transform = popup.style.right === '100%' ? 'translateX(10px)' : 'translateX(-10px)';
+                const triggerIcon = document.querySelector(`.live2d-trigger-icon-${buttonId}`);
+                if (triggerIcon) triggerIcon.style.transform = 'rotate(0deg)';
                 setTimeout(() => {
                     popup.style.display = 'none';
                     // 重置位置

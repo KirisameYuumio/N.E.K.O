@@ -245,10 +245,11 @@ VRMManager.prototype.setupFloatingButtons = function () {
             const triggerImg = document.createElement('img');
             triggerImg.src = '/static/icons/play_trigger_icon.png' + iconVersion;
             triggerImg.alt = '';
-            triggerImg.setAttribute('aria-hidden', 'true');
+            triggerImg.className = `vrm-trigger-icon-${config.id}`;
             Object.assign(triggerImg.style, {
                 width: '22px', height: '22px', objectFit: 'contain',
-                pointerEvents: 'none', imageRendering: 'crisp-edges'
+                pointerEvents: 'none', imageRendering: 'crisp-edges',
+                transition: 'transform 0.3s cubic-bezier(0.1, 0.9, 0.2, 1)'
             });
             Object.assign(triggerBtn.style, {
                 width: '24px', height: '24px', borderRadius: '50%',
