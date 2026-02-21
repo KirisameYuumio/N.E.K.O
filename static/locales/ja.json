@@ -573,6 +573,7 @@
     "siliconAssist": "SiliconFlow: コスパ良、Agentモード対応",
     "openaiAssist": "OpenAI: 記憶管理能力が高い",
     "geminiAssist": "Gemini: 知能・コスパ共に極めて優秀、中国国内版は非対応",
+    "kimiAssist": "Kimi: 中国国内利用可、ロングコンテキスト・ビジョン対応",
     "assistApiNote": "注: カスタム音声機能はAlibabaのみ対応です。GLMとStepFunは非推奨です。",
     "assistApiKeyQwen": "Assist APIキー - Alibaba",
     "assistApiKeyOpenai": "Assist APIキー - OpenAI",
@@ -580,6 +581,7 @@
     "assistApiKeyStep": "Assist APIキー - StepFun",
     "assistApiKeySilicon": "Assist APIキー - SiliconFlow",
     "assistApiKeyGemini": "Assist APIキー - Gemini",
+    "assistApiKeyKimi": "Assist APIキー - Kimi",
     "assistApiKeyHint": "（Assist APIが {{provider}} の場合のみ必要）",
     "assistApiKeyPlaceholder": "任意（空欄ならCore APIキーを使用）",
     "providerNames": {
@@ -605,7 +607,8 @@
       "glm": "GLM",
       "step": "StepFun",
       "silicon": "SiliconFlow（高コスパ、推奨）",
-      "gemini": "Gemini（Google、高知能、中国国内版非対応）"
+      "gemini": "Gemini（Google、高知能、中国国内版非対応）",
+      "kimi": "Kimi（Moonshot、中国国内利用可、ロングコンテキスト対応）"
     },
     "freeVersionNoApiKey": "無料版はAPIキー不要です",
     "pleaseEnterApiKey": "APIキーを入力してください",

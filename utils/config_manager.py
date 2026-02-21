@@ -880,6 +880,7 @@ class ConfigManager:
         config['ASSIST_API_KEY_STEP'] = core_cfg.get('assistApiKeyStep', '') or config['CORE_API_KEY']
         config['ASSIST_API_KEY_SILICON'] = core_cfg.get('assistApiKeySilicon', '') or config['CORE_API_KEY']
         config['ASSIST_API_KEY_GEMINI'] = core_cfg.get('assistApiKeyGemini', '') or config['CORE_API_KEY']
+        config['ASSIST_API_KEY_KIMI'] = core_cfg.get('assistApiKeyKimi', '') or config['CORE_API_KEY']
 
         if core_cfg.get('mcpToken'):
             config['MCP_ROUTER_API_KEY'] = core_cfg['mcpToken']
@@ -913,7 +914,7 @@ class ConfigManager:
 
         if assist_profile:
             config.update(assist_profile)
-        # agent api 默认跟随辅助 API 的视觉模型
+        # agent api 默认跟随辅助 API 的 agent_model，缺失时回退到 VISION_MODEL
         config['AGENT_MODEL'] = config.get('AGENT_MODEL') or config.get('VISION_MODEL', '')
         config['AGENT_MODEL_URL'] = config.get('AGENT_MODEL_URL') or config.get('VISION_MODEL_URL', '') or config.get('OPENROUTER_URL', '')
 
@@ -930,7 +931,7 @@ class ConfigManager:
         if not config['OPENROUTER_API_KEY']:
             config['OPENROUTER_API_KEY'] = config['CORE_API_KEY']
 
-        # Agent API 配置处理（默认跟随 assist vision，可单独覆盖）
+        # Agent API 配置处理（默认跟随 assist agent_model，可单独覆盖）
         if core_cfg.get('agentModelUrl') is not None:
             config['AGENT_MODEL_URL'] = core_cfg.get('agentModelUrl', '') or config.get('AGENT_MODEL_URL', '')
         if core_cfg.get('agentModelId') is not None:

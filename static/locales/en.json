@@ -573,6 +573,7 @@
         "siliconAssist": "SiliconFlow: Good value, supports Agent mode",
         "openaiAssist": "OpenAI: Strong memory management capability",
         "geminiAssist": "Gemini: Excellent intelligence and value, but not available in China domestic version",
+        "kimiAssist": "Kimi: Available in China, supports long context and vision",
         "assistApiNote": "Note: Only Alibaba supports custom voice functionality. GLM and StepFun are not recommended.",
         "assistApiKeyQwen": "Assist API Key - Alibaba",
         "assistApiKeyOpenai": "Assist API Key - OpenAI",
@@ -580,6 +581,7 @@
         "assistApiKeyStep": "Assist API Key - StepFun",
         "assistApiKeySilicon": "Assist API Key - SiliconFlow",
         "assistApiKeyGemini": "Assist API Key - Gemini",
+        "assistApiKeyKimi": "Assist API Key - Kimi",
         "assistApiKeyHint": "(Only required when Assist API is {{provider}})",
         "assistApiKeyPlaceholder": "Optional, defaults to Core API Key",
         "providerNames": {
@@ -605,7 +607,8 @@
             "glm": "GLM",
             "step": "StepFun",
             "silicon": "SiliconFlow (Good Value, Recommended)",
-            "gemini": "Gemini (Google, High Intelligence, not available in China)"
+            "gemini": "Gemini (Google, High Intelligence, not available in China)",
+            "kimi": "Kimi (Moonshot, Available in China, Long Context)"
         },
         "freeVersionNoApiKey": "Free version does not require API Key",
         "pleaseEnterApiKey": "Please enter your API Key",

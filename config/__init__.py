@@ -95,7 +95,7 @@ DEFAULT_SUMMARY_MODEL = "qwen-plus"
 DEFAULT_CORRECTION_MODEL = 'qwen-max'
 DEFAULT_EMOTION_MODEL = 'qwen-flash'
 DEFAULT_VISION_MODEL = "qwen3-vl-plus-2025-09-23"
-DEFAULT_AGENT_MODEL = DEFAULT_VISION_MODEL
+DEFAULT_AGENT_MODEL = "qwen3.5-plus"
 
 # 用户自定义模型配置（可选，暂未使用）
 DEFAULT_REALTIME_MODEL = "Qwen3-Omni-30B-A3B-Instruct"  # 全模态模型(语音+文字+图片)
@@ -316,6 +316,7 @@ DEFAULT_ASSIST_API_PROFILES = {
         'CORRECTION_MODEL': "free-model",
         'EMOTION_MODEL': "free-model",
         'VISION_MODEL': "free-vision-model",
+        'AGENT_MODEL': "free-model",
         'AUDIO_API_KEY': "free-access",
         'OPENROUTER_API_KEY': "free-access",
         'IS_FREE_VERSION': True,
@@ -327,6 +328,7 @@ DEFAULT_ASSIST_API_PROFILES = {
         'CORRECTION_MODEL': "qwen3-235b-a22b-instruct-2507",
         'EMOTION_MODEL': "qwen-flash",
         'VISION_MODEL': "qwen3-vl-plus-2025-09-23",
+        'AGENT_MODEL': "qwen3.5-plus",
     },
     'openai': {
         'OPENROUTER_URL': "https://api.openai.com/v1",
@@ -335,6 +337,7 @@ DEFAULT_ASSIST_API_PROFILES = {
         'CORRECTION_MODEL': "gpt-5-chat-latest",
         'EMOTION_MODEL': "gpt-4.1-nano",
         'VISION_MODEL': "gpt-5-chat-latest",
+        'AGENT_MODEL': "gpt-5-chat-latest",
     },
     'glm': {
         'OPENROUTER_URL': "https://open.bigmodel.cn/api/paas/v4",
@@ -343,6 +346,7 @@ DEFAULT_ASSIST_API_PROFILES = {
         'CORRECTION_MODEL': "glm-4.5-air",
         'EMOTION_MODEL': "glm-4.5-flash",
         'VISION_MODEL': "glm-4.6v-flash",
+        'AGENT_MODEL': "glm-4.5-air",
     },
     'step': {
         'OPENROUTER_URL': "https://api.stepfun.com/v1",
@@ -351,6 +355,7 @@ DEFAULT_ASSIST_API_PROFILES = {
         'CORRECTION_MODEL': "step-2-mini",
         'EMOTION_MODEL': "step-2-mini",
         'VISION_MODEL': "step-1o-turbo-vision",
+        'AGENT_MODEL': "step-2-mini",
     },
     'silicon': {
         'OPENROUTER_URL': "https://api.siliconflow.cn/v1",
@@ -359,6 +364,7 @@ DEFAULT_ASSIST_API_PROFILES = {
         'CORRECTION_MODEL': "deepseek-ai/DeepSeek-V3.2",
         'EMOTION_MODEL': "inclusionAI/Ling-mini-2.0",
         'VISION_MODEL': "zai-org/GLM-4.6V",
+        'AGENT_MODEL': "deepseek-ai/DeepSeek-V3.2",
     },
     'gemini': {
         'OPENROUTER_URL': "https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -367,6 +373,16 @@ DEFAULT_ASSIST_API_PROFILES = {
         'CORRECTION_MODEL': "gemini-3-flash-preview",
         'EMOTION_MODEL': "gemini-2.5-flash",
         'VISION_MODEL': "gemini-3-flash-preview",
+        'AGENT_MODEL': "gemini-3-flash-preview",
+    },
+    'kimi': {
+        'OPENROUTER_URL': "https://api.moonshot.cn/v1",
+        'CONVERSATION_MODEL': "kimi-latest",
+        'SUMMARY_MODEL': "moonshot-v1-8k",
+        'CORRECTION_MODEL': "kimi-latest",
+        'EMOTION_MODEL': "moonshot-v1-8k",
+        'VISION_MODEL': "kimi-latest",
+        'AGENT_MODEL': "kimi-latest",
     },
 }
 
@@ -377,6 +393,7 @@ DEFAULT_ASSIST_API_KEY_FIELDS = {
     'step': 'ASSIST_API_KEY_STEP',
     'silicon': 'ASSIST_API_KEY_SILICON',
     'gemini': 'ASSIST_API_KEY_GEMINI',
+    'kimi': 'ASSIST_API_KEY_KIMI',
 }
 
 DEFAULT_CONFIG_DATA = {
