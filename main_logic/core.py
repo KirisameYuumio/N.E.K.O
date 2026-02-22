@@ -2153,7 +2153,7 @@ class LLMSessionManager:
     def _get_translation_service(self):
         """获取翻译服务实例（延迟初始化）"""
         if self._translation_service is None:
-            from utils.translation_service import get_translation_service
+            from utils.language_utils import get_translation_service
             self._translation_service = get_translation_service(self._config_manager)
         return self._translation_service
     
@@ -2198,7 +2198,7 @@ class LLMSessionManager:
         
         try:
             translation_service = self._get_translation_service()
-            translated = await translation_service.translate_text(text, self.user_language)
+            translated = await translation_service.translate_text_robust(text, self.user_language)
             return translated
         except Exception as e:
             logger.error(f"翻译失败: {e}，返回原文")

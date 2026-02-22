@@ -573,7 +573,7 @@ def _sync_preload_modules():
     - pyrnnoise/audiolab: audio_processor.py 中通过 _get_rnnoise() 延迟加载
     - dashscope: tts_client.py 中仅在 cosyvoice_vc_tts_worker 函数内部导入
     - googletrans/translatepy: language_utils.py 中延迟导入的翻译库
-    - translation_service: main_logic/core.py 中延迟初始化的翻译服务
+    - translation_service: language_utils.py 中的翻译服务（TranslationService）
     """
     import time
     start = time.time()
@@ -591,8 +591,10 @@ def _sync_preload_modules():
     
     # 2. 翻译服务实例（需要 config_manager）
     try:
-        from utils.translation_service import get_translation_service
+        # 提前初始化翻译服务（如果在初始化过程中需要翻译数据）
+        from utils.language_utils import get_translation_service
         from utils.config_manager import get_config_manager
+        # 此处仅调用以触发单例初始化，后续使用时通过 get_translation_service 获取即可
         config_manager = get_config_manager()
         # 预初始化翻译服务实例（触发 LLM 客户端创建等）
         _ = get_translation_service(config_manager)
