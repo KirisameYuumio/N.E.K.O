@@ -452,6 +452,8 @@ function init_app() {
 
                     window._geminiTurnFullText = '';
 
+                    (async () => { await clearAudioQueue(); })();
+
                     const retryMsg = window.t ? window.t('console.aiRetrying') : '猫娘链接出现异常，校准中…';
                     const failMsg = window.t ? window.t('console.aiFailed') : '猫娘链接出现异常';
                     showStatusToast(response.will_retry ? retryMsg : failMsg, 2500);
@@ -811,6 +813,17 @@ function init_app() {
                     } catch (e) {
                         console.warn('[App] 处理 agent_task_update 失败:', e);
                     }
+                } else if (response.type === 'request_screenshot') {
+                    (async () => {
+                        try {
+                            const dataUrl = await captureProactiveChatScreenshot();
+                            if (dataUrl && socket && socket.readyState === WebSocket.OPEN) {
+                                socket.send(JSON.stringify({ action: 'screenshot_response', data: dataUrl }));
+                            }
+                        } catch (e) {
+                            console.warn('[App] request_screenshot capture failed:', e);
+                        }
+                    })();
                 } else if (response.type === 'system' && response.data === 'turn end') {
                     console.log(window.t('console.turnEndReceived'));
                     // 合并消息关闭（分句模式）时：兜底 flush 未以标点结尾的最后缓冲，避免最后一段永远不显示
