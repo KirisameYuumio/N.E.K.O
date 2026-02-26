@@ -21,18 +21,29 @@ except Exception as e:
     logger.error(f"TTS Worker Error: {e}")
     # Worker dies or hangs, user stuck on "Preparing..."
 
-# Good Pattern (Notifies the user via Frontend Toast)
+# Good Pattern (Structured JSON error for i18n frontend toasts)
+import json
 except Exception as e:
     logger.error(f"TTS Worker Error: {e}")
-    response_queue.put(("__error__", str(e)))
+    # Map to specific error codes known to i18n
+    error_payload = json.dumps({"code": "API_QUOTA_TIME", "details": str(e)})
+    response_queue.put(("__error__", error_payload))
+
+# Acceptable Fallback (Fallback 1008 error if code unknown)
+except Exception as e:
+    logger.error(f"TTS Worker Error: {e}")
+    error_payload = json.dumps({"code": "API_1008_FALLBACK", "msg": str(e)})
+    response_queue.put(("__error__", error_payload))
 ```
 
 ### WebSocket Stream Callbacks Example
 
 ```python
+import json
 def on_error(self, message: str): 
     logger.error(f"TTS Error: {message}")
-    self.response_queue.put(("__error__", message))
+    error_payload = json.dumps({"code": "API_1008_FALLBACK", "msg": message})
+    self.response_queue.put(("__error__", error_payload))
 ```
 
 ## Checklist for Adding a New TTS Worker
