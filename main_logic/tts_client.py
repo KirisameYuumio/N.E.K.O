@@ -107,6 +107,19 @@ def _resample_audio(audio_int16: np.ndarray, src_rate: int, dst_rate: int,
     return resampled_int16.tobytes()
 
 
+def _enqueue_error(response_queue, error_value):
+    """统一错误日志与错误消息入队。"""
+    if isinstance(error_value, str):
+        formatted_msg = error_value
+    else:
+        try:
+            formatted_msg = json.dumps(error_value, ensure_ascii=False, default=str)
+        except Exception:
+            formatted_msg = str(error_value)
+    logger.error(f"TTS错误: {formatted_msg}")
+    response_queue.put(("__error__", formatted_msg))
+
+
 def step_realtime_tts_worker(request_queue, response_queue, audio_api_key, voice_id, free_mode=False):
     """
     StepFun实时TTS worker（用于默认音色）
@@ -159,13 +172,10 @@ def step_realtime_tts_worker(request_queue, response_queue, audio_api_key, voice
                             session_ready.set()
                             break
                         elif event_type == "tts.response.error":
-                            error_msg = json.dumps(event, ensure_ascii=False)
-                            logger.error(f"TTS服务器错误: {error_msg}")
-                            response_queue.put(("__error__", error_msg))
+                            _enqueue_error(response_queue, event)
                             break
                 except Exception as e:
-                    logger.error(f"等待连接时出错: {e}")
-                    response_queue.put(("__error__", str(e)))
+                    _enqueue_error(response_queue, e)
             
             # 等待连接成功
             try:
@@ -227,9 +237,7 @@ def step_realtime_tts_worker(request_queue, response_queue, audio_api_key, voice
                         event_type = event.get("type")
                         
                         if event_type == "tts.response.error":
-                            error_msg = json.dumps(event, ensure_ascii=False)
-                            logger.error(f"TTS错误: {error_msg}")
-                            response_queue.put(("__error__", error_msg))
+                            _enqueue_error(response_queue, event)
                         elif event_type == "tts.response.audio.delta":
                             try:
                                 # StepFun 返回 BASE64 编码的完整音频（包含 wav header）
@@ -370,9 +378,7 @@ def step_realtime_tts_worker(request_queue, response_queue, audio_api_key, voice
                                     event_type = event.get("type")
                                     
                                     if event_type == "tts.response.error":
-                                        error_msg = json.dumps(event, ensure_ascii=False)
-                                        logger.error(f"TTS错误: {error_msg}")
-                                        response_queue.put(("__error__", error_msg))
+                                        _enqueue_error(response_queue, event)
                                     elif event_type == "tts.response.audio.delta":
                                         try:
                                             audio_b64 = event.get("data", {}).get("audio", "")
@@ -517,13 +523,10 @@ def qwen_realtime_tts_worker(request_queue, response_queue, audio_api_key, voice
                             session_ready.set()
                             break
                         elif event_type == "error":
-                            error_msg = json.dumps(event, ensure_ascii=False)
-                            logger.error(f"TTS服务器错误: {error_msg}")
-                            response_queue.put(("__error__", error_msg))
+                            _enqueue_error(response_queue, event)
                             break
                 except Exception as e:
-                    logger.error(f"等待会话就绪时出错: {e}")
-                    response_queue.put(("__error__", str(e)))
+                    _enqueue_error(response_queue, e)
             
             # 发送配置
             await ws.send(json.dumps(config_message))
@@ -554,9 +557,7 @@ def qwen_realtime_tts_worker(request_queue, response_queue, audio_api_key, voice
                         event_type = event.get("type")
                         
                         if event_type == "error":
-                            error_msg = json.dumps(event, ensure_ascii=False)
-                            logger.error(f"TTS错误: {error_msg}")
-                            response_queue.put(("__error__", error_msg))
+                            _enqueue_error(response_queue, event)
                         elif event_type == "response.audio.delta":
                             try:
                                 audio_bytes = base64.b64decode(event.get("delta", ""))
@@ -657,13 +658,10 @@ def qwen_realtime_tts_worker(request_queue, response_queue, audio_api_key, voice
                                         session_ready.set()
                                         break
                                     elif event_type == "error":
-                                        error_msg = json.dumps(event, ensure_ascii=False)
-                                        logger.error(f"等待期间收到错误: {error_msg}")
-                                        response_queue.put(("__error__", error_msg))
+                                        _enqueue_error(response_queue, event)
                                         break
                             except Exception as e:
-                                logger.error(f"wait_ready 异常: {e}")
-                                response_queue.put(("__error__", str(e)))
+                                _enqueue_error(response_queue, e)
                         
                         try:
                             await asyncio.wait_for(wait_ready(), timeout=2.0)
@@ -678,9 +676,7 @@ def qwen_realtime_tts_worker(request_queue, response_queue, audio_api_key, voice
                                     event_type = event.get("type")
                                     
                                     if event_type == "error":
-                                        error_msg = json.dumps(event, ensure_ascii=False)
-                                        logger.error(f"TTS错误: {error_msg}")
-                                        response_queue.put(("__error__", error_msg))
+                                        _enqueue_error(response_queue, event)
                                     elif event_type == "response.audio.delta":
                                         try:
                                             audio_bytes = base64.b64decode(event.get("delta", ""))
@@ -788,8 +784,7 @@ def cosyvoice_vc_tts_worker(request_queue, response_queue, audio_api_key, voice_
                 
         def on_error(self, message: str): 
             if "request timeout after 23 seconds" not in message:
-                logger.error(f"TTS Error: {message}")
-                self.response_queue.put(("__error__", message))
+                _enqueue_error(self.response_queue, message)
             
         def on_close(self): 
             pass
@@ -1066,11 +1061,9 @@ def cogtts_tts_worker(request_queue, response_queue, audio_api_key, voice_id):
                                                             logger.error(f"处理音频数据时出错: {e}")
                                         else:
                                             error_text = await resp.text()
-                                            logger.error(f"CogTTS API错误 ({resp.status}): {error_text}")
-                                            response_queue.put(("__error__", f"CogTTS API错误 ({resp.status}): {error_text}"))
+                                            _enqueue_error(response_queue, f"CogTTS API错误 ({resp.status}): {error_text}")
                             except Exception as e:
-                                logger.error(f"CogTTS合成失败: {e}")
-                                response_queue.put(("__error__", f"CogTTS合成失败: {e}"))
+                                _enqueue_error(response_queue, f"CogTTS合成失败: {e}")
                     
                     # 清空缓冲区
                     text_buffer = []
@@ -1081,8 +1074,7 @@ def cogtts_tts_worker(request_queue, response_queue, audio_api_key, voice_id):
                     text_buffer.append(tts_text)
         
         except Exception as e:
-            logger.error(f"CogTTS Worker错误: {e}")
-            response_queue.put(("__error__", str(e)))
+            _enqueue_error(response_queue, f"CogTTS Worker错误: {e}")
     
     # 运行异步worker
     try:
@@ -1218,7 +1210,7 @@ def gemini_tts_worker(request_queue, response_queue, audio_api_key, voice_id):
                             dt = time.time() - t0
                             logger.warning(f"Gemini TTS attempt {attempt}/{MAX_RETRIES} 失败 ({dt:.1f}s): {e}")
                             if attempt == MAX_RETRIES:
-                                response_queue.put(("__error__", f"Gemini TTS失败: {e}"))
+                                _enqueue_error(response_queue, f"Gemini TTS失败: {e}")
 
                     if audio_data:
                         audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -1328,8 +1320,7 @@ def openai_tts_worker(request_queue, response_queue, audio_api_key, voice_id):
                                             response_queue.put(resampled_bytes)
                                             
                             except Exception as e:
-                                logger.error(f"OpenAI TTS 合成失败: {e}")
-                                response_queue.put(("__error__", f"OpenAI TTS 合成失败: {e}"))
+                                _enqueue_error(response_queue, f"OpenAI TTS 合成失败: {e}")
                     
                     # 清空缓冲区
                     text_buffer = []
@@ -1341,8 +1332,7 @@ def openai_tts_worker(request_queue, response_queue, audio_api_key, voice_id):
                     text_buffer.append(tts_text)
         
         except Exception as e:
-            logger.error(f"OpenAI TTS Worker错误: {e}")
-            response_queue.put(("__error__", str(e)))
+            _enqueue_error(response_queue, f"OpenAI TTS Worker错误: {e}")
     
     # 运行异步worker
     try:
@@ -1469,8 +1459,7 @@ def gptsovits_tts_worker(request_queue, response_queue, audio_api_key, voice_id)
                                 logger.debug("[GPT-SoVITS v3] 会话完成")
                             elif msg_type == 'error':
                                 error_msg = str(msg.get('message', ''))
-                                logger.error(f"[GPT-SoVITS v3] 服务端错误: {error_msg}")
-                                response_queue.put(("__error__", error_msg))
+                                _enqueue_error(response_queue, f"[GPT-SoVITS v3] 服务端错误: {error_msg}")
                             elif msg_type == 'flushed':
                                 logger.debug("[GPT-SoVITS v3] flush 完成")
                         except json.JSONDecodeError:
@@ -1480,8 +1469,7 @@ def gptsovits_tts_worker(request_queue, response_queue, audio_api_key, voice_id)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                logger.error(f"[GPT-SoVITS v3] 接收循环异常: {e}")
-                response_queue.put(("__error__", str(e)))
+                _enqueue_error(response_queue, f"[GPT-SoVITS v3] 接收循环异常: {e}")
 
         async def close_session(ws_conn, recv_task, send_end=True):
             """关闭当前 WS 会话"""
@@ -1598,8 +1586,7 @@ def gptsovits_tts_worker(request_queue, response_queue, audio_api_key, voice_id)
                         current_speech_id = None
 
         except Exception as e:
-            logger.error(f"[GPT-SoVITS v3] Worker 错误: {e}")
-            response_queue.put(("__error__", str(e)))
+            _enqueue_error(response_queue, f"[GPT-SoVITS v3] Worker 错误: {e}")
         finally:
             # 清理
             if _ws_is_open(ws):
@@ -1766,8 +1753,7 @@ def local_cosyvoice_worker(request_queue, response_queue, audio_api_key, voice_i
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                logger.error(f"接收循环异常: {e}")
-                response_queue.put(("__error__", str(e)))
+                _enqueue_error(response_queue, f"接收循环异常: {e}")
 
         async def send_end_signal(ws_conn):
             """发送结束信号（文本已在主循环中实时发送，此处只需发送 end）"""
@@ -1775,8 +1761,7 @@ def local_cosyvoice_worker(request_queue, response_queue, audio_api_key, voice_i
                 await ws_conn.send(json.dumps({"event": "end"}))
                 logger.debug("发送结束信号")
             except Exception as e:
-                logger.error(f"发送结束信号失败: {e}")
-                response_queue.put(("__error__", str(e)))
+                _enqueue_error(response_queue, f"发送结束信号失败: {e}")
 
         async def create_connection():
             """创建新连接并发送配置"""
@@ -1863,8 +1848,7 @@ def local_cosyvoice_worker(request_queue, response_queue, audio_api_key, voice_i
                     await ws.send(json.dumps({"text": tts_text}))
                     logger.debug(f"发送合成片段: {tts_text}")
                 except Exception as e:
-                    logger.error(f"发送失败: {e}")
-                    response_queue.put(("__error__", str(e)))
+                    _enqueue_error(response_queue, f"发送失败: {e}")
                     ws = None
 
         # 清理

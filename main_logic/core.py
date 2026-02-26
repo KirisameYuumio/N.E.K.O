@@ -511,19 +511,20 @@ class LLMSessionManager:
         self.session_closed_by_server = True
         
         if message:
-            message_lower = message.lower()
-            if '欠费' in message_lower or 'standing' in message_lower:
+            message_text = str(message)
+            message_text_lower = message_text.lower()
+            if '欠费' in message_text_lower or 'standing' in message_text_lower:
                 await self.send_status(json.dumps({"code": "API_ARREARS"}))
-            elif 'quota' in message_lower or 'time limit' in message_lower:
+            elif 'quota' in message_text_lower or 'time limit' in message_text_lower:
                 await self.send_status(json.dumps({"code": "API_QUOTA_TIME"}))
-            elif '429' in message_lower or 'too many' in message_lower:
+            elif '429' in message_text_lower or 'too many' in message_text_lower:
                 await self.send_status(json.dumps({"code": "API_RATE_LIMIT"}))
-            elif 'policy violation' in message_lower:
-                await self.send_status(json.dumps({"code": "API_POLICY_VIOLATION", "details": {"msg": message}}))
-            elif '1008' in message_lower:
-                await self.send_status(json.dumps({"code": "API_1008_FALLBACK", "details": {"msg": message}}))
+            elif 'policy violation' in message_text_lower:
+                await self.send_status(json.dumps({"code": "API_POLICY_VIOLATION", "details": {"msg": message_text}}))
+            elif '1008' in message_text_lower:
+                await self.send_status(json.dumps({"code": "API_1008_FALLBACK", "details": {"msg": message_text}}))
             else:
-                await self.send_status(message)
+                await self.send_status(message_text)
         logger.info("💥 Session closed by API Server.")
         await self.disconnected_by_server()
     
@@ -2446,8 +2447,9 @@ class LLMSessionManager:
                         continue
                     elif data[0] == "__error__":
                         error_msg = data[1]
+                        error_msg_text = str(error_msg)
                         logger.error(f"TTS Worker Error: {error_msg}")
-                        error_msg_lower = error_msg.lower()
+                        error_msg_lower = error_msg_text.lower()
                         # 识别配额限制
                         if '欠费' in error_msg_lower or 'standing' in error_msg_lower:
                             user_msg = json.dumps({"code": "API_ARREARS"})
@@ -2456,11 +2458,11 @@ class LLMSessionManager:
                         elif '429' in error_msg_lower or 'too many' in error_msg_lower:
                             user_msg = json.dumps({"code": "API_RATE_LIMIT"})
                         elif 'policy violation' in error_msg_lower:
-                            user_msg = json.dumps({"code": "API_POLICY_VIOLATION", "details": {"msg": error_msg}})
+                            user_msg = json.dumps({"code": "API_POLICY_VIOLATION", "details": {"msg": error_msg_text}})
                         elif '1008' in error_msg_lower:
-                            user_msg = json.dumps({"code": "API_1008_FALLBACK", "details": {"msg": error_msg}})
+                            user_msg = json.dumps({"code": "API_1008_FALLBACK", "details": {"msg": error_msg_text}})
                         else:
-                            user_msg = f"TTS服务连接失败: {error_msg}"
+                            user_msg = f"TTS服务连接失败: {error_msg_text}"
                         asyncio.create_task(self.send_status(user_msg))
                         continue
 

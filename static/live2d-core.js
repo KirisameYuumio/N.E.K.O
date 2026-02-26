@@ -286,15 +286,44 @@ class Live2DManager {
     }
 
     async ensurePIXIReady(canvasId, containerId, options = {}) {
-        if (this.isInitialized && this.pixi_app && this.pixi_app.stage) {
+        const lastContext = this._lastPIXIContext || {};
+        const contextMatches = (
+            lastContext.canvasId === canvasId &&
+            lastContext.containerId === containerId
+        );
+
+        if (this.isInitialized && this.pixi_app && this.pixi_app.stage && contextMatches) {
             return this.pixi_app;
         }
-        return await this.initPIXI(canvasId, containerId, options);
+        if (this.isInitialized && !contextMatches) {
+            if (this._screenChangeHandler) {
+                window.removeEventListener('resize', this._screenChangeHandler);
+                this._screenChangeHandler = null;
+            }
+            if (this.pixi_app && this.pixi_app.destroy) {
+                try {
+                    this.pixi_app.destroy(true);
+                } catch (e) {
+                    console.warn('[Live2D Core] ensurePIXIReady 销毁旧 PIXI 失败:', e);
+                }
+            }
+            this.pixi_app = null;
+            this.isInitialized = false;
+        }
+        const app = await this.initPIXI(canvasId, containerId, options);
+        if (app && app.stage) {
+            this._lastPIXIContext = { canvasId, containerId };
+        }
+        return app;
     }
 
     async rebuildPIXI(canvasId, containerId, options = {}) {
         if (this._initPIXIPromise) {
-            await this._initPIXIPromise;
+            try {
+                await this._initPIXIPromise;
+            } catch (e) {
+                console.warn('[Live2D Core] 忽略旧初始化失败，继续重建 PIXI:', e);
+            }
         }
         if (this._screenChangeHandler) {
             window.removeEventListener('resize', this._screenChangeHandler);
