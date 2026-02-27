@@ -41,7 +41,7 @@ background: #fff;
 border-radius: 0;
 box-shadow: none;
 padding: 0;
-padding-bottom: 100px; /*归还被保存按钮占用的空间 */
+padding-bottom: 100px; /* 归还被保存按钮占用的空间 */
 position: relative;
 min-height: 100vh;
 }
