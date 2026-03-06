@@ -5,7 +5,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Windows multiprocessing 支持：确保子进程不会重复执行模块级初始化
 from multiprocessing import freeze_support
+import multiprocessing
 freeze_support()
+
+# 设置 multiprocessing 启动方法（确保跨进程共享结构的一致性）
+# 在 Linux/macOS 上使用 fork，在 Windows 上使用 spawn（默认）
+if sys.platform != "win32":
+    try:
+        multiprocessing.set_start_method('fork', force=False)
+    except RuntimeError:
+        # 启动方法已经设置过，忽略
+        pass
 
 # 检查是否需要执行初始化（用于防止 Windows spawn 方式创建的子进程重复初始化）
 # 方案：首次导入时设置环境变量标记，子进程会继承这个标记从而跳过初始化
@@ -34,17 +44,43 @@ import mimetypes # noqa
 mimetypes.add_type("application/javascript", ".js")
 import asyncio # noqa
 import logging # noqa
-from fastapi import FastAPI # noqa
-from fastapi.staticfiles import StaticFiles # noqa
-from main_logic import core as core, cross_server as cross_server # noqa
-from main_logic.agent_event_bus import MainServerAgentBridge, notify_analyze_ack, set_main_bridge # noqa
-from fastapi.templating import Jinja2Templates # noqa
-from threading import Thread, Event as ThreadEvent # noqa
-from queue import Queue # noqa
 import atexit # noqa
 import httpx # noqa
 from config import MAIN_SERVER_PORT, MONITOR_SERVER_PORT # noqa
-from utils.config_manager import get_config_manager # noqa
+from utils.config_manager import get_config_manager, get_reserved # noqa
+# 将日志初始化提前，确保导入阶段异常也能落盘
+from utils.logger_config import setup_logging # noqa: E402
+from utils.ssl_env_diagnostics import probe_ssl_environment, write_ssl_diagnostic # noqa: E402
+
+logger, log_config = setup_logging(service_name="Main", log_level=logging.INFO, silent=not _IS_MAIN_PROCESS)
+
+if _IS_MAIN_PROCESS:
+    _ssl_precheck = probe_ssl_environment()
+    if not _ssl_precheck.get("ok", True):
+        diag_dir = os.path.join(log_config.get_log_directory_path(), "diagnostics")
+        diag_path = write_ssl_diagnostic(
+            event="main_server_ssl_precheck_failed",
+            output_dir=diag_dir,
+            extra=_ssl_precheck,
+        )
+        logger.warning(
+            "SSL environment precheck failed: %s%s",
+            _ssl_precheck.get("error_message"),
+            f" | diagnostic: {diag_path}" if diag_path else "",
+        )
+
+try:
+    from fastapi import FastAPI # noqa
+    from fastapi.staticfiles import StaticFiles # noqa
+    from main_logic import core as core, cross_server as cross_server # noqa
+    from main_logic.agent_event_bus import MainServerAgentBridge, notify_analyze_ack, set_main_bridge # noqa
+    from fastapi.templating import Jinja2Templates # noqa
+    from threading import Thread, Event as ThreadEvent # noqa
+    from queue import Queue # noqa
+except Exception as e:
+    logger.exception(f"[Main] Module import failed during startup: {e}")
+    raise
+
 # 导入创意工坊工具模块
 from utils.workshop_utils import ( # noqa
     get_workshop_root,
@@ -121,11 +157,6 @@ def get_default_steam_info():
 # 这样可以避免在模块导入时就执行 DLL 加载等操作
 steamworks = None
 
-# 配置日志（子进程静默初始化，避免重复打印初始化消息）
-from utils.logger_config import setup_logging # noqa: E402
-
-logger, log_config = setup_logging(service_name="Main", log_level=logging.INFO, silent=not _IS_MAIN_PROCESS)
-
 _config_manager = get_config_manager()
 
 def cleanup():
@@ -200,9 +231,18 @@ async def _handle_agent_event(event: dict):
                             pass
             return
 
-        if not lanlan or lanlan not in session_manager:
+        # Resolve target session manager; fallback to broadcast if lanlan is unknown
+        mgr = session_manager.get(lanlan) if lanlan else None
+        if not mgr and event_type == "task_update":
+            # Broadcast task_update to all connected sessions when lanlan is unresolvable
+            task_payload = {"type": "agent_task_update", "task": event.get("task", {})}
+            for _mgr in session_manager.values():
+                if _mgr and _mgr.websocket and hasattr(_mgr.websocket, "send_json"):
+                    try:
+                        await _mgr.websocket.send_json(task_payload)
+                    except Exception:
+                        pass
             return
-        mgr = session_manager.get(lanlan)
         if not mgr:
             return
         if event_type in ("task_result", "proactive_message"):
@@ -226,12 +266,16 @@ async def _handle_agent_event(event: dict):
                 mgr._pending_agent_callback_task = asyncio.create_task(mgr.trigger_agent_callbacks())
                 if mgr.websocket and hasattr(mgr.websocket, "send_json"):
                     try:
-                        await mgr.websocket.send_json({
+                        notif = {
                             "type": "agent_notification",
                             "text": text,
                             "source": "brain",
                             "status": cb_status,
-                        })
+                        }
+                        err_msg = event.get("error_message") or ""
+                        if err_msg:
+                            notif["error_message"] = err_msg[:500]
+                        await mgr.websocket.send_json(notif)
                     except Exception:
                         pass
         elif event_type == "task_update":
@@ -312,7 +356,12 @@ async def initialize_character_data():
                         _
                     ) = _config_manager.get_character_data()
                     # 更新voice_id（这是切换音色时需要的）
-                    old_mgr.voice_id = lanlan_basic_config_updated[k].get('voice_id', '')
+                    old_mgr.voice_id = get_reserved(
+                        lanlan_basic_config_updated[k],
+                        'voice_id',
+                        default='',
+                        legacy_keys=('voice_id',),
+                    )
                     logger.info(f"{k} 有活跃session，只更新配置，不重新创建session_manager")
                 except Exception as e:
                     logger.error(f"更新 {k} 的活跃session配置失败: {e}", exc_info=True)
@@ -757,6 +806,38 @@ async def on_startup():
         except Exception as e:
             logger.warning(f"全局语言初始化失败: {e}，将使用默认值")
 
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    """服务器关闭时清理资源"""
+    if _IS_MAIN_PROCESS:
+        logger.info("正在清理资源...")
+        
+        # 等待预加载任务完成（如果还在运行）
+        global _preload_task, agent_event_bridge
+        if _preload_task:
+            try:
+                await asyncio.wait_for(_preload_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                _preload_task.cancel()
+                try:
+                    await _preload_task
+                except asyncio.CancelledError:
+                    logger.debug("预加载任务清理时超时并已取消（正常关闭流程）")
+            except asyncio.CancelledError:
+                logger.debug("预加载任务清理时已取消（正常关闭流程）")
+            except Exception as e:
+                logger.debug(f"预加载任务清理时出错（正常关闭流程）: {e}", exc_info=True)
+        
+        # Clean up agent_event_bridge (ZMQ context/sockets/recv thread)
+        if agent_event_bridge is not None:
+            try:
+                await agent_event_bridge.stop()
+            except Exception as e:
+                logger.debug(f"Agent event bridge cleanup failed: {e}", exc_info=True)
+        
+        logger.info("✅ 资源清理完成")
+
 # 使用 FastAPI 的 app.state 来管理启动配置
 def get_start_config():
     """从 app.state 获取启动配置"""
@@ -1048,7 +1129,14 @@ if __name__ == "__main__":
     try:
         server.run()
     except KeyboardInterrupt:
-        # 信号处理器已经处理了，这里只是捕获异常防止 traceback
+        # Ctrl+C 正常关闭，不显示 traceback
+        logger.info("收到关闭信号（Ctrl+C），正在关闭服务器...")
+    except (asyncio.CancelledError, SystemExit):
+        # 正常的关闭信号
         pass
+    except Exception as e:
+        # 真正的错误，显示完整 traceback
+        logger.error(f"服务器运行时发生错误: {e}", exc_info=True)
+        raise
     finally:
         logger.info("服务器已关闭")

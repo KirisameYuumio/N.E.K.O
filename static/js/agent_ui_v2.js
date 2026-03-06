@@ -111,9 +111,30 @@
         if (!snapshot || typeof snapshot !== 'object') return;
         const rev = Number(snapshot.revision ?? -1);
         if (Number.isFinite(rev) && rev <= state.revision) return;
+
+        // Detect precheck failure transitions: PENDING → specific failure reason
+        const prevCaps = (state.snapshot && state.snapshot.capabilities) || {};
+        const newCaps = snapshot.capabilities || {};
+        for (const [capName, capInfo] of Object.entries(newCaps)) {
+            if (!capInfo || capInfo.ready) continue;
+            const prevInfo = prevCaps[capName];
+            const wasPending = prevInfo && !prevInfo.ready && prevInfo.reason && prevInfo.reason.includes('PENDING');
+            const nowFailed = capInfo.reason && !capInfo.reason.includes('PENDING');
+            if (wasPending && nowFailed && typeof window.showStatusToast === 'function' && window.t) {
+                const precheckKey = `agent.precheck.${capInfo.reason}`;
+                let reasonText = window.t(precheckKey);
+                if (reasonText === precheckKey) reasonText = capInfo.reason;
+                window.showStatusToast(window.t('agent.status.precheckFailed', { reason: reasonText }), 5000);
+            }
+        }
+
         state.snapshot = snapshot;
         if (Number.isFinite(rev)) state.revision = rev;
         window._agentStatusSnapshot = snapshot;
+        if (snapshot.notification && typeof window.showStatusToast === 'function') {
+            const msg = window.translateStatusMessage ? window.translateStatusMessage(snapshot.notification) : snapshot.notification;
+            window.showStatusToast(msg, 4000);
+        }
         render(source);
     }
 
@@ -187,14 +208,38 @@
             const canUse = effectiveAnalyzerEnabled && ready;
             list.forEach(target => {
                 target.checked = optimisticValue && canUse;
-                target.disabled = !!state.globalBusy || disabledByPending || !canUse;
-                target.title = canUse ? getName(k) : (reason || (window.t ? window.t('settings.toggles.masterRequired', { name: getName(k) }) : '请先开启Agent总开关'));
+                // When master is ON, keep child toggles clickable even if capability cache
+                // is stale — backend set_agent_flags does a live check and will notify on error.
+                target.disabled = !!state.globalBusy || disabledByPending || !effectiveAnalyzerEnabled;
+                if (canUse) {
+                    target.title = getName(k);
+                } else if (!effectiveAnalyzerEnabled) {
+                    target.title = window.t ? window.t('settings.toggles.masterRequired', { name: getName(k) }) : '请先开启Agent总开关';
+                } else {
+                    // Translate precheck reason code via i18n
+                    let reasonText = reason;
+                    if (reason && window.t) {
+                        const precheckKey = `agent.precheck.${reason}`;
+                        const translated = window.t(precheckKey);
+                        if (translated && translated !== precheckKey) {
+                            reasonText = translated;
+                        }
+                    }
+                    target.title = reasonText
+                        ? (window.t ? window.t('agent.status.precheckFailed', { reason: reasonText }) : reasonText)
+                        : (window.t ? window.t('settings.toggles.capabilityNotReady', { name: getName(k) }) : `${getName(k)}尚未就绪，点击尝试启用`);
+                }
             });
             sync(list);
         });
 
+        const anyPending = Object.values(snap.capabilities || {}).some(
+            c => c && typeof c.reason === 'string' && c.reason.includes('PENDING')
+        );
         if (state.globalBusy) {
             setStatus(window.t ? window.t('settings.toggles.checking') : '已接受操作，切换中...');
+        } else if (anyPending) {
+            setStatus(window.t ? window.t('agent.status.connectivityCheck') : 'Agent LLM 连接检查中...');
         } else if (!analyzerEnabled) {
             setStatus(window.t ? window.t('agent.status.ready') : 'Agent服务器就绪');
         } else {

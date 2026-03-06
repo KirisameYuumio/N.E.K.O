@@ -11,21 +11,45 @@ Handles configuration-related API endpoints including:
 
 import json
 import os
+import threading
+import urllib.parse
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 from .shared_state import get_config_manager, get_steamworks, get_session_manager, get_initialize_character_data
 from .characters_router import get_current_live2d_model
 from utils.preferences import load_user_preferences, update_model_preferences, validate_model_preferences, move_model_to_top
 from utils.logger_config import get_module_logger
+from utils.config_manager import get_reserved
+from config import (
+    CHARACTER_SYSTEM_RESERVED_FIELDS,
+    CHARACTER_WORKSHOP_RESERVED_FIELDS,
+    CHARACTER_RESERVED_FIELDS,
+)
 
 
 router = APIRouter(prefix="/api/config", tags=["config"])
+
+# --- proxy mode helpers ---
+_PROXY_LOCK = threading.Lock()
+_proxy_snapshot: dict[str, str] = {}
 logger = get_module_logger(__name__, "Main")
 
 # VRM 模型路径常量
 VRM_STATIC_PATH = "/static/vrm"  # 项目目录下的 VRM 模型路径
 VRM_USER_PATH = "/user_vrm"  # 用户文档目录下的 VRM 模型路径
+
+
+@router.get("/character_reserved_fields")
+async def get_character_reserved_fields():
+    """返回角色档案保留字段配置（供前端与路由统一使用）。"""
+    return {
+        "success": True,
+        "system_reserved_fields": list(CHARACTER_SYSTEM_RESERVED_FIELDS),
+        "workshop_reserved_fields": list(CHARACTER_WORKSHOP_RESERVED_FIELDS),
+        "all_reserved_fields": list(CHARACTER_RESERVED_FIELDS),
+    }
 
 
 @router.get("/page_config")
@@ -41,21 +65,35 @@ async def get_page_config(lanlan_name: str = ""):
         
         # 获取角色配置
         catgirl_config = lanlan_basic_config.get(target_name, {})
-        model_type = catgirl_config.get('model_type', 'live2d')  # 默认为live2d以保持兼容性
+        model_type = get_reserved(catgirl_config, 'avatar', 'model_type', default='live2d', legacy_keys=('model_type',))
         
         model_path = ""
         
         # 根据模型类型获取模型路径
         if model_type == 'vrm':
             # VRM模型：处理路径转换
-            vrm_path = catgirl_config.get('vrm', '')
+            vrm_path = get_reserved(catgirl_config, 'avatar', 'vrm', 'model_path', default='', legacy_keys=('vrm',))
             if vrm_path:
                 if vrm_path.startswith('http://') or vrm_path.startswith('https://'):
                     model_path = vrm_path
                     logger.debug(f"获取页面配置 - 角色: {target_name}, VRM模型HTTP路径: {model_path}")
                 elif vrm_path.startswith('/'):
-                    model_path = vrm_path
-                    logger.debug(f"获取页面配置 - 角色: {target_name}, VRM模型绝对路径: {model_path}")
+                    # 对已知前缀的路径验证文件是否实际存在，防止返回指向已删除文件的路径
+                    _vrm_file_verified = False
+                    if vrm_path.startswith(VRM_USER_PATH + '/'):
+                        _fname = vrm_path[len(VRM_USER_PATH) + 1:]
+                        _vrm_file_verified = (_config_manager.vrm_dir / _fname).exists()
+                    elif vrm_path.startswith(VRM_STATIC_PATH + '/'):
+                        _fname = vrm_path[len(VRM_STATIC_PATH) + 1:]
+                        _vrm_file_verified = (_config_manager.project_root / 'static' / 'vrm' / _fname).exists()
+                    else:
+                        _vrm_file_verified = True  # 未知前缀，不做判断
+                    if _vrm_file_verified:
+                        model_path = vrm_path
+                        logger.debug(f"获取页面配置 - 角色: {target_name}, VRM模型绝对路径: {model_path}")
+                    else:
+                        model_path = ""
+                        logger.warning(f"获取页面配置 - 角色: {target_name}, VRM模型文件未找到: {vrm_path}")
                 else:
                     filename = os.path.basename(vrm_path)
                     project_root = _config_manager.project_root
@@ -77,8 +115,14 @@ async def get_page_config(lanlan_name: str = ""):
                 logger.warning(f"角色 {target_name} 的VRM模型路径为空")
         else:
             # Live2D模型：使用原有逻辑
-            live2d = catgirl_config.get('live2d', 'mao_pro')
-            live2d_item_id = catgirl_config.get('live2d_item_id', '')
+            live2d = get_reserved(catgirl_config, 'avatar', 'live2d', 'model_path', default='mao_pro', legacy_keys=('live2d',))
+            live2d_item_id = get_reserved(
+                catgirl_config,
+                'avatar',
+                'asset_source_id',
+                default='',
+                legacy_keys=('live2d_item_id', 'item_id'),
+            )
             
             logger.debug(f"获取页面配置 - 角色: {target_name}, Live2D模型: {live2d}, item_id: {live2d_item_id}")
         
@@ -217,7 +261,6 @@ async def get_steam_language():
         # 使用 language_utils 的归一化函数，统一映射逻辑
         # format='full' 返回 'zh-CN', 'zh-TW', 'en', 'ja', 'ko' 格式（用于前端 i18n）
         i18n_language = normalize_language_code(steam_language, format='full')
-        logger.info(f"[i18n] Steam 语言映射: '{steam_language}' -> '{i18n_language}'")
         
         # 获取用户 IP 所在国家（用于判断是否为中国大陆用户）
         ip_country = None
@@ -227,28 +270,18 @@ async def get_steam_language():
             # 使用 Steam Utils API 获取用户 IP 所在国家
             raw_ip_country = steamworks.Utils.GetIPCountry()
             
-            # 醒目调试日志
-            print("=" * 60)
-            print(f"[GeoIP API DEBUG] Raw GetIPCountry() returned: {repr(raw_ip_country)}")
-            
             if isinstance(raw_ip_country, bytes):
                 ip_country = raw_ip_country.decode('utf-8')
-                print(f"[GeoIP API DEBUG] Decoded from bytes: '{ip_country}'")
             else:
                 ip_country = raw_ip_country
             
-            # 转为大写以便比较
             if ip_country:
                 ip_country = ip_country.upper()
-                # 判断是否为中国大陆（国家代码为 "CN"）
                 is_mainland_china = (ip_country == "CN")
-                print(f"[GeoIP API DEBUG] Country (upper): '{ip_country}'")
-                print(f"[GeoIP API DEBUG] Is mainland China: {is_mainland_china}")
-            else:
-                print(f"[GeoIP API DEBUG] Country is empty/None")
-            print("=" * 60)
             
-            logger.info(f"[GeoIP] 用户 IP 国家: {ip_country}, 是否大陆: {is_mainland_china}")
+            if not getattr(get_steam_language, '_logged', False) or not get_steam_language._logged:
+                get_steam_language._logged = True
+                logger.info(f"[GeoIP] 用户 IP 国家: {ip_country}, 是否大陆: {is_mainland_china}")
             # Write back to ConfigManager so URL adjustment uses the same result
             try:
                 from utils.config_manager import ConfigManager
@@ -256,7 +289,7 @@ async def get_steam_language():
             except Exception:
                 pass
         except Exception as geo_error:
-            print(f"[GeoIP API DEBUG] Exception: {geo_error}")
+            get_steam_language._logged = False
             logger.warning(f"[GeoIP] 获取用户 IP 国家失败: {geo_error}，默认为非大陆用户")
             ip_country = None
             is_mainland_china = False
@@ -644,3 +677,81 @@ async def list_gptsovits_voices(request: Request):
     except Exception as e:
         logger.error(f"获取 GPT-SoVITS 语音列表失败: {e}")
         return {"success": False, "error": str(e)}
+
+
+def _sanitize_proxies(proxies: dict[str, str]) -> dict[str, str]:
+    """Remove credentials from proxy URLs before returning to the client."""
+    sanitized: dict[str, str] = {}
+    for scheme, url in proxies.items():
+        try:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.username or parsed.password:
+                # Rebuild without credentials
+                netloc = parsed.hostname or ""
+                if parsed.port:
+                    netloc += f":{parsed.port}"
+                sanitized[scheme] = urllib.parse.urlunparse(
+                    (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+                )
+            else:
+                sanitized[scheme] = url
+        except Exception:
+            sanitized[scheme] = "<redacted>"
+    return sanitized
+
+
+@router.post("/set_proxy_mode")
+async def set_proxy_mode(request: Request):
+    """运行时热切换代理模式。
+
+    body: { "direct": true }   → 直连（禁用代理）
+    body: { "direct": false }  → 恢复系统代理
+    """
+    try:
+        data = await request.json()
+        raw_direct = data.get("direct", False)
+        if isinstance(raw_direct, bool):
+            direct = raw_direct
+        elif isinstance(raw_direct, str):
+            direct = raw_direct.lower() in ("true", "1", "yes")
+        else:
+            direct = bool(raw_direct)
+
+        # 代理相关环境变量 key 列表
+        proxy_keys = [
+            'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+            'http_proxy', 'https_proxy', 'all_proxy',
+        ]
+
+        global _proxy_snapshot
+        all_keys = proxy_keys + ['NO_PROXY', 'no_proxy']
+        with _PROXY_LOCK:
+            if direct:
+                # 仅在首次切换到直连时保存快照，避免重复调用覆盖原始值
+                if not _proxy_snapshot:
+                    _proxy_snapshot = {k: os.environ[k] for k in all_keys if k in os.environ}
+                # 设置 NO_PROXY=* 使 httpx/aiohttp/urllib 跳过 Windows 注册表系统代理
+                os.environ['NO_PROXY'] = '*'
+                os.environ['no_proxy'] = '*'
+                for key in proxy_keys:
+                    os.environ.pop(key, None)
+                logger.info("[ProxyMode] 已切换到直连模式 (NO_PROXY=*)")
+            else:
+                if _proxy_snapshot:
+                    # 从快照恢复所有代理相关环境变量（含 NO_PROXY）
+                    for k in all_keys:
+                        if k in _proxy_snapshot:
+                            os.environ[k] = _proxy_snapshot[k]
+                        else:
+                            os.environ.pop(k, None)
+                    _proxy_snapshot = {}
+                    logger.info("[ProxyMode] 已恢复系统代理模式")
+                else:
+                    logger.info("[ProxyMode] 无快照可恢复，保持当前环境变量")
+
+        import urllib.request
+        proxies_after = _sanitize_proxies(urllib.request.getproxies())
+        return {"success": True, "direct": direct, "proxies_after": proxies_after}
+    except Exception:
+        logger.exception("[ProxyMode] 切换失败")
+        return JSONResponse({"success": False, "error": "切换失败，服务器内部错误"}, status_code=500)

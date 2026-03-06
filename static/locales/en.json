@@ -448,7 +448,47 @@
         "API_QUOTA_TIME": "💥 Free API quota exhausted. Please try again tomorrow or switch to another API.",
         "API_RATE_LIMIT": "💥 Too many requests (429) or quota limit reached. Please try again later.",
         "API_POLICY_VIOLATION": "💥 Policy violation or security block: {{msg}}",
-        "API_1008_FALLBACK": "💥 Connection disconnected (1008): {{msg}}"
+        "API_1008_FALLBACK": "💥 Connection disconnected (1008): {{msg}}",
+        "API_UNKNOWN_ERROR": "💥 API error: {{msg}}",
+        "MEMORY_SERVER_NOT_RUNNING": "🧠 Memory server not started! Please run memory_server.py first.",
+        "MEMORY_SERVER_CRASHED": "🧠 Memory server (port {{port}}) has crashed. Please restart memory_server.py.",
+        "CONNECTION_REFUSED": "💥 Server connection refused. Please check your API Key and network connection.",
+        "API_KEY_REJECTED": "💥 API Key rejected by server. Please check if your API Key matches the selected model.",
+        "API_RATE_LIMIT_SESSION": "💥 API request rate too high, please try again later.",
+        "LLM_CONNECTION_FAILED": "💥 LLM API connection failed. Please check your network connection and API configuration.",
+        "CONNECTION_CLOSED_ABNORMAL": "💥 Connection closed abnormally: {{error}}",
+        "AGENT_QUOTA_EXCEEDED": "💥 Free Agent model daily trial limit reached ({{used}}/{{limit}}). Please try again tomorrow.",
+        "SESSION_START_CRITICAL": "⛔ Session failed to start {{count}} times in a row. Auto-retry stopped. Please check your network and API configuration, then refresh the page.",
+        "SESSION_START_FAILED": "💥 Session start failed: {{error}} (failed {{count}} times)",
+        "INTERNAL_UPDATE_FAILED": "💥 Internal update switch failed: {{error}}",
+        "CHARACTER_DISCONNECTED": "{{name}} disconnected, restarting soon!",
+        "CHARACTER_LEFT": "{{name}} has left.",
+        "ERROR_1011_MIC_CHECK": "💥 Note: Error 1011 detected. This indicates an API server anomaly. Please first check if your microphone is working.",
+        "ERROR_1007_ARREARS": "💥 Note: Error 1007 detected. This is most likely caused by insufficient balance.",
+        "IMAGE_BLOCKED": "⚠️ Image content blocked by review system. Please try a different image or content.",
+        "SERVER_BUSY_THROTTLE": "⚠️ Server busy, automatically adjusting send rate...",
+        "RESPONSE_TIMEOUT": "💥 Connection timeout (Response timeout), voice conversation interrupted.",
+        "CONNECTION_TIMEOUT": "💥 Connection timeout. Please check your network connection.",
+        "RESPONSE_TOO_LONG": "Response too long, output discarded (you can increase TEXT_GUARD_MAX_LENGTH in settings)",
+        "RESPONSE_INVALID": "AI response did not meet requirements, output discarded",
+        "CHARACTER_SWITCHING_TERMINAL": "{{name}} is heading to another terminal...",
+        "RELOAD_PAGE": "Voice updated, page will refresh shortly",
+        "AGENT_AUTO_DISABLED_COMPUTER": "Keyboard/mouse control auto-disabled: $t(agent.precheck.{{reason_code}})",
+        "AGENT_AUTO_DISABLED_BROWSER": "Browser control auto-disabled: $t(agent.precheck.{{reason_code}})",
+        "AGENT_LLM_CHECK_ERROR": "Agent LLM connectivity check error",
+        "INVALID_INPUT_TYPE": "Invalid input type: {{input_type}}",
+        "UNKNOWN_ACTION": "Unknown action: {{action}}",
+        "SERVER_ERROR": "Internal server error",
+        "AGENT_CU_MODULE_NOT_LOADED": "Cannot enable Computer Use: module not loaded",
+        "AGENT_CU_ENABLED_CHECKING": "Keyboard/mouse control enabled, checking Agent LLM connectivity...",
+        "AGENT_CU_UNAVAILABLE": "Cannot enable Computer Use: $t(agent.precheck.{{reason_code}})",
+        "AGENT_CU_ENABLE_FAILED": "Failed to enable Computer Use: {{error}}",
+        "AGENT_BU_MODULE_NOT_LOADED": "Cannot enable Browser Use: module not loaded",
+        "AGENT_BU_NOT_INSTALLED": "Cannot enable Browser Use: {{error}}",
+        "AGENT_BU_ENABLED_CHECKING": "Browser control enabled, checking Agent LLM connectivity...",
+        "AGENT_CU_AUTO_CLOSED": "Computer Use module not loaded, auto-disabled",
+        "AGENT_CU_CAPABILITY_LOST": "Computer Use unavailable: $t(agent.precheck.{{reason_code}})",
+        "TTS_CONNECTION_FAILED": "TTS service connection failed: {{msg}}"
     },
     "camera": {
         "iosPermissionHint": "Please check iOS Settings → Safari → Camera permission is set to \"Allow\"",
@@ -924,7 +964,9 @@
             "savingParameters": "Saving...",
             "parametersSaved": "Saved!",
             "parametersSavePartialFailed": "Save failed: {{errors}}",
-            "parametersSaveFailed": "Save failed: {{error}}"
+            "parametersSaveFailed": "Save failed: {{error}}",
+            "emptyHint": "Nothing in here!",
+            "foundYou": "You found me!"
         },
         "modelDirectorySaveFailed": "File save failed",
         "userPreferencesSaveFailed": "Prefs save failed",
@@ -1015,7 +1057,28 @@
         "deleteFailed": "Delete failed",
         "deleteError": "Delete failed: {{error}}",
         "freePresetLabel": "Free Preset Voices",
-        "freePresetBadge": "Preset"
+        "freePresetBadge": "Preset",
+        "silenceModal": {
+            "title": "Smart Silence Detection Results",
+            "originalDuration": "Original Audio Duration",
+            "silenceDuration": "Removable Silence Duration",
+            "estimatedDuration": "Estimated Duration After Trim",
+            "savingPercentage": "Saving Ratio",
+            "processing": "Processing...",
+            "analyzing": "Analyzing...",
+            "trimming": "Trimming...",
+            "done": "Done",
+            "cancelled": "Cancelled",
+            "trimSuccess": "✅ Trimming Complete!",
+            "downloadTrimmed": "Download Trimmed Audio",
+            "useTrimmed": "Use Smart Trimmed Audio",
+            "useOriginal": "Upload Original Audio",
+            "cancel": "Cancel",
+            "noSilence": "No removable silence segments detected",
+            "trimError": "Trimming failed: {{error}}",
+            "trimmedLabel": "[Trimmed]",
+            "confirmTrimmed": "Use Smart Trimmed Audio"
+        }
     },
     "memory": {
         "title": "Memory Browser",
@@ -1074,6 +1137,7 @@
         "profileName": "Profile Name",
         "profileNameMaxHint": "Max 20 characters",
         "profileNameTooLong": "Profile name is too long",
+        "profileNameContainsSlash": "Profile name cannot contain path separators (/ or \\)",
         "newProfileNameRequired": "New profile name cannot be empty",
         "newProfileNameTooLong": "Profile name is too long",
         "required": "*",
@@ -1090,6 +1154,7 @@
         "lightingNotSet": "Default",
         "live2dNotSet": "Not Set",
         "voiceNotSet": "No Voice Specified",
+        "voiceSetting": "Voice Settings",
         "manageModel": "Click to manage model",
         "fillProfileNameFirst": "Please fill in the neko profile name first, then set the model",
         "registerNewVoice": "Register New Voice",
@@ -1298,7 +1363,8 @@
             "frameRate": "Frame Rate",
             "frameRateLow": "30fps",
             "frameRateMedium": "45fps",
-            "frameRateHigh": "60fps"
+            "frameRateHigh": "60fps",
+            "mouseTracking": "Mouse Tracking"
         }
     },
     "subtitle": {
@@ -1319,9 +1385,27 @@
             "disconnected": "Server connection lost",
             "agentDisconnected": "Agent server connection lost",
             "freeModelWarning": "Due to quota limitations, free models are prone to blocking in Agent mode. It is recommended to switch to a paid model.\n\nIf you have already configured a paid API, please try restarting NEKO.",
-            "freeModelWarningTitle": "Free Model Notice"
+            "freeModelWarningTitle": "Free Model Notice",
+            "connectivityCheck": "Agent LLM connectivity check in progress...",
+            "precheckFailed": "Agent precheck failed: {{reason}}"
+        },
+        "precheck": {
+            "AGENT_PRECHECK_PENDING": "Connectivity check in progress...",
+            "AGENT_ENDPOINT_NOT_CONFIGURED": "Agent API not configured",
+            "AGENT_PYAUTOGUI_NOT_INSTALLED": "pyautogui not installed",
+            "AGENT_BROWSER_USE_NOT_INSTALLED": "browser-use not installed",
+            "AGENT_NOT_INITIALIZED": "Agent initialization failed",
+            "AGENT_LLM_UNREACHABLE": "Agent LLM unreachable",
+            "AGENT_MODEL_NOT_CONFIGURED": "Agent model not configured",
+            "AGENT_URL_NOT_CONFIGURED": "Agent API URL not configured",
+            "AGENT_KEY_NOT_CONFIGURED": "Agent API Key not configured or unavailable",
+            "AGENT_NO_PLUGINS": "No available plugins found",
+            "AGENT_NO_PLUGINS_FOUND": "No available plugins found",
+            "AGENT_PLUGIN_SERVER_ERROR": "Plugin server connection failed",
+            "AGENT_CONNECTIVITY_FAILED": "Agent LLM connection failed"
         },
         "quotaExceeded": "The free Agent model daily trial limit has been reached ({{limit}} uses). Please try again tomorrow.",
+        "contentFilterError": "The web page content browsed by Agent was rejected by the AI model's safety filter and the task has been aborted. This usually happens when the page contains sensitive topics. Please try different keywords or websites.",
         "taskHud": {
             "title": "Agent Tasks",
             "running": "Running",
@@ -2048,5 +2132,128 @@
         "switchToLight": "Switch to Light Mode",
         "themeChanged": "Theme changed"
     },
-    "characterModelNotSet": "Current character has no model set"
+    "characterModelNotSet": "Current character has no model set",
+   "cookiesLogin": {
+        "title": "N.E.K.O Credential Control Center",
+        "header": "🔐 Credential Acquisition Center",
+        "bilibili": "📺 Bilibili",
+        "douyin": "🎵 Douyin",
+        "kuaishou": "🧡 Kuaishou",
+        "weibo": "🌏 Weibo",
+        "twitter": "🐦 Twitter/X",
+        "reddit": "👽 Reddit",
+        "saveConfig": "Save Configuration",
+        "encryptStorage": "Securely encrypt and store to local file",
+        "localMonitoring": "Local Status Monitoring",
+        "removeCredentials": "Remove",
+        "confirmRemove": "Are you sure you want to clear the login credentials for {{platformName}}?",
+        "credentialsRemoved": "✅ Credentials removed successfully",
+        "credentialsSaved": "✅ {{platformName}} credentials saved successfully!",
+        "credentialsRemovedFailed": "Removal failed",
+        "removeFailed": "❌ Removal failed, please check your network",
+        "requiredField": "⚠️ Please fill in the required field: [{{fieldName}}]",
+        "invalidChars": "⚠️ [{{fieldName}}] contains invalid characters...",
+        "whitespaceTrimmed": "⚠️ [{{fieldName}}] contains leading/trailing spaces, which have been automatically trimmed. Please confirm and resubmit.",
+        "networkError": "❌ Network error: Unable to connect to backend service",
+        "saveFailed": "Save failed, please check if the format is correct",
+        "pasteHere": "Paste here",
+        "submitting": "Securely encrypting and transmitting...",
+        "noCookies": "Please configure Cookies first",
+        "statusLoadFailed": "Status load failed",
+        "thisPlatform": "this platform",
+        "instructions": {
+            "bilibili": "📌 <b>Target:</b> Go to <b>bilibili.com</b> to fetch these cookies.",
+            "douyin": "📌 <b>Target:</b> Go to <b>douyin.com</b> to fetch these cookies.",
+            "kuaishou": "📌 <b>Target:</b> Go to <b>kuaishou.com</b> to fetch these cookies.",
+            "weibo": "📌 <b>Target:</b> Go to <b>weibo.com</b> to fetch these cookies.",
+            "twitter": "📌 <b>Target:</b> Go to <b>x.com</b> to fetch these cookies.",
+            "reddit": "📌 <b>Target:</b> Go to <b>reddit.com</b> to fetch these cookies."
+        },
+        "guide": {
+            "title": "Universal Guide for Beginners",
+            "step1": "Open the target platform website in browser and <span class=\"highlight-text\">log in</span>.",
+            "step2_prefix": "Press",
+            "step2_suffix": "to open Developer Tools.",
+            "step3": "Find and click <span class=\"highlight-text\">Application</span> tab at the top.",
+            "step4": "Find <span class=\"highlight-text\">Cookies</span> on the left sidebar, click the domain, and copy the required values on the right."
+        },
+        "fields": {
+            "SESSDATA": {
+                "label": "SESSDATA",
+                "desc": "Core identity credential (Required)"
+            },
+            "bili_jct": {
+                "label": "bili_jct",
+                "desc": "CSRF Token (Required)"
+            },
+            "DedeUserID": {
+                "label": "DedeUserID",
+                "desc": "Account UID (Required)"
+            },
+            "buvid3": {
+                "label": "buvid3",
+                "desc": "Device fingerprint (Optional)"
+            },
+            "sessionid": {
+                "label": "sessionid",
+                "desc": "Core session credential (Required)"
+            },
+            "ttwid": {
+                "label": "ttwid",
+                "desc": "Device risk control code (Required)"
+            },
+            "passport_csrf_token": {
+                "label": "csrf_token",
+                "desc": "Security verification token"
+            },
+            "odin_tt": {
+                "label": "odin_tt",
+                "desc": "Device characteristics"
+            },
+            "ks_web_st": {
+                "label": "web_st",
+                "desc": "Core ticket (Required)"
+            },
+            "ks_web_ph": {
+                "label": "web_ph",
+                "desc": "Auxiliary ticket (Required)"
+            },
+            "userId": {
+                "label": "userId",
+                "desc": "User ID"
+            },
+            "did": {
+                "label": "did",
+                "desc": "Device ID"
+            },
+            "SUB": {
+                "label": "SUB",
+                "desc": "Core credential (Starts with _2A)"
+            },
+            "XSRF-TOKEN": {
+                "label": "XSRF-TOKEN",
+                "desc": "Anti-forgery token"
+            },
+            "auth_token": {
+                "label": "auth_token",
+                "desc": "Core identity Token"
+            },
+            "ct0": {
+                "label": "ct0",
+                "desc": "CSRF verification code"
+            },
+            "reddit_session": {
+                "label": "reddit_session",
+                "desc": "Core session credential (Required)"
+            },
+            "csrftoken": {
+                "label": "csrftoken",
+                "desc": "CSRF token"
+            }
+        },
+        "status": {
+            "active": "● Ready",
+            "inactive": "○ Not configured"
+        }
+    }   
 }

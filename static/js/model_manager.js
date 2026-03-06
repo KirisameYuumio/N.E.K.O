@@ -61,6 +61,29 @@
 class DropdownManager {
     static instances = [];
 
+    static getVisualWidth(str) {
+        let width = 0;
+        for (const char of str) {
+            width += char.charCodeAt(0) > 127 ? 2 : 1;
+        }
+        return width;
+    }
+
+    static truncateText(text, maxVisualWidth) {
+        if (!text || DropdownManager.getVisualWidth(text) <= maxVisualWidth) {
+            return text;
+        }
+        let truncated = '';
+        let currentWidth = 0;
+        for (const char of text) {
+            const charWidth = char.charCodeAt(0) > 127 ? 2 : 1;
+            if (currentWidth + charWidth > maxVisualWidth - 3) break;
+            truncated += char;
+            currentWidth += charWidth;
+        }
+        return truncated + '...';
+    }
+
     constructor(config) {
         this.config = {
             buttonId: config.buttonId,
@@ -142,16 +165,17 @@ class DropdownManager {
         }
 
         let text = defaultText;
+        let fullText = null;
 
         // 如果配置了 alwaysShowDefault，始终显示默认文字
         if (this.config.alwaysShowDefault) {
             text = defaultText;
         } else if (this.select) {
             if (this.select.value) {
-                // 有选择的值，显示选中的选项
                 const selectedOption = this.select.options[this.select.selectedIndex];
                 if (selectedOption) {
                     text = this.config.getText(selectedOption);
+                    fullText = text;
                 }
             } else if (this.select.options.length > 0) {
                 // 没有选择，但有选项：显示第一个“可显示”的选项
@@ -165,8 +189,21 @@ class DropdownManager {
             }
         }
 
-        this.textSpan.textContent = text;
-        this.textSpan.setAttribute('data-text', text);
+        const maxVisualWidth = this.config.maxVisualWidth || 13;
+        const displayText = DropdownManager.truncateText(text, maxVisualWidth);
+
+        this.textSpan.textContent = displayText;
+        this.textSpan.setAttribute('data-text', displayText);
+
+        if (this.button) {
+            if (fullText && fullText !== defaultText) {
+                this.button.title = fullText;
+                this.button.removeAttribute('data-i18n-title');
+            } else {
+                const titleText = this.config.iconAltKey && window.t ? window.t(this.config.iconAltKey) : this.config.iconAlt;
+                this.button.title = titleText;
+            }
+        }
     }
 
     updateDropdown() {
@@ -213,6 +250,13 @@ class DropdownManager {
             textSpan.setAttribute('data-text', text);
             item.appendChild(textSpan);
 
+            if (option.dataset.itemId) {
+                const steamBadge = document.createElement('span');
+                steamBadge.className = 'steam-badge';
+                steamBadge.textContent = 'Steam';
+                item.appendChild(steamBadge);
+            }
+
             item.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.selectItem(option.value);
@@ -253,11 +297,27 @@ class DropdownManager {
 
         this.updateDropdown();
         this.dropdown.style.display = 'block';
+        
+        // 检测是否显示滚动条
+        this._scrollbarRafId = requestAnimationFrame(() => {
+            if (this.dropdown && this.dropdown.style.display === 'block') {
+                if (this.dropdown.scrollHeight > this.dropdown.clientHeight) {
+                    this.dropdown.classList.add('has-scrollbar');
+                } else {
+                    this.dropdown.classList.remove('has-scrollbar');
+                }
+            }
+        });
     }
 
     hideDropdown() {
+        if (this._scrollbarRafId) {
+            cancelAnimationFrame(this._scrollbarRafId);
+            this._scrollbarRafId = null;
+        }
         if (this.dropdown) {
             this.dropdown.style.display = 'none';
+            this.dropdown.classList.remove('has-scrollbar');
         }
     }
 
@@ -718,6 +778,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     let vrmAnimationManager = null;
     let vrmExpressionManager = null;
 
+    // 防抖/合并刷新标志
+    let isRefreshScheduled = false;
+
     // 延迟初始化管理器（确保 DOM 已加载）
     function initDropdownManagers() {
         if (!modelTypeManager) {
@@ -917,6 +980,45 @@ document.addEventListener('DOMContentLoaded', async () => {
     } else {
         initDropdownManagers();
     }
+
+    // 暴露模型更新函数到全局作用域，供其他模块调用
+    window.updateLive2DModelDropdown = function() {
+        if (live2dModelManager) {
+            live2dModelManager.updateDropdown();
+        }
+    };
+
+    window.updateLive2DModelSelectButtonText = function() {
+        if (live2dModelManager) {
+            live2dModelManager.updateButtonText();
+        }
+    };
+
+    // 刷新模型下拉菜单和按钮文字（合并每帧多次调用）
+    function scheduleRefresh() {
+        if (isRefreshScheduled) {
+            return;
+        }
+        isRefreshScheduled = true;
+        requestAnimationFrame(() => {
+            try {
+                if (live2dModelManager) {
+                    live2dModelManager.updateDropdown();
+                    live2dModelManager.updateButtonText();
+                }
+            } catch (e) {
+                console.warn('[model_manager] 刷新模型列表失败:', e);
+            } finally {
+                isRefreshScheduled = false;
+            }
+        });
+    }
+
+    // 监听模型扫描完成事件，刷新模型列表（具有容错能力）
+    window.addEventListener('modelsScanned', function(event) {
+        console.log('[model_manager] 收到模型扫描完成事件，刷新模型列表');
+        scheduleRefresh();
+    });
 
 
     // 更新动作选择器按钮文字的函数（使用统一管理器）
@@ -1135,7 +1237,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const option = document.createElement('option');
                 option.value = model.name;
                 option.textContent = model.display_name || model.name;
-                option.dataset.itemId = model.item_id;
+                if (model.item_id) {
+                    option.dataset.itemId = model.item_id;
+                }
                 modelSelect.appendChild(option);
             });
             // 如果没有选择，自动选择第一个模型
@@ -1202,15 +1306,42 @@ document.addEventListener('DOMContentLoaded', async () => {
     })();
 
     //
+    // 注意：必须使用专用接口保存模型和光照设置，因为通用接口会过滤掉保留字段
     // 保存模型设置到角色的函数（全面升级版）
     async function saveModelToCharacter(modelName, itemId = null, vrmAnimation = null) {
+        function decodeMaybeUrlComponent(value) {
+            if (typeof value !== 'string') return value;
+            try {
+                return decodeURIComponent(value);
+            } catch {
+                return value;
+            }
+        }
+
+        function extractLive2DFolderNameFromPath(modelPath) {
+            if (!modelPath || typeof modelPath !== 'string') return null;
+            const normalized = modelPath.split('?')[0].split('#')[0].replace(/\\/g, '/');
+            const segments = normalized.split('/').filter(Boolean);
+            if (segments.length < 2) return null;
+            const filename = segments[segments.length - 1];
+            const folder = segments[segments.length - 2];
+            if (!/\.model3\.json$/i.test(filename)) return null;
+
+            if (segments[0] === 'workshop') {
+                if (segments.length >= 4) return decodeMaybeUrlComponent(folder);
+                const base = filename.replace(/\.model3\.json$/i, '');
+                return decodeMaybeUrlComponent(base) || null;
+            }
+
+            return decodeMaybeUrlComponent(folder) || null;
+        }
+
         try {
             // 1. 获取角色名并验证
             const lanlanName = await getLanlanName();
             if (!lanlanName || lanlanName.trim() === '') {
                 const errorMsg = t('live2d.cannotSaveNoCharacter', '无法保存：未指定角色名称');
                 showStatus(errorMsg, 3000);
-                // 显示错误提示（如果存在 toast 功能）
                 if (typeof showToast === 'function') {
                     showToast(errorMsg, 'error');
                 }
@@ -1219,7 +1350,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             // 在发送 PUT 请求保存数据前，添加校验
             if (currentModelType === 'vrm') {
-                // 如果 modelName (即路径) 是 "undefined"，抛出错误或尝试自动修复
                 if (!modelName ||
                     modelName === 'undefined' ||
                     modelName === 'null' ||
@@ -1230,7 +1360,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                     ))) {
                     console.error('[模型管理] 检测到无效的 VRM 模型路径，尝试自动修复:', modelName);
 
-                    // 尝试从 currentModelInfo 获取有效路径
                     if (currentModelInfo && currentModelInfo.path &&
                         currentModelInfo.path !== 'undefined' &&
                         currentModelInfo.path !== 'null' &&
@@ -1240,13 +1369,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                         currentModelInfo.name !== 'undefined' &&
                         currentModelInfo.name !== 'null' &&
                         !currentModelInfo.name.toLowerCase().includes('undefined')) {
-                        // 使用 ModelPathHelper 标准化路径
                         const filename = currentModelInfo.name.endsWith('.vrm')
                             ? currentModelInfo.name
                             : `${currentModelInfo.name}.vrm`;
                         modelName = ModelPathHelper.normalizeModelPath(filename, 'model');
                     } else {
-                        // 如果无法修复，抛出错误
                         const errorMsg = t('live2d.vrmModelPathInvalid', 'VRM 模型路径无效，无法保存。请重新选择模型。');
                         showStatus(errorMsg, 5000);
                         throw new Error('VRM 模型路径无效: ' + modelName);
@@ -1256,86 +1383,128 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             showStatus(t('live2d.savingSettings', '正在保存设置...'));
 
-            // 2. 🔥 先从服务器拉取当前角色的完整档案（防止覆盖掉其他不需要修改的属性）
-            // 使用 RequestHelper 确保统一的错误处理和超时
-            const allData = await RequestHelper.fetchJson('/api/characters');
-            // 拿到该角色的旧数据，如果没有就初始化为空对象
-            const charData = allData['猫娘']?.[lanlanName] || {};
+            // 2. 构建模型数据，使用专用接口保存
+            const modelData = {
+                model_type: currentModelType,
+            };
 
-            // 3. 更新模型相关字段
             if (currentModelType === 'vrm') {
-                charData.model_type = 'vrm';
-                // 绝对不要把 "undefined" 字符串保存到后端数据库
-                charData.vrm = modelName;
-                // 清空 Live2D 字段，避免混淆
-                charData.live2d = "";
-                if (vrmAnimation) charData.vrm_animation = vrmAnimation;
-
-                // 🔥 获取并写入光照数据
-                const ambient = document.getElementById('ambient-light-slider');
-                const main = document.getElementById('main-light-slider');
-                const fill = document.getElementById('fill-light-slider');
-                const rim = document.getElementById('rim-light-slider');
-                const top = document.getElementById('top-light-slider');
-                const bottom = document.getElementById('bottom-light-slider');
-
-                if (ambient && main) {
-                    charData.lighting = {
-                        ambient: parseFloat(ambient.value),
-                        main: parseFloat(main.value),
-                        // 简化模式下，辅助光强制保存为 0.0
-                        fill: 0.0,
-                        rim: 0.0,
-                        top: 0.0,
-                        bottom: 0.0
-                    };
-                    // 保存曝光值
-                    const exposure = document.getElementById('exposure-slider');
-                    if (exposure) {
-                        charData.lighting.exposure = parseFloat(exposure.value);
+                // 转换 VRM 路径：从完整 HTTP 路径转换为后端要求的相对路径
+                let vrmPath = modelName;
+                if (vrmPath && typeof vrmPath === 'string') {
+                    const urlMatch = vrmPath.match(/^(?:http|https):\/\/[^/]+(\/user_vrm\/.*|\/static\/vrm\/.*)/);
+                    if (urlMatch) {
+                        vrmPath = urlMatch[1];
                     }
-                    // 保存色调映射
-                    const tonemapping = document.getElementById('tonemapping-select');
-                    if (tonemapping) {
-                        charData.lighting.toneMapping = parseInt(tonemapping.value);
+                    if (!vrmPath.startsWith('/user_vrm/') && !vrmPath.startsWith('/static/vrm/')) {
+                        if (currentModelInfo && currentModelInfo.path) {
+                            const infoPathMatch = currentModelInfo.path.match(/^(?:http|https):\/\/[^/]+(\/user_vrm\/.*|\/static\/vrm\/.*)/);
+                            if (infoPathMatch) {
+                                vrmPath = infoPathMatch[1];
+                            } else if (currentModelInfo.path.startsWith('/user_vrm/') || currentModelInfo.path.startsWith('/static/vrm/')) {
+                                vrmPath = currentModelInfo.path;
+                            }
+                        }
                     }
                 }
-                // 保存待机动作
+                modelData.vrm = vrmPath;
                 const idleAnimSel = document.getElementById('idle-animation-select');
-                if (idleAnimSel && idleAnimSel.value) {
-                    charData.idleAnimation = idleAnimSel.value;
+                if (vrmAnimation) {
+                    modelData.vrm_animation = vrmAnimation;
+                } else if (idleAnimSel && idleAnimSel.value) {
+                    modelData.vrm_animation = idleAnimSel.value;
                 }
-                // 移除旧的预设字段
-                delete charData.lightingPreset;
+
+                if (idleAnimSel && idleAnimSel.value) {
+                    modelData.idle_animation = idleAnimSel.value;
+                }
             } else {
-                // Live2D 逻辑
-                charData.model_type = 'live2d';
-                charData.live2d = modelName;
-                charData.vrm = null;
-                if (itemId) charData.item_id = itemId;
+                const inferredFolderName = extractLive2DFolderNameFromPath(
+                    (currentModelInfo && currentModelInfo.path) ? currentModelInfo.path : modelName
+                );
+                modelData.live2d = decodeMaybeUrlComponent(inferredFolderName || modelName);
+                if (itemId != null && itemId !== '') {
+                    modelData.item_id = itemId;
+                    modelData.live2d_item_id = itemId;
+                }
             }
 
-
-            // 4. 🔥 使用【通用更新接口】发送数据（这个接口支持保存任意字段）
-            // 后端 API: PUT /api/characters/catgirl/{name}
-            // 使用 RequestHelper 确保统一的错误处理和超时
-            const result = await RequestHelper.fetchJson(
-                `/api/characters/catgirl/${encodeURIComponent(lanlanName)}`,
+            // 3. 使用【专用模型接口】保存模型设置（包含光照和待机动作）
+            const modelResult = await RequestHelper.fetchJson(
+                `/api/characters/catgirl/l2d/${encodeURIComponent(lanlanName)}`,
                 {
                     method: 'PUT',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify(charData)
+                    body: JSON.stringify(modelData)
                 }
             );
-            if (result.success) {
-                const modelDisplayName = currentModelType === 'vrm' ? `VRM: ${modelName}` : modelName;
-                showStatus(t('live2d.modelSettingsSaved', `已保存模型和光照设置`, { name: lanlanName }), 2000);
-                return true;
-            } else {
-                throw new Error(result.error || '保存失败');
+
+            if (!modelResult.success) {
+                throw new Error(modelResult.error || '保存模型设置失败');
             }
+
+            let lightingResult = null;
+            const ambient = document.getElementById('ambient-light-slider');
+            const main = document.getElementById('main-light-slider');
+
+            // 4. 如果是 VRM 模式，单独保存光照设置（仅光照部分独立保存）
+            if (currentModelType === 'vrm' && ambient && main) {
+                const lightingData = {
+                    lighting: {
+                        ambient: parseFloat(ambient.value),
+                        main: parseFloat(main.value),
+                        fill: 0.0,
+                        rim: 0.0,
+                        top: 0.0,
+                        bottom: 0.0
+                    }
+                };
+
+                const exposure = document.getElementById('exposure-slider');
+                if (exposure) {
+                    lightingData.lighting.exposure = parseFloat(exposure.value);
+                }
+                const tonemapping = document.getElementById('tonemapping-select');
+                if (tonemapping) {
+                    lightingData.lighting.toneMapping = parseInt(tonemapping.value);
+                }
+
+                try {
+                    lightingResult = await RequestHelper.fetchJson(
+                        `/api/characters/catgirl/${encodeURIComponent(lanlanName)}/lighting`,
+                        {
+                            method: 'PUT',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify(lightingData)
+                        }
+                    );
+                } catch (e) {
+                    console.warn('保存光照设置失败:', e);
+                    lightingResult = { success: false, error: e.message };
+                }
+            }
+
+            let modelDisplayName = currentModelType === 'vrm' 
+                ? modelName.split(/[\\/]/).pop().replace(/\.vrm$/i, '') 
+                : modelName;
+            let saveMessage;
+            const lightingFailed = currentModelType === 'vrm' && ambient && main && (!lightingResult || !lightingResult.success);
+
+            if (lightingFailed) {
+                saveMessage = t('live2d.modelSavedLightingFailed', `已保存模型设置，光照设置保存失败`, { name: modelDisplayName });
+            } else if (currentModelType === 'vrm' && ambient && main) {
+                saveMessage = t('live2d.modelSettingsSavedWithLighting', `已保存模型和光照设置`, { name: modelDisplayName });
+            } else if (currentModelType === 'vrm') {
+                saveMessage = t('live2d.modelSettingsSaved', `已保存模型设置`, { name: modelDisplayName });
+            } else {
+                saveMessage = t('live2d.modelSettingsSaved', `已保存模型设置`, { name: modelDisplayName });
+            }
+            showStatus(saveMessage, 2000);
+            return true;
 
         } catch (error) {
             console.error('保存模型设置失败:', error);
@@ -3234,6 +3403,28 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // 确保图标仍然是播放图标
                 updateMotionPlayButtonIcon();
                 showStatus(t('live2d.motionStopped', '动作已停止'), 1000);
+
+                // 清除动作预览恢复定时器
+                if (window._motionPreviewRestoreTimer) {
+                    clearTimeout(window._motionPreviewRestoreTimer);
+                    window._motionPreviewRestoreTimer = null;
+                }
+
+                // 清除预览标记
+                window._currentMotionPreviewId = null;
+
+                // 停止动作后平滑恢复到初始状态（smoothReset 内部会在快照后停止 motion/expression）
+                if (window.live2dManager && typeof window.live2dManager.smoothResetToInitialState === 'function') {
+                    window.live2dManager.smoothResetToInitialState().catch(e => {
+                        console.warn('[ModelManager] 停止动作后平滑恢复失败:', e);
+                        // 降级：尝试清除表情以确保不残留
+                        if (window.live2dManager && typeof window.live2dManager.clearExpression === 'function') {
+                            window.live2dManager.clearExpression();
+                        }
+                    });
+                } else if (window.live2dManager && typeof window.live2dManager.clearExpression === 'function') {
+                    window.live2dManager.clearExpression();
+                }
             } catch (error) {
                 console.error('停止动作失败:', error);
             }
@@ -3242,11 +3433,62 @@ document.addEventListener('DOMContentLoaded', async () => {
             const motionIndex = currentModelFiles.motion_files.indexOf(motionSelect.value);
             if (motionIndex > -1) {
                 try {
+                    // 清除之前的恢复定时器
+                    if (window._motionPreviewRestoreTimer) {
+                        clearTimeout(window._motionPreviewRestoreTimer);
+                        window._motionPreviewRestoreTimer = null;
+                    }
+                    if (window._expressionPreviewRestoreTimer) {
+                        clearTimeout(window._expressionPreviewRestoreTimer);
+                        window._expressionPreviewRestoreTimer = null;
+                    }
+                    // 使在途的表情 await 回调失效，防止异步返回后设置恢复定时器打断动作
+                    window._currentExpressionPreviewToken = null;
+
                     live2dModel.motion('PreviewAll', motionIndex, 3);
                     isMotionPlaying = true;
                     // 确保图标仍然是播放图标
                     updateMotionPlayButtonIcon();
                     showStatus(t('live2d.playingMotion', `播放动作: ${motionSelect.value}`, { motion: motionSelect.value }), 1000);
+
+                    // 创建预览标记，防止快速切换预览时旧的 fetch 回调覆盖新的恢复定时器
+                    window._currentMotionPreviewId = (window._currentMotionPreviewId || 0) + 1;
+                    const previewId = window._currentMotionPreviewId;
+
+                    // 尝试获取动作持续时间，设置自动恢复定时器
+                    const _motionRestoreCallback = () => {
+                        if (window._currentMotionPreviewId !== previewId) return; // 已被新的预览覆盖
+                        window._motionPreviewRestoreTimer = null;
+                        window._currentMotionPreviewId = null;
+                        isMotionPlaying = false;
+                        updateMotionPlayButtonIcon();
+                        console.log('[ModelManager] 动作预览结束，自动恢复到初始状态');
+                        if (window.live2dManager && typeof window.live2dManager.smoothResetToInitialState === 'function') {
+                            window.live2dManager.smoothResetToInitialState().catch(() => {
+                                if (window.live2dManager && typeof window.live2dManager.clearExpression === 'function') {
+                                    window.live2dManager.clearExpression();
+                                }
+                            });
+                        } else if (window.live2dManager && typeof window.live2dManager.clearExpression === 'function') {
+                            window.live2dManager.clearExpression();
+                        }
+                    };
+                    try {
+                        const motionFile = motionSelect.value;
+                        const motionUrl = window.live2dManager ? window.live2dManager.resolveAssetPath(motionFile) : motionFile;
+                        RequestHelper.fetchJson(motionUrl).then(data => {
+                            if (window._currentMotionPreviewId !== previewId) return; // 过时的响应
+                            const dur = data?.Meta?.Duration ? data.Meta.Duration * 1000 + 500 : 10000; // 动作时长 + 500ms缓冲，或10秒后备
+                            window._motionPreviewRestoreTimer = setTimeout(_motionRestoreCallback, dur);
+                        }).catch(() => {
+                            if (window._currentMotionPreviewId !== previewId) return; // 过时的响应
+                            // fetch失败，使用10秒后备定时器
+                            window._motionPreviewRestoreTimer = setTimeout(_motionRestoreCallback, 10000);
+                        });
+                    } catch (e) {
+                        // 设置后备定时器
+                        window._motionPreviewRestoreTimer = setTimeout(_motionRestoreCallback, 10000);
+                    }
                 } catch (error) {
                     console.error('播放动作失败:', error);
                     showStatus(t('live2d.playMotionFailed', `播放动作失败: ${motionSelect.value}`, { motion: motionSelect.value }), 2000);
@@ -3339,12 +3581,50 @@ document.addEventListener('DOMContentLoaded', async () => {
         const expressionName = expressionSelect.value.split('/').pop().replace('.exp3.json', '');
 
         try {
+            // 清除之前的表情预览恢复定时器
+            if (window._expressionPreviewRestoreTimer) {
+                clearTimeout(window._expressionPreviewRestoreTimer);
+                window._expressionPreviewRestoreTimer = null;
+            }
+            // 使在途的动作预览 fetch 回调失效，防止异步返回后设置恢复定时器打断表情
+            if (window._motionPreviewRestoreTimer) {
+                clearTimeout(window._motionPreviewRestoreTimer);
+                window._motionPreviewRestoreTimer = null;
+            }
+            window._currentMotionPreviewId = null;
+
+            // 创建预览标记，防止快速连续点击时并发 await 导致多个定时器共存
+            window._currentExpressionPreviewToken = (window._currentExpressionPreviewToken || 0) + 1;
+            const previewToken = window._currentExpressionPreviewToken;
+
             // expression 方法是异步的，需要使用 await
             // 注意：Live2D SDK 的 expression 方法可能返回 null/undefined 但仍然成功播放
             const result = await currentModel.expression(expressionName);
+
+            // await 返回后检查标记是否仍然匹配（可能已被新的预览覆盖）
+            if (window._currentExpressionPreviewToken !== previewToken) return;
+
             // Live2D SDK 的 expression 方法成功时可能返回 falsy 值，这里改为检查是否抛出异常
             // 如果没有抛出异常，就认为播放成功
             showStatus(t('live2d.playingExpression', `播放表情: ${expressionName}`, { expression: expressionName }), 1000);
+
+            // 设置自动恢复定时器：5秒后平滑恢复到初始状态
+            window._expressionPreviewRestoreTimer = setTimeout(() => {
+                window._expressionPreviewRestoreTimer = null;
+                if (window._currentExpressionPreviewToken !== previewToken) return; // 已被新的预览覆盖
+                window._currentExpressionPreviewToken = null;
+                console.log('[ModelManager] 表情预览结束，自动恢复到初始状态');
+                if (window.live2dManager && typeof window.live2dManager.smoothResetToInitialState === 'function') {
+                    window.live2dManager.smoothResetToInitialState().catch(e => {
+                        console.warn('[ModelManager] 平滑恢复失败:', e);
+                        if (window.live2dManager && typeof window.live2dManager.clearExpression === 'function') {
+                            window.live2dManager.clearExpression();
+                        }
+                    });
+                } else if (window.live2dManager && typeof window.live2dManager.clearExpression === 'function') {
+                    window.live2dManager.clearExpression();
+                }
+            }, 5000);
         } catch (error) {
             console.error('播放表情失败:', error);
             showStatus(t('live2d.playExpressionFailed', `播放表情失败: ${expressionName}`, { expression: expressionName }), 2000);
@@ -3369,7 +3649,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         } else {
             // Live2D模式下需要currentModelInfo
-            if (!currentModelInfo) return;
+            if (!currentModelInfo) {
+                showStatus(t('live2d.pleaseSelectModel', '请先选择模型'), 2000);
+                return;
+            }
         }
 
         showStatus(t('live2d.savingSettings', '正在保存设置...'));
@@ -3774,6 +4057,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                             option.value = model.name;
                             // 使用display_name（如果存在）显示更友好的名称
                             option.textContent = model.display_name || model.name;
+                            if (model.item_id) {
+                                option.dataset.itemId = model.item_id;
+                            }
                             modelSelect.appendChild(option);
                         });
 

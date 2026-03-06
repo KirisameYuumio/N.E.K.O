@@ -225,6 +225,11 @@ function init_app() {
     let currentPlayingSpeechId = null;   // 当前正在播放的 speech_id
     let pendingDecoderReset = false;     // 是否需要在下一个新 speech_id 时重置解码器
     let skipNextAudioBlob = false;       // 是否跳过下一个音频 blob（被打断的旧音频）
+    let incomingAudioBlobQueue = [];     // 二进制音频包队列（串行消费，避免并发解码竞态）
+    let pendingAudioChunkMetaQueue = []; // 与二进制包一一对应的 header 元数据队列
+    let incomingAudioEpoch = 0;          // 音频代际号：用于淘汰打断前在途包
+    let isProcessingIncomingAudioBlob = false;
+    let decoderResetPromise = null;      // speech 切换时的解码器重置任务
 
     // 麦克风静音检测相关变量
     let silenceDetectionTimer = null;
@@ -336,6 +341,7 @@ function init_app() {
     // 动画设置：画质和帧率
     let renderQuality = 'medium';   // 'low' | 'medium' | 'high'
     let targetFrameRate = 60;       // 30 | 45 | 60
+    const mapRenderQualityToFollowPerf = (quality) => (quality === 'high' ? 'medium' : 'low');
 
     // 暴露到全局作用域，供 live2d.js 等其他模块访问和修改
     window.proactiveChatEnabled = proactiveChatEnabled;
@@ -350,6 +356,7 @@ function init_app() {
     window.proactiveVisionInterval = proactiveVisionInterval;
     window.renderQuality = renderQuality;
     window.targetFrameRate = targetFrameRate;
+    window.cursorFollowPerformanceLevel = mapRenderQualityToFollowPerf(renderQuality);
 
     // WebSocket心跳保活
     let heartbeatInterval = null;
@@ -364,11 +371,106 @@ function init_app() {
         );
     }
 
+    /**
+     * 等待 WebSocket 连接就绪（OPEN 状态）。
+     * - 已 OPEN → 立即返回
+     * - CONNECTING → 通过 addEventListener('open') 等待（不覆盖 onopen）
+     * - CLOSED/CLOSING 或 socket 不存在 → 取消排队的自动重连，触发 connectWebSocket() 后等待
+     * @param {number} timeoutMs 超时毫秒数，默认 5000
+     * @returns {Promise<void>}
+     */
+    function ensureWebSocketOpen(timeoutMs = 5000) {
+        return new Promise((resolve, reject) => {
+            // 已 OPEN，直接返回
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                return resolve();
+            }
+
+            let settled = false;
+            let timer = null;
+
+            const settle = (fn, arg) => {
+                if (settled) return;
+                settled = true;
+                if (timer) { clearTimeout(timer); timer = null; }
+                fn(arg);
+            };
+
+            // 超时处理
+            timer = setTimeout(() => {
+                settle(reject, new Error(window.t ? window.t('app.websocketNotConnectedError') : 'WebSocket未连接'));
+            }, timeoutMs);
+
+            // 监听当前或即将创建的 socket 的 open 事件
+            const attachOpenListener = (ws) => {
+                if (!ws || settled) return;
+                if (ws.readyState === WebSocket.OPEN) {
+                    settle(resolve); return;
+                }
+                if (ws.readyState === WebSocket.CONNECTING) {
+                    // 用 addEventListener 而非覆写 onopen，不干扰 connectWebSocket 的 onopen handler
+                    ws.addEventListener('open', () => settle(resolve), { once: true });
+                    ws.addEventListener('error', () => {
+                        // socket 连接失败，等新的 connectWebSocket 重建
+                    }, { once: true });
+                    return;
+                }
+                // CLOSING/CLOSED — 等待新 socket 被创建后重新挂载
+            };
+
+            if (socket && socket.readyState === WebSocket.CONNECTING) {
+                // 乐观路径：直接挂 listener，不触发重连
+                attachOpenListener(socket);
+                // 不 return — 下方轮询兜底：若此 socket 失败被替换，轮询自动挂到新 socket
+            } else {
+                // socket 不存在或已 CLOSED/CLOSING → 触发重建
+                // ★ 先取消排队的自动重连定时器，避免 3 秒后再多建一个重复连接
+                if (autoReconnectTimeoutId) {
+                    clearTimeout(autoReconnectTimeoutId);
+                    autoReconnectTimeoutId = null;
+                }
+                connectWebSocket();
+            }
+
+            // 轮询兜底：追踪 socket 引用，在 socket 被替换后自动重挂 listener
+            // 初始化为 null：确保首次轮询时一定会对当前 socket 调用 attachOpenListener
+            // （若初始化为 socket，connectWebSocket() 刚创建的 socket 会被跳过）
+            let lastAttachedWs = null;
+            const waitForNewSocket = () => {
+                if (settled) return;
+                if (socket) {
+                    if (socket !== lastAttachedWs) {
+                        lastAttachedWs = socket;
+                        attachOpenListener(socket);
+                    }
+                    if (!settled) {
+                        setTimeout(waitForNewSocket, socket.readyState === WebSocket.CONNECTING ? 200 : 50);
+                    }
+                } else {
+                    setTimeout(waitForNewSocket, 50);
+                }
+            };
+            setTimeout(waitForNewSocket, 10);
+        });
+    }
+
     // 建立WebSocket连接
     function connectWebSocket() {
+        const currentLanlanName = (window.lanlan_config && window.lanlan_config.lanlan_name)
+            ? window.lanlan_config.lanlan_name
+            : '';
+        if (!currentLanlanName) {
+            console.warn('[WebSocket] lanlan_name is empty, wait for page config and retry');
+            if (autoReconnectTimeoutId) {
+                clearTimeout(autoReconnectTimeoutId);
+            }
+            autoReconnectTimeoutId = setTimeout(connectWebSocket, 500);
+            return;
+        }
+
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-        const wsUrl = `${protocol}://${window.location.host}/ws/${lanlan_config.lanlan_name}`;
-        console.log(window.t('console.websocketConnecting'), lanlan_config.lanlan_name, window.t('console.websocketUrl'), wsUrl);
+        const wsUrl = `${protocol}://${window.location.host}/ws/${currentLanlanName}`;
+        console.log(window.t('console.websocketConnecting'), currentLanlanName, window.t('console.websocketUrl'), wsUrl);
         socket = new WebSocket(wsUrl);
 
         socket.onopen = () => {
@@ -417,7 +519,7 @@ function init_app() {
                 if (window.DEBUG_AUDIO) {
                     console.log(window.t('console.audioBinaryReceived'), event.data.size, window.t('console.audioBinaryBytes'));
                 }
-                handleAudioBlob(event.data);
+                enqueueIncomingAudioBlob(event.data);
                 return;
             }
 
@@ -524,6 +626,9 @@ function init_app() {
                     interruptedSpeechId = response.interrupted_speech_id || null;
                     pendingDecoderReset = true;  // 标记需要在新 speech_id 到来时重置
                     skipNextAudioBlob = false;   // 重置跳过标志
+                    incomingAudioEpoch += 1;     // 让当前代际之前的在途包全部失效
+                    incomingAudioBlobQueue = []; // 丢弃尚未处理的旧音频包
+                    pendingAudioChunkMetaQueue = []; // 丢弃尚未消费的旧 header
 
                     // 只清空播放队列，不重置解码器（避免丢失新音频的头信息）
                     clearAudioQueueWithoutDecoderReset();
@@ -533,21 +638,20 @@ function init_app() {
                     }
                     // 精确打断控制：根据 speech_id 决定是否接收此音频
                     const speechId = response.speech_id;
+                    let shouldSkip = false;
 
                     // 检查是否是被打断的旧音频，如果是则丢弃
                     if (speechId && interruptedSpeechId && speechId === interruptedSpeechId) {
-                        console.log(window.t('console.discardInterruptedAudio'), speechId);
-                        skipNextAudioBlob = true;  // 标记跳过后续的二进制数据
-                        return;
-                    }
-
-                    // 检查是否是新的 speech_id（新轮对话开始）
-                    if (speechId && speechId !== currentPlayingSpeechId) {
+                        if (window.DEBUG_AUDIO) {
+                            console.log(window.t('console.discardInterruptedAudio'), speechId);
+                        }
+                        shouldSkip = true;
+                    } else if (speechId && speechId !== currentPlayingSpeechId) {
+                        // 检查是否是新的 speech_id（新轮对话开始）
                         // 新轮对话开始，在此时重置解码器（确保有新的头信息）
                         if (pendingDecoderReset) {
                             console.log(window.t('console.newConversationResetDecoder'), speechId);
-                            // 使用立即执行的异步函数等待重置完成，避免竞态条件
-                            (async () => {
+                            decoderResetPromise = (async () => {
                                 await resetOggOpusDecoder();
                                 pendingDecoderReset = false;
                             })();
@@ -558,7 +662,13 @@ function init_app() {
                         interruptedSpeechId = null;  // 清除旧的打断记录
                     }
 
-                    skipNextAudioBlob = false;  // 允许接收后续的二进制数据
+                    // 记录该 header 对应的 blob 处理策略，后续二进制包按顺序消费
+                    pendingAudioChunkMetaQueue.push({
+                        speechId: speechId || currentPlayingSpeechId || null,
+                        shouldSkip: shouldSkip,
+                        epoch: incomingAudioEpoch
+                    });
+                    skipNextAudioBlob = false;  // 兼容旧逻辑：重置标志
                 } else if (response.type === 'cozy_audio') {
                     // 处理音频响应
                     console.log(window.t('console.newAudioHeaderReceived'))
@@ -609,16 +719,22 @@ function init_app() {
                     console.log(window.t('console.currentFrontendCatgirl'), lanlan_config.lanlan_name);
                     handleCatgirlSwitch(newCatgirl, oldCatgirl);
                 } else if (response.type === 'status') {
+                    // 尝试解析结构化消息
+                    let statusCode = null;
+                    try {
+                        const parsed = JSON.parse(response.message);
+                        if (parsed && parsed.code) statusCode = parsed.code;
+                    } catch (_) {}
+
                     // 如果正在切换模式且收到"已离开"消息，则忽略
-                    if (isSwitchingMode && response.message.includes('已离开')) {
+                    if (isSwitchingMode && (statusCode === 'CHARACTER_LEFT' || response.message.includes('已离开'))) {
                         console.log(window.t('console.modeSwitchingIgnoreLeft'));
                         return;
                     }
 
                     // 检测严重错误，自动隐藏准备提示（兜底机制）
-                    const criticalErrorKeywords = ['连续失败', '已停止', '自动重试', '崩溃', '欠费', 'API Key被', '限额', '耗尽', '额度', '429', '1008', 'time limit', '超时'];
-                    const responseMessageLower = String(response.message || '').toLowerCase();
-                    if (criticalErrorKeywords.some(keyword => responseMessageLower.includes(keyword.toLowerCase()))) {
+                    const criticalErrorCodes = ['SESSION_START_CRITICAL', 'MEMORY_SERVER_CRASHED', 'API_KEY_REJECTED', 'API_RATE_LIMIT_SESSION', 'ERROR_1007_ARREARS', 'AGENT_QUOTA_EXCEEDED', 'RESPONSE_TIMEOUT', 'CONNECTION_TIMEOUT'];
+                    if (statusCode && criticalErrorCodes.includes(statusCode)) {
                         console.log(window.t('console.seriousErrorHidePreparing'));
                         hideVoicePreparingToast();
                     }
@@ -626,7 +742,7 @@ function init_app() {
                     // 翻译后端发送的状态消息
                     const translatedMessage = window.translateStatusMessage ? window.translateStatusMessage(response.message) : response.message;
                     showStatusToast(translatedMessage, 4000);
-                    if (response.message === `${lanlan_config.lanlan_name}失联了，即将重启！`) {
+                    if (statusCode === 'CHARACTER_DISCONNECTED') {
                         if (isRecording === false && !isTextSessionActive) {
                             showStatusToast(window.t ? window.t('app.catgirlResting', { name: lanlan_config.lanlan_name }) : `${lanlan_config.lanlan_name}正在打盹...`, 5000);
                         } else if (isTextSessionActive) {
@@ -662,7 +778,8 @@ function init_app() {
                                         }
                                     });
 
-                                    // 发送start session事件
+                                    // 发送start session事件（确保 WebSocket 已连接）
+                                    await ensureWebSocketOpen();
                                     socket.send(JSON.stringify({
                                         action: 'start_session',
                                         input_type: 'audio'
@@ -677,7 +794,7 @@ function init_app() {
                                             window.sessionTimeoutId = null;
 
                                             // 超时时向后端发送 end_session 消息
-                                            if (socket.readyState === WebSocket.OPEN) {
+                                            if (socket && socket.readyState === WebSocket.OPEN) {
                                                 socket.send(JSON.stringify({
                                                     action: 'end_session'
                                                 }));
@@ -712,8 +829,16 @@ function init_app() {
                                 } catch (error) {
                                     console.error(window.t('console.restartError'), error);
 
+                                    // 清除超时定时器和 Promise 状态（与 mic button catch 对齐）
+                                    if (window.sessionTimeoutId) {
+                                        clearTimeout(window.sessionTimeoutId);
+                                        window.sessionTimeoutId = null;
+                                    }
+                                    sessionStartedResolver = null;
+                                    sessionStartedRejecter = null;
+
                                     // 重启失败时向后端发送 end_session 消息
-                                    if (socket.readyState === WebSocket.OPEN) {
+                                    if (socket && socket.readyState === WebSocket.OPEN) {
                                         socket.send(JSON.stringify({
                                             action: 'end_session'
                                         }));
@@ -798,7 +923,7 @@ function init_app() {
                                 if (t && t.id) window._agentTaskMap.set(t.id, t);
                             });
                             const tasks = Array.from(window._agentTaskMap.values());
-                            if (window.live2dManager && typeof window.AgentHUD.updateAgentTaskHUD === 'function') {
+                            if (window.AgentHUD && typeof window.AgentHUD.updateAgentTaskHUD === 'function') {
                                 window.AgentHUD.updateAgentTaskHUD({
                                     success: true,
                                     tasks,
@@ -817,16 +942,36 @@ function init_app() {
                     if (msg) {
                         setFloatingAgentStatus(msg, response.status || 'completed');
                         maybeShowAgentQuotaExceededModal(msg);
+                        maybeShowContentFilterModal(msg);
+                        if (response.error_message) maybeShowContentFilterModal(response.error_message);
                     }
                 } else if (response.type === 'agent_task_update') {
                     try {
                         if (!window._agentTaskMap) window._agentTaskMap = new Map();
+                        if (!window._agentTaskRemoveTimers) window._agentTaskRemoveTimers = new Map();
                         const task = response.task || {};
                         if (task.id) {
                             window._agentTaskMap.set(task.id, task);
+                            if (['completed', 'failed', 'cancelled'].includes(task.status)) {
+                                if (window._agentTaskRemoveTimers.has(task.id)) clearTimeout(window._agentTaskRemoveTimers.get(task.id));
+                                window._agentTaskRemoveTimers.set(task.id, setTimeout(() => {
+                                    const current = window._agentTaskMap.get(task.id);
+                                    if (current && ['completed', 'failed', 'cancelled'].includes(current.status)) {
+                                        window._agentTaskMap.delete(task.id);
+                                    }
+                                    window._agentTaskRemoveTimers.delete(task.id);
+                                    const remaining = Array.from(window._agentTaskMap.values());
+                                    if (window.AgentHUD && typeof window.AgentHUD.updateAgentTaskHUD === 'function') {
+                                        window.AgentHUD.updateAgentTaskHUD({ success: true, tasks: remaining, total_count: remaining.length, running_count: remaining.filter(t => t.status === 'running').length, queued_count: remaining.filter(t => t.status === 'queued').length, completed_count: remaining.filter(t => t.status === 'completed').length, failed_count: remaining.filter(t => t.status === 'failed').length, timestamp: new Date().toISOString() });
+                                    }
+                                }, 8000));
+                            } else if (window._agentTaskRemoveTimers.has(task.id)) {
+                                clearTimeout(window._agentTaskRemoveTimers.get(task.id));
+                                window._agentTaskRemoveTimers.delete(task.id);
+                            }
                         }
                         const tasks = Array.from(window._agentTaskMap.values());
-                        if (window.live2dManager && typeof window.AgentHUD.updateAgentTaskHUD === 'function') {
+                        if (window.AgentHUD && typeof window.AgentHUD.updateAgentTaskHUD === 'function') {
                             window.AgentHUD.updateAgentTaskHUD({
                                 success: true,
                                 tasks,
@@ -842,6 +987,7 @@ function init_app() {
                             const errMsg = task.error || task.reason || '';
                             if (errMsg) {
                                 maybeShowAgentQuotaExceededModal(errMsg);
+                                maybeShowContentFilterModal(errMsg);
                             }
                         }
                     } catch (e) {
@@ -1063,7 +1209,8 @@ function init_app() {
                 } else if (response.type === 'reload_page') {
                     console.log(window.t('console.reloadPageReceived'), response.message);
                     // 显示提示信息
-                    showStatusToast(response.message || (window.t ? window.t('app.configUpdated') : '配置已更新，页面即将刷新'), 3000);
+                    const reloadMsg = window.translateStatusMessage ? window.translateStatusMessage(response.message) : response.message;
+                    showStatusToast(reloadMsg || (window.t ? window.t('app.configUpdated') : '配置已更新，页面即将刷新'), 3000);
 
                     // 延迟2.5秒后刷新页面，让后端有足够时间完成session关闭和配置重新加载
                     setTimeout(() => {
@@ -2190,8 +2337,16 @@ function init_app() {
         }
     }
 
-    // 保存选择的麦克风到服务器
+    // 保存选择的麦克风到服务器和 localStorage
     async function saveSelectedMicrophone(deviceId) {
+        try {
+            if (deviceId) {
+                localStorage.setItem('neko_selected_microphone', deviceId);
+            } else {
+                localStorage.removeItem('neko_selected_microphone');
+            }
+        } catch (e) { }
+
         try {
             const response = await fetch('/api/characters/set_microphone', {
                 method: 'POST',
@@ -2211,16 +2366,15 @@ function init_app() {
         }
     }
 
-    // 加载上次选择的麦克风
-    async function loadSelectedMicrophone() {
+    // 加载上次选择的麦克风（优先从 localStorage 加载，快速恢复）
+    function loadSelectedMicrophone() {
         try {
-            const response = await fetch('/api/characters/get_microphone');
-            if (response.ok) {
-                const data = await response.json();
-                selectedMicrophoneId = data.microphone_id || null;
+            const saved = localStorage.getItem('neko_selected_microphone');
+            if (saved) {
+                selectedMicrophoneId = saved;
+                console.log(`已加载麦克风设置: ${saved}`);
             }
-        } catch (err) {
-            console.error(window.t('console.loadMicrophoneSelectionFailed'), err);
+        } catch (e) {
             selectedMicrophoneId = null;
         }
     }
@@ -2927,6 +3081,12 @@ function init_app() {
             screenButton.classList.add('active');
             syncFloatingScreenButtonState(true);
 
+            if (window.unlockAchievement) {
+                window.unlockAchievement('ACH_SEND_IMAGE').catch(err => {
+                    console.error('解锁发送图片成就失败:', err);
+                });
+            }
+
             try {
                 stopProactiveVisionDuringSpeech();
             } catch (e) {
@@ -3303,50 +3463,36 @@ function init_app() {
                 }
             });
 
-            // 发送start session事件
-            if (socket.readyState === WebSocket.OPEN) {
-                socket.send(JSON.stringify({
-                    action: 'start_session',
-                    input_type: 'audio'
-                }));
+            // 发送start session事件（确保 WebSocket 已连接）
+            await ensureWebSocketOpen();
+            socket.send(JSON.stringify({
+                action: 'start_session',
+                input_type: 'audio'
+            }));
 
-                // 设置超时（15秒，略大于后端12秒以对冲网络延迟）
-                window.sessionTimeoutId = setTimeout(() => {
-                    if (sessionStartedRejecter) {
-                        const rejecter = sessionStartedRejecter;
-                        sessionStartedResolver = null; // 先清除，防止重复触发
-                        sessionStartedRejecter = null; // 同时清理 rejecter
-                        window.sessionTimeoutId = null; // 清除全局定时器ID
-
-                        // 超时时向后端发送 end_session 消息
-                        if (socket.readyState === WebSocket.OPEN) {
-                            socket.send(JSON.stringify({
-                                action: 'end_session'
-                            }));
-                            console.log(window.t('console.sessionTimeoutEndSession'));
-                        }
-
-                        // 更新提示信息，显示超时
-                        showVoicePreparingToast(window.t ? window.t('app.sessionTimeout') || '连接超时' : '连接超时，请检查网络连接');
-                        rejecter(new Error(window.t ? window.t('app.sessionTimeout') : 'Session启动超时'));
-                    } else {
-                        window.sessionTimeoutId = null; // 即使 rejecter 不存在也清除
-                    }
-                }, 15000);
-            } else {
-                // WebSocket未连接，清除超时定时器和状态
-                if (window.sessionTimeoutId) {
-                    clearTimeout(window.sessionTimeoutId);
-                    window.sessionTimeoutId = null;
-                }
-                if (sessionStartedResolver) {
-                    sessionStartedResolver = null;
-                }
+            // 设置超时（15秒，略大于后端12秒以对冲网络延迟）
+            window.sessionTimeoutId = setTimeout(() => {
                 if (sessionStartedRejecter) {
-                    sessionStartedRejecter = null; //  同时清理 rejecter
+                    const rejecter = sessionStartedRejecter;
+                    sessionStartedResolver = null; // 先清除，防止重复触发
+                    sessionStartedRejecter = null; // 同时清理 rejecter
+                    window.sessionTimeoutId = null; // 清除全局定时器ID
+
+                    // 超时时向后端发送 end_session 消息
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({
+                            action: 'end_session'
+                        }));
+                        console.log(window.t('console.sessionTimeoutEndSession'));
+                    }
+
+                    // 更新提示信息，显示超时
+                    showVoicePreparingToast(window.t ? window.t('app.sessionTimeout') || '连接超时' : '连接超时，请检查网络连接');
+                    rejecter(new Error(window.t ? window.t('app.sessionTimeout') : 'Session启动超时'));
+                } else {
+                    window.sessionTimeoutId = null; // 即使 rejecter 不存在也清除
                 }
-                throw new Error(window.t ? window.t('app.websocketNotConnectedError') : 'WebSocket未连接');
-            }
+            }, 15000);
 
             // 等待session真正启动成功 AND 麦克风初始化完成（并行执行以减少等待时间）
             // 并行执行：
@@ -3418,7 +3564,7 @@ function init_app() {
             }
 
             // 确保后端清理资源，避免前后端状态不一致
-            if (socket.readyState === WebSocket.OPEN) {
+            if (socket && socket.readyState === WebSocket.OPEN) {
                 socket.send(JSON.stringify({
                     action: 'end_session'
                 }));
@@ -3629,7 +3775,7 @@ function init_app() {
                         window.sessionTimeoutId = null; // 清除全局定时器ID
 
                         // 超时时向后端发送 end_session 消息
-                        if (socket.readyState === WebSocket.OPEN) {
+                        if (socket && socket.readyState === WebSocket.OPEN) {
                             socket.send(JSON.stringify({
                                 action: 'end_session'
                             }));
@@ -3641,28 +3787,13 @@ function init_app() {
                 }, 15000);
             });
 
-            // 启动文本session
-            if (socket.readyState === WebSocket.OPEN) {
-                socket.send(JSON.stringify({
-                    action: 'start_session',
-                    input_type: 'text',
-                    new_session: true
-                }));
-            } else {
-                // WebSocket未连接，清除超时定时器和状态
-                if (window.sessionTimeoutId) {
-                    clearTimeout(window.sessionTimeoutId);
-                    window.sessionTimeoutId = null;
-                }
-                if (sessionStartedResolver) {
-                    sessionStartedResolver = null;
-                }
-                if (sessionStartedRejecter) {
-                    sessionStartedRejecter = null; // 同时清理 rejecter
-                }
-                hideVoicePreparingToast();
-                throw new Error(window.t ? window.t('app.websocketNotConnectedError') : 'WebSocket未连接');
-            }
+            // 启动文本session（确保 WebSocket 已连接）
+            await ensureWebSocketOpen();
+            socket.send(JSON.stringify({
+                action: 'start_session',
+                input_type: 'text',
+                new_session: true
+            }));
 
             // 等待session真正启动成功
             await sessionStartPromise;
@@ -3782,29 +3913,39 @@ function init_app() {
                 // 创建一个 Promise 来等待 session_started 消息
                 const sessionStartPromise = new Promise((resolve, reject) => {
                     sessionStartedResolver = resolve;
-                    sessionStartedRejecter = reject; // 保存 reject 函数
+                    sessionStartedRejecter = reject;
 
-                    // 设置超时（15秒，略大于后端12秒以对冲网络延迟）
-                    setTimeout(() => {
-                        if (sessionStartedRejecter) {
-                            const rejecter = sessionStartedRejecter;
-                            sessionStartedResolver = null;
-                            sessionStartedRejecter = null; // 同时清理 rejecter
-                            rejecter(new Error(window.t ? window.t('app.sessionTimeout') : 'Session启动超时'));
-                        }
-                    }, 15000);
+                    // 清除之前的超时定时器（如果存在），防止旧 attempt 的 rejecter 影响新 attempt
+                    if (window.sessionTimeoutId) {
+                        clearTimeout(window.sessionTimeoutId);
+                        window.sessionTimeoutId = null;
+                    }
                 });
 
-                // 启动文本session
-                if (socket.readyState === WebSocket.OPEN) {
-                    socket.send(JSON.stringify({
-                        action: 'start_session',
-                        input_type: 'text',
-                        new_session: false
-                    }));
-                } else {
-                    throw new Error(window.t ? window.t('app.websocketNotConnectedError') : 'WebSocket未连接');
-                }
+                // 启动文本session（确保 WebSocket 已连接）
+                await ensureWebSocketOpen();
+                socket.send(JSON.stringify({
+                    action: 'start_session',
+                    input_type: 'text',
+                    new_session: false
+                }));
+
+                // 在 WebSocket 确认连接后才开始超时计时（与 mic button 流程对齐）
+                window.sessionTimeoutId = setTimeout(() => {
+                    if (sessionStartedRejecter) {
+                        const rejecter = sessionStartedRejecter;
+                        sessionStartedResolver = null;
+                        sessionStartedRejecter = null;
+                        window.sessionTimeoutId = null;
+
+                        if (socket && socket.readyState === WebSocket.OPEN) {
+                            socket.send(JSON.stringify({ action: 'end_session' }));
+                            console.log('[TextSession] timeout → sent end_session');
+                        }
+
+                        rejecter(new Error(window.t ? window.t('app.sessionTimeout') : 'Session启动超时'));
+                    }
+                }, 15000);
 
                 // 等待session真正启动成功
                 await sessionStartPromise;
@@ -3822,6 +3963,14 @@ function init_app() {
                 console.error(window.t('console.startTextSessionFailed'), error);
                 hideVoicePreparingToast(); // 确保失败时隐藏准备提示
                 showStatusToast(window.t ? window.t('app.startFailed', { error: error.message }) : `启动失败: ${error.message}`, 5000);
+
+                // 清除超时定时器和 Promise 状态，防止跨 attempt 污染
+                if (window.sessionTimeoutId) {
+                    clearTimeout(window.sessionTimeoutId);
+                    window.sessionTimeoutId = null;
+                }
+                sessionStartedResolver = null;
+                sessionStartedRejecter = null;
 
                 // 重新启用按钮，允许用户重试
                 textSendButton.disabled = false;
@@ -4512,14 +4661,11 @@ function init_app() {
     }
 
 
-    async function handleAudioBlob(blob) {
-        // 精确打断控制：检查是否应跳过此音频（属于被打断的旧音频）
-        if (skipNextAudioBlob) {
-            console.log('跳过被打断的音频 blob');
+    async function handleAudioBlob(blob, expectedEpoch = incomingAudioEpoch) {
+        const arrayBuffer = await blob.arrayBuffer();
+        if (expectedEpoch !== incomingAudioEpoch) {
             return;
         }
-
-        const arrayBuffer = await blob.arrayBuffer();
         if (!arrayBuffer || arrayBuffer.byteLength === 0) {
             console.warn('收到空的音频数据，跳过处理');
             return;
@@ -4532,6 +4678,9 @@ function init_app() {
 
         if (audioPlayerContext.state === 'suspended') {
             await audioPlayerContext.resume();
+            if (expectedEpoch !== incomingAudioEpoch) {
+                return;
+            }
         }
 
         // 检测是否是 OGG 格式 (魔数 "OggS" = 0x4F 0x67 0x67 0x53)
@@ -4545,6 +4694,9 @@ function init_app() {
             // OGG OPUS 格式，用 WASM 流式解码
             try {
                 const result = await decodeOggOpusChunk(new Uint8Array(arrayBuffer));
+                if (expectedEpoch !== incomingAudioEpoch) {
+                    return;
+                }
                 if (!result) {
                     // 数据不足，等待更多
                     return;
@@ -4565,6 +4717,9 @@ function init_app() {
         }
 
         if (!float32Data || float32Data.length === 0) {
+            return;
+        }
+        if (expectedEpoch !== incomingAudioEpoch) {
             return;
         }
 
@@ -4595,6 +4750,77 @@ function init_app() {
                     // 静默兜底，避免控制台噪声
                 }
             }, 0);
+        }
+    }
+
+    function enqueueIncomingAudioBlob(blob) {
+        const meta = pendingAudioChunkMetaQueue.shift();
+        if (!meta) {
+            if (window.DEBUG_AUDIO) {
+                console.warn('[Audio] 收到无匹配 header 的音频 blob，已丢弃');
+            }
+            return;
+        }
+        if (!meta.speechId) {
+            if (window.DEBUG_AUDIO) {
+                console.warn('[Audio] 收到 speechId 为空的音频 blob，已丢弃');
+            }
+            return;
+        }
+        incomingAudioBlobQueue.push({
+            blob,
+            shouldSkip: !!meta.shouldSkip,
+            speechId: meta.speechId,
+            epoch: meta.epoch
+        });
+        if (!isProcessingIncomingAudioBlob) {
+            void processIncomingAudioBlobQueue();
+        }
+    }
+
+    async function processIncomingAudioBlobQueue() {
+        if (isProcessingIncomingAudioBlob) return;
+        isProcessingIncomingAudioBlob = true;
+
+        try {
+            while (incomingAudioBlobQueue.length > 0) {
+                const item = incomingAudioBlobQueue.shift();
+                if (!item) continue;
+                if (item.epoch !== incomingAudioEpoch) {
+                    continue;
+                }
+
+                if (item.shouldSkip) {
+                    if (window.DEBUG_AUDIO) {
+                        console.log('[Audio] 跳过被打断的音频 blob', item.speechId);
+                    }
+                    continue;
+                }
+
+                if (decoderResetPromise) {
+                    const resetTask = decoderResetPromise;
+                    try {
+                        await resetTask;
+                    } catch (e) {
+                        console.warn('等待 OGG OPUS 解码器重置失败:', e);
+                    } finally {
+                        // 仅清理当前等待的任务，避免覆盖并发写入的新任务
+                        if (decoderResetPromise === resetTask) {
+                            decoderResetPromise = null;
+                        }
+                    }
+                }
+                if (item.epoch !== incomingAudioEpoch) {
+                    continue;
+                }
+
+                await handleAudioBlob(item.blob, item.epoch);
+            }
+        } finally {
+            isProcessingIncomingAudioBlob = false;
+            if (incomingAudioBlobQueue.length > 0) {
+                void processIncomingAudioBlobQueue();
+            }
         }
     }
 
@@ -4760,10 +4986,30 @@ function init_app() {
         const container = document.getElementById('live2d-container');
         console.log('[App] hideLive2d调用前，容器类列表:', container.classList.toString());
 
-        // 首先清除任何可能干扰动画的强制显示样式
+        // 首先清除任何可能干扰动画的强制显示样式（包括 showLive2d 设置的内联 transform）
         container.style.removeProperty('visibility');
         container.style.removeProperty('display');
         container.style.removeProperty('opacity');
+        container.style.removeProperty('transform');
+
+        // 取消 return 渐入的清理定时器（防止与退出动画冲突）
+        if (window._returnFadeTimer) {
+            clearTimeout(window._returnFadeTimer);
+            window._returnFadeTimer = null;
+        }
+        // 重置 PIXI model alpha 到 1（确保退出动画时模型不透明）
+        if (window.live2dManager) {
+            const fadeModel = window.live2dManager.getCurrentModel();
+            if (fadeModel && !fadeModel.destroyed) {
+                fadeModel.alpha = 1;
+            }
+        }
+        // 清除 canvas 上的渐入动画残留样式
+        const live2dCanvasForHide = document.getElementById('live2d-canvas');
+        if (live2dCanvasForHide) {
+            live2dCanvasForHide.style.transition = '';
+            live2dCanvasForHide.style.opacity = '';
+        }
 
         // 添加minimized类，触发CSS过渡动画
         container.classList.add('minimized');
@@ -4852,15 +5098,93 @@ function init_app() {
             statusElement.style.setProperty('opacity', '0', 'important');
         }
 
-        // 强制显示live2d容器
-        container.classList.remove('hidden'); // 先移除hidden类
-        container.classList.remove('minimized'); // 移除minimized类
+        // 取消"请她离开"的延迟隐藏定时器（如果正在倒计时中）
+        if (window._goodbyeHideTimerId) {
+            clearTimeout(window._goodbyeHideTimerId);
+            window._goodbyeHideTimerId = null;
+            console.log('[App] showLive2d: 已取消 goodbye 延迟隐藏定时器');
+        }
+
+        // 取消上一次 return 渐入的清理定时器
+        if (window._returnFadeTimer) {
+            clearTimeout(window._returnFadeTimer);
+            window._returnFadeTimer = null;
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // 【渐入动画 - 完全复刻 _configureLoadedModel 的 CSS 揭示机制】
+        //
+        // 这套机制在模型首次加载时已被证明有效。核心原理：
+        // 1. 先用 CSS opacity:0 隐藏画布（canvas 可 visibility:visible 但不可见）
+        // 2. PIXI 在 opacity:0 的画布中正常渲染（framebuffer 内容正确）
+        // 3. 通过 CSS transition 将 opacity 从 0 过渡到 1 → 用户看到平滑淡入
+        //
+        // 之前失败的原因：
+        // - 尝试1-3: 动画作用在 container 而非 canvas（被 container 的退出 transition 干扰）
+        // - 尝试4: setInterval 在 canvas 上改 opacity，但没有 forced reflow 锁定初始 0 状态
+        // - 尝试5-6: model.alpha 方式，但 canvas 可见一瞬间旧帧就被合成到屏幕
+        // ═══════════════════════════════════════════════════════════════
+
+        // 确保 model.alpha = 1（WebGL 层面完全不透明，与加载代码一致）
+        const fadeModel = window.live2dManager ? window.live2dManager.getCurrentModel() : null;
+        if (fadeModel && !fadeModel.destroyed) {
+            fadeModel.alpha = 1;
+        }
+
+        // 第一步：在 canvas 变得可见之前，先将 CSS opacity 设为近 0
+        // 用 '0.001' 而非 '0' 可避免 loadModel finally 安全网干扰（它只检查 === '0'）
+        const live2dCanvas = document.getElementById('live2d-canvas');
+        if (live2dCanvas) {
+            live2dCanvas.style.transition = 'none';   // 禁止过渡，确保立即生效
+            live2dCanvas.style.opacity = '0.001';      // CSS 层面隐藏
+        }
+
+        // 第二步：让容器立即可见（禁用 CSS 过渡，避免"离开动画倒放"）
+        container.style.transition = 'none';
+        container.classList.remove('hidden');
+        container.classList.remove('minimized');
         container.style.visibility = 'visible';
         container.style.display = 'block';
         container.style.opacity = '1';
+        container.style.transform = 'none';
 
-        // 强制浏览器重新计算样式，确保过渡效果正常
-        void container.offsetWidth;
+        // 第三步：让 canvas 的 visibility 恢复（用 !important 覆盖 goodbye 定时器的 hidden）
+        // 此时 canvas 虽然 visibility:visible，但 CSS opacity:0.001 使其对用户不可见
+        if (live2dCanvas) {
+            live2dCanvas.style.setProperty('visibility', 'visible', 'important');
+            live2dCanvas.style.setProperty('pointer-events', 'auto', 'important');
+        }
+
+        // 第四步：强制浏览器刷新布局 —— 确保浏览器已经"看到"了 opacity:0.001 状态
+        // 这是让 CSS transition 能正确从 0 开始到 1 的关键!!!
+        // 如果不做 reflow，浏览器可能把 opacity:0.001 和后续的 opacity:1 合并，跳过动画
+        if (live2dCanvas) {
+            void live2dCanvas.offsetWidth;
+        }
+
+        // 第五步：恢复容器的 CSS 过渡（为后续"请她离开"做准备）
+        container.style.transition = '';
+
+        // 确保 PIXI ticker 在运行（长时间 hidden 后 rAF 可能被 Chromium 暂停）
+        const pixiApp = window.live2dManager ? window.live2dManager.pixi_app : null;
+        if (pixiApp && pixiApp.ticker && !pixiApp.ticker.started) {
+            pixiApp.ticker.start();
+        }
+
+        // 第六步：触发 CSS transition 淡入（与 _configureLoadedModel 相同的机制）
+        if (live2dCanvas) {
+            live2dCanvas.style.transition = 'opacity 0.5s ease-out';
+            live2dCanvas.style.opacity = '1';
+
+            // 过渡完成后清除内联样式，避免干扰后续功能
+            window._returnFadeTimer = setTimeout(() => {
+                if (live2dCanvas) {
+                    live2dCanvas.style.transition = '';
+                    live2dCanvas.style.opacity = '';
+                }
+                window._returnFadeTimer = null;
+            }, 550);
+        }
 
         // 如果容器没有其他类，完全移除class属性以避免显示为class=""
         if (container.classList.length === 0) {
@@ -4918,21 +5242,68 @@ function init_app() {
                 const vrmContainer = document.getElementById('vrm-container');
                 console.log('[showCurrentModel] vrmContainer存在:', !!vrmContainer);
                 if (vrmContainer) {
+                    // 取消"请她离开"的延迟隐藏定时器
+                    if (window._goodbyeHideTimerId) {
+                        clearTimeout(window._goodbyeHideTimerId);
+                        window._goodbyeHideTimerId = null;
+                    }
+                    // 取消上一次 VRM canvas 渐入动画
+                    if (window._vrmCanvasFadeInId) {
+                        clearInterval(window._vrmCanvasFadeInId);
+                        window._vrmCanvasFadeInId = null;
+                    }
+
+                    // 【第一步】在容器可见之前，先将 VRM canvas opacity 设为 0（防止旧帧闪烁）
+                    const vrmCanvasInner = document.getElementById('vrm-canvas');
+                    if (vrmCanvasInner) {
+                        vrmCanvasInner.style.opacity = '0';
+                    }
+
+                    // 禁用过渡，避免出现"离开动画倒放"效果
+                    vrmContainer.style.transition = 'none';
                     vrmContainer.classList.remove('hidden');
+                    vrmContainer.classList.remove('minimized');
                     vrmContainer.style.display = 'block';
                     vrmContainer.style.visibility = 'visible';
+                    vrmContainer.style.transform = 'none';
+                    vrmContainer.style.opacity = '1'; // 容器直接完全可见
                     vrmContainer.style.removeProperty('pointer-events');
-                    console.log('[showCurrentModel] 已设置vrmContainer可见');
+
+                    // 强制浏览器刷新样式
+                    void vrmContainer.offsetWidth;
+                    // 立即恢复 CSS 过渡（以便后续退出动画正常播放）
+                    vrmContainer.style.transition = '';
+
+                    // 【第二步】恢复 VRM canvas 可见性并启动渐入动画
+                    if (vrmCanvasInner) {
+                        vrmCanvasInner.style.setProperty('visibility', 'visible', 'important');
+                        vrmCanvasInner.style.setProperty('pointer-events', 'auto', 'important');
+
+                        // 使用 setInterval 渐入动画（VRM 使用 Three.js，无 model.alpha，用 CSS opacity）
+                        let vrmFadeStep = 0;
+                        const vrmFadeSteps = 30;
+                        const vrmFadeInterval = 16;
+                        window._vrmCanvasFadeInId = setInterval(() => {
+                            vrmFadeStep++;
+                            const progress = Math.min(vrmFadeStep / vrmFadeSteps, 1);
+                            const eased = 1 - Math.pow(1 - progress, 2.5);
+                            vrmCanvasInner.style.opacity = String(eased);
+                            if (vrmFadeStep >= vrmFadeSteps) {
+                                clearInterval(window._vrmCanvasFadeInId);
+                                window._vrmCanvasFadeInId = null;
+                                vrmCanvasInner.style.opacity = '';
+                            }
+                        }, vrmFadeInterval);
+                    }
+                    console.log('[showCurrentModel] 已设置vrmContainer可见（带canvas渐入动画）');
                 }
 
-                // 恢复 VRM canvas 的可见性
+                // 恢复 VRM canvas 的可见性（确保 handleReturnClick 后续不会再干扰）
                 const vrmCanvas = document.getElementById('vrm-canvas');
                 console.log('[showCurrentModel] vrmCanvas存在:', !!vrmCanvas);
                 if (vrmCanvas) {
-                    vrmCanvas.style.removeProperty('visibility');
-                    vrmCanvas.style.removeProperty('pointer-events');
-                    vrmCanvas.style.visibility = 'visible';
-                    vrmCanvas.style.pointerEvents = 'auto';
+                    vrmCanvas.style.setProperty('visibility', 'visible', 'important');
+                    vrmCanvas.style.setProperty('pointer-events', 'auto', 'important');
                     console.log('[showCurrentModel] 已设置vrmCanvas可见');
                 }
 
@@ -5159,14 +5530,12 @@ function init_app() {
             window.vrmManager.core.setLocked(true);
         }
 
-        // 隐藏 Live2D canvas，使 Electron 的 alpha 检测认为该区域完全透明
-        // 仅设置 pointer-events: none 不够，因为 Electron 根据像素 alpha 值来决定事件转发
-        // 必须设置 visibility: hidden 来确保 canvas 不渲染任何像素
+        // 【修复】不立即隐藏 canvas，而是先仅禁用交互，让 CSS 过渡动画（slide + fade）完成后再隐藏
+        // 之前的做法是立即设置 visibility: hidden，导致模型瞬间消失而非平滑退场
         const live2dCanvas = document.getElementById('live2d-canvas');
         if (live2dCanvas) {
-            live2dCanvas.style.setProperty('visibility', 'hidden', 'important');
             live2dCanvas.style.setProperty('pointer-events', 'none', 'important');
-            console.log('[App] 已隐藏 live2d-canvas（visibility: hidden），Electron 将认为该区域透明');
+            console.log('[App] 已禁用 live2d-canvas 交互（pointer-events: none），等待过渡动画完成后再隐藏');
         }
 
         // 【关键修复】在隐藏按钮之前，先判断当前激活的模型类型
@@ -5178,19 +5547,57 @@ function init_app() {
             !vrmContainer.classList.contains('hidden');
         console.log('[App] 判断当前模型类型 - isVrmActive:', isVrmActive);
 
-        // 隐藏 VRM 容器和 canvas
-        if (vrmContainer) {
-            vrmContainer.style.setProperty('visibility', 'hidden', 'important');
-            vrmContainer.style.setProperty('pointer-events', 'none', 'important');
-            vrmContainer.style.setProperty('display', 'none', 'important');
-            console.log('[App] 已隐藏 vrm-container（visibility: hidden），Electron 将认为该区域透明');
-        }
+        // 【修复】VRM 也先仅禁用交互，延迟隐藏，让过渡动画正常播放
         const vrmCanvas = document.getElementById('vrm-canvas');
-        if (vrmCanvas) {
-            vrmCanvas.style.setProperty('visibility', 'hidden', 'important');
-            vrmCanvas.style.setProperty('pointer-events', 'none', 'important');
-            console.log('[App] 已隐藏 vrm-canvas（visibility: hidden）');
+        if (vrmContainer) {
+            vrmContainer.style.setProperty('pointer-events', 'none', 'important');
+            console.log('[App] 已禁用 vrm-container 交互，等待过渡动画完成后再隐藏');
         }
+        if (vrmCanvas) {
+            vrmCanvas.style.setProperty('pointer-events', 'none', 'important');
+            console.log('[App] 已禁用 vrm-canvas 交互');
+        }
+
+        // 【修复】为 VRM 容器添加 minimized 类，触发 slide+fade 退出动画（与 Live2D 一致）
+        if (isVrmActive && vrmContainer) {
+            // 清除可能冲突的内联样式（由 showCurrentModel 设置）
+            vrmContainer.style.removeProperty('visibility');
+            vrmContainer.style.removeProperty('display');
+            vrmContainer.style.removeProperty('opacity');
+            vrmContainer.style.removeProperty('transform');
+            // 取消 VRM canvas 渐入动画
+            if (window._vrmCanvasFadeInId) {
+                clearInterval(window._vrmCanvasFadeInId);
+                window._vrmCanvasFadeInId = null;
+            }
+            // 清除 VRM canvas 上可能残留的内联 opacity
+            const vrmCanvasForHide = document.getElementById('vrm-canvas');
+            if (vrmCanvasForHide) {
+                vrmCanvasForHide.style.opacity = '';
+            }
+            vrmContainer.classList.add('minimized');
+            console.log('[App] 已为 vrm-container 添加 minimized 类，触发退出动画');
+        }
+
+        // 在过渡动画完成（1s）后，彻底隐藏 canvas / container，使 Electron alpha 检测认为透明
+        // 保存 setTimeout ID，以便"请她回来"时取消
+        if (window._goodbyeHideTimerId) clearTimeout(window._goodbyeHideTimerId);
+        window._goodbyeHideTimerId = setTimeout(() => {
+            window._goodbyeHideTimerId = null;
+            if (live2dCanvas) {
+                live2dCanvas.style.setProperty('visibility', 'hidden', 'important');
+                console.log('[App] 过渡完成，已隐藏 live2d-canvas（visibility: hidden）');
+            }
+            if (vrmContainer) {
+                vrmContainer.style.setProperty('visibility', 'hidden', 'important');
+                vrmContainer.style.setProperty('display', 'none', 'important');
+                console.log('[App] 过渡完成，已隐藏 vrm-container');
+            }
+            if (vrmCanvas) {
+                vrmCanvas.style.setProperty('visibility', 'hidden', 'important');
+                console.log('[App] 过渡完成，已隐藏 vrm-canvas');
+            }
+        }, 1100); // 比 CSS transition 的 1s 稍长，确保动画完全结束
 
         // 在隐藏 DOM 之前先读取 "请她离开" 按钮的位置（避免隐藏后 getBoundingClientRect 返回异常）
         // 优先读取当前激活模型的按钮位置（Live2D 或 VRM）
@@ -5396,6 +5803,13 @@ function init_app() {
     const handleReturnClick = async () => {
         console.log('[App] 请她回来按钮被点击，开始恢复所有界面');
 
+        // 立即取消"请她离开"的延迟隐藏定时器，防止在恢复后被意外隐藏
+        if (window._goodbyeHideTimerId) {
+            clearTimeout(window._goodbyeHideTimerId);
+            window._goodbyeHideTimerId = null;
+            console.log('[App] handleReturnClick: 已取消 goodbye 延迟隐藏定时器');
+        }
+
         // 第一步：同步 window 中的设置值到局部变量（防止从 l2d 页面返回时值丢失）
         if (typeof window.focusModeEnabled !== 'undefined') {
             focusModeEnabled = window.focusModeEnabled;
@@ -5457,8 +5871,10 @@ function init_app() {
         }
 
         // 【关键修复】恢复 Live2D canvas 的可见性（如果存在）
+        // 注意：如果 return 渐入动画正在播放（_returnFadeTimer 存在），
+        // 不要用 removeProperty 扰动 canvas 的内联样式，否则可能中断 CSS transition
         const live2dCanvas = document.getElementById('live2d-canvas');
-        if (live2dCanvas) {
+        if (live2dCanvas && !window._returnFadeTimer) {
             live2dCanvas.style.removeProperty('visibility');
             live2dCanvas.style.removeProperty('pointer-events');
             live2dCanvas.style.visibility = 'visible';
@@ -5820,7 +6236,7 @@ function init_app() {
         _updateUI() {
             const master = document.getElementById('live2d-agent-master');
             const keyboard = document.getElementById('live2d-agent-keyboard');
-
+            const browser = document.getElementById('live2d-agent-browser');
             const userPlugin = document.getElementById('live2d-agent-user-plugin');
             const status = document.getElementById('live2d-agent-status');
 
@@ -5833,7 +6249,7 @@ function init_app() {
                     // 空闲：所有按钮禁用
                     if (master) { master.disabled = true; master.title = ''; syncUI(master); }
                     if (keyboard) { keyboard.disabled = true; keyboard.checked = false; keyboard.title = ''; syncUI(keyboard); }
-
+                    if (browser) { browser.disabled = true; browser.checked = false; browser.title = ''; syncUI(browser); }
                     if (userPlugin) { userPlugin.disabled = true; userPlugin.checked = false; userPlugin.title = ''; syncUI(userPlugin); }
                     break;
 
@@ -5849,7 +6265,11 @@ function init_app() {
                         keyboard.title = window.t ? window.t('settings.toggles.checking') : '查询中...';
                         syncUI(keyboard);
                     }
-
+                    if (browser) {
+                        browser.disabled = true;
+                        browser.title = window.t ? window.t('settings.toggles.checking') : '查询中...';
+                        syncUI(browser);
+                    }
                     if (userPlugin) {
                         userPlugin.disabled = true;
                         userPlugin.title = window.t ? window.t('settings.toggles.checking') : '查询中...';
@@ -5877,7 +6297,7 @@ function init_app() {
                         syncUI(master);
                     }
                     if (keyboard) { keyboard.disabled = true; keyboard.checked = false; syncUI(keyboard); }
-
+                    if (browser) { browser.disabled = true; browser.checked = false; syncUI(browser); }
                     if (status) status.textContent = window.t ? window.t('settings.toggles.serverOffline') : 'Agent服务器未启动';
                     if (userPlugin) { userPlugin.disabled = true; userPlugin.checked = false; syncUI(userPlugin); }
                     break;
@@ -5886,7 +6306,7 @@ function init_app() {
                     // 处理中：所有按钮禁用，防止重复操作
                     if (master) { master.disabled = true; syncUI(master); }
                     if (keyboard) { keyboard.disabled = true; syncUI(keyboard); }
-
+                    if (browser) { browser.disabled = true; syncUI(browser); }
                     if (userPlugin) { userPlugin.disabled = true; syncUI(userPlugin); }
                     break;
             }
@@ -5897,7 +6317,7 @@ function init_app() {
     window.agentStateMachine = agentStateMachine;
     window._agentStatusSnapshot = window._agentStatusSnapshot || null;
 
-    // Agent 定时检查器（暴露到 window 供 live2d-ui-hud.js 调用）
+    // Agent 定时检查器
     let agentCheckInterval = null;
     let lastFlagsSyncTime = 0;
     const FLAGS_SYNC_INTERVAL = 3000; // 3秒同步一次后端flags状态
@@ -5910,7 +6330,7 @@ function init_app() {
     const checkAgentCapabilities = async () => {
         const agentMasterCheckbox = document.getElementById('live2d-agent-master');
         const agentKeyboardCheckbox = document.getElementById('live2d-agent-keyboard');
-
+        const agentBrowserCheckbox = document.getElementById('live2d-agent-browser');
         const agentUserPluginCheckbox = document.getElementById('live2d-agent-user-plugin');
 
         // 【状态机控制】如果正在处理用户操作，跳过轮询
@@ -5984,7 +6404,7 @@ function init_app() {
         // 【减少能力检查频率】只在必要时检查子功能可用性
         const checks = [
             { id: 'live2d-agent-keyboard', capability: 'computer_use', flagKey: 'computer_use_enabled', nameKey: 'keyboardControl' },
-
+            { id: 'live2d-agent-browser', capability: 'browser_use', flagKey: 'browser_use_enabled', nameKey: 'browserUse' },
             { id: 'live2d-agent-user-plugin', capability: 'user_plugin', flagKey: 'user_plugin_enabled', nameKey: 'userPlugin' }
         ];
         for (const { id, capability, flagKey, nameKey } of checks) {
@@ -6070,10 +6490,23 @@ function init_app() {
                         const notification = data.notification;
                         if (notification) {
                             console.log('[App] 收到后端通知:', notification);
-                            setFloatingAgentStatus(notification);
-                            // 如果是错误通知，也可以考虑弹窗
-                            if (notification.includes('失败') || notification.includes('断开') || notification.includes('错误')) {
-                                showStatusToast(notification, 3000);
+                            // notification 是 JSON 字符串，通过 translateStatusMessage 解析并翻译
+                            const translatedNotification = window.translateStatusMessage ? window.translateStatusMessage(notification) : notification;
+                            setFloatingAgentStatus(translatedNotification);
+                            maybeShowContentFilterModal(notification);
+                            // 检查是否包含错误/失败类通知（基于结构化 code 或回退到文本匹配）
+                            let isErrorNotification = false;
+                            try {
+                                const parsed = JSON.parse(notification);
+                                if (parsed && parsed.code) {
+                                    const errorCodes = ['AGENT_AUTO_DISABLED_COMPUTER', 'AGENT_AUTO_DISABLED_BROWSER', 'AGENT_LLM_CHECK_ERROR', 'AGENT_CU_UNAVAILABLE', 'AGENT_CU_ENABLE_FAILED', 'AGENT_CU_CAPABILITY_LOST'];
+                                    isErrorNotification = errorCodes.includes(parsed.code);
+                                }
+                            } catch (_) {
+                                isErrorNotification = notification.includes('失败') || notification.includes('断开') || notification.includes('错误');
+                            }
+                            if (isErrorNotification) {
+                                showStatusToast(translatedNotification, 3000);
                             }
                         }
 
@@ -6087,7 +6520,7 @@ function init_app() {
                             agentMasterCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
                             agentMasterCheckbox._autoDisabled = false;
                             if (typeof agentMasterCheckbox._updateStyle === 'function') agentMasterCheckbox._updateStyle();
-                            [agentKeyboardCheckbox, agentUserPluginCheckbox].forEach(cb => {
+                            [agentKeyboardCheckbox, agentBrowserCheckbox, agentUserPluginCheckbox].forEach(cb => {
                                 if (cb) {
                                     cb.checked = false;
                                     cb.disabled = true;
@@ -6137,6 +6570,31 @@ function init_app() {
 
 
 
+                        // 浏览器控制 flag 同步
+                        if (agentBrowserCheckbox && !agentBrowserCheckbox._processing) {
+                            const flagEnabled = flags.browser_use_enabled || false;
+                            const isAvailable = capabilityCheckFailed
+                                ? agentBrowserCheckbox.checked
+                                : (capabilityResults['browser_use_enabled'] !== false);
+                            const shouldBeChecked = flagEnabled && isAvailable;
+
+                            if (agentBrowserCheckbox.checked !== shouldBeChecked) {
+                                if (shouldBeChecked) {
+                                    agentBrowserCheckbox.checked = true;
+                                    agentBrowserCheckbox._autoDisabled = true;
+                                    agentBrowserCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
+                                    agentBrowserCheckbox._autoDisabled = false;
+                                    if (typeof agentBrowserCheckbox._updateStyle === 'function') agentBrowserCheckbox._updateStyle();
+                                } else if (!flagEnabled) {
+                                    agentBrowserCheckbox.checked = false;
+                                    agentBrowserCheckbox._autoDisabled = true;
+                                    agentBrowserCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
+                                    agentBrowserCheckbox._autoDisabled = false;
+                                    if (typeof agentBrowserCheckbox._updateStyle === 'function') agentBrowserCheckbox._updateStyle();
+                                }
+                            }
+                        }
+
                         // 用户插件 flag 同步独立处理，避免依赖 MCP 分支
                         if (agentUserPluginCheckbox && !agentUserPluginCheckbox._processing) {
                             const flagEnabled = flags.user_plugin_enabled || false;
@@ -6182,7 +6640,7 @@ function init_app() {
                 agentMasterCheckbox._autoDisabled = false;
                 if (typeof agentMasterCheckbox._updateStyle === 'function') agentMasterCheckbox._updateStyle();
 
-                [agentKeyboardCheckbox, agentUserPluginCheckbox].forEach(cb => {
+                [agentKeyboardCheckbox, agentBrowserCheckbox, agentUserPluginCheckbox].forEach(cb => {
                     if (cb) {
                         cb.checked = false;
                         cb.disabled = true;
@@ -6289,6 +6747,45 @@ function init_app() {
             });
     }
 
+    let _contentFilterModalOpen = false;
+    let _contentFilterModalCooldownUntil = 0;
+
+    function _isContentFilterError(text) {
+        if (!text) return false;
+        const s = String(text).toLowerCase();
+        return (
+            s.includes('content_filter') ||
+            s.includes('data_inspection_failed') ||
+            s.includes('datainspectionfailed') ||
+            s.includes('inappropriate content') ||
+            s.includes('content filter') ||
+            s.includes('responsible ai policy') ||
+            s.includes('content management policy')
+        );
+    }
+
+    function maybeShowContentFilterModal(rawMessage) {
+        if (!_isContentFilterError(rawMessage)) return;
+        if (typeof window.showAlert !== 'function') return;
+
+        const now = Date.now();
+        if (_contentFilterModalOpen || now < _contentFilterModalCooldownUntil) return;
+
+        _contentFilterModalOpen = true;
+        _contentFilterModalCooldownUntil = now + 5000;
+
+        const title = window.t ? window.t('common.alert') : '提示';
+        const msg = window.t
+            ? window.t('agent.contentFilterError')
+            : 'Agent 浏览的网页内容触发了 AI 模型的安全审查过滤，任务已中止。这通常发生在页面包含敏感话题时，请尝试其他关键词或网站。';
+
+        Promise.resolve(window.showAlert(msg, title))
+            .catch(() => { /* ignore */ })
+            .finally(() => {
+                _contentFilterModalOpen = false;
+            });
+    }
+
     // 检查Agent服务器健康状态
     async function checkToolServerHealth() {
         // 兼容服务启动竞态：首次失败时做短重试，避免必须手动刷新。
@@ -6310,6 +6807,7 @@ function init_app() {
     async function checkCapability(kind, showError = true) {
         const apis = {
             computer_use: { url: '/api/agent/computer_use/availability', nameKey: 'keyboardControl' },
+            browser_use: { url: '/api/agent/browser_use/availability', nameKey: 'browserUse' },
             user_plugin: { url: '/api/agent/user_plugin/availability', nameKey: 'userPlugin' }
         };
         const config = apis[kind];
@@ -6348,7 +6846,7 @@ function init_app() {
 
         const agentMasterCheckbox = document.getElementById('live2d-agent-master');
         const agentKeyboardCheckbox = document.getElementById('live2d-agent-keyboard');
-
+        const agentBrowserCheckbox = document.getElementById('live2d-agent-browser');
         const agentUserPluginCheckbox = document.getElementById('live2d-agent-user-plugin');
 
         if (!agentMasterCheckbox) {
@@ -6360,13 +6858,13 @@ function init_app() {
 
         // 【状态机】操作序列号由状态机管理，子开关保留独立序列号
         let keyboardOperationSeq = 0;
-
+        let browserOperationSeq = 0;
         let userPluginOperationSeq = 0;
 
         // 标记这些 checkbox 有外部处理器
         agentMasterCheckbox._hasExternalHandler = true;
         if (agentKeyboardCheckbox) agentKeyboardCheckbox._hasExternalHandler = true;
-
+        if (agentBrowserCheckbox) agentBrowserCheckbox._hasExternalHandler = true;
         if (agentUserPluginCheckbox) agentUserPluginCheckbox._hasExternalHandler = true;
 
 
@@ -6434,6 +6932,13 @@ function init_app() {
             );
 
             applySub(
+                agentBrowserCheckbox,
+                flags.browser_use_enabled,
+                caps.browser_use_ready,
+                window.t ? window.t('settings.toggles.browserUse') : 'Browser Control'
+            );
+
+            applySub(
                 agentUserPluginCheckbox,
                 flags.user_plugin_enabled,
                 caps.user_plugin_ready,
@@ -6447,10 +6952,10 @@ function init_app() {
         const resetSubCheckboxes = () => {
             const names = {
                 'live2d-agent-keyboard': window.t ? window.t('settings.toggles.keyboardControl') : '键鼠控制',
-
+                'live2d-agent-browser': window.t ? window.t('settings.toggles.browserUse') : 'Browser Control',
                 'live2d-agent-user-plugin': window.t ? window.t('settings.toggles.userPlugin') : '用户插件'
             };
-            [agentKeyboardCheckbox, agentUserPluginCheckbox].forEach(cb => {
+            [agentKeyboardCheckbox, agentBrowserCheckbox, agentUserPluginCheckbox].forEach(cb => {
                 if (cb) {
                     cb.disabled = true;
                     cb.checked = false;
@@ -6524,6 +7029,12 @@ function init_app() {
                         syncCheckboxUI(agentKeyboardCheckbox);
                     }
 
+                    if (agentBrowserCheckbox) {
+                        agentBrowserCheckbox.disabled = true;
+                        agentBrowserCheckbox.title = window.t ? window.t('settings.toggles.checking') : '检查中...';
+                        syncCheckboxUI(agentBrowserCheckbox);
+                    }
+
                     if (agentUserPluginCheckbox) {
                         agentUserPluginCheckbox.disabled = true;
                         agentUserPluginCheckbox.title = window.t ? window.t('settings.toggles.checking') : '检查中...';
@@ -6544,6 +7055,20 @@ function init_app() {
                             agentKeyboardCheckbox.disabled = !available;
                             agentKeyboardCheckbox.title = available ? (window.t ? window.t('settings.toggles.keyboardControl') : '键鼠控制') : (window.t ? window.t('settings.toggles.unavailable', { name: window.t('settings.toggles.keyboardControl') }) : '键鼠控制不可用');
                             syncCheckboxUI(agentKeyboardCheckbox);
+                        })(),
+
+                        (async () => {
+                            if (!agentBrowserCheckbox) return;
+                            const available = await checkCapability('browser_use', false);
+                            if (isExpired() || !agentMasterCheckbox.checked) {
+                                agentBrowserCheckbox.disabled = true;
+                                agentBrowserCheckbox.checked = false;
+                                syncCheckboxUI(agentBrowserCheckbox);
+                                return;
+                            }
+                            agentBrowserCheckbox.disabled = !available;
+                            agentBrowserCheckbox.title = available ? (window.t ? window.t('settings.toggles.browserUse') : 'Browser Control') : (window.t ? window.t('settings.toggles.unavailable', { name: window.t('settings.toggles.browserUse') }) : 'Browser Control不可用');
+                            syncCheckboxUI(agentBrowserCheckbox);
                         })(),
 
                         (async () => {
@@ -6570,7 +7095,7 @@ function init_app() {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 lanlan_name: lanlan_config.lanlan_name,
-                                flags: { agent_enabled: true, computer_use_enabled: false, user_plugin_enabled: false }
+                                flags: { agent_enabled: true, computer_use_enabled: false, browser_use_enabled: false, user_plugin_enabled: false }
                             })
                         });
                         if (!r.ok) throw new Error('main_server rejected');
@@ -6636,7 +7161,7 @@ function init_app() {
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 lanlan_name: lanlan_config.lanlan_name,
-                                flags: { agent_enabled: false, computer_use_enabled: false, user_plugin_enabled: false }
+                                flags: { agent_enabled: false, computer_use_enabled: false, browser_use_enabled: false, user_plugin_enabled: false }
                             })
                         });
 
@@ -6780,6 +7305,15 @@ function init_app() {
             () => ++keyboardOperationSeq
         );
 
+        // 浏览器控制开关逻辑（传入序列号的getter和setter）
+        setupSubCheckbox(
+            agentBrowserCheckbox,
+            'browser_use',
+            'browser_use_enabled',
+            'browserUse',
+            () => browserOperationSeq,
+            () => ++browserOperationSeq
+        );
 
         // 用户插件开关逻辑（传入序列号的getter和setter）
         setupSubCheckbox(
@@ -6865,12 +7399,26 @@ function init_app() {
                     }
                     syncCheckboxUI(agentKeyboardCheckbox);
                 }
+                // 同步 浏览器控制子开关
+                if (agentBrowserCheckbox) {
+                    if (analyzerEnabled) {
+                        // Agent 已开启，但子开关保持禁用等待能力检查
+                        agentBrowserCheckbox.checked = false;
+                        agentBrowserCheckbox.disabled = true;
+                        agentBrowserCheckbox.title = window.t ? window.t('settings.toggles.checking') : '检查中...';
+                    } else {
+                        agentBrowserCheckbox.checked = false;
+                        agentBrowserCheckbox.disabled = true;
+                        agentBrowserCheckbox.title = window.t ? window.t('settings.toggles.masterRequired', { name: window.t ? window.t('settings.toggles.browserUse') : 'Browser Control' }) : '请先开启Agent总开关';
+                    }
+                    syncCheckboxUI(agentBrowserCheckbox);
+                }
                 // 同步 用户插件子开关
                 if (agentUserPluginCheckbox) {
                     if (analyzerEnabled) {
-                        // Agent 已开启，根据后端状态设置
-                        agentUserPluginCheckbox.checked = flags.user_plugin_enabled || false;
-                        agentUserPluginCheckbox.disabled = true; // 先设为可用，后续可用性检查会更新
+                        // Agent 已开启，但子开关保持禁用等待能力检查
+                        agentUserPluginCheckbox.checked = false;
+                        agentUserPluginCheckbox.disabled = true;
                         agentUserPluginCheckbox.title = window.t ? window.t('settings.toggles.checking') : '检查中...';
                     } else {
                         // Agent 未开启，复位子开关
@@ -6930,7 +7478,7 @@ function init_app() {
                 agentMasterCheckbox.title = window.t ? window.t('settings.toggles.checking') : '查询中...';
                 syncCheckboxUI(agentMasterCheckbox);
             }
-            [agentKeyboardCheckbox, agentUserPluginCheckbox].forEach(cb => {
+            [agentKeyboardCheckbox, agentBrowserCheckbox, agentUserPluginCheckbox].forEach(cb => {
                 if (cb) {
                     cb.disabled = true;
                     cb.title = window.t ? window.t('settings.toggles.checking') : '查询中...';
@@ -6943,11 +7491,11 @@ function init_app() {
                 agentStateMachine.recordCheck();
 
                 // 并行请求所有状态
-                const [healthOk, flagsData, keyboardAvailable, mcpAvailable, userPluginAvailable] = await Promise.all([
+                const [healthOk, flagsData, keyboardAvailable, browserAvailable, userPluginAvailable] = await Promise.all([
                     checkToolServerHealth(),
                     fetch('/api/agent/flags').then(r => r.ok ? r.json() : { success: false }),
                     checkCapability('computer_use', false),
-
+                    checkCapability('browser_use', false),
                     checkCapability('user_plugin', false)
                 ]);
 
@@ -6993,7 +7541,14 @@ function init_app() {
                             syncCheckboxUI(agentKeyboardCheckbox);
                         }
 
-
+                        // 浏览器控制
+                        if (agentBrowserCheckbox) {
+                            const shouldEnable = flags.browser_use_enabled && browserAvailable;
+                            agentBrowserCheckbox.checked = shouldEnable;
+                            agentBrowserCheckbox.disabled = !browserAvailable;
+                            agentBrowserCheckbox.title = browserAvailable ? (window.t ? window.t('settings.toggles.browserUse') : 'Browser Control') : (window.t ? window.t('settings.toggles.unavailable', { name: window.t('settings.toggles.browserUse') }) : 'Browser Control不可用');
+                            syncCheckboxUI(agentBrowserCheckbox);
+                        }
 
                         // 用户插件
                         if (agentUserPluginCheckbox) {
@@ -7248,9 +7803,12 @@ function init_app() {
                 return;
             }
 
+            keyboardCheckbox.removeEventListener('change', checkAndToggleTaskHUD);
             keyboardCheckbox.addEventListener('change', checkAndToggleTaskHUD);
+            browserCheckbox.removeEventListener('change', checkAndToggleTaskHUD);
             browserCheckbox.addEventListener('change', checkAndToggleTaskHUD);
             if (userPluginCheckbox) {
+                userPluginCheckbox.removeEventListener('change', checkAndToggleTaskHUD);
                 userPluginCheckbox.addEventListener('change', checkAndToggleTaskHUD);
             }
             
@@ -8371,6 +8929,11 @@ function init_app() {
                     const screenshotDataUrl = results[screenshotIndex];
                     if (screenshotDataUrl) {
                         requestBody.screenshot_data = screenshotDataUrl;
+                        if (window.unlockAchievement) {
+                            window.unlockAchievement('ACH_SEND_IMAGE').catch(err => {
+                                console.error('解锁发送图片成就失败:', err);
+                            });
+                        }
                     } else {
                         // 截图失败，从 enabled_modes 中移除 vision
                         console.log('截图失败，移除 vision 模式');
@@ -8705,16 +9268,46 @@ function init_app() {
         }
     }
 
-    // 主动搭话截图函数（前端 getDisplayMedia → 后端 pyautogui 兜底）
+    // 主动搭话截图函数（优先后端 pyautogui 静默截图 → 前端 getDisplayMedia 缓存流复用）
     async function captureProactiveChatScreenshot() {
-        // 策略1: 前端 getDisplayMedia
+        // 策略1: 后端 pyautogui 优先（本地运行时完全静默，无弹窗）
+        const backendDataUrl = await fetchBackendScreenshot();
+        if (backendDataUrl) {
+            console.log('[主动搭话截图] 后端截图成功');
+            return backendDataUrl;
+        }
+
+        // 策略2: 前端 getDisplayMedia（远程服务器等后端不可用时的备选）
+        // 复用缓存的 screenCaptureStream，仅在无有效流时才请求新流
         if (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
-            let captureStream = null;
             try {
-                captureStream = await navigator.mediaDevices.getDisplayMedia({
-                    video: { cursor: 'always' },
-                    audio: false,
-                });
+                let captureStream = screenCaptureStream;
+
+                if (!captureStream || !captureStream.active) {
+                    captureStream = await navigator.mediaDevices.getDisplayMedia({
+                        video: { cursor: 'always', frameRate: { max: 1 } },
+                        audio: false,
+                    });
+
+                    screenCaptureStream = captureStream;
+
+                    captureStream.getVideoTracks().forEach(track => {
+                        track.addEventListener('ended', () => {
+                            console.log('[ProactiveVision] 屏幕共享流被用户终止');
+                            if (screenCaptureStream === captureStream) {
+                                screenCaptureStream = null;
+                                screenCaptureStreamLastUsed = null;
+                                if (screenCaptureStreamIdleTimer) {
+                                    clearTimeout(screenCaptureStreamIdleTimer);
+                                    screenCaptureStreamIdleTimer = null;
+                                }
+                            }
+                        });
+                    });
+                }
+
+                screenCaptureStreamLastUsed = Date.now();
+                scheduleScreenCaptureIdleCheck();
 
                 const video = document.createElement('video');
                 video.srcObject = captureStream;
@@ -8726,22 +9319,11 @@ function init_app() {
                 video.srcObject = null;
                 video.remove();
 
-                console.log(`主动搭话截图成功，尺寸: ${width}x${height}`);
+                console.log(`[主动搭话截图] 前端截图成功（流已缓存），尺寸: ${width}x${height}`);
                 return dataUrl;
             } catch (err) {
-                console.warn('[主动搭话截图] getDisplayMedia 失败，尝试后端兜底:', err);
-            } finally {
-                if (captureStream) {
-                    captureStream.getTracks().forEach(track => track.stop());
-                }
+                console.warn('[主动搭话截图] getDisplayMedia 失败:', err);
             }
-        }
-
-        // 策略2: 后端 pyautogui 兜底
-        const backendDataUrl = await fetchBackendScreenshot();
-        if (backendDataUrl) {
-            console.log('[主动搭话截图] 后端兜底截图成功');
-            return backendDataUrl;
         }
 
         console.warn('[主动搭话截图] 所有截图方式均失败');
@@ -8793,6 +9375,9 @@ function init_app() {
         const currentTargetFrameRate = typeof window.targetFrameRate !== 'undefined'
             ? window.targetFrameRate
             : targetFrameRate;
+        const currentMouseTracking = typeof window.mouseTrackingEnabled !== 'undefined'
+            ? window.mouseTrackingEnabled
+            : true;
 
         const settings = {
             proactiveChatEnabled: currentProactive,
@@ -8806,7 +9391,8 @@ function init_app() {
             proactiveVisionInterval: currentProactiveVisionInterval,
             proactivePersonalChatEnabled: currentPersonalChat,
             renderQuality: currentRenderQuality,
-            targetFrameRate: currentTargetFrameRate
+            targetFrameRate: currentTargetFrameRate,
+            mouseTrackingEnabled: currentMouseTracking
         };
         localStorage.setItem('project_neko_settings', JSON.stringify(settings));
 
@@ -8911,9 +9497,18 @@ function init_app() {
                 // 画质设置
                 renderQuality = settings.renderQuality ?? 'medium';
                 window.renderQuality = renderQuality;
+                window.cursorFollowPerformanceLevel = mapRenderQualityToFollowPerf(renderQuality);
                 // 帧率设置
                 targetFrameRate = settings.targetFrameRate ?? 60;
                 window.targetFrameRate = targetFrameRate;
+                // 鼠标跟踪设置（严格转换为布尔值）
+                if (typeof settings.mouseTrackingEnabled === 'boolean') {
+                    window.mouseTrackingEnabled = settings.mouseTrackingEnabled;
+                } else if (typeof settings.mouseTrackingEnabled === 'string') {
+                    window.mouseTrackingEnabled = settings.mouseTrackingEnabled === 'true';
+                } else {
+                    window.mouseTrackingEnabled = true;
+                }
 
                 console.log('已加载设置:', {
                     proactiveChatEnabled: proactiveChatEnabled,
@@ -8947,7 +9542,9 @@ function init_app() {
                 window.proactiveChatInterval = proactiveChatInterval;
                 window.proactiveVisionInterval = proactiveVisionInterval;
                 window.renderQuality = renderQuality;
+                window.cursorFollowPerformanceLevel = mapRenderQualityToFollowPerf(renderQuality);
                 window.targetFrameRate = targetFrameRate;
+                window.mouseTrackingEnabled = true;
 
                 // 持久化首次启动设置，避免每次重新检测
                 saveSettings();
@@ -8966,12 +9563,17 @@ function init_app() {
             window.proactiveChatInterval = proactiveChatInterval;
             window.proactiveVisionInterval = proactiveVisionInterval;
             window.renderQuality = renderQuality;
+            window.cursorFollowPerformanceLevel = mapRenderQualityToFollowPerf(renderQuality);
             window.targetFrameRate = targetFrameRate;
+            window.mouseTrackingEnabled = true;
         }
     }
 
     // 加载设置
     loadSettings();
+
+    // 加载麦克风设备选择
+    loadSelectedMicrophone();
 
     // 加载麦克风增益设置
     loadMicGainSetting();
@@ -9860,9 +10462,31 @@ function init_app() {
     });
 } // 兼容老按钮
 
-const ready = () => {
+const ready = async () => {
     if (ready._called) return;
     ready._called = true;
+    if (window.pageConfigReady && typeof window.pageConfigReady.then === 'function') {
+        const PAGE_CONFIG_READY_TIMEOUT = Symbol('page-config-ready-timeout');
+        const PAGE_CONFIG_READY_TIMEOUT_MS = 3000;
+        let timeoutId = null;
+        try {
+            const waitResult = await Promise.race([
+                window.pageConfigReady,
+                new Promise(resolve => {
+                    timeoutId = setTimeout(() => resolve(PAGE_CONFIG_READY_TIMEOUT), PAGE_CONFIG_READY_TIMEOUT_MS);
+                })
+            ]);
+            if (waitResult === PAGE_CONFIG_READY_TIMEOUT) {
+                console.warn(`[Init] pageConfigReady pending over ${PAGE_CONFIG_READY_TIMEOUT_MS}ms, continue with fallback config`);
+            }
+        } catch (error) {
+            console.warn('[Init] pageConfigReady rejected, continue with fallback config', error);
+        } finally {
+            if (timeoutId !== null) {
+                clearTimeout(timeoutId);
+            }
+        }
+    }
     init_app();
 };
 

@@ -448,7 +448,47 @@
         "API_QUOTA_TIME": "💥 無料APIの利用制限に達しました。明日やり直すか他のAPIに切り替えてください。",
         "API_RATE_LIMIT": "💥 リクエストが多すぎます(429)。しばらくしてからもう一度お試しください。",
         "API_POLICY_VIOLATION": "💥 ポリシー違反またはセキュリティブロック：{{msg}}",
-        "API_1008_FALLBACK": "💥 接続が切断されました(1008)：{{msg}}"
+        "API_1008_FALLBACK": "💥 接続が切断されました(1008)：{{msg}}",
+        "API_UNKNOWN_ERROR": "💥 APIエラー：{{msg}}",
+        "MEMORY_SERVER_NOT_RUNNING": "🧠 メモリサーバーが起動していません！先に memory_server.py を実行してください。",
+        "MEMORY_SERVER_CRASHED": "🧠 メモリサーバー(ポート{{port}})がクラッシュしました。memory_server.py を再起動してください。",
+        "CONNECTION_REFUSED": "💥 サーバー接続が拒否されました。API Keyとネットワーク接続を確認してください。",
+        "API_KEY_REJECTED": "💥 API Keyがサーバーに拒否されました。API Keyが選択したモデルと一致しているか確認してください。",
+        "API_RATE_LIMIT_SESSION": "💥 APIリクエストが多すぎます。しばらくしてから再試行してください。",
+        "LLM_CONNECTION_FAILED": "💥 LLM API の接続に失敗しました。ネットワーク接続とAPI設定を確認してください。",
+        "CONNECTION_CLOSED_ABNORMAL": "💥 接続が異常終了しました: {{error}}",
+        "AGENT_QUOTA_EXCEEDED": "💥 無料 Agent モデルの本日の試用上限に達しました ({{used}}/{{limit}})。明日お試しください。",
+        "SESSION_START_CRITICAL": "⛔ Sessionの起動が{{count}}回連続で失敗しました。自動リトライを停止しました。ネットワークとAPI設定を確認し、ページを更新してください。",
+        "SESSION_START_FAILED": "💥 Session起動失敗: {{error}} (失敗{{count}}回)",
+        "INTERNAL_UPDATE_FAILED": "💥 内部更新切り替え失敗: {{error}}",
+        "CHARACTER_DISCONNECTED": "{{name}}の接続が切れました。まもなく再起動します！",
+        "CHARACTER_LEFT": "{{name}}が退室しました。",
+        "ERROR_1011_MIC_CHECK": "💥 注意：1011エラーを検出しました。APIサーバーの異常です。まずマイクが機能しているか確認してください。",
+        "ERROR_1007_ARREARS": "💥 注意：1007エラーを検出しました。残高不足が原因である可能性が高いです。",
+        "IMAGE_BLOCKED": "⚠️ 画像が審査システムにブロックされました。別の画像またはコンテンツをお試しください。",
+        "SERVER_BUSY_THROTTLE": "⚠️ サーバーが混雑しています。送信レートを自動調整中...",
+        "RESPONSE_TIMEOUT": "💥 接続タイムアウト (Response timeout)、音声会話が中断されました。",
+        "CONNECTION_TIMEOUT": "💥 接続タイムアウト。ネットワーク接続を確認してください。",
+        "RESPONSE_TOO_LONG": "回答が長すぎるため、出力を破棄しました（設定で TEXT_GUARD_MAX_LENGTH を増やすことができます）",
+        "RESPONSE_INVALID": "AIの回答が要件を満たしていないため、出力を破棄しました",
+        "CHARACTER_SWITCHING_TERMINAL": "{{name}}が別のターミナルに移動中...",
+        "RELOAD_PAGE": "音声が更新されました。ページがまもなく更新されます",
+        "AGENT_AUTO_DISABLED_COMPUTER": "キーボード/マウス制御が自動無効化されました: $t(agent.precheck.{{reason_code}})",
+        "AGENT_AUTO_DISABLED_BROWSER": "ブラウザ制御が自動無効化されました: $t(agent.precheck.{{reason_code}})",
+        "AGENT_LLM_CHECK_ERROR": "Agent LLM 接続チェックエラー",
+        "INVALID_INPUT_TYPE": "無効な入力タイプ: {{input_type}}",
+        "UNKNOWN_ACTION": "不明な操作: {{action}}",
+        "SERVER_ERROR": "サーバー内部エラー",
+        "AGENT_CU_MODULE_NOT_LOADED": "Computer Use を有効にできません：モジュール未ロード",
+        "AGENT_CU_ENABLED_CHECKING": "キーボード/マウス制御が有効化されました。Agent LLM 接続確認中...",
+        "AGENT_CU_UNAVAILABLE": "Computer Use を有効にできません：$t(agent.precheck.{{reason_code}})",
+        "AGENT_CU_ENABLE_FAILED": "Computer Use の有効化に失敗しました：{{error}}",
+        "AGENT_BU_MODULE_NOT_LOADED": "Browser Use を有効にできません：モジュール未ロード",
+        "AGENT_BU_NOT_INSTALLED": "Browser Use を有効にできません：{{error}}",
+        "AGENT_BU_ENABLED_CHECKING": "ブラウザ制御が有効化されました。Agent LLM 接続確認中...",
+        "AGENT_CU_AUTO_CLOSED": "Computer Use モジュール未ロード、自動無効化されました",
+        "AGENT_CU_CAPABILITY_LOST": "Computer Use が利用できません：$t(agent.precheck.{{reason_code}})",
+        "TTS_CONNECTION_FAILED": "TTSサービス接続失敗: {{msg}}"
     },
     "camera": {
         "iosPermissionHint": "iOS設定 → Safari → カメラの権限が「許可」に設定されているか確認してください",
@@ -924,7 +964,9 @@
             "savingParameters": "保存中...",
             "parametersSaved": "保存しました！",
             "parametersSavePartialFailed": "一部の保存に失敗: {{errors}}",
-            "parametersSaveFailed": "保存に失敗しました: {{error}}"
+            "parametersSaveFailed": "保存に失敗しました: {{error}}",
+            "emptyHint": "ここには何もありません！",
+            "foundYou": "見つけた！"
         },
         "modelDirectorySaveFailed": "ファイル保存失敗",
         "userPreferencesSaveFailed": "設定保存失敗",
@@ -1015,7 +1057,28 @@
         "deleteFailed": "削除失敗",
         "deleteError": "削除失敗：{{error}}",
         "freePresetLabel": "無料プリセット",
-        "freePresetBadge": "プリセット"
+        "freePresetBadge": "プリセット",
+        "silenceModal": {
+            "title": "スマート無音検出結果",
+            "originalDuration": "元の音声の長さ",
+            "silenceDuration": "除去可能な無音の長さ",
+            "estimatedDuration": "処理後の予想長さ",
+            "savingPercentage": "節約率",
+            "processing": "処理中...",
+            "analyzing": "分析中...",
+            "trimming": "トリミング中...",
+            "done": "完了",
+            "cancelled": "キャンセル済み",
+            "trimSuccess": "✅ トリミング完了！",
+            "downloadTrimmed": "処理済み音声をダウンロード",
+            "useTrimmed": "スマートトリミング音声を使用",
+            "useOriginal": "元の音声をアップロード",
+            "cancel": "キャンセル",
+            "noSilence": "除去可能な無音区間は検出されませんでした",
+            "trimError": "トリミング失敗: {{error}}",
+            "trimmedLabel": "[トリミング済]",
+            "confirmTrimmed": "トリミング済み音声を使用"
+        }
     },
     "memory": {
         "title": "メモリブラウザ",
@@ -1074,6 +1137,7 @@
         "profileName": "プロフィール名",
         "profileNameMaxHint": "最大20文字",
         "profileNameTooLong": "プロフィール名が長すぎます",
+        "profileNameContainsSlash": "プロフィール名にパス区切り文字(/または\\)を含めることはできません",
         "newProfileNameRequired": "新しいプロフィール名は空にできません",
         "newProfileNameTooLong": "プロフィール名が長すぎます",
         "required": "*",
@@ -1090,6 +1154,7 @@
         "lightingNotSet": "デフォルト",
         "live2dNotSet": "未設定",
         "voiceNotSet": "ボイスが指定されていません",
+        "voiceSetting": "ボイス設定",
         "manageModel": "クリックしてモデルを管理",
         "fillProfileNameFirst": "まず neko プロフィール名を入力してから、モデルを設定してください",
         "registerNewVoice": "新しいボイスを登録",
@@ -1298,7 +1363,8 @@
             "frameRate": "フレームレート",
             "frameRateLow": "30fps",
             "frameRateMedium": "45fps",
-            "frameRateHigh": "60fps"
+            "frameRateHigh": "60fps",
+            "mouseTracking": "マウス追跡"
         }
     },
     "subtitle": {
@@ -1319,9 +1385,27 @@
             "disconnected": "サーバー接続が失われました",
             "agentDisconnected": "エージェントサーバー接続が失われました",
             "freeModelWarning": "クォータの制限により、無料モデルではAgentモードがブロックされやすくなります。有料モデルへの切り替えをお勧めします。\n\nすでに有料APIを設定済みの場合は、NEKOを再起動してみてください。",
-            "freeModelWarningTitle": "無料モデルのお知らせ"
+            "freeModelWarningTitle": "無料モデルのお知らせ",
+            "connectivityCheck": "Agent LLM 接続チェック中...",
+            "precheckFailed": "Agent プリチェック失敗：{{reason}}"
+        },
+        "precheck": {
+            "AGENT_PRECHECK_PENDING": "接続チェック中...",
+            "AGENT_ENDPOINT_NOT_CONFIGURED": "Agent API が設定されていません",
+            "AGENT_PYAUTOGUI_NOT_INSTALLED": "pyautogui がインストールされていません",
+            "AGENT_BROWSER_USE_NOT_INSTALLED": "browser-use がインストールされていません",
+            "AGENT_NOT_INITIALIZED": "Agent の初期化に失敗",
+            "AGENT_LLM_UNREACHABLE": "Agent LLM に接続できません",
+            "AGENT_MODEL_NOT_CONFIGURED": "Agent モデルが設定されていません",
+            "AGENT_URL_NOT_CONFIGURED": "Agent API URL が設定されていません",
+            "AGENT_KEY_NOT_CONFIGURED": "Agent API Key が設定されていないか無効です",
+            "AGENT_NO_PLUGINS": "利用可能なプラグインが見つかりません",
+            "AGENT_NO_PLUGINS_FOUND": "利用可能なプラグインが見つかりません",
+            "AGENT_PLUGIN_SERVER_ERROR": "プラグインサーバー接続失敗",
+            "AGENT_CONNECTIVITY_FAILED": "Agent LLM 接続失敗"
         },
         "quotaExceeded": "無料 Agent モデルの本日の試用上限（{{limit}}回）に達しました。明日もう一度お試しください。",
+        "contentFilterError": "Agent が閲覧したウェブページの内容が AI モデルの安全フィルターに引っかかり、タスクが中止されました。ページにセンシティブなトピックが含まれている場合に発生します。別のキーワードやウェブサイトをお試しください。",
         "taskHud": {
             "title": "エージェントタスク",
             "running": "実行中",
@@ -2048,5 +2132,128 @@
         "switchToLight": "ライトモードに切り替え",
         "themeChanged": "テーマが変更されました"
     },
-    "characterModelNotSet": "現在のキャラクターにモデルが設定されていません"
+    "characterModelNotSet": "現在のキャラクターにモデルが設定されていません",
+    "cookiesLogin": {
+        "title": "N.E.K.O クレデンシャル制御センター",
+        "header": "🔐 クレデンシャル取得センター",
+        "bilibili": "📺 ビリビリ (Bilibili)",
+        "douyin": "🎵 抖音 (Douyin)",
+        "kuaishou": "🧡 快手 (Kuaishou)",
+        "weibo": "🌏 微博 (Weibo)",
+        "twitter": "🐦 Twitter/X",
+        "reddit": "👽 Reddit",
+        "saveConfig": "設定を保存",
+        "encryptStorage": "ローカルファイルに安全に暗号化保存",
+        "localMonitoring": "ローカルステータス監視",
+        "removeCredentials": "削除",
+        "confirmRemove": "{{platformName}}のログインクレデンシャルを本当にクリアしますか？",
+        "credentialsRemoved": "✅ クレデンシャルの削除に成功しました",
+        "credentialsSaved": "✅ {{platformName}} クレデンシャルの保存に成功しました！",
+        "credentialsRemovedFailed": "削除に失敗しました",
+        "removeFailed": "❌ 削除に失敗しました、ネットワークを確認してください",
+        "requiredField": "⚠️ 必須項目を記入してください: [{{fieldName}}]",
+        "invalidChars": "⚠️ [{{fieldName}}] に無効な文字が含まれています...",
+        "whitespaceTrimmed": "⚠️ [{{fieldName}}] に前後の空白が含まれていたため、自動的にトリミングされました。確認後、再提出してください",
+        "networkError": "❌ ネットワークエラー: バックエンドサービスに接続できません",
+        "saveFailed": "保存に失敗しました、フォーマットが正しいか確認してください",
+        "pasteHere": "ペーストここ",
+        "submitting": "安全に暗号化して送信する...",
+        "noCookies": "Cookiesを先に設定してください",
+        "statusLoadFailed": "状態の読み込みに失敗しました",
+        "thisPlatform": "このプラットフォーム",
+        "instructions": {
+            "bilibili": "📌 <b>対象：</b> <b>bilibili.com</b> にアクセスして Cookie を取得してください。",
+            "douyin": "📌 <b>対象：</b> <b>douyin.com</b> にアクセスして Cookie を取得してください。",
+            "kuaishou": "📌 <b>対象：</b> <b>kuaishou.com</b> にアクセスして Cookie を取得してください。",
+            "weibo": "📌 <b>対象：</b> <b>weibo.com</b> にアクセスして Cookie を取得してください。",
+            "twitter": "📌 <b>対象：</b> <b>x.com</b> にアクセスして Cookie を取得してください。",
+            "reddit": "📌 <b>対象：</b> <b>reddit.com</b> にアクセスして Cookie を取得してください。"
+        },
+        "guide": {
+            "title": "初心者向け共通ガイド",
+            "step1": "ブラウザで対象のウェブサイトを開き、<span class=\"highlight-text\">ログイン</span>します。",
+            "step2_prefix": "キーボードの",
+            "step2_suffix": "キーを押して開発者ツールを開きます。",
+            "step3": "上部にある <span class=\"highlight-text\">Application（アプリケーション）</span> タブを探してクリックします。",
+            "step4": "左側の <span class=\"highlight-text\">Cookies</span> を展開し、ドメインをクリックして右側にある必要な値をコピーします。"
+        },
+        "fields": {
+            "SESSDATA": {
+                "label": "SESSDATA",
+                "desc": "コアIDクレデンシャル (必須)"
+            },
+            "bili_jct": {
+                "label": "bili_jct",
+                "desc": "CSRFトークン (必須)"
+            },
+            "DedeUserID": {
+                "label": "DedeUserID",
+                "desc": "アカウントUID (必須)"
+            },
+            "buvid3": {
+                "label": "buvid3",
+                "desc": "デバイスフィンガープリント (任意)"
+            },
+            "sessionid": {
+                "label": "sessionid",
+                "desc": "コアセッションクレデンシャル (必須)"
+            },
+            "ttwid": {
+                "label": "ttwid",
+                "desc": "デバイスリスクコントロールコード (必須)"
+            },
+            "passport_csrf_token": {
+                "label": "csrf_token",
+                "desc": "セキュリティ検証トークン"
+            },
+            "odin_tt": {
+                "label": "odin_tt",
+                "desc": "デバイス特徴"
+            },
+            "ks_web_st": {
+                "label": "web_st",
+                "desc": "コアチケット (必須)"
+            },
+            "ks_web_ph": {
+                "label": "web_ph",
+                "desc": "補助チケット (必須)"
+            },
+            "userId": {
+                "label": "userId",
+                "desc": "ユーザーID"
+            },
+            "did": {
+                "label": "did",
+                "desc": "デバイスID"
+            },
+            "SUB": {
+                "label": "SUB",
+                "desc": "コアクレデンシャル (_2Aで始まる)"
+            },
+            "XSRF-TOKEN": {
+                "label": "XSRF-TOKEN",
+                "desc": "なりすまし防止トークン"
+            },
+            "auth_token": {
+                "label": "auth_token",
+                "desc": "コアIDトークン"
+            },
+            "ct0": {
+                "label": "ct0",
+                "desc": "CSRF検証コード"
+            },
+            "reddit_session": {
+                "label": "reddit_session",
+                "desc": "コアセッションクレデンシャル (必須)"
+            },
+            "csrftoken": {
+                "label": "csrftoken",
+                "desc": "CSRFトークン"
+            }
+        },
+        "status": {
+            "active": "● 準備完了",
+            "inactive": "○ 未設定"
+        }
+    }
 }

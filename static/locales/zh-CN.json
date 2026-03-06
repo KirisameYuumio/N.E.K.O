@@ -448,7 +448,47 @@
         "API_QUOTA_TIME": "💥 免费API限额已耗尽，请更换API或明天再试。",
         "API_RATE_LIMIT": "💥 API达到限额或请求过于频繁(429)，请稍后再试。",
         "API_POLICY_VIOLATION": "💥 服务器返回安全策略拦截或政策限制：{{msg}}",
-        "API_1008_FALLBACK": "💥 会话断开(1008)：{{msg}}"
+        "API_1008_FALLBACK": "💥 会话断开(1008)：{{msg}}",
+        "API_UNKNOWN_ERROR": "💥 API错误：{{msg}}",
+        "MEMORY_SERVER_NOT_RUNNING": "🧠 记忆服务器未启动！请先运行 memory_server.py",
+        "MEMORY_SERVER_CRASHED": "🧠 记忆服务器(端口{{port}})已崩溃。请重启 memory_server.py",
+        "CONNECTION_REFUSED": "💥 服务器连接被拒绝。请检查API Key和网络连接。",
+        "API_KEY_REJECTED": "💥 API Key被服务器拒绝。请检查API Key是否与所选模型匹配。",
+        "API_RATE_LIMIT_SESSION": "💥 API请求频率过高，请稍后再试。",
+        "LLM_CONNECTION_FAILED": "💥 LLM API 连接失败。请检查网络连接和API配置。",
+        "CONNECTION_CLOSED_ABNORMAL": "💥 连接异常关闭: {{error}}",
+        "AGENT_QUOTA_EXCEEDED": "💥 免费 Agent 模型今日试用次数已达上限 ({{used}}/{{limit}})，请明日再试。",
+        "SESSION_START_CRITICAL": "⛔ Session启动连续失败{{count}}次，已停止自动重试。请检查网络连接和API配置，然后刷新页面重试。",
+        "SESSION_START_FAILED": "💥 Session启动失败: {{error}} (失败{{count}}次)",
+        "INTERNAL_UPDATE_FAILED": "💥 内部更新切换失败: {{error}}",
+        "CHARACTER_DISCONNECTED": "{{name}}失联了，即将重启！",
+        "CHARACTER_LEFT": "{{name}}已离开。",
+        "ERROR_1011_MIC_CHECK": "💥 备注：检测到1011错误。该错误表示API服务器异常。请首先检查自己的麦克风是否有声音。",
+        "ERROR_1007_ARREARS": "💥 备注：检测到1007错误。该错误大概率是欠费导致。",
+        "IMAGE_BLOCKED": "⚠️ 图片内容被审查系统拦截，请尝试更换图片或内容。",
+        "SERVER_BUSY_THROTTLE": "⚠️ 服务器繁忙，正在自动调节发送速率...",
+        "RESPONSE_TIMEOUT": "💥 连接超时 (Response timeout)，语音对话已中断。",
+        "CONNECTION_TIMEOUT": "💥 连接超时，请检查网络连接。",
+        "RESPONSE_TOO_LONG": "回复过长，已放弃输出（可在配置中调大 TEXT_GUARD_MAX_LENGTH）",
+        "RESPONSE_INVALID": "AI回复不符合要求，已放弃输出",
+        "CHARACTER_SWITCHING_TERMINAL": "{{name}}正在前往另一个终端...",
+        "RELOAD_PAGE": "语音已更新，页面即将刷新",
+        "AGENT_AUTO_DISABLED_COMPUTER": "已自动关闭键鼠控制: $t(agent.precheck.{{reason_code}})",
+        "AGENT_AUTO_DISABLED_BROWSER": "已自动关闭浏览器控制: $t(agent.precheck.{{reason_code}})",
+        "AGENT_LLM_CHECK_ERROR": "Agent LLM 连接检查异常",
+        "INVALID_INPUT_TYPE": "无效的输入类型: {{input_type}}",
+        "UNKNOWN_ACTION": "未知操作: {{action}}",
+        "SERVER_ERROR": "服务器内部错误",
+        "AGENT_CU_MODULE_NOT_LOADED": "无法开启 Computer Use：模块未加载",
+        "AGENT_CU_ENABLED_CHECKING": "键鼠控制已开启，Agent LLM 连接确认中...",
+        "AGENT_CU_UNAVAILABLE": "无法开启 Computer Use：$t(agent.precheck.{{reason_code}})",
+        "AGENT_CU_ENABLE_FAILED": "开启 Computer Use 失败：{{error}}",
+        "AGENT_BU_MODULE_NOT_LOADED": "无法开启 Browser Use：模块未加载",
+        "AGENT_BU_NOT_INSTALLED": "无法开启 Browser Use：{{error}}",
+        "AGENT_BU_ENABLED_CHECKING": "浏览器控制已开启，Agent LLM 连接确认中...",
+        "AGENT_CU_AUTO_CLOSED": "Computer Use 模块未加载，已自动关闭",
+        "AGENT_CU_CAPABILITY_LOST": "Computer Use 不可用：$t(agent.precheck.{{reason_code}})",
+        "TTS_CONNECTION_FAILED": "TTS服务连接失败: {{msg}}"
     },
     "camera": {
         "iosPermissionHint": "请检查 iOS 设置 → Safari → 摄像头 权限是否为「允许」",
@@ -924,7 +964,9 @@
             "savingParameters": "正在保存参数...",
             "parametersSaved": "参数保存成功！",
             "parametersSavePartialFailed": "参数保存部分失败: {{errors}}",
-            "parametersSaveFailed": "参数保存失败: {{error}}"
+            "parametersSaveFailed": "参数保存失败: {{error}}",
+            "emptyHint": "里面什么也没有！",
+            "foundYou": "你找到我了！"
         },
         "modelDirectorySaveFailed": "模型目录文件保存失败",
         "userPreferencesSaveFailed": "用户偏好设置保存失败",
@@ -1015,7 +1057,28 @@
         "deleteFailed": "删除失败",
         "deleteError": "删除失败：{{error}}",
         "freePresetLabel": "免费预设音色",
-        "freePresetBadge": "预设"
+        "freePresetBadge": "预设",
+        "silenceModal": {
+            "title": "智能空白音频检测结果",
+            "originalDuration": "原始音频总时长",
+            "silenceDuration": "可移除空白总时长",
+            "estimatedDuration": "处理后预计剩余时长",
+            "savingPercentage": "节省比例",
+            "processing": "处理中...",
+            "analyzing": "分析中...",
+            "trimming": "裁剪中...",
+            "done": "完成",
+            "cancelled": "已取消",
+            "trimSuccess": "✅ 裁剪完成！",
+            "downloadTrimmed": "下载已处理音频",
+            "useTrimmed": "使用智能裁剪音频",
+            "useOriginal": "上传原音频",
+            "cancel": "取消",
+            "noSilence": "未检测到可移除的静音段",
+            "trimError": "裁剪失败: {{error}}",
+            "trimmedLabel": "[已裁剪]",
+            "confirmTrimmed": "使用智能裁切后的音频"
+        }
     },
     "memory": {
         "title": "记忆整理",
@@ -1074,6 +1137,7 @@
         "profileName": "档案名",
         "profileNameMaxHint": "最多20个字符",
         "profileNameTooLong": "档案名过长",
+        "profileNameContainsSlash": "档案名不能包含路径分隔符(/或\\)",
         "newProfileNameRequired": "新档案名不能为空",
         "newProfileNameTooLong": "档案名过长",
         "required": "*",
@@ -1090,6 +1154,7 @@
         "lightingNotSet": "默认",
         "live2dNotSet": "未设置",
         "voiceNotSet": "未指定音色",
+        "voiceSetting": "音色设定",
         "manageModel": "点击管理模型",
         "fillProfileNameFirst": "请先填写猫娘档案名，然后再设置模型",
         "registerNewVoice": "注册新声音",
@@ -1298,7 +1363,8 @@
             "frameRate": "帧率",
             "frameRateLow": "30fps",
             "frameRateMedium": "45fps",
-            "frameRateHigh": "60fps"
+            "frameRateHigh": "60fps",
+            "mouseTracking": "跟踪鼠标"
         }
     },
     "subtitle": {
@@ -1319,9 +1385,27 @@
             "disconnected": "服务器连接已断开",
             "agentDisconnected": "Agent 服务器连接已断开",
             "freeModelWarning": "由于限额问题，免费模型使用Agent模式容易阻塞，建议您切换至自费模型。\n\n如果您已经配置好自费API，请尝试重启NEKO。",
-            "freeModelWarningTitle": "免费模型提示"
+            "freeModelWarningTitle": "免费模型提示",
+            "connectivityCheck": "Agent LLM 连接检查中...",
+            "precheckFailed": "Agent 预检失败：{{reason}}"
+        },
+        "precheck": {
+            "AGENT_PRECHECK_PENDING": "连接检查中...",
+            "AGENT_ENDPOINT_NOT_CONFIGURED": "Agent API 未配置",
+            "AGENT_PYAUTOGUI_NOT_INSTALLED": "pyautogui 未安装",
+            "AGENT_BROWSER_USE_NOT_INSTALLED": "browser-use 未安装",
+            "AGENT_NOT_INITIALIZED": "Agent 初始化失败",
+            "AGENT_LLM_UNREACHABLE": "Agent LLM 连接失败",
+            "AGENT_MODEL_NOT_CONFIGURED": "Agent 模型未配置",
+            "AGENT_URL_NOT_CONFIGURED": "Agent API URL 未配置",
+            "AGENT_KEY_NOT_CONFIGURED": "Agent API Key 未配置或不可用",
+            "AGENT_NO_PLUGINS": "未发现可用插件",
+            "AGENT_NO_PLUGINS_FOUND": "未发现可用插件",
+            "AGENT_PLUGIN_SERVER_ERROR": "插件服务器连接失败",
+            "AGENT_CONNECTIVITY_FAILED": "Agent LLM 连接失败"
         },
         "quotaExceeded": "免费 Agent 模型今日试用次数已达上限（{{limit}}次），请明日再试。",
+        "contentFilterError": "Agent 浏览的网页内容触发了 AI 模型的安全审查过滤，任务已中止。这通常发生在页面包含敏感话题时，请尝试其他关键词或网站。",
         "taskHud": {
             "title": "Agent 任务",
             "running": "运行中",
@@ -2048,5 +2132,128 @@
         "switchToLight": "切换到亮色模式",
         "themeChanged": "主题已切换"
     },
-    "characterModelNotSet": "当前角色未设置模型"
+    "characterModelNotSet": "当前角色未设置模型",
+    "cookiesLogin": {
+        "title": "N.E.K.O 凭证控制中心",
+        "header": "🔐 凭证获取中心",
+        "bilibili": "📺 Bilibili",
+        "douyin": "🎵 抖音",
+        "kuaishou": "🧡 快手",
+        "weibo": "🌏 微博",
+        "twitter": "🐦 Twitter/X",
+        "reddit": "👽 Reddit",
+        "saveConfig": "保存配置",
+        "encryptStorage": "安全加密存储至本地文件",
+        "localMonitoring": "本地状态监控",
+        "removeCredentials": "移除",
+        "confirmRemove": "确定要清空 {{platformName}} 的登录凭证吗？",
+        "credentialsRemoved": "✅ 已成功移除凭证",
+        "credentialsSaved": "✅ {{platformName}} 凭证保存成功！",
+        "credentialsRemovedFailed": "删除失败",
+        "removeFailed": "❌ 删除失败，请检查网络",
+        "requiredField": "⚠️ 请填写必填项: [{{fieldName}}]",
+        "invalidChars": "⚠️ [{{fieldName}}] 包含无效字符...",
+        "whitespaceTrimmed": "⚠️ [{{fieldName}}] 包含前/后空白，已自动修剪，请确认后重新提交",
+        "networkError": "❌ 网络异常: 无法连接至后端服务",
+        "saveFailed": "保存失败，请检查格式是否正确",
+        "pasteHere": "在此粘贴",
+        "submitting": "安全加密传输中...",
+        "noCookies": "请先配置 Cookies",
+        "statusLoadFailed": "状态加载失败",
+        "thisPlatform": "此平台",
+        "instructions": {
+            "bilibili": "📌 <b>目标：</b>请前往 <b>bilibili.com</b>获取这些 Cookies。",
+            "douyin": "📌 <b>目标：</b> 请前往 <b>douyin.com</b> 获取这些 Cookies。",
+            "kuaishou": "📌 <b>目标：</b> 请前往 <b>kuaishou.com</b> 获取这些 Cookies。",
+            "weibo": "📌 <b>目标：</b> 请前往 <b>weibo.com</b> 获取这些 Cookies。",
+            "twitter": "📌 <b>目标：</b> 请前往 <b>x.com</b> 获取这些 Cookies。",
+            "reddit": "📌 <b>目标：</b> 请前往 <b>reddit.com</b> 获取这些 Cookies。"
+        },
+        "guide": {
+            "title": "新手通用获取教程",
+            "step1": "在浏览器打开目标平台网页并完成登录。",
+            "step2_prefix": "按下键盘",
+            "step2_suffix": "打开开发者工具。",
+            "step3": "在顶部找到并点击 Application（应用程序）面板。",
+            "step4": "在左侧找到 <span class=\"highlight-text\">Cookies</span>，点击域名后在右侧复制对应的值。"
+        },
+        "fields": {
+            "SESSDATA": {
+                "label": "SESSDATA",
+                "desc": "核心身份凭证 (必填)"
+            },
+            "bili_jct": {
+                "label": "bili_jct",
+                "desc": "CSRF Token (必填)"
+            },
+            "DedeUserID": {
+                "label": "DedeUserID",
+                "desc": "账号 UID (必填)"
+            },
+            "buvid3": {
+                "label": "buvid3",
+                "desc": "设备指纹 (选填)"
+            },
+            "sessionid": {
+                "label": "sessionid",
+                "desc": "核心会话凭证 (必填)"
+            },
+            "ttwid": {
+                "label": "ttwid",
+                "desc": "设备风控码 (必填)"
+            },
+            "passport_csrf_token": {
+                "label": "csrf_token",
+                "desc": "安全验证令牌"
+            },
+            "odin_tt": {
+                "label": "odin_tt",
+                "desc": "设备特征"
+            },
+            "ks_web_st": {
+                "label": "web_st",
+                "desc": "核心票据 (必填)"
+            },
+            "ks_web_ph": {
+                "label": "web_ph",
+                "desc": "辅助票据 (必填)"
+            },
+            "userId": {
+                "label": "userId",
+                "desc": "用户ID"
+            },
+            "did": {
+                "label": "did",
+                "desc": "设备ID"
+            },
+            "SUB": {
+                "label": "SUB",
+                "desc": "核心凭证 (以 _2A 开头)"
+            },
+            "XSRF-TOKEN": {
+                "label": "XSRF-TOKEN",
+                "desc": "防伪造令牌"
+            },
+            "auth_token": {
+                "label": "auth_token",
+                "desc": "核心身份 Token"
+            },
+            "ct0": {
+                "label": "ct0",
+                "desc": "CSRF 校验码"
+            },
+            "reddit_session": {
+                "label": "reddit_session",
+                "desc": "核心会话凭证 (必填)"
+            },
+            "csrftoken": {
+                "label": "csrftoken",
+                "desc": "CSRF 令牌"
+            }
+        },
+        "status": {
+            "active": "● 已就绪",
+            "inactive": "○ 未配置"
+        }
+    }
 }

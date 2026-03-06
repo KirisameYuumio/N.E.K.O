@@ -1,6 +1,7 @@
 # 忽略敏感配置
 core_config.txt
 test.py
+mcp_server/servers.json
 tests/api_keys.json
 tests/test_inputs/*.wav
 
@@ -39,6 +40,7 @@ __pycache__/
 .ipynb_checkpoints/
 .vscode/
 .idea/
+.cursor/
 .pytest_cache/
 .DS_Store
 .venv
@@ -51,6 +53,7 @@ playwright_browsers/
 .env.test.local
 .env.production.local
 .ruff_cache
+*.code-workspace
 .claude
 CLAUDE.md
 
@@ -59,11 +62,17 @@ CLAUDE.md
 **/target/
 Cargo.lock
 
+# Ignore embedded Rust subprojects (not part of current PR)
+/rust/neko-message-plane/
+
 # Node/Front-end temp (if any)
 node_modules/
 *.cache/
 dist/
 build/
+
+# Plugin frontend exported artifacts
+plugin/frontend/exported/
 
 # Python venvs and wheels
 *.egg-info/
@@ -109,3 +118,4 @@ latest_report.json
 sendText.js
 data/browser_use_prompts/*.md
 data/browser_use_extensions/
+.coverage
