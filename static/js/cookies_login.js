@@ -211,7 +211,7 @@ function decreaseColorLightness(hexColor, lightnessPercent) {
 }
 
 
-async function showQRLogin(config) {
+async function showQRLogin(config, platformKey) {
     let qrSupportedPlatforms =[];
     const qrLoginBox = document.getElementById('QRLogin');
     qrLoginBox.innerHTML = "";
@@ -225,12 +225,12 @@ async function showQRLogin(config) {
         const QRinfo =  document.createElement("div");
         const butt = document.createElement("button");
         QRinfo.innerHTML = safeT('cookiesLogin.qrLogin.tryQR', '或者...试试扫码登陆?');
-        QRinfo.style = 'margin-bottom: 10px;color: #64748b;fontSize: 14px';
+        QRinfo.style = 'margin-bottom: 10px;color: #64748b;font-size: 14px';
         butt.innerHTML = safeT('cookiesLogin.qrLogin.openQR', '📱 打开扫码登陆');
         butt.style.cssText = `width: 100%; padding: 12px; margin-top: 10px; font-size: 14px; font-weight: 600; border-radius: 10px; border: 2px dashed #4f46e5; background: ${config["theme"]} ; color: #f8fafc; cursor: pointer; transition: all 0.2s;`;
         butt.onmouseover = function() { butt.style.background = decreaseColorLightness(config["theme"],20); };
         butt.onmouseout = function() { butt.style.background = config["theme"]; };
-        butt.onclick = function(){requestQR(config)};
+        butt.onclick = function(){requestQR(config, platformKey)};
         qrLoginBox.appendChild(QRinfo);
         qrLoginBox.appendChild(butt);
     }else{
@@ -241,9 +241,10 @@ async function showQRLogin(config) {
 
 let qrPollTimeout = null;
 let qrPollInFlight = false;
+let qrRefreshTimeout = null;
 let currentQrKey = null;
 
-async function requestQR(config) {
+async function requestQR(config, platformKey) {
     const qrLoginBox = document.getElementById('QRLogin');
     qrLoginBox.innerHTML = `
         <div style="text-align: center; padding: 20px;">
@@ -280,10 +281,10 @@ async function requestQR(config) {
             
             document.getElementById('qr-refresh-btn').onclick = function() {
                 stopQrPoll();
-                requestQR(config);
+                requestQR(config, platformKey);
             };
             
-            startQrPoll(config);
+            startQrPoll(config, platformKey);
         } else {
             qrLoginBox.innerHTML = `
                 <div style="text-align: center; padding: 20px; color: #ef4444;">
@@ -292,7 +293,7 @@ async function requestQR(config) {
                 </div>
             `;
             document.getElementById('qr-retry-btn').onclick = function() {
-                requestQR(config);
+                requestQR(config, platformKey);
             };
         }
     } catch (err) {
@@ -304,12 +305,12 @@ async function requestQR(config) {
             </div>
         `;
         document.getElementById('qr-retry-btn-err').onclick = function() {
-            requestQR(config);
+            requestQR(config, platformKey);
         };
     }
 }
 
-function startQrPoll(config) {
+function startQrPoll(config, platformKey) {
     stopQrPoll();
 
     const pollOnce = async () => {
@@ -356,8 +357,13 @@ function startQrPoll(config) {
 
                 showAlert(true, safeT('cookiesLogin.qrLogin.successAlert', '扫码登录成功！Cookie 已自动填入，请点击保存配置'));
 
-                setTimeout(() => {
-                    showQRLogin(config);
+                if (qrRefreshTimeout) {
+                    clearTimeout(qrRefreshTimeout);
+                }
+                qrRefreshTimeout = setTimeout(() => {
+                    if (currentPlatform !== platformKey) return;
+                    showQRLogin(config, platformKey);
+                    qrRefreshTimeout = null;
                 }, 2000);
 
             } else if (data) {
@@ -411,6 +417,10 @@ function switchTab(platformKey, btnElement, isReRender = false) {
     if (!PLATFORM_CONFIG[platformKey]) return;
     stopQrPoll();
     currentQrKey = null;
+    if (qrRefreshTimeout) {
+        clearTimeout(qrRefreshTimeout);
+        qrRefreshTimeout = null;
+    }
     currentPlatform = platformKey;
     const config = PLATFORM_CONFIG[platformKey];
     // 更新选项卡文本
@@ -431,7 +441,7 @@ function switchTab(platformKey, btnElement, isReRender = false) {
             descBox.style.display = 'none'; 
         }
     }
-    showQRLogin(PLATFORM_CONFIG_DATA[platformKey])
+    showQRLogin(PLATFORM_CONFIG_DATA[platformKey], platformKey)
     // 更新动态 Cookies 配置字段
     const fieldsContainer = document.getElementById('dynamic-fields');
     if (fieldsContainer) {
