@@ -265,14 +265,18 @@ async function requestQR(config, platformKey) {
             body: JSON.stringify({ platform: config["name"] })
         });
         
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
+
         
         if (currentPlatform !== platformKey) return;
         const result = await response.json();
         if (currentPlatform !== platformKey) return;
-        
+        if (!response.ok) {
+            throw new Error(
+                typeof result?.detail === 'string' && result.detail
+                    ? result.detail
+                    : safeT('cookiesLogin.qrLogin.fetchFailed', '获取二维码失败，请稍后重试')
+            );
+        }
         if (result.success && result.data) {
             currentQrKey = result.data.qrcode_key;
             const timeout = result.data.timeout || 180;
@@ -308,9 +312,13 @@ async function requestQR(config, platformKey) {
     } catch (err) {
         console.error("Request QR error:", err);
         if (currentPlatform !== platformKey) return;
+        const errorMessage =
+            typeof err?.message === 'string' && err.message
+                ? err.message
+                : safeT('cookiesLogin.qrLogin.networkError', '网络请求失败，请检查连接');
         qrLoginBox.innerHTML = `
             <div style="text-align: center; padding: 20px; color: #ef4444;">
-                ${safeT('cookiesLogin.qrLogin.networkError', '网络请求失败，请检查连接')}
+                ${errorMessage}
                 <button id="qr-retry-btn-err" style="display: block; margin: 10px auto 0; padding: 8px 16px; border-radius: 8px; border: 1px solid #ef4444; background: white; color: #ef4444; cursor: pointer;">${safeT('cookiesLogin.qrLogin.retry', '重试')}</button>
             </div>
         `;
@@ -361,13 +369,23 @@ function startQrPoll(config, platformKey) {
             
             const statusEl = document.getElementById('qr-status');
             const data = result.data;
+            const setStatusSpan = (color, text, fontWeight = 'normal') => {
+                if (!statusEl) return;
+                const span = document.createElement('span');
+                span.style.color = color;
+                span.style.fontWeight = fontWeight;
+                span.textContent = text;
+                statusEl.replaceChildren(span);
+            };
 
             if (result.success && data?.status === 'success') {
                 shouldContinuePolling = false;
                 stopQrPoll();
-                if (statusEl) {
-                    statusEl.innerHTML = '<span style="color: #22c55e; font-weight: 600;">' + safeT('cookiesLogin.qrLogin.status.success', '✅ {{message}}').replace('{{message}}', data.message) + '</span>';
-                }
+                setStatusSpan(
+                    '#22c55e',
+                    safeT('cookiesLogin.qrLogin.status.success', '✅ {{message}}').replace('{{message}}', data.message),
+                    '600'
+                );
 
                 const cookies = data.cookies;
                 const cookieFields = data.cookie_fields || [];
@@ -397,10 +415,16 @@ function startQrPoll(config, platformKey) {
                 if (statusEl) {
                     if (status === 'expired') {
                         shouldContinuePolling = false;
-                        statusEl.innerHTML = '<span style="color: #ef4444;">' + safeT('cookiesLogin.qrLogin.status.expired', '❌ {{message}}，请刷新').replace('{{message}}', message) + '</span>';
+                        setStatusSpan(
+                            '#ef4444',
+                            safeT('cookiesLogin.qrLogin.status.expired', '❌ {{message}}，请刷新').replace('{{message}}', message)
+                        );
                         stopQrPoll();
                     } else if (status === 'scanned') {
-                        statusEl.innerHTML = '<span style="color: #f59e0b;">' + safeT('cookiesLogin.qrLogin.status.scanned', '📱 {{message}}').replace('{{message}}', message) + '</span>';
+                        setStatusSpan(
+                            '#f59e0b',
+                            safeT('cookiesLogin.qrLogin.status.scanned', '📱 {{message}}').replace('{{message}}', message)
+                        );
                     } else if (status === 'waiting') {
                         statusEl.textContent = safeT('cookiesLogin.qrLogin.status.waiting', '{{message}}...').replace('{{message}}', message);
                     } else {
