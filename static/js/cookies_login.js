@@ -221,16 +221,6 @@ async function showQRLogin(config) {
     const resp = await fetch('/api/auth/get_CanQRLoginList');
     qrSupportedPlatforms = await resp.json();
 
-    // const PLATFORM_CONFIG_DATA = {
-    //     'bilibili': {
-    //         name: 'Bilibili', 
-    //         nameKey: 'cookiesLogin.bilibili',
-    //         icon: '📺', theme: '#4f46e5',
-
-
-
-    
-
     if (qrSupportedPlatforms.includes(config["name"])){
         const QRinfo =  document.createElement("div");
         const butt = document.createElement("button");
@@ -244,7 +234,7 @@ async function showQRLogin(config) {
         qrLoginBox.appendChild(QRinfo);
         qrLoginBox.appendChild(butt);
     }else{
-        let a = 1;
+        // let a = 1;希望这里可以空着不会报错 报错了就肘喵老师
         // 当前只做了"Bilibili"扫码登录,其他平台再说吧
     }
 }
@@ -400,6 +390,8 @@ function stopQrPoll() {
 // 切换选项卡时，更新当前平台配置
 function switchTab(platformKey, btnElement, isReRender = false) {
     if (!PLATFORM_CONFIG[platformKey]) return;
+    stopQrPoll();
+    currentQrKey = null;
     currentPlatform = platformKey;
     const config = PLATFORM_CONFIG[platformKey];
     // 更新选项卡文本
@@ -420,7 +412,7 @@ function switchTab(platformKey, btnElement, isReRender = false) {
             descBox.style.display = 'none'; 
         }
     }
-    showQRLogin(config)
+    showQRLogin(PLATFORM_CONFIG_DATA[platformKey])
     // 更新动态 Cookies 配置字段
     const fieldsContainer = document.getElementById('dynamic-fields');
     if (fieldsContainer) {
