@@ -313,6 +313,8 @@ function startQrPoll(config) {
     stopQrPoll();
 
     const pollOnce = async () => {
+        let shouldContinuePolling = true;
+
         if (!currentQrKey) {
             stopQrPoll();
             return;
@@ -336,6 +338,7 @@ function startQrPoll(config) {
             const data = result.data;
 
             if (result.success && data.status === 'success') {
+                shouldContinuePolling = false;
                 stopQrPoll();
                 if (statusEl) {
                     statusEl.innerHTML = '<span style="color: #22c55e; font-weight: 600;">' + safeT('cookiesLogin.qrLogin.status.success', '✅ {{message}}').replace('{{message}}', data.message) + '</span>';
@@ -363,6 +366,7 @@ function startQrPoll(config) {
 
                 if (statusEl) {
                     if (status === 'expired') {
+                        shouldContinuePolling = false;
                         statusEl.innerHTML = '<span style="color: #ef4444;">' + safeT('cookiesLogin.qrLogin.status.expired', '❌ {{message}}，请刷新').replace('{{message}}', message) + '</span>';
                         stopQrPoll();
                     } else if (status === 'scanned') {
@@ -373,12 +377,17 @@ function startQrPoll(config) {
                         statusEl.textContent = message;
                     }
                 }
+            } else {
+                shouldContinuePolling = false;
+                stopQrPoll();
             }
         } catch (err) {
             console.error("Poll error:", err);
+            shouldContinuePolling = false;
+            stopQrPoll();
         } finally {
             qrPollInFlight = false;
-            if (currentQrKey) {
+            if (shouldContinuePolling && currentQrKey) {
                 qrPollTimeout = setTimeout(pollOnce, 1500);
             }
         }
