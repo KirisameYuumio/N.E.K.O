@@ -12,7 +12,7 @@ import base64
 from typing import Dict, Optional
 
 import qrcode
-import requests
+import httpx
 from fastapi import APIRouter, Request, HTTPException, status, Depends, Body
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -280,9 +280,10 @@ async def api_get_qr_code(
     response_config = config.get("response", {})
     
     try:
-        response = requests.get(url=config["get"], headers=config["headers"], timeout=10)
-        response.raise_for_status()
-        resp_data = response.json()
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url=config["get"], headers=config["headers"], timeout=10)
+            response.raise_for_status()
+            resp_data = response.json()
         
         success_code = response_config.get("success_code", 0)
         if resp_data.get("code") != success_code:
@@ -326,7 +327,7 @@ async def api_get_qr_code(
                 "timeout": config.get("timeout", 180)
             }
         }
-    except requests.RequestException as e:
+    except httpx.HTTPError as e:
         logger.error(f"获取二维码网络请求失败: {type(e).__name__}")
         raise HTTPException(status_code=500, detail="网络请求失败，请稍后重试")
     except Exception as e:
@@ -348,13 +349,14 @@ async def api_qr_login_poll(
     cookie_fields = config.get("cookie_fields", [])
     
     try:
-        response = requests.get(
-            url=config["login"], 
-            params={"qrcode_key": qrcode_key}, 
-            headers=config["headers"],
-            timeout=10
-        )
-        resp_data = response.json()
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url=config["login"], 
+                params={"qrcode_key": qrcode_key}, 
+                headers=config["headers"],
+                timeout=10
+            )
+            resp_data = response.json()
         
         poll_code_path = response_config.get("poll_code_path", "data.code")
         poll_message_path = response_config.get("poll_message_path", "data.message")
@@ -396,7 +398,7 @@ async def api_qr_login_poll(
                 }
             }
             return ret
-    except requests.RequestException as e:
+    except httpx.HTTPError as e:
         logger.error(f"轮询登录状态网络请求失败: {type(e).__name__}")
         raise HTTPException(status_code=500, detail="网络请求失败")
     except Exception as e:

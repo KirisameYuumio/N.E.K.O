@@ -2272,7 +2272,7 @@
                 "scanned": "📱 {{message}}",
                 "waiting": "{{message}}..."
             },
-            "successAlert": "QR login successful! Cookies have been filled in automatically, please click Save Config"
+            "successAlert": "QR login successful! Cookies have been filled in automatically, please click Save Configuration"
         }
     }   
 }

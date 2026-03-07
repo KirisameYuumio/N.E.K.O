@@ -235,7 +235,7 @@ async function showQRLogin(config) {
         const QRinfo =  document.createElement("div");
         const butt = document.createElement("button");
         QRinfo.innerHTML = safeT('cookiesLogin.qrLogin.tryQR', '或者...试试扫码登陆?');
-        QRinfo.style = 'marginBottom: 10px;color: #64748b;fontSize: 14px';
+        QRinfo.style = 'margin-bottom: 10px;color: #64748b;fontSize: 14px';
         butt.innerHTML = safeT('cookiesLogin.qrLogin.openQR', '📱 打开扫码登陆');
         butt.style.cssText = `width: 100%; padding: 12px; margin-top: 10px; font-size: 14px; font-weight: 600; border-radius: 10px; border: 2px dashed #4f46e5; background: ${config["theme"]} ; color: #f8fafc; cursor: pointer; transition: all 0.2s;`;
         butt.onmouseover = function() { butt.style.background = decreaseColorLightness(config["theme"],20); };
@@ -297,18 +297,24 @@ async function requestQR(config) {
             qrLoginBox.innerHTML = `
                 <div style="text-align: center; padding: 20px; color: #ef4444;">
                     ${safeT('cookiesLogin.qrLogin.fetchFailed', '获取二维码失败，请稍后重试')}
-                    <button onclick="requestQR('${config}')" style="display: block; margin: 10px auto 0; padding: 8px 16px; border-radius: 8px; border: 1px solid #ef4444; background: white; color: #ef4444; cursor: pointer;">${safeT('cookiesLogin.qrLogin.retry', '重试')}</button>
+                    <button id="qr-retry-btn" style="display: block; margin: 10px auto 0; padding: 8px 16px; border-radius: 8px; border: 1px solid #ef4444; background: white; color: #ef4444; cursor: pointer;">${safeT('cookiesLogin.qrLogin.retry', '重试')}</button>
                 </div>
             `;
+            document.getElementById('qr-retry-btn').onclick = function() {
+                requestQR(config);
+            };
         }
     } catch (err) {
         console.error("Request QR error:", err);
         qrLoginBox.innerHTML = `
             <div style="text-align: center; padding: 20px; color: #ef4444;">
                 ${safeT('cookiesLogin.qrLogin.networkError', '网络请求失败，请检查连接')}
-                <button onclick="requestQR('${config}')" style="display: block; margin: 10px auto 0; padding: 8px 16px; border-radius: 8px; border: 1px solid #ef4444; background: white; color: #ef4444; cursor: pointer;">${safeT('cookiesLogin.qrLogin.retry', '重试')}</button>
+                <button id="qr-retry-btn-err" style="display: block; margin: 10px auto 0; padding: 8px 16px; border-radius: 8px; border: 1px solid #ef4444; background: white; color: #ef4444; cursor: pointer;">${safeT('cookiesLogin.qrLogin.retry', '重试')}</button>
             </div>
         `;
+        document.getElementById('qr-retry-btn-err').onclick = function() {
+            requestQR(config);
+        };
     }
 }
 
