@@ -219,7 +219,9 @@ async function showQRLogin(config, platformKey) {
         qrLoginBox.style.display = 'block';
     }
     const resp = await fetch('/api/auth/get_CanQRLoginList');
+    if (currentPlatform !== platformKey) return;
     qrSupportedPlatforms = await resp.json();
+    if (currentPlatform !== platformKey) return;
 
     if (qrSupportedPlatforms.includes(config["name"])){
         const QRinfo =  document.createElement("div");
@@ -245,6 +247,10 @@ let qrRefreshTimeout = null;
 let currentQrKey = null;
 
 async function requestQR(config, platformKey) {
+    if (qrRefreshTimeout) {
+        clearTimeout(qrRefreshTimeout);
+        qrRefreshTimeout = null;
+    }
     const qrLoginBox = document.getElementById('QRLogin');
     qrLoginBox.innerHTML = `
         <div style="text-align: center; padding: 20px;">
@@ -263,7 +269,9 @@ async function requestQR(config, platformKey) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
         
+        if (currentPlatform !== platformKey) return;
         const result = await response.json();
+        if (currentPlatform !== platformKey) return;
         
         if (result.success && result.data) {
             currentQrKey = result.data.qrcode_key;
@@ -280,6 +288,7 @@ async function requestQR(config, platformKey) {
             `;
             
             document.getElementById('qr-refresh-btn').onclick = function() {
+                currentQrKey = null;
                 stopQrPoll();
                 requestQR(config, platformKey);
             };
@@ -315,8 +324,9 @@ function startQrPoll(config, platformKey) {
 
     const pollOnce = async () => {
         let shouldContinuePolling = true;
+        const expectedQrKey = currentQrKey;
 
-        if (!currentQrKey) {
+        if (!expectedQrKey) {
             stopQrPoll();
             return;
         }
@@ -330,11 +340,17 @@ function startQrPoll(config, platformKey) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ 
                     platform: config["name"], 
-                    qrcode_key: currentQrKey 
+                    qrcode_key: expectedQrKey 
                 })
             });
 
             const result = await response.json();
+            
+            if (currentPlatform !== platformKey || currentQrKey !== expectedQrKey) {
+                shouldContinuePolling = false;
+                return;
+            }
+            
             const statusEl = document.getElementById('qr-status');
             const data = result.data;
 
@@ -392,8 +408,9 @@ function startQrPoll(config, platformKey) {
             shouldContinuePolling = false;
             stopQrPoll();
         } finally {
+            if (currentPlatform !== platformKey || currentQrKey !== expectedQrKey) return;
             qrPollInFlight = false;
-            if (shouldContinuePolling && currentQrKey) {
+            if (shouldContinuePolling && currentQrKey === expectedQrKey) {
                 qrPollTimeout = setTimeout(pollOnce, 1500);
             }
         }
