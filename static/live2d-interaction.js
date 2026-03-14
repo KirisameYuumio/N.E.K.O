@@ -1485,7 +1485,7 @@ Live2DManager.prototype.playTutorialMotion = async function() {
 
     if (fileRefMotions && typeof fileRefMotions === 'object') {
         motionGroups = Object.keys(fileRefMotions)
-            .filter(group => Array.isArray(fileRefMotions[group]) && fileRefMotions[group].length > 0);
+            .filter(group => group !== 'PreviewAll' && Array.isArray(fileRefMotions[group]) && fileRefMotions[group].length > 0);
     }
 
     if (motionGroups.length === 0 &&
@@ -1494,7 +1494,7 @@ Live2DManager.prototype.playTutorialMotion = async function() {
         this.currentModel.internalModel.motionManager.definitions) {
         const defs = this.currentModel.internalModel.motionManager.definitions;
         motionGroups = Object.keys(defs)
-            .filter(group => Array.isArray(defs[group]) && defs[group].length > 0);
+            .filter(group => group !== 'PreviewAll' && Array.isArray(defs[group]) && defs[group].length > 0);
     }
 
     if (motionGroups.length === 0) {
@@ -1785,7 +1785,10 @@ Live2DManager.prototype._playTouchSetAnimation = async function(hitAreaId) {
                             
                             // 获取motion的实际持续时间
                             try {
-                                const motionPath = motion.File;
+                                let motionPath = motion.File;
+                                if (!motionPath.startsWith('http') && !motionPath.startsWith('/')) {
+                                    motionPath = `${this.modelRootPath}/${motionPath}`;
+                                }
                                 const response = await fetch(motionPath);
                                 if (response.ok) {
                                     const motionData = await response.json();

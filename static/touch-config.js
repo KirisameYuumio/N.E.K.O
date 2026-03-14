@@ -647,7 +647,7 @@ function touchPage_init(){
     
     const text = document.createElement("span")
     const displayText = (typeof window.t === 'function') ? window.t('live2d.touchAnim.title') : '触摸动画配置'
-    sset(text,{id:"touch-anim-text","class":"round-stroke-text","data-i18n":"live2d.touchAnim.title","data-text":"Touch Anim Config","innerHTML":displayText})
+    sset(text,{id:"touch-anim-text","class":"round-stroke-text","data-i18n":"live2d.touchAnim.title","data-text":displayText,"innerHTML":displayText})
     d.appendChild(text)
     
     d.onclick = function(){
