@@ -1780,7 +1780,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 live2dReturnBtn.remove();
             }
             // 隐藏 Live2D 特有的控件
-            const live2dOnlyControls = ['motion-select', 'expression-select', 'play-motion-btn', 'play-expression-btn','tuoch_set'];
+            const live2dOnlyControls = ['motion-select', 'expression-select', 'play-motion-btn', 'play-expression-btn','touch_set'];
             live2dOnlyControls.forEach(id => {
                 const elem = document.getElementById(id);
                 if (elem) {
