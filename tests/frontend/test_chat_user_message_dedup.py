@@ -532,6 +532,59 @@ def test_import_jpeg_under_limit_keeps_original_data(
 
 
 @pytest.mark.frontend
+def test_wrapped_jpeg_data_url_is_canonicalized_before_budget_check(
+    mock_page: Page,
+    running_server: str,
+):
+    _open_app_buttons_page(mock_page, running_server)
+
+    result = mock_page.evaluate(
+        r"""async () => {
+            const targetBytes = 700 * 1024;
+            const limitBase64Chars = Math.ceil(targetBytes / 3) * 4;
+            const canvas = document.createElement('canvas');
+            canvas.width = 2;
+            canvas.height = 2;
+            const context = canvas.getContext('2d');
+            context.fillStyle = '#336699';
+            context.fillRect(0, 0, 2, 2);
+            const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.92);
+            const jpegBytes = Uint8Array.from(
+                atob(jpegDataUrl.split(',')[1]),
+                (char) => char.charCodeAt(0)
+            );
+            const bytes = new Uint8Array(targetBytes);
+            bytes.set(jpegBytes);
+            const file = new File([bytes], 'wrapped-700kib.jpg', { type: 'image/jpeg' });
+            const canonical = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(reader.error);
+                reader.readAsDataURL(file);
+            });
+            const commaIndex = canonical.indexOf(',');
+            const wrappedPayload = canonical.slice(commaIndex + 1).replace(/.{64}/g, '$&\n');
+            const wrapped = canonical.slice(0, commaIndex + 1) + wrappedPayload;
+            const normalized = await window.appButtons.normalizeImageDataUrlForPendingList(wrapped);
+            const normalizedPayload = normalized.slice(normalized.indexOf(',') + 1);
+            return {
+                canonical,
+                normalized,
+                wrappedBase64Chars: wrappedPayload.length,
+                normalizedBase64Chars: normalizedPayload.length,
+                normalizedHasWhitespace: /\s/.test(normalizedPayload),
+                limitBase64Chars
+            };
+        }"""
+    )
+
+    assert result["wrappedBase64Chars"] > result["limitBase64Chars"]
+    assert result["normalized"] == result["canonical"]
+    assert result["normalizedBase64Chars"] <= result["limitBase64Chars"]
+    assert result["normalizedHasWhitespace"] is False
+
+
+@pytest.mark.frontend
 def test_import_jpeg_over_limit_compresses_attachment(
     mock_page: Page,
     running_server: str,
@@ -586,6 +639,77 @@ def test_import_jpeg_over_limit_compresses_attachment(
     assert result["importedBase64Chars"] <= result["limitBase64Chars"]
     assert result["importedChanged"] is True
     assert result["importedIsJpeg"] is True
+
+
+@pytest.mark.frontend
+def test_extra_image_data_url_is_normalized_before_avatar_drop_send(
+    mock_page: Page,
+    running_server: str,
+):
+    _open_app_buttons_page(mock_page, running_server)
+    _install_chat_send_harness(mock_page)
+
+    result = mock_page.evaluate(
+        r"""async () => {
+            window.appState.isTextSessionActive = true;
+            const sourceBytes = 768 * 1024;
+            const limitBytes = 700 * 1024;
+            const limitBase64Chars = Math.ceil(limitBytes / 3) * 4;
+            const dataUrlBytes = (dataUrl) => {
+                const b64 = String(dataUrl || '').split(',')[1] || '';
+                const padding = b64.endsWith('==') ? 2 : (b64.endsWith('=') ? 1 : 0);
+                return Math.max(0, Math.floor(b64.length * 3 / 4) - padding);
+            };
+            const canvas = document.createElement('canvas');
+            canvas.width = 2;
+            canvas.height = 2;
+            const context = canvas.getContext('2d');
+            context.fillStyle = '#336699';
+            context.fillRect(0, 0, 2, 2);
+            const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.92);
+            const jpegBytes = Uint8Array.from(
+                atob(jpegDataUrl.split(',')[1]),
+                (char) => char.charCodeAt(0)
+            );
+            const bytes = new Uint8Array(sourceBytes);
+            bytes.set(jpegBytes);
+            const file = new File([bytes], 'avatar-drop-768kib.jpg', { type: 'image/jpeg' });
+            const original = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(reader.error);
+                reader.readAsDataURL(file);
+            });
+
+            const sent = await window.sendTextPayload('avatar drop image', {
+                source: 'avatar-drop',
+                extraImageDataUrls: [original],
+                ignoreComposerAttachments: true
+            });
+            const imageMessage = window.__chatTest.sentPayloads.find(
+                (payload) => payload.action === 'stream_data'
+                    && payload.input_type === 'avatar_drop_image'
+            );
+            const sentData = imageMessage && imageMessage.data;
+            const sentPayload = String(sentData || '').split(',')[1] || '';
+            return {
+                sent,
+                sourceBytes: file.size,
+                sentBytes: dataUrlBytes(sentData),
+                sentBase64Chars: sentPayload.length,
+                limitBase64Chars,
+                changed: sentData !== original,
+                source: imageMessage && imageMessage.source
+            };
+        }"""
+    )
+
+    assert result["sent"] is True
+    assert result["sourceBytes"] == 768 * 1024
+    assert result["sentBytes"] <= 700 * 1024
+    assert result["sentBase64Chars"] <= result["limitBase64Chars"]
+    assert result["changed"] is True
+    assert result["source"] == "avatar-drop"
 
 
 @pytest.mark.frontend

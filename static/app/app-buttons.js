@@ -280,7 +280,17 @@
             return 0;
         }
 
-        return text.slice(commaIndex + 1).replace(/\s/g, '').length;
+        return text.slice(commaIndex + 1).length;
+    }
+
+    function canonicalizeBase64DataUrl(dataUrl) {
+        var text = String(dataUrl || '');
+        var commaIndex = text.indexOf(',');
+        if (commaIndex < 0) {
+            return text;
+        }
+
+        return text.slice(0, commaIndex + 1) + text.slice(commaIndex + 1).replace(/\s/g, '');
     }
 
     function getDataUrlBinaryBytes(dataUrl) {
@@ -562,9 +572,12 @@
             throw new Error('INVALID_IMAGE_DATA_URL');
         }
 
+        var isBase64Jpeg = /^data:image\/jpe?g;base64,/i.test(src);
+        if (isBase64Jpeg) {
+            src = canonicalizeBase64DataUrl(src);
+        }
         var image = await loadImageFromSource(src);
-        if (/^data:image\/jpe?g;base64,/i.test(src)
-                && isPendingImageWithinTransportBudget(src)) {
+        if (isBase64Jpeg && isPendingImageWithinTransportBudget(src)) {
             return src;
         }
         return compressLoadedImageToPendingDataUrl(image);
@@ -2635,6 +2648,21 @@
             if (isHomeTutorialInteractionLocked()) {
                 showHomeTutorialLockedToast();
                 return false;
+            }
+
+            if (hasExtraImages) {
+                try {
+                    extraImageDataUrls = await Promise.all(extraImageDataUrls.map(function (dataUrl) {
+                        return mod.normalizeImageDataUrlForPendingList(dataUrl);
+                    }));
+                } catch (error) {
+                    console.error('[Chat] 额外图片处理失败:', error);
+                    window.showStatusToast(
+                        window.t ? window.t('app.importImageFailed') : '导入图片失败',
+                        4000
+                    );
+                    return false;
+                }
             }
 
             if (hasScreenshots) {
