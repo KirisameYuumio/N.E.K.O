@@ -642,6 +642,78 @@ def test_import_jpeg_over_limit_compresses_attachment(
 
 
 @pytest.mark.frontend
+def test_high_entropy_image_uses_quality_ladder_before_resolution_downsampling(
+    mock_page: Page,
+    running_server: str,
+):
+    _open_app_buttons_page(mock_page, running_server)
+
+    result = mock_page.evaluate(
+        r"""async () => {
+            const limitBytes = 700 * 1024;
+            const limitBase64Chars = Math.ceil(limitBytes / 3) * 4;
+            const dataUrlBytes = (dataUrl) => {
+                const b64 = String(dataUrl || '').split(',')[1] || '';
+                const padding = b64.endsWith('==') ? 2 : (b64.endsWith('=') ? 1 : 0);
+                return Math.max(0, Math.floor(b64.length * 3 / 4) - padding);
+            };
+            const canvas = document.createElement('canvas');
+            canvas.width = 1921;
+            canvas.height = 1921;
+            const context = canvas.getContext('2d');
+            const imageData = context.createImageData(canvas.width, canvas.height);
+            let seed = 0x13579bdf;
+            for (let offset = 0; offset < imageData.data.length; offset += 4) {
+                seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+                imageData.data[offset] = seed & 0xff;
+                imageData.data[offset + 1] = (seed >>> 8) & 0xff;
+                imageData.data[offset + 2] = (seed >>> 16) & 0xff;
+                imageData.data[offset + 3] = 255;
+            }
+            context.putImageData(imageData, 0, 0);
+            const source = canvas.toDataURL('image/jpeg', 0.98);
+
+            const calls = [];
+            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function (type, quality) {
+                calls.push({ width: this.width, height: this.height, quality });
+                return originalToDataURL.call(this, type, quality);
+            };
+            let normalized;
+            try {
+                normalized = await window.appButtons.normalizeImageDataUrlForPendingList(source);
+            } finally {
+                HTMLCanvasElement.prototype.toDataURL = originalToDataURL;
+            }
+
+            const normalizedPayload = String(normalized || '').split(',')[1] || '';
+            return {
+                sourceBytes: dataUrlBytes(source),
+                normalizedBytes: dataUrlBytes(normalized),
+                normalizedBase64Chars: normalizedPayload.length,
+                limitBase64Chars,
+                calls
+            };
+        }"""
+    )
+
+    assert result["sourceBytes"] > 700 * 1024
+    assert result["normalizedBytes"] <= 700 * 1024
+    assert result["normalizedBase64Chars"] <= result["limitBase64Chars"]
+    quality_ladder = [0.92, 0.86, 0.78, 0.70, 0.62, 0.52, 0.42, 0.32]
+    assert len(result["calls"]) >= 16
+    assert [call["quality"] for call in result["calls"][:8]] == pytest.approx(quality_ladder)
+    assert [call["quality"] for call in result["calls"][8:16]] == pytest.approx(quality_ladder)
+    dimensions = []
+    for call in result["calls"]:
+        size = (call["width"], call["height"])
+        if not dimensions or dimensions[-1] != size:
+            dimensions.append(size)
+    assert dimensions[0] == (1921, 1921)
+    assert dimensions[1] == (1920, 1920)
+
+
+@pytest.mark.frontend
 def test_extra_image_data_url_is_normalized_before_avatar_drop_send(
     mock_page: Page,
     running_server: str,
