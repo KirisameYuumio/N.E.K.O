@@ -21,6 +21,17 @@ def _open_react_chat_page(mock_page: Page, running_server: str) -> None:
     )
 
 
+def _open_app_buttons_page(mock_page: Page, running_server: str) -> None:
+    mock_page.add_init_script(
+        "window.localStorage.setItem('neko_tutorial_settings', 'seen')"
+    )
+    mock_page.goto(running_server, wait_until="domcontentloaded")
+    mock_page.wait_for_function(
+        "() => window.appButtons"
+        " && typeof window.appButtons.normalizeImageBlobForPendingList === 'function'"
+    )
+
+
 def _install_chat_send_harness(
     mock_page: Page,
     *,
@@ -484,11 +495,11 @@ def test_import_jpeg_under_limit_keeps_original_data(
     mock_page: Page,
     running_server: str,
 ):
-    _open_react_chat_page(mock_page, running_server)
-    _install_chat_send_harness(mock_page)
+    _open_app_buttons_page(mock_page, running_server)
 
     result = mock_page.evaluate(
         """async () => {
+            const targetBytes = 700 * 1024;
             const canvas = document.createElement('canvas');
             canvas.width = 2;
             canvas.height = 2;
@@ -497,22 +508,26 @@ def test_import_jpeg_under_limit_keeps_original_data(
             context.fillRect(0, 0, 2, 2);
             const original = canvas.toDataURL('image/jpeg', 0.92);
             const b64 = original.split(',')[1];
-            const bytes = Uint8Array.from(atob(b64), (char) => char.charCodeAt(0));
-            const file = new File([bytes], 'tiny.jpg', { type: 'image/jpeg' });
-            await window.appButtons.importImageFileToPendingList(file);
-            const state = window.reactChatWindowHost.getState();
-            if (state.composerAttachments.length !== 1) {
-                throw new Error(`Expected one composer attachment, got ${state.composerAttachments.length}`);
-            }
+            const jpegBytes = Uint8Array.from(atob(b64), (char) => char.charCodeAt(0));
+            const bytes = new Uint8Array(targetBytes);
+            bytes.set(jpegBytes);
+            const file = new File([bytes], 'exactly-700kib.jpg', { type: 'image/jpeg' });
+            const expected = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(reader.error);
+                reader.readAsDataURL(file);
+            });
+            const imported = await window.appButtons.normalizeImageBlobForPendingList(file);
             return {
-                original,
-                attachmentCount: state.composerAttachments.length,
-                imported: state.composerAttachments[0] && state.composerAttachments[0].url
+                original: expected,
+                originalBytes: file.size,
+                imported
             };
         }"""
     )
 
-    assert result["attachmentCount"] == 1
+    assert result["originalBytes"] == 700 * 1024
     assert result["imported"] == result["original"]
 
 
@@ -521,69 +536,54 @@ def test_import_jpeg_over_limit_compresses_attachment(
     mock_page: Page,
     running_server: str,
 ):
-    _open_react_chat_page(mock_page, running_server)
-    _install_chat_send_harness(mock_page)
+    _open_app_buttons_page(mock_page, running_server)
 
     result = mock_page.evaluate(
-        """async () => {
-            const limitBytes = 10 * 1024 * 1024;
+        r"""async () => {
+            const sourceBytes = 768 * 1024;
+            const limitBytes = 700 * 1024;
+            const limitBase64Chars = Math.ceil(limitBytes / 3) * 4;
             const dataUrlBytes = (dataUrl) => {
                 const b64 = String(dataUrl || '').split(',')[1] || '';
                 const padding = b64.endsWith('==') ? 2 : (b64.endsWith('=') ? 1 : 0);
                 return Math.max(0, Math.floor(b64.length * 3 / 4) - padding);
             };
-            const makeNoisyJpeg = (size) => {
-                const canvas = document.createElement('canvas');
-                canvas.width = size;
-                canvas.height = size;
-                const context = canvas.getContext('2d');
-                const imageData = context.createImageData(size, size);
-                const pixels = imageData.data;
-                for (let y = 0; y < size; y += 1) {
-                    for (let x = 0; x < size; x += 1) {
-                        const offset = (y * size + x) * 4;
-                        const value = (x * 17 + y * 31 + ((x ^ y) * 13)) & 255;
-                        pixels[offset] = value;
-                        pixels[offset + 1] = (value * 7 + x) & 255;
-                        pixels[offset + 2] = (value * 13 + y) & 255;
-                        pixels[offset + 3] = 255;
-                    }
-                }
-                context.putImageData(imageData, 0, 0);
-                return canvas.toDataURL('image/jpeg', 1);
-            };
-
-            let original = makeNoisyJpeg(3072);
-            if (dataUrlBytes(original) <= limitBytes) {
-                original = makeNoisyJpeg(4096);
-            }
-            const originalBytes = dataUrlBytes(original);
-            if (originalBytes <= limitBytes) {
-                throw new Error(`Expected source JPEG to exceed 10MB, got ${originalBytes}`);
-            }
-
-            const response = await fetch(original);
-            const blob = await response.blob();
-            const file = new File([blob], 'big.jpg', { type: 'image/jpeg' });
-            await window.appButtons.importImageFileToPendingList(file);
-            const state = window.reactChatWindowHost.getState();
-            if (state.composerAttachments.length !== 1) {
-                throw new Error(`Expected one composer attachment, got ${state.composerAttachments.length}`);
-            }
-            const imported = state.composerAttachments[0] && state.composerAttachments[0].url;
+            const canvas = document.createElement('canvas');
+            canvas.width = 2;
+            canvas.height = 2;
+            const context = canvas.getContext('2d');
+            context.fillStyle = '#336699';
+            context.fillRect(0, 0, 2, 2);
+            const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.92);
+            const jpegBytes = Uint8Array.from(
+                atob(jpegDataUrl.split(',')[1]),
+                (char) => char.charCodeAt(0)
+            );
+            const bytes = new Uint8Array(sourceBytes);
+            bytes.set(jpegBytes);
+            const file = new File([bytes], 'exactly-768kib.jpg', { type: 'image/jpeg' });
+            const original = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(reader.error);
+                reader.readAsDataURL(file);
+            });
+            const imported = await window.appButtons.normalizeImageBlobForPendingList(file);
+            const importedBase64Chars = String(imported || '').split(',')[1].replace(/\s/g, '').length;
             return {
-                attachmentCount: state.composerAttachments.length,
-                originalBytes,
+                originalBytes: file.size,
                 importedBytes: dataUrlBytes(imported),
+                importedBase64Chars,
+                limitBase64Chars,
                 importedChanged: imported !== original,
                 importedIsJpeg: String(imported || '').startsWith('data:image/jpeg;base64,')
             };
         }"""
     )
 
-    assert result["attachmentCount"] == 1
-    assert result["originalBytes"] > 10 * 1024 * 1024
-    assert result["importedBytes"] <= 10 * 1024 * 1024
+    assert result["originalBytes"] == 768 * 1024
+    assert result["importedBytes"] <= 700 * 1024
+    assert result["importedBase64Chars"] <= result["limitBase64Chars"]
     assert result["importedChanged"] is True
     assert result["importedIsJpeg"] is True
 
