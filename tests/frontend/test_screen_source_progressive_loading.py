@@ -839,6 +839,85 @@ def test_stale_remembered_reconciliation_cannot_clear_a_newer_selection(
 
 
 @pytest.mark.frontend
+def test_popup_discards_metadata_superseded_by_cross_renderer_selection(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            let resolveOldMetadata;
+            let metadataCalls = 0;
+            window.__desktopProvider.getSources = (options) => {
+                if (options.thumbnailSize.width !== 0) {
+                    return Promise.resolve([]);
+                }
+                metadataCalls += 1;
+                if (metadataCalls === 1) {
+                    return new Promise((resolve) => {
+                        resolveOldMetadata = resolve;
+                    });
+                }
+                return Promise.resolve([
+                    { id: 'screen:1', name: 'Entire Screen', display_id: '1' },
+                    { id: 'window:new', name: 'Browser', display_id: '' },
+                ]);
+            };
+            const rendering = window.renderFloatingScreenSourceList(
+                document.getElementById('live2d-popup-screen')
+            );
+            await new Promise((resolve) => setTimeout(resolve, 0));
+
+            window.__storedValues.set('selectedScreenSourceId', 'window:new');
+            window.__storedValues.set('selectedScreenWindowTitle', 'Browser');
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'selectedScreenSourceId',
+                oldValue: 'window:2',
+                newValue: 'window:new',
+            }));
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'selectedScreenWindowTitle',
+                oldValue: 'Editor',
+                newValue: 'Browser',
+            }));
+            resolveOldMetadata([
+                { id: 'screen:1', name: 'Entire Screen', display_id: '1' },
+                { id: 'window:2', name: 'Editor', display_id: '' },
+            ]);
+            const rendered = await rendering;
+            return {
+                rendered,
+                metadataCalls,
+                selectedId: window.appState.selectedScreenSourceId,
+                persistedId: window.__storedValues.get('selectedScreenSourceId'),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                renderedNewSource: Boolean(document.querySelector(
+                    '.screen-source-option[data-source-id="window:new"]'
+                )),
+            };
+        }"""
+    )
+
+    assert result == {
+        "rendered": True,
+        "metadataCalls": 2,
+        "selectedId": "window:new",
+        "persistedId": "window:new",
+        "rememberedTitle": "Browser",
+        "renderedNewSource": True,
+    }
+
+
+@pytest.mark.frontend
 def test_prompt_native_provider_accepts_renderer_trusted_source_without_stream(
     page: Page,
 ) -> None:
@@ -1682,6 +1761,10 @@ def test_new_window_selection_clears_stale_title_when_storage_write_fails(
 
     result = page.evaluate(
         """async () => {
+            const toggle = document.createElement('input');
+            toggle.className = 'neko-screen-source-title-match-toggle';
+            toggle.checked = true;
+            document.body.appendChild(toggle);
             const originalSetItem = window.localStorage.setItem.bind(
                 window.localStorage
             );
@@ -1698,6 +1781,8 @@ def test_new_window_selection_clears_stale_title_when_storage_write_fails(
                 rememberedTitle: window.__storedValues.get(
                     'selectedScreenWindowTitle'
                 ),
+                enabled: window.isScreenSourceTitleMatchEnabled(),
+                toggleChecked: toggle.checked,
             };
         }"""
     )
@@ -1706,6 +1791,8 @@ def test_new_window_selection_clears_stale_title_when_storage_write_fails(
         "selectedId": "window:3",
         "persistedId": "window:3",
         "rememberedTitle": None,
+        "enabled": False,
+        "toggleChecked": False,
     }
 
 

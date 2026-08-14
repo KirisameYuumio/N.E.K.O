@@ -179,6 +179,20 @@ def test_native_frame_capture_is_used_by_stream_and_screenshot_paths() -> None:
         assert "await dc.captureSourceAsDataUrl(" not in consumer
 
 
+def test_avatar_screen_selectors_delegate_to_the_shared_filtered_renderer() -> None:
+    avatar_popup = read_text("static/avatar/avatar-ui-popup.js")
+    renderer = avatar_popup[
+        avatar_popup.index("ManagerProto.renderScreenSourceList = async function"):
+        avatar_popup.index("ManagerProto.renderMicList = async function")
+    ]
+
+    delegate = "window.renderFloatingScreenSourceList(popup)"
+    assert delegate in renderer
+    assert renderer.index(delegate) < renderer.index(
+        "const desktopProvider = typeof window.getDesktopCaptureProvider"
+    )
+
+
 def test_native_frame_stream_lifecycle_preserves_source_and_cancels_stale_frames() -> None:
     screen = read_text("static/app/app-screen.js")
     native_stream = screen[

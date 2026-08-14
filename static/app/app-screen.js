@@ -146,7 +146,7 @@
 
     function storeNewRememberedWindowTitle(title) {
         if (storeRememberedWindowTitle(title)) return true;
-        clearRememberedWindowTitle();
+        setScreenSourceTitleMatchEnabled(false);
         return false;
     }
 
@@ -2518,6 +2518,10 @@
 
             // 第一阶段只枚举来源元数据。Electron 明确允许用 0x0 跳过每个窗口的
             // 缩略图捕获，名称返回后立即绘制，完整图片在第二阶段后台补齐。
+            var metadataRememberedGeneration = rememberedWindowStateGeneration;
+            var metadataSelectedSourceId = S.selectedScreenSourceId;
+            var metadataRememberedTitle = readRememberedWindowTitle();
+            var metadataRememberedEnabled = isScreenSourceTitleMatchEnabled();
             var metadataLoadPromise = beginScreenSourceMetadataLoad(desktopProvider);
             var sources;
             try {
@@ -2529,6 +2533,12 @@
             }
 
             if (!isPopupAvailable()) return false;
+            if (metadataRememberedGeneration !== rememberedWindowStateGeneration
+                || metadataSelectedSourceId !== S.selectedScreenSourceId
+                || metadataRememberedTitle !== readRememberedWindowTitle()
+                || metadataRememberedEnabled !== isScreenSourceTitleMatchEnabled()) {
+                return window.renderFloatingScreenSourceList(screenPopup, renderOptions);
+            }
 
             screenPopup.innerHTML = '';
 
