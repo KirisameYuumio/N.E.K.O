@@ -1265,6 +1265,70 @@ def test_forced_capture_resolution_keeps_trusted_window_after_title_change(
 
 
 @pytest.mark.frontend
+def test_trusted_window_rejects_a_non_unique_dynamic_title(page: Page) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const first = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider
+                );
+            window.__metadataSources[1].name = 'Shared document';
+            window.__metadataSources.push({
+                id: 'window:3',
+                name: ' shared document ',
+                display_id: '',
+                thumbnail: null,
+            });
+            const second = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            const rememberedAfterRetitle = window.__storedValues.get(
+                'selectedScreenWindowTitle'
+            );
+            window.__metadataSources = window.__metadataSources.filter(
+                (source) => source.id !== 'window:2'
+            );
+            const third = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                firstStatus: first.status,
+                secondStatus: second.status,
+                rememberedAfterRetitle,
+                secondNeedsSelection: window.appScreen
+                    .rememberedWindowResolutionNeedsSelection(second),
+                secondBlocksAutomatic: window.appScreen
+                    .rememberedWindowResolutionBlocksAutomaticCapture(second),
+                thirdStatus: third.status,
+                finalSelectedId: window.appState.selectedScreenSourceId,
+            };
+        }"""
+    )
+    assert result == {
+        "firstStatus": "matched",
+        "secondStatus": "title-update-rejected",
+        "rememberedAfterRetitle": "Editor",
+        "secondNeedsSelection": True,
+        "secondBlocksAutomatic": True,
+        "thirdStatus": "missing",
+        "finalSelectedId": None,
+    }
+
+
+@pytest.mark.frontend
 def test_trusted_window_rejects_an_overlong_live_title_without_dropping_memory(
     page: Page,
 ) -> None:

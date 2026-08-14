@@ -415,7 +415,15 @@
                     var selectedTitleForStorage = normalizeRememberedWindowTitleForStorage(
                         selectedSource.name
                     );
+                    var selectedTitleMatches = sources.filter(function (source) {
+                        return source.id.startsWith('window:')
+                            && normalizeScreenSourceTitle(source.name)
+                                === normalizedSelectedTitle;
+                    });
+                    var selectedTitleIsUnique = selectedTitleMatches.length === 1
+                        && selectedTitleMatches[0].id === selectedSource.id;
                     result.status = selectedTitleForStorage
+                        && selectedTitleIsUnique
                         && storeRememberedWindowTitle(selectedTitleForStorage)
                             ? 'retitled-trusted-current'
                             : 'title-update-rejected';
