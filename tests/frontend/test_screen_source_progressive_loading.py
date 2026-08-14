@@ -1334,6 +1334,68 @@ def test_forced_capture_resolution_keeps_trusted_window_after_title_change(
 
 
 @pytest.mark.frontend
+def test_trusted_retitle_storage_failure_preserves_previous_title(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const first = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider
+                );
+            window.__metadataSources[1].name = 'Browser';
+            const originalSetItem = window.localStorage.setItem.bind(
+                window.localStorage
+            );
+            window.localStorage.setItem = (key, value) => {
+                if (key === 'selectedScreenWindowTitle') {
+                    throw new Error('quota exceeded');
+                }
+                originalSetItem(key, value);
+            };
+            const second = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            const rememberedAfterFailure = window.__storedValues.get(
+                'selectedScreenWindowTitle'
+            );
+            const third = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                firstStatus: first.status,
+                secondStatus: second.status,
+                rememberedAfterFailure,
+                thirdStatus: third.status,
+                thirdBlocksAutomatic: window.appScreen
+                    .rememberedWindowResolutionBlocksAutomaticCapture(third),
+            };
+        }"""
+    )
+
+    assert result == {
+        "firstStatus": "matched",
+        "secondStatus": "title-update-rejected",
+        "rememberedAfterFailure": "Editor",
+        "thirdStatus": "title-update-rejected",
+        "thirdBlocksAutomatic": True,
+    }
+
+
+@pytest.mark.frontend
 def test_trusted_window_rejects_a_non_unique_dynamic_title(page: Page) -> None:
     _install_screen_source_harness(
         page,

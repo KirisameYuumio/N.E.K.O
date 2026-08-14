@@ -134,7 +134,6 @@
             return true;
         } catch (error) {
             console.warn('[屏幕源] 无法保存窗口标题:', error);
-            clearRememberedWindowTitle();
             return false;
         }
     }
@@ -143,6 +142,12 @@
         advanceRememberedWindowStateGeneration();
         trustedRememberedWindowSourceId = null;
         try { localStorage.removeItem(SCREEN_SOURCE_WINDOW_TITLE_KEY); } catch (_) { }
+    }
+
+    function storeNewRememberedWindowTitle(title) {
+        if (storeRememberedWindowTitle(title)) return true;
+        clearRememberedWindowTitle();
+        return false;
     }
 
     function updateScreenSourceTitleMatchToggleState() {
@@ -163,7 +168,7 @@
                     options[i].dataset.sourceName || ''
                 );
                 if (!sourceTitle) continue;
-                if (storeRememberedWindowTitle(sourceTitle)) {
+                if (storeNewRememberedWindowTitle(sourceTitle)) {
                     trustedRememberedWindowSourceId = selectedId;
                     return true;
                 }
@@ -181,7 +186,7 @@
         var selectedSource = sources.find(function (source) {
             return source && source.id === selectedId && source.id.startsWith('window:');
         });
-        if (!selectedSource || !storeRememberedWindowTitle(selectedSource.name || '')) {
+        if (!selectedSource || !storeNewRememberedWindowTitle(selectedSource.name || '')) {
             return false;
         }
         trustedRememberedWindowSourceId = selectedId;
@@ -486,7 +491,7 @@
 
         if (selectedSource) {
             if (selectedSource.id.startsWith('window:')) {
-                if (storeRememberedWindowTitle(selectedSource.name || '')) {
+                if (storeNewRememberedWindowTitle(selectedSource.name || '')) {
                     trustedRememberedWindowSourceId = selectedSource.id;
                 }
                 result.status = 'adopted-current-window';
@@ -2370,7 +2375,7 @@
 
         if (isScreenSourceTitleMatchEnabled()) {
             if (sourceId && sourceId.startsWith('window:')) {
-                if (storeRememberedWindowTitle(sourceName || '')) {
+                if (storeNewRememberedWindowTitle(sourceName || '')) {
                     trustedRememberedWindowSourceId = sourceId;
                 }
             } else {
