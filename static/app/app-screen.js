@@ -19,6 +19,91 @@
     const C = window.appConst;
     const safeT = window.safeT;
     const isMobile = window.appUtils.isMobile;
+    const SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY = 'screenSourceTitleMatchEnabled';
+    const SCREEN_SOURCE_WINDOW_TITLE_KEY = 'selectedScreenWindowTitle';
+    const MAX_REMEMBERED_WINDOW_TITLE_LENGTH = 512;
+
+    function normalizeScreenSourceTitle(value) {
+        return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    }
+
+    function isScreenSourceTitleMatchEnabled() {
+        try {
+            return localStorage.getItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY) === 'true';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function readRememberedWindowTitle() {
+        try {
+            var title = localStorage.getItem(SCREEN_SOURCE_WINDOW_TITLE_KEY) || '';
+            if (!title || title.length > MAX_REMEMBERED_WINDOW_TITLE_LENGTH) return '';
+            return title;
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function storeRememberedWindowTitle(title) {
+        try {
+            var value = String(title || '').trim();
+            if (!value || value.length > MAX_REMEMBERED_WINDOW_TITLE_LENGTH) {
+                localStorage.removeItem(SCREEN_SOURCE_WINDOW_TITLE_KEY);
+                return false;
+            }
+            localStorage.setItem(SCREEN_SOURCE_WINDOW_TITLE_KEY, value);
+            return true;
+        } catch (error) {
+            console.warn('[屏幕源] 无法保存窗口标题:', error);
+            return false;
+        }
+    }
+
+    function clearRememberedWindowTitle() {
+        try { localStorage.removeItem(SCREEN_SOURCE_WINDOW_TITLE_KEY); } catch (_) { }
+    }
+
+    function updateScreenSourceTitleMatchToggleState() {
+        var enabled = isScreenSourceTitleMatchEnabled();
+        document.querySelectorAll('.neko-screen-source-title-match-toggle').forEach(function (input) {
+            input.checked = enabled;
+            input.dispatchEvent(new CustomEvent('neko:toggle-visual-sync'));
+        });
+    }
+
+    function rememberCurrentlySelectedWindowFromDom() {
+        var selectedId = S.selectedScreenSourceId;
+        if (!selectedId || !selectedId.startsWith('window:')) return;
+        var options = document.querySelectorAll('.screen-source-option');
+        for (var i = 0; i < options.length; i += 1) {
+            if (options[i].dataset.sourceId === selectedId) {
+                storeRememberedWindowTitle(options[i].dataset.sourceName || '');
+                return;
+            }
+        }
+    }
+
+    function setScreenSourceTitleMatchEnabled(enabled) {
+        try {
+            if (enabled) {
+                localStorage.setItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY, 'true');
+            } else {
+                localStorage.removeItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY);
+            }
+        } catch (error) {
+            console.warn('[屏幕源] 无法保存标题匹配设置:', error);
+        }
+        if (enabled) {
+            rememberCurrentlySelectedWindowFromDom();
+        } else {
+            clearRememberedWindowTitle();
+        }
+        updateScreenSourceTitleMatchToggleState();
+    }
+
+    window.isScreenSourceTitleMatchEnabled = isScreenSourceTitleMatchEnabled;
+    window.setScreenSourceTitleMatchEnabled = setScreenSourceTitleMatchEnabled;
 
     function resolveDesktopCaptureProvider() {
         return typeof window.getDesktopCaptureProvider === 'function'
@@ -128,6 +213,67 @@
     }
     mod.clearSelectedScreenSource = clearSelectedScreenSource;
 
+    function reconcileRememberedWindowSource(sources) {
+        var result = {
+            enabled: isScreenSourceTitleMatchEnabled(),
+            hadRememberedTitle: false,
+            status: 'disabled',
+            sourceId: S.selectedScreenSourceId
+        };
+        if (!result.enabled) return result;
+
+        sources = Array.isArray(sources) ? sources : [];
+        var selectedSource = sources.find(function (source) {
+            return source.id === S.selectedScreenSourceId;
+        });
+        var rememberedTitle = readRememberedWindowTitle();
+        var normalizedRememberedTitle = normalizeScreenSourceTitle(rememberedTitle);
+        result.hadRememberedTitle = !!normalizedRememberedTitle;
+
+        if (normalizedRememberedTitle) {
+            var titleMatches = sources.filter(function (source) {
+                return source.id.startsWith('window:')
+                    && normalizeScreenSourceTitle(source.name) === normalizedRememberedTitle;
+            });
+            if (titleMatches.length === 1) {
+                if (S.selectedScreenSourceId !== titleMatches[0].id) {
+                    S.selectedScreenSourceId = titleMatches[0].id;
+                    try { localStorage.setItem('selectedScreenSourceId', titleMatches[0].id); } catch (_) { }
+                    pushSelectedSourceToMain(titleMatches[0].id);
+                    console.log('[屏幕源] 已通过唯一窗口标题恢复来源:', rememberedTitle);
+                }
+                result.status = 'matched';
+            } else {
+                if (S.selectedScreenSourceId != null) {
+                    clearSelectedScreenSource(
+                        titleMatches.length > 1 ? '窗口标题存在多个匹配' : '窗口标题未匹配到来源'
+                    );
+                }
+                result.status = titleMatches.length > 1 ? 'ambiguous' : 'missing';
+            }
+            result.sourceId = S.selectedScreenSourceId;
+            return result;
+        }
+
+        if (selectedSource) {
+            if (selectedSource.id.startsWith('window:')) {
+                storeRememberedWindowTitle(selectedSource.name || '');
+                result.status = 'adopted-current-window';
+            } else {
+                clearRememberedWindowTitle();
+                result.status = 'current-screen';
+            }
+        } else {
+            if (S.selectedScreenSourceId != null) {
+                clearSelectedScreenSource('已保存的来源 ID 不在当前枚举结果中');
+            }
+            result.status = 'no-preference';
+        }
+        result.sourceId = S.selectedScreenSourceId;
+        return result;
+    }
+    mod.reconcileRememberedWindowSource = reconcileRememberedWindowSource;
+
     // ======================== maybeClearSourceOnNotFound ========================
     /**
      * 通用兜底：主进程 captureSourceAsDataUrl 返回 { error: 'Source not found' }
@@ -155,6 +301,10 @@
     // 另一窗口会触发 storage 事件（w3c 规范）。监听它把 S 拉回最新值。
     // 注意：storage 事件在写入它的那个窗口内部并不触发，所以不会产生回环。
     window.addEventListener('storage', function (e) {
+        if (e.key === SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY) {
+            updateScreenSourceTitleMatchToggleState();
+            return;
+        }
         if (e.key !== 'selectedScreenSourceId') return;
         var newId = e.newValue || null;
         if (S.selectedScreenSourceId === newId) return;
@@ -1243,6 +1393,7 @@
                     var selectedSourceId = window.getSelectedScreenSourceId ? window.getSelectedScreenSourceId() : null;
                     var desktopProvider = resolveDesktopCaptureProvider();
                     var sourceEnumerationMayPrompt = desktopSourceEnumerationMayPrompt(desktopProvider);
+                    var rememberedWindowNeedsSelection = false;
 
                     // Native-frame shells do not expose Chromium's picker.
                     // Default to the first monitor when no source is persisted.
@@ -1261,17 +1412,24 @@
                         if (discardCancelledScreenSharingStart(attempt)) return;
                     }
 
-                    if (selectedSourceId && desktopProvider && !sourceEnumerationMayPrompt
+                    var hasRememberedWindowTitle = isScreenSourceTitleMatchEnabled()
+                        && !!normalizeScreenSourceTitle(readRememberedWindowTitle());
+                    if ((selectedSourceId || hasRememberedWindowTitle)
+                        && desktopProvider && !sourceEnumerationMayPrompt
                         && typeof desktopProvider.getSources === 'function') {
                         // 验证选中的源是否仍然存在（窗口可能已关闭）
                         try {
                             var currentSources = await desktopProvider.getSources({
                                 types: ['window', 'screen'],
-                                thumbnailSize: { width: 1, height: 1 }
+                                thumbnailSize: { width: 0, height: 0 }
                             });
+                            var titleResolution = reconcileRememberedWindowSource(currentSources);
+                            selectedSourceId = S.selectedScreenSourceId;
                             var sourceStillExists = currentSources.some(function (s) { return s.id === selectedSourceId; });
+                            var rememberedWindowNeedsPicker = titleResolution.hadRememberedTitle
+                                && titleResolution.status !== 'matched';
 
-                            if (!sourceStillExists) {
+                            if (!sourceStillExists && !rememberedWindowNeedsPicker) {
                                 console.warn('[屏幕源] 选中的源已不可用 (ID:', selectedSourceId, ')，自动回退到全屏');
                                 window.showStatusToast(
                                     safeT('app.screenSource.sourceLost', '屏幕分享无法找到之前选择窗口，已切换为全屏分享'),
@@ -1292,11 +1450,26 @@
                                     try { localStorage.removeItem('selectedScreenSourceId'); } catch (e) { }
                                     pushSelectedSourceToMain(null);
                                 }
+                            } else if (rememberedWindowNeedsPicker) {
+                                selectedSourceId = null;
+                                rememberedWindowNeedsSelection = true;
+                                console.warn('[屏幕源] 记住的窗口标题无法唯一匹配，停止本次启动并等待用户重新选择');
                             }
                         } catch (validateErr) {
                             console.warn('[屏幕源] 验证源可用性失败，继续尝试使用保存的源:', validateErr);
                         }
                         if (discardCancelledScreenSharingStart(attempt)) return;
+                    }
+
+                    if (rememberedWindowNeedsSelection) {
+                        window.showStatusToast(
+                            safeT(
+                                'app.screenSource.rememberedWindowUnavailable',
+                                '无法唯一找到记住的窗口，请重新选择屏幕来源'
+                            ),
+                            4000
+                        );
+                        return;
                     }
 
                     if (selectedSourceId && isNativeFrameProvider(desktopProvider)) {
@@ -1673,6 +1846,14 @@
             console.warn('[屏幕源] 无法保存到 localStorage:', e);
         }
 
+        if (isScreenSourceTitleMatchEnabled()) {
+            if (sourceId && sourceId.startsWith('window:')) {
+                storeRememberedWindowTitle(sourceName || '');
+            } else {
+                clearRememberedWindowTitle();
+            }
+        }
+
         // 同步到主进程，确保 setDisplayMediaRequestHandler 兜底也认这个选择
         pushSelectedSourceToMain(sourceId);
 
@@ -1831,6 +2012,10 @@
             var windows = sources.filter(function (s) { return s.id.startsWith('window:'); });
             var previewHosts = new Map();
 
+            // Electron 的 source ID 只适合当前枚举结果；显式开启“记住窗口”后，
+            // 用规范化标题重新解析当前 ID。只有唯一精确匹配才恢复，避免同名窗口误选。
+            reconcileRememberedWindowSource(sources);
+
             function previewFrameStyles() {
                 return {
                     width: '100%',
@@ -1936,6 +2121,8 @@
                 var option = document.createElement('div');
                 option.className = 'screen-source-option';
                 option.dataset.sourceId = source.id;
+                option.dataset.sourceName = source.name || '';
+                option.dataset.sourceSearchText = normalizeScreenSourceTitle(source.name || displayName);
                 Object.assign(option.style, {
                     display: 'flex',
                     flexDirection: 'column',
@@ -2005,9 +2192,64 @@
                 return option;
             }
 
+            var windowGrid = null;
+            var noWindowMatchesItem = null;
+            if (windows.length > 0) {
+                var filterWrap = document.createElement('div');
+                Object.assign(filterWrap.style, {
+                    padding: '2px 6px 6px',
+                    flexShrink: '0'
+                });
+                var titleFilterInput = document.createElement('input');
+                titleFilterInput.type = 'search';
+                titleFilterInput.className = 'screen-source-title-filter';
+                titleFilterInput.placeholder = window.t
+                    ? window.t('app.screenSource.titleFilterPlaceholder')
+                    : '筛选窗口标题';
+                titleFilterInput.setAttribute(
+                    'aria-label',
+                    window.t ? window.t('app.screenSource.titleFilterAriaLabel') : '按标题筛选窗口'
+                );
+                Object.assign(titleFilterInput.style, {
+                    width: '100%',
+                    height: '28px',
+                    padding: '4px 9px',
+                    boxSizing: 'border-box',
+                    border: '1px solid var(--neko-popup-separator)',
+                    borderRadius: '6px',
+                    outline: 'none',
+                    background: 'var(--neko-popup-bg)',
+                    color: 'var(--neko-popup-text)',
+                    fontSize: '12px'
+                });
+                titleFilterInput.addEventListener('focus', function () {
+                    titleFilterInput.style.borderColor = '#4f8cff';
+                });
+                titleFilterInput.addEventListener('blur', function () {
+                    titleFilterInput.style.borderColor = 'var(--neko-popup-separator)';
+                });
+                titleFilterInput.addEventListener('input', function () {
+                    if (!windowGrid) return;
+                    var query = normalizeScreenSourceTitle(titleFilterInput.value);
+                    var visibleCount = 0;
+                    windowGrid.querySelectorAll('.screen-source-option').forEach(function (option) {
+                        var visible = !query || option.dataset.sourceSearchText.indexOf(query) !== -1;
+                        option.hidden = !visible;
+                        option.style.display = visible ? 'flex' : 'none';
+                        if (visible) visibleCount += 1;
+                    });
+                    if (noWindowMatchesItem) {
+                        noWindowMatchesItem.hidden = visibleCount !== 0;
+                    }
+                });
+                filterWrap.appendChild(titleFilterInput);
+                screenPopup.appendChild(filterWrap);
+            }
+
             // 添加屏幕列表（网格布局）
             if (screens.length > 0) {
                 var screenLabel = document.createElement('div');
+                screenLabel.className = 'screen-source-group-label screen-source-screen-label';
                 screenLabel.textContent = window.t ? window.t('app.screenSource.screens') : '屏幕';
                 Object.assign(screenLabel.style, {
                     padding: '4px 8px',
@@ -2028,6 +2270,7 @@
             // 添加窗口列表（网格布局）
             if (windows.length > 0) {
                 var windowLabel = document.createElement('div');
+                windowLabel.className = 'screen-source-group-label screen-source-window-label';
                 windowLabel.textContent = window.t ? window.t('app.screenSource.windows') : '窗口';
                 Object.assign(windowLabel.style, {
                     padding: '4px 8px',
@@ -2039,11 +2282,25 @@
                 });
                 screenPopup.appendChild(windowLabel);
 
-                var windowGrid = createGridContainer();
+                windowGrid = createGridContainer();
                 windows.forEach(function (source) {
                     windowGrid.appendChild(createSourceOption(source, null));
                 });
                 screenPopup.appendChild(windowGrid);
+
+                noWindowMatchesItem = document.createElement('div');
+                noWindowMatchesItem.className = 'screen-source-no-window-matches';
+                noWindowMatchesItem.textContent = window.t
+                    ? window.t('app.screenSource.noWindowMatches')
+                    : '没有匹配的窗口';
+                noWindowMatchesItem.hidden = true;
+                Object.assign(noWindowMatchesItem.style, {
+                    padding: '8px 12px',
+                    color: 'var(--neko-popup-text-sub)',
+                    fontSize: '12px',
+                    textAlign: 'center'
+                });
+                screenPopup.appendChild(noWindowMatchesItem);
             }
 
             // Linux portal 的来源枚举可能再次弹出系统选择器。名称阶段已经完成

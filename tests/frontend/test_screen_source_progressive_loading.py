@@ -14,6 +14,7 @@ def _install_screen_source_harness(
     *,
     thumbnail_timeout_ms: int = 15_000,
     source_enumeration_may_prompt: bool = False,
+    initial_storage: dict[str, str] | None = None,
 ) -> None:
     page.set_content(
         '<div id="live2d-popup-screen" '
@@ -21,6 +22,22 @@ def _install_screen_source_harness(
     )
     page.evaluate(
         """(options) => {
+            const storedValues = new Map(Object.entries(options.initialStorage));
+            Object.defineProperty(window, 'localStorage', {
+                configurable: true,
+                value: {
+                    getItem(key) {
+                        return storedValues.has(key) ? storedValues.get(key) : null;
+                    },
+                    setItem(key, value) {
+                        storedValues.set(key, String(value));
+                    },
+                    removeItem(key) {
+                        storedValues.delete(key);
+                    },
+                },
+            });
+            window.__storedValues = storedValues;
             window.appState = { selectedScreenSourceId: null };
             window.appConst = {
                 SCREEN_SOURCE_THUMBNAIL_TIMEOUT: options.thumbnailTimeoutMs,
@@ -31,6 +48,15 @@ def _install_screen_source_harness(
                 if (key === 'app.screenSource.loading') return 'Loading...';
                 if (key === 'app.screenSource.screenLabel') {
                     return `Screen ${options.index}`;
+                }
+                if (key === 'app.screenSource.titleFilterPlaceholder') {
+                    return 'Filter window titles';
+                }
+                if (key === 'app.screenSource.titleFilterAriaLabel') {
+                    return 'Filter windows by title';
+                }
+                if (key === 'app.screenSource.noWindowMatches') {
+                    return 'No matching windows';
                 }
                 return key;
             };
@@ -48,26 +74,31 @@ def _install_screen_source_harness(
                     return '';
                 },
             };
-            const metadataSources = [
+            window.__metadataSources = [
                 { id: 'screen:1', name: 'Entire Screen', display_id: '1', thumbnail: emptyMetadataThumbnail },
                 { id: 'window:2', name: 'Editor', display_id: '', thumbnail: emptyMetadataThumbnail },
             ];
+            window.__selectedSourceCalls = [];
             window.__desktopProvider = {
                 sourceEnumerationMayPrompt: options.sourceEnumerationMayPrompt,
                 getSources(options) {
                     window.__captureCalls.push(options);
                     if (options.thumbnailSize.width === 0) {
-                        return Promise.resolve(metadataSources);
+                        return Promise.resolve(window.__metadataSources);
                     }
                     return thumbnailPromise;
                 },
-                setSelectedSource() { return Promise.resolve(); },
+                setSelectedSource(sourceId) {
+                    window.__selectedSourceCalls.push(sourceId);
+                    return Promise.resolve();
+                },
             };
             window.electronDesktopCapturer = window.__desktopProvider;
         }""",
         {
             "thumbnailTimeoutMs": thumbnail_timeout_ms,
             "sourceEnumerationMayPrompt": source_enumeration_may_prompt,
+            "initialStorage": initial_storage or {},
         },
     )
     page.add_script_tag(path=str(DESKTOP_CAPTURE_PROVIDER))
@@ -203,6 +234,270 @@ def test_screen_source_hung_thumbnail_request_falls_back_after_timeout(
         ],
         "loadingCount": 0,
         "fallbackCount": 2,
+    }
+
+
+@pytest.mark.frontend
+def test_window_title_filter_is_local_and_keeps_screens_visible(page: Page) -> None:
+    _install_screen_source_harness(page, source_enumeration_may_prompt=True)
+    page.evaluate(
+        """() => {
+            window.__metadataSources.push({
+                id: 'window:3',
+                name: 'Browser Preview',
+                display_id: '',
+                thumbnail: null,
+            });
+        }"""
+    )
+
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """() => {
+            const input = document.querySelector('.screen-source-title-filter');
+            input.value = '  EDIT  ';
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            const filtered = Object.fromEntries(
+                Array.from(document.querySelectorAll('.screen-source-option'))
+                    .map((option) => [option.dataset.sourceName, option.hidden])
+            );
+            const editorDisplay = getComputedStyle(document.querySelector(
+                '.screen-source-option[data-source-id="window:2"]'
+            )).display;
+            const browserDisplay = getComputedStyle(document.querySelector(
+                '.screen-source-option[data-source-id="window:3"]'
+            )).display;
+            input.value = 'missing title';
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            return {
+                filtered,
+                editorDisplay,
+                browserDisplay,
+                filterBeforeScreens: Boolean(
+                    input.compareDocumentPosition(document.querySelector(
+                        '.screen-source-screen-label'
+                    )) & Node.DOCUMENT_POSITION_FOLLOWING
+                ),
+                screenHiddenAfterNoMatch: document.querySelector(
+                    '.screen-source-option[data-source-id="screen:1"]'
+                ).hidden,
+                noMatchHidden: document.querySelector(
+                    '.screen-source-no-window-matches'
+                ).hidden,
+                captureCalls: window.__captureCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "filtered": {
+            "Entire Screen": False,
+            "Editor": False,
+            "Browser Preview": True,
+        },
+        "editorDisplay": "flex",
+        "browserDisplay": "none",
+        "filterBeforeScreens": True,
+        "screenHiddenAfterNoMatch": False,
+        "noMatchHidden": False,
+        "captureCalls": [
+            {
+                "types": ["window", "screen"],
+                "thumbnailSize": {"width": 0, "height": 0},
+            }
+        ],
+    }
+
+
+@pytest.mark.frontend
+def test_remembered_title_restores_only_one_normalized_exact_match(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "EDITOR",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+    page.evaluate(
+        """() => {
+            window.__metadataSources[1].id = 'window:new';
+            window.__metadataSources[1].name = '  Editor  ';
+        }"""
+    )
+
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """() => ({
+            selectedId: window.appState.selectedScreenSourceId,
+            storedId: window.__storedValues.get('selectedScreenSourceId'),
+            rememberedTitle: window.__storedValues.get('selectedScreenWindowTitle'),
+            selectedSourceCalls: window.__selectedSourceCalls,
+            selectedOptions: Array.from(document.querySelectorAll(
+                '.screen-source-option.selected'
+            )).map((option) => option.dataset.sourceId),
+        })"""
+    )
+    assert result == {
+        "selectedId": "window:new",
+        "storedId": "window:new",
+        "rememberedTitle": "EDITOR",
+        "selectedSourceCalls": ["window:stale", "window:new"],
+        "selectedOptions": ["window:new"],
+    }
+
+
+@pytest.mark.frontend
+def test_remembered_title_does_not_guess_between_duplicate_windows(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+    page.evaluate(
+        """() => {
+            window.__metadataSources.push({
+                id: 'window:3',
+                name: ' editor ',
+                display_id: '',
+                thumbnail: null,
+            });
+        }"""
+    )
+
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """() => ({
+            selectedId: window.appState.selectedScreenSourceId,
+            hasStoredId: window.__storedValues.has('selectedScreenSourceId'),
+            rememberedTitle: window.__storedValues.get('selectedScreenWindowTitle'),
+            selectedSourceCalls: window.__selectedSourceCalls,
+        })"""
+    )
+    assert result == {
+        "selectedId": None,
+        "hasStoredId": False,
+        "rememberedTitle": "Editor",
+        "selectedSourceCalls": ["window:stale", None],
+    }
+
+
+@pytest.mark.frontend
+def test_remembered_title_wins_when_an_old_source_id_is_reused(page: Page) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Browser Preview",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+    page.evaluate(
+        """() => {
+            window.__metadataSources.push({
+                id: 'window:new-browser',
+                name: 'Browser Preview',
+                display_id: '',
+                thumbnail: null,
+            });
+        }"""
+    )
+
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    assert page.evaluate("window.appState.selectedScreenSourceId") == (
+        "window:new-browser"
+    )
+    assert page.evaluate("window.__selectedSourceCalls") == [
+        "window:2",
+        "window:new-browser",
+    ]
+
+
+@pytest.mark.frontend
+def test_window_selection_and_toggle_bound_the_remembered_title(page: Page) -> None:
+    _install_screen_source_harness(page, source_enumeration_may_prompt=True)
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """async () => {
+            document.querySelector(
+                '.screen-source-option[data-source-id="window:2"]'
+            ).click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const hasTitleBeforeEnable = window.__storedValues.has(
+                'selectedScreenWindowTitle'
+            );
+            window.setScreenSourceTitleMatchEnabled(true);
+            const rememberedAfterEnable = window.__storedValues.get(
+                'selectedScreenWindowTitle'
+            );
+            document.querySelector(
+                '.screen-source-option[data-source-id="screen:1"]'
+            ).click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const hasTitleAfterScreen = window.__storedValues.has(
+                'selectedScreenWindowTitle'
+            );
+            document.querySelector(
+                '.screen-source-option[data-source-id="window:2"]'
+            ).click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const rememberedAfterWindow = window.__storedValues.get(
+                'selectedScreenWindowTitle'
+            );
+            window.setScreenSourceTitleMatchEnabled(false);
+            return {
+                hasTitleBeforeEnable,
+                rememberedAfterEnable,
+                hasTitleAfterScreen,
+                rememberedAfterWindow,
+                enabledAfterDisable: window.isScreenSourceTitleMatchEnabled(),
+                hasRememberedTitleAfterDisable: window.__storedValues.has(
+                    'selectedScreenWindowTitle'
+                ),
+            };
+        }"""
+    )
+    assert result == {
+        "hasTitleBeforeEnable": False,
+        "rememberedAfterEnable": "Editor",
+        "hasTitleAfterScreen": False,
+        "rememberedAfterWindow": "Editor",
+        "enabledAfterDisable": False,
+        "hasRememberedTitleAfterDisable": False,
     }
 
 
