@@ -577,6 +577,186 @@ def test_prompt_required_remembered_window_blocks_only_automatic_capture(
 
 
 @pytest.mark.frontend
+def test_remembered_window_reconciliation_timeout_releases_shared_request(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        thumbnail_timeout_ms=25,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+    page.evaluate(
+        """() => {
+            window.__desktopProvider.getSources = () => new Promise(() => {});
+        }"""
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const first = await Promise.race([
+                window.appScreen.reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                ),
+                new Promise((resolve) => setTimeout(
+                    () => resolve({ status: 'test-timeout' }),
+                    150
+                )),
+            ]);
+            window.__desktopProvider.getSources = () => Promise.resolve(
+                window.__metadataSources
+            );
+            const second = await Promise.race([
+                window.appScreen.reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                ),
+                new Promise((resolve) => setTimeout(
+                    () => resolve({ status: 'test-timeout' }),
+                    150
+                )),
+            ]);
+            return {
+                firstStatus: first.status,
+                secondStatus: second.status,
+                selectedId: window.appState.selectedScreenSourceId,
+            };
+        }"""
+    )
+    assert result == {
+        "firstStatus": "enumeration-failed",
+        "secondStatus": "matched",
+        "selectedId": "window:2",
+    }
+
+
+@pytest.mark.frontend
+def test_prompt_required_user_acquisition_discards_unknown_cache_and_opens_picker(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            let stoppedTracks = 0;
+            let getUserMediaCalls = 0;
+            let getDisplayMediaCalls = 0;
+            const cachedTrack = {
+                readyState: 'live',
+                stop() { stoppedTracks += 1; this.readyState = 'ended'; },
+                addEventListener() {},
+            };
+            const cachedStream = {
+                active: true,
+                getTracks: () => [cachedTrack],
+                getVideoTracks: () => [cachedTrack],
+            };
+            const pickerTrack = {
+                readyState: 'live',
+                stop() {},
+                addEventListener() {},
+            };
+            const pickerStream = {
+                active: true,
+                getTracks: () => [pickerTrack],
+                getVideoTracks: () => [pickerTrack],
+            };
+            window.appState.screenCaptureStream = cachedStream;
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    async getUserMedia() {
+                        getUserMediaCalls += 1;
+                        return cachedStream;
+                    },
+                    async getDisplayMedia() {
+                        getDisplayMediaCalls += 1;
+                        return pickerStream;
+                    },
+                },
+            });
+
+            const acquired = await window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: true,
+            });
+            const resolution = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                acquiredPicker: acquired === pickerStream,
+                stoppedTracks,
+                getUserMediaCalls,
+                getDisplayMediaCalls,
+                resolutionStatus: resolution.status,
+            };
+        }"""
+    )
+    assert result == {
+        "acquiredPicker": True,
+        "stoppedTracks": 1,
+        "getUserMediaCalls": 0,
+        "getDisplayMediaCalls": 1,
+        "resolutionStatus": "trusted-live-stream",
+    }
+
+
+@pytest.mark.frontend
+def test_prompt_native_provider_accepts_renderer_trusted_source_without_stream(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            window.__desktopProvider.nativeFrameCapture = true;
+            window.__desktopProvider.captureSourceAsDataUrl = async () => null;
+            const adopted = window.appScreen.reconcileRememberedWindowSource(
+                window.__metadataSources
+            );
+            const forced = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                adoptedStatus: adopted.status,
+                forcedStatus: forced.status,
+                sourceId: forced.sourceId,
+                hasStream: !!window.appState.screenCaptureStream,
+            };
+        }"""
+    )
+    assert result == {
+        "adoptedStatus": "matched",
+        "forcedStatus": "trusted-native-source",
+        "sourceId": "window:2",
+        "hasStream": False,
+    }
+
+
+@pytest.mark.frontend
 def test_prompt_provider_reuses_only_registered_trusted_remembered_stream(
     page: Page,
 ) -> None:

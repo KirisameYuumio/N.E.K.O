@@ -79,6 +79,36 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
         "if (captureStream == null)"
     )
     assert "rememberedWindowResolutionNeedsSelection(cachedTitleResolution)" in start_once
+    assert "forceRememberedWindowPicker" in start_once
+    assert "cachedTitleResolution.status === 'prompt-required'" in start_once
+    assert "selectedSourceId = forceRememberedWindowPicker" in start_once
+    assert "rememberPromptConfirmedRememberedWindowStream(captureStream)" in start_once
+    assert start_once.index("sourceEnumerationMayPrompt && hasRememberedWindowTitle") < (
+        start_once.index("var selectedSourceId = forceRememberedWindowPicker")
+    )
+
+
+@pytest.mark.unit
+def test_remembered_metadata_promises_and_cached_constraints_are_bounded():
+    source = APP_SCREEN_JS.read_text(encoding="utf-8")
+    metadata_load = source.split(
+        "function beginScreenSourceMetadataLoad(provider)", 1
+    )[1].split("function setScreenSourceTitleMatchEnabled", 1)[0]
+    reconcile = source.split(
+        "async function reconcileRememberedWindowSourceForCapture(provider, options)", 1
+    )[1].split(
+        "mod.reconcileRememberedWindowSourceForCapture", 1
+    )[0]
+    acquire = source.split(
+        "async function acquireOrReuseCachedStream(opts)", 1
+    )[1].split("mod.acquireOrReuseCachedStream", 1)[0]
+
+    assert "boundedPromise.catch(function () { });" in metadata_load
+    assert "getScreenSourceMetadataWithTimeout(provider)" in reconcile
+    assert "provider.getSources({" not in reconcile
+    assert acquire.count("isPromptConfirmedRememberedWindowStream(") == 1
+    assert "promptRequiredRememberedPicker" in acquire
+    assert "&& !promptRequiredRememberedPicker" in acquire
 
 
 @pytest.mark.unit

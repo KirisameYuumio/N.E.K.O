@@ -64,6 +64,24 @@
         });
     }
 
+    function releaseCachedScreenCaptureStream(stream) {
+        if (!stream) return;
+        try {
+            if (typeof stream.getTracks === 'function') {
+                stream.getTracks().forEach(function (track) {
+                    try { track.stop(); } catch (_) { }
+                });
+            }
+        } catch (_) { }
+        if (S.screenCaptureStream !== stream) return;
+        S.screenCaptureStream = null;
+        S.screenCaptureStreamLastUsed = null;
+        if (S.screenCaptureStreamIdleTimer) {
+            clearTimeout(S.screenCaptureStreamIdleTimer);
+            S.screenCaptureStreamIdleTimer = null;
+        }
+    }
+
     function normalizeScreenSourceTitle(value) {
         return String(value || '').normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
     }
@@ -161,27 +179,26 @@
         }
     }
 
-    function beginScreenSourceMetadataLoad(provider) {
+    function getScreenSourceMetadataWithTimeout(provider) {
         var configuredTimeoutMs = Number(C && C.SCREEN_SOURCE_THUMBNAIL_TIMEOUT);
         var timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
             ? configuredTimeoutMs
             : 15000;
-        var timeoutId = null;
-        var providerPromise = Promise.resolve(provider.getSources({
-            types: ['window', 'screen'],
-            thumbnailSize: { width: 0, height: 0 }
-        }));
-        var boundedPromise = Promise.race([
-            providerPromise,
-            new Promise(function (_, reject) {
-                timeoutId = setTimeout(function () {
-                    reject(new Error('Screen source metadata timeout'));
-                }, timeoutMs);
-            })
-        ]).finally(function () {
-            if (timeoutId !== null) clearTimeout(timeoutId);
-        });
+        return window.invokeDesktopCaptureWithTimeout(
+            provider,
+            'getSources',
+            [{
+                types: ['window', 'screen'],
+                thumbnailSize: { width: 0, height: 0 }
+            }],
+            timeoutMs
+        );
+    }
+
+    function beginScreenSourceMetadataLoad(provider) {
+        var boundedPromise = getScreenSourceMetadataWithTimeout(provider);
         screenSourceMetadataLoadPromise = boundedPromise;
+        boundedPromise.catch(function () { });
         return boundedPromise;
     }
 
@@ -494,6 +511,15 @@
             };
         }
         if (desktopSourceEnumerationMayPrompt(provider)) {
+            if (isNativeFrameProvider(provider)
+                && S.selectedScreenSourceId
+                && trustedRememberedWindowSourceId === S.selectedScreenSourceId) {
+                return {
+                    status: 'trusted-native-source',
+                    sourceId: S.selectedScreenSourceId,
+                    hadRememberedTitle: true
+                };
+            }
             if (hasLiveScreenCaptureTrack(S.screenCaptureStream)
                 && isPromptConfirmedRememberedWindowStream(S.screenCaptureStream)) {
                 return {
@@ -527,10 +553,7 @@
 
         rememberedWindowCaptureReconcilePromise = (async function () {
             try {
-                var sources = await provider.getSources({
-                    types: ['window', 'screen'],
-                    thumbnailSize: { width: 0, height: 0 }
-                });
+                var sources = await getScreenSourceMetadataWithTimeout(provider);
                 return reconcileRememberedWindowSource(sources);
             } catch (error) {
                 console.warn('[屏幕源] 截图前按标题解析来源失败:', error);
@@ -859,6 +882,10 @@
         var promptConfirmedStreamConstraint = !!(titleResolution
             && titleResolution.status === 'trusted-live-stream'
             && isPromptConfirmedRememberedWindowStream(S.screenCaptureStream));
+        var promptRequiredRememberedPicker = !!(titleResolution
+            && titleResolution.hadRememberedTitle
+            && titleResolution.status === 'prompt-required'
+            && opts.allowPrompt);
         var requiredSourceId = opts.requiredSourceId
             || (derivedRememberedWindowConstraint ? titleResolution.sourceId : null);
         function unavailableRememberedWindowResult() {
@@ -873,6 +900,11 @@
         if (requiredSourceId && S.selectedScreenSourceId !== requiredSourceId) {
             return unavailableRememberedWindowResult();
         }
+        if (titleResolution && titleResolution.hadRememberedTitle
+            && titleResolution.status === 'prompt-required'
+            && !opts.allowPrompt) {
+            return unavailableRememberedWindowResult();
+        }
 
         // 1. 缓存流有效且 tracks live → 直接返回（~0ms）
         if (S.screenCaptureStream && S.screenCaptureStream.active) {
@@ -882,26 +914,27 @@
                     && !screenCaptureStreamMatchesSource(S.screenCaptureStream, requiredSourceId)) {
                     return unavailableRememberedWindowResult();
                 }
-                if (promptConfirmedStreamConstraint
-                    && !isPromptConfirmedRememberedWindowStream(S.screenCaptureStream)) {
-                    return unavailableRememberedWindowResult();
+                if (promptRequiredRememberedPicker) {
+                    releaseCachedScreenCaptureStream(S.screenCaptureStream);
+                } else {
+                    S.screenCaptureStreamLastUsed = Date.now();
+                    scheduleScreenCaptureIdleCheck();
+                    return S.screenCaptureStream;
                 }
-                S.screenCaptureStreamLastUsed = Date.now();
-                scheduleScreenCaptureIdleCheck();
-                return S.screenCaptureStream;
             }
             // tracks 已结束，废弃流
-            console.warn('[acquireStream] 缓存流 tracks 已结束，废弃');
-            try { S.screenCaptureStream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { } }); } catch (e) { }
-            S.screenCaptureStream = null;
-            S.screenCaptureStreamLastUsed = null;
+            if (S.screenCaptureStream) {
+                console.warn('[acquireStream] 缓存流 tracks 已结束，废弃');
+                releaseCachedScreenCaptureStream(S.screenCaptureStream);
+            }
         }
 
         // 2. Electron selectedScreenSourceId → getUserMedia(chromeMediaSource).
         // Native-frame providers such as Tauri do not expose a MediaStream and
         // must skip this Chromium-only branch.
         var selectedSourceId = S.selectedScreenSourceId;
-        if (selectedSourceId && desktopProvider && !isNativeFrameProvider(desktopProvider)) {
+        if (selectedSourceId && desktopProvider && !isNativeFrameProvider(desktopProvider)
+            && !promptRequiredRememberedPicker) {
             try {
                 var timedOut = false;
                 var acquiredSourceId = null;
@@ -1672,6 +1705,8 @@
             // return after proactive vision has already installed another stream;
             // it must never overwrite that newer global stream.
             var captureStream = attempt.initialStream;
+            var forceRememberedWindowPicker = false;
+            var cachedTitleResolution = null;
 
             // 初始化音频播放上下文
             await ensureModelVisibleForScreenSharing();
@@ -1692,7 +1727,7 @@
             // stream if the window ID changed, so the local snapshot must be discarded too.
             if (captureStream != null && !isMobile()) {
                 var cachedDesktopProvider = resolveDesktopCaptureProvider();
-                var cachedTitleResolution = await reconcileRememberedWindowSourceForCapture(
+                cachedTitleResolution = await reconcileRememberedWindowSourceForCapture(
                     cachedDesktopProvider,
                     { forceValidation: true }
                 );
@@ -1705,6 +1740,12 @@
                         4000
                     );
                     return;
+                }
+                if (cachedTitleResolution && cachedTitleResolution.hadRememberedTitle
+                    && cachedTitleResolution.status === 'prompt-required') {
+                    releaseCachedScreenCaptureStream(captureStream);
+                    captureStream = null;
+                    forceRememberedWindowPicker = true;
                 }
                 if (S.screenCaptureStream !== captureStream) {
                     captureStream = null;
@@ -1725,10 +1766,29 @@
                 } else {
 
                     // Desktop/laptop: capture the user's chosen screen / window / tab.
-                    var selectedSourceId = window.getSelectedScreenSourceId ? window.getSelectedScreenSourceId() : null;
                     var desktopProvider = resolveDesktopCaptureProvider();
                     var sourceEnumerationMayPrompt = desktopSourceEnumerationMayPrompt(desktopProvider);
                     var rememberedWindowNeedsSelection = false;
+                    var hasRememberedWindowTitle = isScreenSourceTitleMatchEnabled()
+                        && !!normalizeScreenSourceTitle(readRememberedWindowTitle());
+
+                    // A prompt-backed provider cannot prove a persisted source ID after
+                    // restart. Without an already validated stream, use this user gesture
+                    // to open the picker instead of attempting the stale explicit ID.
+                    if (sourceEnumerationMayPrompt && hasRememberedWindowTitle
+                        && !cachedTitleResolution) {
+                        cachedTitleResolution = await reconcileRememberedWindowSourceForCapture(
+                            desktopProvider,
+                            { forceValidation: true }
+                        );
+                        if (cachedTitleResolution.status === 'prompt-required') {
+                            forceRememberedWindowPicker = true;
+                        }
+                        if (discardCancelledScreenSharingStart(attempt)) return;
+                    }
+                    var selectedSourceId = forceRememberedWindowPicker
+                        ? null
+                        : (window.getSelectedScreenSourceId ? window.getSelectedScreenSourceId() : null);
 
                     // Native-frame shells do not expose Chromium's picker.
                     // Default to the first monitor when no source is persisted.
@@ -1747,8 +1807,6 @@
                         if (discardCancelledScreenSharingStart(attempt)) return;
                     }
 
-                    var hasRememberedWindowTitle = isScreenSourceTitleMatchEnabled()
-                        && !!normalizeScreenSourceTitle(readRememberedWindowTitle());
                     if ((selectedSourceId || hasRememberedWindowTitle)
                         && desktopProvider && !sourceEnumerationMayPrompt
                         && typeof desktopProvider.getSources === 'function') {
@@ -1921,6 +1979,9 @@
                                 },
                                 audio: false,
                             }));
+                            if (hasRememberedWindowTitle) {
+                                rememberPromptConfirmedRememberedWindowStream(captureStream);
+                            }
                         } catch (displayErr) {
                             if (discardCancelledScreenSharingStart(attempt)) return;
                             // 用户主动取消则直接抛出，不兜底
