@@ -24,6 +24,30 @@
     const MAX_REMEMBERED_WINDOW_TITLE_LENGTH = 512;
     var trustedRememberedWindowSourceId = null;
     var rememberedWindowCaptureReconcilePromise = null;
+    // Associate only streams created for an explicit Electron desktop source
+    // with that source ID. WeakMap does not retain streams after their normal
+    // capture lifecycle ends, so this proof cannot grow into a strong registry.
+    var screenCaptureStreamSourceIds = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+    function rememberScreenCaptureStreamSource(stream, sourceId) {
+        if (screenCaptureStreamSourceIds && stream && sourceId) {
+            screenCaptureStreamSourceIds.set(stream, sourceId);
+        }
+        return stream;
+    }
+
+    function screenCaptureStreamMatchesSource(stream, sourceId) {
+        return !!(screenCaptureStreamSourceIds && stream && sourceId
+            && screenCaptureStreamSourceIds.get(stream) === sourceId);
+    }
+
+    function hasLiveScreenCaptureTrack(stream) {
+        if (!stream || !stream.active || typeof stream.getVideoTracks !== 'function') return false;
+        var tracks = stream.getVideoTracks();
+        return tracks.length > 0 && tracks.some(function (track) {
+            return track.readyState === 'live';
+        });
+    }
 
     function normalizeScreenSourceTitle(value) {
         return String(value || '').normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
@@ -375,6 +399,19 @@
             };
         }
         if (desktopSourceEnumerationMayPrompt(provider)) {
+            if (S.selectedScreenSourceId
+                && trustedRememberedWindowSourceId === S.selectedScreenSourceId
+                && hasLiveScreenCaptureTrack(S.screenCaptureStream)
+                && screenCaptureStreamMatchesSource(
+                    S.screenCaptureStream,
+                    trustedRememberedWindowSourceId
+                )) {
+                return {
+                    status: 'trusted-live-stream',
+                    sourceId: trustedRememberedWindowSourceId,
+                    hadRememberedTitle: true
+                };
+            }
             return {
                 status: 'prompt-required',
                 sourceId: S.selectedScreenSourceId,
@@ -734,6 +771,10 @@
         if (S.screenCaptureStream && S.screenCaptureStream.active) {
             var tracks = S.screenCaptureStream.getVideoTracks();
             if (tracks.length > 0 && tracks.some(function (t) { return t.readyState === 'live'; })) {
+                if (requiredSourceId
+                    && !screenCaptureStreamMatchesSource(S.screenCaptureStream, requiredSourceId)) {
+                    return unavailableRememberedWindowResult();
+                }
                 S.screenCaptureStreamLastUsed = Date.now();
                 scheduleScreenCaptureIdleCheck();
                 return S.screenCaptureStream;
@@ -752,6 +793,7 @@
         if (selectedSourceId && desktopProvider && !isNativeFrameProvider(desktopProvider)) {
             try {
                 var timedOut = false;
+                var acquiredSourceId = null;
                 var newStream = await Promise.race([
                     (async function () {
                         var captureSourceId = selectedSourceId;
@@ -785,6 +827,7 @@
                             }
                         }
 
+                        acquiredSourceId = captureSourceId;
                         var stream = await navigator.mediaDevices.getUserMedia({
                             audio: false,
                             video: {
@@ -816,6 +859,7 @@
                         newStream.getTracks().forEach(function (track) { track.stop(); });
                         return unavailableRememberedWindowResult();
                     }
+                    rememberScreenCaptureStreamSource(newStream, acquiredSourceId);
                     S.screenCaptureStream = newStream;
                     S.screenCaptureStreamLastUsed = Date.now();
                     S.screenCaptureAutoPromptFailed = false;
@@ -1626,6 +1670,7 @@
                                     // 连全屏源都拿不到，清空选择让下面走 getDisplayMedia
                                     selectedSourceId = null;
                                     S.selectedScreenSourceId = null;
+                                    selectedSourceId = null;
                                     try { localStorage.removeItem('selectedScreenSourceId'); } catch (e) { }
                                     pushSelectedSourceToMain(null);
                                 }
@@ -1673,6 +1718,16 @@
                         } catch (captureErr) {
                             if (discardCancelledScreenSharingStart(attempt)) return;
                             console.warn('[屏幕源] 指定源捕获失败，尝试回退:', captureErr);
+                            if (hasRememberedWindowTitle) {
+                                window.showStatusToast(
+                                    safeT(
+                                        'app.screenSource.rememberedWindowUnavailable',
+                                        '无法唯一找到记住的窗口，请重新选择屏幕来源'
+                                    ),
+                                    4000
+                                );
+                                return;
+                            }
                             var fallbackSucceeded = false;
 
                             // 回退策略1: 非 Portal 平台可静默枚举其它全屏源。
@@ -1697,6 +1752,7 @@
                                             }
                                         }));
                                         if (discardCancelledScreenSharingStart(attempt)) return;
+                                        selectedSourceId = fallbackSources[0].id;
                                         S.selectedScreenSourceId = fallbackSources[0].id;
                                         try { localStorage.setItem('selectedScreenSourceId', fallbackSources[0].id); } catch (e) { }
                                         pushSelectedSourceToMain(fallbackSources[0].id);
@@ -1733,6 +1789,9 @@
                             if (!fallbackSucceeded) {
                                 console.warn('[屏幕源] 所有前端持续流方式均失败，停止屏幕分享');
                             }
+                        }
+                        if (captureStream) {
+                            rememberScreenCaptureStreamSource(captureStream, selectedSourceId);
                         }
                         if (captureStream) {
                             console.log(window.t('console.screenShareUsingSource'), selectedSourceId);

@@ -82,6 +82,28 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
 
 
 @pytest.mark.unit
+def test_remembered_window_manual_share_never_widens_after_capture_failure():
+    source = APP_SCREEN_JS.read_text(encoding="utf-8")
+    start_once = source.split("async function startScreenSharingOnce(attempt)", 1)[1].split(
+        "mod.startScreenSharing = startScreenSharing;",
+        1,
+    )[0]
+    capture_fallback = start_once.split(
+        "} catch (captureErr) {",
+        1,
+    )[1].split("if (captureStream)", 1)[0]
+
+    assert "if (hasRememberedWindowTitle)" in capture_fallback
+    assert "app.screenSource.rememberedWindowUnavailable" in capture_fallback
+    assert capture_fallback.index("if (hasRememberedWindowTitle)") < capture_fallback.index(
+        "desktopProvider.getSources({"
+    )
+    assert capture_fallback.index("if (hasRememberedWindowTitle)") < capture_fallback.index(
+        "navigator.mediaDevices.getDisplayMedia({"
+    )
+
+
+@pytest.mark.unit
 def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture():
     screen_source = APP_SCREEN_JS.read_text(encoding="utf-8")
     buttons_source = APP_BUTTONS_JS.read_text(encoding="utf-8")
@@ -166,4 +188,12 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     )
     assert screenshot_once.index(
         "acquiredStream.rememberedWindowUnavailable"
+    ) < screenshot_once.index("var backendResult = await window.fetchBackendScreenshot()")
+    assert "var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution" in recapture_once
+    assert "var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution" in screenshot_once
+    assert recapture_once.index(
+        "if (rememberedWindowCaptureConstrained)"
+    ) < recapture_once.index("var result = await window.fetchBackendScreenshot()")
+    assert screenshot_once.index(
+        "if (rememberedWindowCaptureConstrained)"
     ) < screenshot_once.index("var backendResult = await window.fetchBackendScreenshot()")

@@ -3651,6 +3651,8 @@
                 showRememberedWindowUnavailable();
                 return null;
             }
+            var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution
+                && rememberedWindowResolution.hadRememberedTitle);
             var selectedSourceId = S.selectedScreenSourceId;
             if (desktopProvider
                 && typeof desktopProvider.captureSourceWithoutNeko === 'function') {
@@ -3770,6 +3772,10 @@
                 }
 
                 // Priority 3: backend pyautogui
+                if (rememberedWindowCaptureConstrained) {
+                    showRememberedWindowUnavailable();
+                    return null;
+                }
                 var result = await window.fetchBackendScreenshot();
                 if (result && result.dataUrl) {
                     return result.dataUrl || null;
@@ -3860,6 +3866,8 @@
                         showRememberedWindowUnavailable();
                         return { rememberedWindowUnavailable: true };
                     }
+                    var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution
+                        && rememberedWindowResolution.hadRememberedTitle);
 
                     // Electron 桌面端优先交给 PC 壳的独立截图编辑窗口。它覆盖当前显示器，
                     // 不改变聊天框/Pet 窗口尺寸，也不会把冻结画面塞进聊天窗口内裁剪。
@@ -3961,6 +3969,10 @@
                     }
 
                     if (!dataUrl) {
+                        if (rememberedWindowCaptureConstrained) {
+                            showRememberedWindowUnavailable();
+                            return { rememberedWindowUnavailable: true };
+                        }
                         try {
                             var backendResult = await window.fetchBackendScreenshot();
                             if (backendResult && backendResult.dataUrl) {

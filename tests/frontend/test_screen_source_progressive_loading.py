@@ -577,6 +577,99 @@ def test_prompt_required_remembered_window_blocks_only_automatic_capture(
 
 
 @pytest.mark.frontend
+def test_prompt_provider_reuses_only_registered_trusted_remembered_stream(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const trusted = window.appScreen.reconcileRememberedWindowSource(
+                window.__metadataSources
+            );
+            const track = {
+                readyState: 'live',
+                stop() {},
+                addEventListener() {},
+            };
+            const capturedStream = {
+                active: true,
+                getTracks: () => [track],
+                getVideoTracks: () => [track],
+            };
+            let getUserMediaCalls = 0;
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    async getUserMedia() {
+                        getUserMediaCalls += 1;
+                        return capturedStream;
+                    },
+                },
+            });
+
+            const acquired = await window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: false,
+                requiredSourceId: trusted.sourceId,
+            });
+            const resolution = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            const reused = await window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: false,
+                requiredSourceId: resolution.sourceId,
+            });
+            window.appState.screenCaptureStream = {
+                active: true,
+                getTracks: () => [track],
+                getVideoTracks: () => [track],
+            };
+            const unknownResolution = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                trustedStatus: trusted.status,
+                resolutionStatus: resolution.status,
+                blocksAutomatic: window.appScreen
+                    .rememberedWindowResolutionBlocksAutomaticCapture(resolution),
+                acquiredRegisteredStream: acquired === capturedStream,
+                reusedRegisteredStream: reused === capturedStream,
+                unknownStatus: unknownResolution.status,
+                unknownBlocksAutomatic: window.appScreen
+                    .rememberedWindowResolutionBlocksAutomaticCapture(
+                        unknownResolution
+                    ),
+                getUserMediaCalls,
+                captureCalls: window.__captureCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "trustedStatus": "matched",
+        "resolutionStatus": "trusted-live-stream",
+        "blocksAutomatic": False,
+        "acquiredRegisteredStream": True,
+        "reusedRegisteredStream": True,
+        "unknownStatus": "prompt-required",
+        "unknownBlocksAutomatic": True,
+        "getUserMediaCalls": 1,
+        "captureCalls": [],
+    }
+
+
+@pytest.mark.frontend
 def test_required_remembered_window_stream_does_not_fall_back_after_source_closes(
     page: Page,
 ) -> None:
