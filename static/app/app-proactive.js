@@ -2164,6 +2164,12 @@
     }
 
     async function captureProactiveChatScreenshotWithSource() {
+        var desktopProvider = getDesktopProvider();
+        if (window.appScreen
+            && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
+            await window.appScreen.reconcileRememberedWindowSourceForCapture(desktopProvider);
+        }
+
         // 策略 0a: 复用有效缓存流（避免打扰正在进行的屏幕共享）
         if (S.screenCaptureStream && S.screenCaptureStream.active) {
             try {
@@ -2187,11 +2193,6 @@
         }
 
         // 策略 0b: 桌面壳直接捕获选中源（Electron / Tauri）
-        var desktopProvider = getDesktopProvider();
-        if (window.appScreen
-            && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
-            await window.appScreen.reconcileRememberedWindowSourceForCapture(desktopProvider);
-        }
         if (S.selectedScreenSourceId && desktopProvider
             && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
             // 捕获前钉住源 ID：下面是异步的，事后再读会拿新源解释旧帧。

@@ -68,6 +68,7 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     assert "reconcileRememberedWindowSource(currentSources)" in start_once
     assert "thumbnailSize: { width: 0, height: 0 }" in start_once
     assert "rememberedWindowNeedsPicker" in start_once
+    assert "titleResolution.status === 'matched-trusted-current'" in start_once
     assert "if (!sourceStillExists && !rememberedWindowNeedsPicker)" in start_once
     assert "rememberedWindowNeedsSelection = true;" in start_once
     assert "if (rememberedWindowNeedsSelection)" in start_once
@@ -86,7 +87,7 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     )[1].split("mod.acquireOrReuseCachedStream = acquireOrReuseCachedStream;", 1)[0]
     assert acquire_once.index(
         "await reconcileRememberedWindowSourceForCapture(desktopProvider);"
-    ) < acquire_once.index("var selectedSourceId = S.selectedScreenSourceId;")
+    ) < acquire_once.index("if (S.screenCaptureStream && S.screenCaptureStream.active)")
 
     recapture_once = buttons_source.split(
         "async function recaptureWithoutNeko()", 1
@@ -94,17 +95,18 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     assert recapture_once.index(
         "await window.appScreen.reconcileRememberedWindowSourceForCapture"
     ) < recapture_once.index("var selectedSourceId = S.selectedScreenSourceId;")
+    assert "{ forceValidation: true }" in recapture_once
 
     screenshot_once = buttons_source.split(
         "mod.captureScreenshotDataUrl = async function captureScreenshotDataUrl()", 1
     )[1].split("mod.captureScreenshotDataUrl", 1)[0]
     assert screenshot_once.index(
         "await window.appScreen.reconcileRememberedWindowSourceForCapture"
-    ) < screenshot_once.index("var selectedSourceId = S.selectedScreenSourceId;")
+    ) < screenshot_once.index("captureDesktopRegionDirectly()")
 
     proactive_once = proactive_source.split(
         "async function captureProactiveChatScreenshotWithSource()", 1
     )[1].split("mod.captureProactiveChatScreenshotWithSource", 1)[0]
     assert proactive_once.index(
         "await window.appScreen.reconcileRememberedWindowSourceForCapture"
-    ) < proactive_once.index("var nativeSourceId = S.selectedScreenSourceId;")
+    ) < proactive_once.index("if (S.screenCaptureStream && S.screenCaptureStream.active)")

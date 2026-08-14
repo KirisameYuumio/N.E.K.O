@@ -217,7 +217,8 @@ def test_native_frame_stream_lifecycle_preserves_source_and_cancels_stale_frames
     assert "window.captureDesktopSourceWithTimeout(" in native_stream
     assert "'captureSourceAsDataUrl'" in native_stream
     assert "data:image/jpeg;base64," in screen
-    assert "(S.screenCaptureStream || activeNativeCaptureSourceId)" in screen
+    assert "function releaseCaptureForScreenSourceChange(oldId, newId)" in screen
+    assert "(!S.screenCaptureStream && !activeNativeCaptureSourceId)" in screen
     assert "var isNativeCaptureActive = activeNativeCaptureSourceId !== null;" in select_source
     assert (
         "var isScreenSharingActive = isNativeCaptureActive || "

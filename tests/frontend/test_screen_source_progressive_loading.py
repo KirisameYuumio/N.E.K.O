@@ -536,6 +536,98 @@ def test_capture_resolution_restores_once_then_reuses_session_trust(
 
 
 @pytest.mark.frontend
+def test_capture_resolution_releases_cached_stream_when_title_restores_new_id(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+    page.evaluate(
+        """() => {
+            window.__metadataSources[1].id = 'window:current';
+            window.__cachedTrackStopped = false;
+            const track = {
+                readyState: 'live',
+                stop() { window.__cachedTrackStopped = true; },
+            };
+            window.appState.screenCaptureStream = {
+                active: true,
+                getTracks: () => [track],
+                getVideoTracks: () => [track],
+            };
+            window.appState.screenCaptureStreamLastUsed = Date.now();
+        }"""
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const resolution = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider
+                );
+            return {
+                status: resolution.status,
+                selectedId: window.appState.selectedScreenSourceId,
+                streamReleased: window.appState.screenCaptureStream === null,
+                trackStopped: window.__cachedTrackStopped,
+            };
+        }"""
+    )
+    assert result == {
+        "status": "matched",
+        "selectedId": "window:current",
+        "streamReleased": True,
+        "trackStopped": True,
+    }
+
+
+@pytest.mark.frontend
+def test_forced_capture_resolution_revalidates_trusted_recreated_window(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const first = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider
+                );
+            window.__metadataSources[1].id = 'window:recreated';
+            const second = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                firstStatus: first.status,
+                secondStatus: second.status,
+                selectedId: window.appState.selectedScreenSourceId,
+                captureCalls: window.__captureCalls.length,
+            };
+        }"""
+    )
+    assert result == {
+        "firstStatus": "matched",
+        "secondStatus": "matched",
+        "selectedId": "window:recreated",
+        "captureCalls": 2,
+    }
+
+
+@pytest.mark.frontend
 def test_remembered_title_wins_when_an_old_source_id_is_reused(page: Page) -> None:
     _install_screen_source_harness(
         page,

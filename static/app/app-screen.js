@@ -205,6 +205,7 @@
     function clearSelectedScreenSource(reason) {
         trustedRememberedWindowSourceId = null;
         if (S.selectedScreenSourceId == null) return;
+        releaseCaptureForScreenSourceChange(S.selectedScreenSourceId, null);
         try {
             console.log('[屏幕源] 清除失效的选中源' + (reason ? ' (' + reason + ')' : ''), S.selectedScreenSourceId);
         } catch (_) { }
@@ -218,6 +219,28 @@
         } catch (_) { }
     }
     mod.clearSelectedScreenSource = clearSelectedScreenSource;
+
+    function releaseCaptureForScreenSourceChange(oldId, newId) {
+        if (oldId === newId || (!S.screenCaptureStream && !activeNativeCaptureSourceId)) return;
+
+        stopScreening();
+        if (S.screenCaptureStream) {
+            try {
+                if (typeof S.screenCaptureStream.getTracks === 'function') {
+                    S.screenCaptureStream.getTracks().forEach(function (track) {
+                        try { track.stop(); } catch (_) { }
+                    });
+                }
+            } catch (_) { }
+        }
+        S.screenCaptureStream = null;
+        S.screenCaptureStreamLastUsed = null;
+        if (S.screenCaptureStreamIdleTimer) {
+            clearTimeout(S.screenCaptureStreamIdleTimer);
+            S.screenCaptureStreamIdleTimer = null;
+        }
+        resetScreenSharingControls();
+    }
 
     function reconcileRememberedWindowSource(sources) {
         var result = {
@@ -243,6 +266,10 @@
             });
             if (titleMatches.length === 1) {
                 if (S.selectedScreenSourceId !== titleMatches[0].id) {
+                    releaseCaptureForScreenSourceChange(
+                        S.selectedScreenSourceId,
+                        titleMatches[0].id
+                    );
                     S.selectedScreenSourceId = titleMatches[0].id;
                     try { localStorage.setItem('selectedScreenSourceId', titleMatches[0].id); } catch (_) { }
                     pushSelectedSourceToMain(titleMatches[0].id);
@@ -292,13 +319,15 @@
     }
     mod.reconcileRememberedWindowSource = reconcileRememberedWindowSource;
 
-    async function reconcileRememberedWindowSourceForCapture(provider) {
+    async function reconcileRememberedWindowSourceForCapture(provider, options) {
         provider = provider || resolveDesktopCaptureProvider();
+        options = options || {};
         var rememberedTitle = readRememberedWindowTitle();
         if (!isScreenSourceTitleMatchEnabled() || !normalizeScreenSourceTitle(rememberedTitle)) {
             return { status: 'disabled-or-empty', sourceId: S.selectedScreenSourceId };
         }
-        if (S.selectedScreenSourceId
+        if (!options.forceValidation
+            && S.selectedScreenSourceId
             && trustedRememberedWindowSourceId === S.selectedScreenSourceId) {
             return { status: 'trusted-current', sourceId: S.selectedScreenSourceId };
         }
@@ -380,29 +409,7 @@
             }
         } catch (_) { }
         // 源切换时释放本窗口缓存的旧流或原生帧发送循环，强制下次用新源。
-        if ((S.screenCaptureStream || activeNativeCaptureSourceId) && oldId !== newId) {
-            // 先停掉可能仍在跑的发送循环，否则 startScreenVideoStreaming 创建的临时
-            // <video> 会保留在旧流上，interval 继续向 WebSocket 推送冻结帧；tracks 停止
-            // 后 UI 和后端都会收到"还在分享但画面不动"的矛盾状态。
-            stopScreening();
-            if (S.screenCaptureStream) {
-                try {
-                    if (typeof S.screenCaptureStream.getTracks === 'function') {
-                        S.screenCaptureStream.getTracks().forEach(function (track) {
-                            try { track.stop(); } catch (_) { }
-                        });
-                    }
-                } catch (_) { }
-            }
-            S.screenCaptureStream = null;
-            S.screenCaptureStreamLastUsed = null;
-            if (S.screenCaptureStreamIdleTimer) {
-                clearTimeout(S.screenCaptureStreamIdleTimer);
-                S.screenCaptureStreamIdleTimer = null;
-            }
-            // 旧源已停止推流，所有分享控件也必须回到未分享状态。
-            resetScreenSharingControls();
-        }
+        releaseCaptureForScreenSourceChange(oldId, newId);
         console.log('[屏幕源] 从其它窗口同步了新选择:', newId);
         // 不要再写 localStorage 或 pushSelectedSourceToMain —— 源窗口已经做过了，
         // 再做会产生回环/重复 IPC。
@@ -655,6 +662,9 @@
     async function acquireOrReuseCachedStream(opts) {
         if (!opts) opts = {};
 
+        var desktopProvider = resolveDesktopCaptureProvider();
+        await reconcileRememberedWindowSourceForCapture(desktopProvider);
+
         // 1. 缓存流有效且 tracks live → 直接返回（~0ms）
         if (S.screenCaptureStream && S.screenCaptureStream.active) {
             var tracks = S.screenCaptureStream.getVideoTracks();
@@ -673,8 +683,6 @@
         // 2. Electron selectedScreenSourceId → getUserMedia(chromeMediaSource).
         // Native-frame providers such as Tauri do not expose a MediaStream and
         // must skip this Chromium-only branch.
-        var desktopProvider = resolveDesktopCaptureProvider();
-        await reconcileRememberedWindowSourceForCapture(desktopProvider);
         var selectedSourceId = S.selectedScreenSourceId;
         if (selectedSourceId && desktopProvider && !isNativeFrameProvider(desktopProvider)) {
             try {
@@ -1491,8 +1499,10 @@
                             var titleResolution = reconcileRememberedWindowSource(currentSources);
                             selectedSourceId = S.selectedScreenSourceId;
                             var sourceStillExists = currentSources.some(function (s) { return s.id === selectedSourceId; });
+                            var rememberedWindowMatched = titleResolution.status === 'matched'
+                                || titleResolution.status === 'matched-trusted-current';
                             var rememberedWindowNeedsPicker = titleResolution.hadRememberedTitle
-                                && titleResolution.status !== 'matched';
+                                && !rememberedWindowMatched;
 
                             if (!sourceStillExists && !rememberedWindowNeedsPicker) {
                                 console.warn('[屏幕源] 选中的源已不可用 (ID:', selectedSourceId, ')，自动回退到全屏');
