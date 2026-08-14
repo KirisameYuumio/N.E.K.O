@@ -3544,6 +3544,22 @@
             return null;
         }
 
+        function rememberedWindowCaptureNeedsSelection(result) {
+            return !!(window.appScreen
+                && typeof window.appScreen.rememberedWindowResolutionNeedsSelection === 'function'
+                && window.appScreen.rememberedWindowResolutionNeedsSelection(result));
+        }
+
+        function showRememberedWindowUnavailable() {
+            if (typeof window.showStatusToast !== 'function') return;
+            window.showStatusToast(
+                window.t
+                    ? window.t('app.screenSource.rememberedWindowUnavailable')
+                    : '无法唯一找到记住的窗口，请重新选择屏幕来源',
+                4000
+            );
+        }
+
         async function captureDesktopRegionDirectly() {
             var regionMethod = getDesktopRegionCaptureMethod();
             if (!regionMethod) return null;
@@ -3623,12 +3639,17 @@
             // 对 Pet 的 DOM 做 visibility:hidden，盖不住 WebGL 合成层 —— 那正是"隐藏NEKO
             // 画面刷新了但立绘还在"的根因。主进程在 sourceId 缺省时会自行选择合适屏幕。
             var desktopProvider = getDesktopProvider();
+            var rememberedWindowResolution = null;
             if (window.appScreen
                 && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
-                await window.appScreen.reconcileRememberedWindowSourceForCapture(
+                rememberedWindowResolution = await window.appScreen.reconcileRememberedWindowSourceForCapture(
                     desktopProvider,
                     { forceValidation: true }
                 );
+            }
+            if (rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)) {
+                showRememberedWindowUnavailable();
+                return null;
             }
             var selectedSourceId = S.selectedScreenSourceId;
             if (desktopProvider
@@ -3822,9 +3843,18 @@
                     }
                 } else {
                     var desktopProvider = getDesktopProvider();
+                    var rememberedWindowResolution = null;
                     if (window.appScreen
                         && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
-                        await window.appScreen.reconcileRememberedWindowSourceForCapture(desktopProvider);
+                        rememberedWindowResolution = await window.appScreen
+                            .reconcileRememberedWindowSourceForCapture(
+                                desktopProvider,
+                                { forceValidation: true }
+                            );
+                    }
+                    if (rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)) {
+                        showRememberedWindowUnavailable();
+                        return null;
                     }
 
                     // Electron 桌面端优先交给 PC 壳的独立截图编辑窗口。它覆盖当前显示器，

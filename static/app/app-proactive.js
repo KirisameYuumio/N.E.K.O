@@ -1915,6 +1915,20 @@
             }
             if (!S.socket || S.socket.readyState !== WebSocket.OPEN) return;
 
+            var desktopProvider = getDesktopProvider();
+            var rememberedWindowResolution = null;
+            if (window.appScreen
+                && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
+                rememberedWindowResolution = await window.appScreen
+                    .reconcileRememberedWindowSourceForCapture(desktopProvider);
+            }
+            if (window.appScreen
+                && typeof window.appScreen.rememberedWindowResolutionNeedsSelection === 'function'
+                && window.appScreen.rememberedWindowResolutionNeedsSelection(rememberedWindowResolution)) {
+                console.warn('[ProactiveVision] 记住的窗口无法唯一恢复，跳过本帧');
+                return;
+            }
+
             var dataUrl = null;
             // 这一帧来自哪种画面来源，决定 Avatar 坐标怎么映射到截图坐标系。
             // 三条来源判据各不相同且逐级回退，必须在取到画面的那一步就定下来——
@@ -1944,7 +1958,6 @@
             // Native desktop shells return encoded frames instead of a
             // Chromium MediaStream.
             if (!dataUrl && S.selectedScreenSourceId) {
-                var desktopProvider = getDesktopProvider();
                 if (desktopProvider
                     && desktopProvider.nativeFrameCapture
                     && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
@@ -2165,9 +2178,17 @@
 
     async function captureProactiveChatScreenshotWithSource() {
         var desktopProvider = getDesktopProvider();
+        var rememberedWindowResolution = null;
         if (window.appScreen
             && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
-            await window.appScreen.reconcileRememberedWindowSourceForCapture(desktopProvider);
+            rememberedWindowResolution = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(desktopProvider);
+        }
+        if (window.appScreen
+            && typeof window.appScreen.rememberedWindowResolutionNeedsSelection === 'function'
+            && window.appScreen.rememberedWindowResolutionNeedsSelection(rememberedWindowResolution)) {
+            console.warn('[主动搭话截图] 记住的窗口无法唯一恢复，跳过本次自动截图');
+            return { dataUrl: null, via: null, captureType: null };
         }
 
         // 策略 0a: 复用有效缓存流（避免打扰正在进行的屏幕共享）

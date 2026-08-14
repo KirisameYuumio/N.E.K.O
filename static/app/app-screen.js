@@ -260,6 +260,21 @@
         result.hadRememberedTitle = !!normalizedRememberedTitle;
 
         if (normalizedRememberedTitle) {
+            if (selectedSource
+                && selectedSource.id === trustedRememberedWindowSourceId
+                && selectedSource.id.startsWith('window:')) {
+                var normalizedSelectedTitle = normalizeScreenSourceTitle(selectedSource.name);
+                if (normalizedSelectedTitle
+                    && normalizedSelectedTitle !== normalizedRememberedTitle) {
+                    // The renderer already proved this source's identity. Window titles
+                    // commonly change with the active document/tab, so keep the trusted
+                    // source and advance the single remembered-title record with it.
+                    storeRememberedWindowTitle(selectedSource.name);
+                    result.status = 'retitled-trusted-current';
+                    result.sourceId = selectedSource.id;
+                    return result;
+                }
+            }
             var titleMatches = sources.filter(function (source) {
                 return source.id.startsWith('window:')
                     && normalizeScreenSourceTitle(source.name) === normalizedRememberedTitle;
@@ -318,6 +333,12 @@
         return result;
     }
     mod.reconcileRememberedWindowSource = reconcileRememberedWindowSource;
+
+    function rememberedWindowResolutionNeedsSelection(result) {
+        return !!(result && result.hadRememberedTitle
+            && (result.status === 'missing' || result.status === 'ambiguous'));
+    }
+    mod.rememberedWindowResolutionNeedsSelection = rememberedWindowResolutionNeedsSelection;
 
     async function reconcileRememberedWindowSourceForCapture(provider, options) {
         provider = provider || resolveDesktopCaptureProvider();
@@ -1450,6 +1471,31 @@
                 if (discardCancelledScreenSharingStart(attempt)) return;
             }
 
+            // A proactive-vision stream may already be cached. Validate the remembered
+            // source before deciding to reuse it; reconciliation releases the old global
+            // stream if the window ID changed, so the local snapshot must be discarded too.
+            if (captureStream != null && !isMobile()) {
+                var cachedDesktopProvider = resolveDesktopCaptureProvider();
+                var cachedTitleResolution = await reconcileRememberedWindowSourceForCapture(
+                    cachedDesktopProvider,
+                    { forceValidation: true }
+                );
+                if (rememberedWindowResolutionNeedsSelection(cachedTitleResolution)) {
+                    window.showStatusToast(
+                        safeT(
+                            'app.screenSource.rememberedWindowUnavailable',
+                            '无法唯一找到记住的窗口，请重新选择屏幕来源'
+                        ),
+                        4000
+                    );
+                    return;
+                }
+                if (S.screenCaptureStream !== captureStream) {
+                    captureStream = null;
+                }
+                if (discardCancelledScreenSharingStart(attempt)) return;
+            }
+
             if (captureStream == null) {
                 if (isMobile()) {
                     // 移动端使用摄像头
@@ -1500,7 +1546,8 @@
                             selectedSourceId = S.selectedScreenSourceId;
                             var sourceStillExists = currentSources.some(function (s) { return s.id === selectedSourceId; });
                             var rememberedWindowMatched = titleResolution.status === 'matched'
-                                || titleResolution.status === 'matched-trusted-current';
+                                || titleResolution.status === 'matched-trusted-current'
+                                || titleResolution.status === 'retitled-trusted-current';
                             var rememberedWindowNeedsPicker = titleResolution.hadRememberedTitle
                                 && !rememberedWindowMatched;
 

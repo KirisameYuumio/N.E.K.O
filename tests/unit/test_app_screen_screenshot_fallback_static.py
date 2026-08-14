@@ -69,11 +69,16 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     assert "thumbnailSize: { width: 0, height: 0 }" in start_once
     assert "rememberedWindowNeedsPicker" in start_once
     assert "titleResolution.status === 'matched-trusted-current'" in start_once
+    assert "titleResolution.status === 'retitled-trusted-current'" in start_once
     assert "if (!sourceStillExists && !rememberedWindowNeedsPicker)" in start_once
     assert "rememberedWindowNeedsSelection = true;" in start_once
     assert "if (rememberedWindowNeedsSelection)" in start_once
     assert "app.screenSource.rememberedWindowUnavailable" in start_once
     assert "停止本次启动并等待用户重新选择" in start_once
+    assert start_once.index("{ forceValidation: true }") < start_once.index(
+        "if (captureStream == null)"
+    )
+    assert "rememberedWindowResolutionNeedsSelection(cachedTitleResolution)" in start_once
 
 
 @pytest.mark.unit
@@ -96,17 +101,36 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
         "await window.appScreen.reconcileRememberedWindowSourceForCapture"
     ) < recapture_once.index("var selectedSourceId = S.selectedScreenSourceId;")
     assert "{ forceValidation: true }" in recapture_once
+    assert recapture_once.index(
+        "rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)"
+    ) < recapture_once.index("'captureSourceWithoutNeko'")
 
     screenshot_once = buttons_source.split(
         "mod.captureScreenshotDataUrl = async function captureScreenshotDataUrl()", 1
     )[1].split("mod.captureScreenshotDataUrl", 1)[0]
     assert screenshot_once.index(
-        "await window.appScreen.reconcileRememberedWindowSourceForCapture"
+        ".reconcileRememberedWindowSourceForCapture("
+    ) < screenshot_once.index("captureDesktopRegionDirectly()")
+    assert screenshot_once.index(
+        "rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)"
     ) < screenshot_once.index("captureDesktopRegionDirectly()")
 
     proactive_once = proactive_source.split(
         "async function captureProactiveChatScreenshotWithSource()", 1
     )[1].split("mod.captureProactiveChatScreenshotWithSource", 1)[0]
     assert proactive_once.index(
-        "await window.appScreen.reconcileRememberedWindowSourceForCapture"
+        ".reconcileRememberedWindowSourceForCapture(desktopProvider)"
     ) < proactive_once.index("if (S.screenCaptureStream && S.screenCaptureStream.active)")
+    assert proactive_once.index(
+        "rememberedWindowResolutionNeedsSelection(rememberedWindowResolution)"
+    ) < proactive_once.index("fetchBackendScreenshot()")
+
+    proactive_vision_once = proactive_source.split(
+        "async function sendOneProactiveVisionFrame()", 1
+    )[1].split("mod.sendOneProactiveVisionFrame", 1)[0]
+    assert proactive_vision_once.index(
+        "await window.appScreen"
+    ) < proactive_vision_once.index("acquireOrReuseCachedStream({ allowPrompt: false })")
+    assert proactive_vision_once.index(
+        "rememberedWindowResolutionNeedsSelection(rememberedWindowResolution)"
+    ) < proactive_vision_once.index("fetchBackendScreenshot()")
