@@ -3875,16 +3875,23 @@
                     var rememberedWindowNeedsPromptPicker = !!(rememberedWindowCaptureBlocked
                         && rememberedWindowResolution
                         && rememberedWindowResolution.status === 'prompt-required');
+                    var rememberedWindowUsesTrustedLiveStream = !!(rememberedWindowResolution
+                        && rememberedWindowResolution.hadRememberedTitle
+                        && rememberedWindowResolution.status === 'trusted-live-stream'
+                        && !rememberedWindowResolution.sourceId);
                     if (rememberedWindowCaptureBlocked && !rememberedWindowNeedsPromptPicker) {
                         showRememberedWindowUnavailable();
                         return { rememberedWindowUnavailable: true };
                     }
                     var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution
                         && rememberedWindowResolution.hadRememberedTitle);
+                    var skipNativeRememberedCapture = rememberedWindowNeedsPromptPicker
+                        || rememberedWindowUsesTrustedLiveStream;
 
-                    // prompt-backed remembered sources need a fresh user choice. Do not
-                    // let a persisted ID reach any native fast path before that picker.
-                    if (!rememberedWindowNeedsPromptPicker) {
+                    // Prompt-backed sources either need a fresh user choice or already
+                    // have a trusted stream without a source ID. Neither may reach a
+                    // native fast path that would choose a default desktop source.
+                    if (!skipNativeRememberedCapture) {
                         // Electron 桌面端优先交给 PC 壳的独立截图编辑窗口。它覆盖当前显示器，
                         // 不改变聊天框/Pet 窗口尺寸，也不会把冻结画面塞进聊天窗口内裁剪。
                         var desktopRegionResult = await captureDesktopRegionDirectly();

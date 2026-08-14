@@ -180,6 +180,11 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
         screenshot_once.index("captureDesktopRegionDirectly()")
     )
     assert "rememberedWindowNeedsPromptPicker" in screenshot_once
+    assert "rememberedWindowUsesTrustedLiveStream" in screenshot_once
+    assert "skipNativeRememberedCapture" in screenshot_once
+    assert screenshot_once.index("skipNativeRememberedCapture") < (
+        screenshot_once.index("captureDesktopRegionDirectly()")
+    )
     assert "return { rememberedWindowUnavailable: true };" in screenshot_once
 
     pending_once = buttons_source.split(

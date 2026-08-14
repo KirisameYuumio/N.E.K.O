@@ -114,7 +114,6 @@
         try {
             var value = String(title || '').trim();
             if (!value || value.length > MAX_REMEMBERED_WINDOW_TITLE_LENGTH) {
-                localStorage.removeItem(SCREEN_SOURCE_WINDOW_TITLE_KEY);
                 return false;
             }
             localStorage.setItem(SCREEN_SOURCE_WINDOW_TITLE_KEY, value);
@@ -405,8 +404,9 @@
                     // The renderer already proved this source's identity. Window titles
                     // commonly change with the active document/tab, so keep the trusted
                     // source and advance the single remembered-title record with it.
-                    storeRememberedWindowTitle(selectedSource.name);
-                    result.status = 'retitled-trusted-current';
+                    result.status = storeRememberedWindowTitle(selectedSource.name)
+                        ? 'retitled-trusted-current'
+                        : 'title-update-rejected';
                     result.sourceId = selectedSource.id;
                     return result;
                 }
@@ -472,7 +472,9 @@
 
     function rememberedWindowResolutionNeedsSelection(result) {
         return !!(result && result.hadRememberedTitle
-            && (result.status === 'missing' || result.status === 'ambiguous'));
+            && (result.status === 'missing'
+                || result.status === 'ambiguous'
+                || result.status === 'title-update-rejected'));
     }
     mod.rememberedWindowResolutionNeedsSelection = rememberedWindowResolutionNeedsSelection;
 
@@ -482,7 +484,8 @@
             || result.status === 'ambiguous'
             || result.status === 'prompt-required'
             || result.status === 'provider-unavailable'
-            || result.status === 'enumeration-failed';
+            || result.status === 'enumeration-failed'
+            || result.status === 'title-update-rejected';
     }
     mod.rememberedWindowResolutionBlocksAutomaticCapture = rememberedWindowResolutionBlocksAutomaticCapture;
 

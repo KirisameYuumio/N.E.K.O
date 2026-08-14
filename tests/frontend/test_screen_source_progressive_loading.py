@@ -1265,6 +1265,55 @@ def test_forced_capture_resolution_keeps_trusted_window_after_title_change(
 
 
 @pytest.mark.frontend
+def test_trusted_window_rejects_an_overlong_live_title_without_dropping_memory(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const first = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider
+                );
+            window.__metadataSources[1].name = 'X'.repeat(513);
+            const second = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                firstStatus: first.status,
+                secondStatus: second.status,
+                selectedId: window.appState.selectedScreenSourceId,
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                needsSelection: window.appScreen
+                    .rememberedWindowResolutionNeedsSelection(second),
+                blocksAutomatic: window.appScreen
+                    .rememberedWindowResolutionBlocksAutomaticCapture(second),
+            };
+        }"""
+    )
+    assert result == {
+        "firstStatus": "matched",
+        "secondStatus": "title-update-rejected",
+        "selectedId": "window:2",
+        "rememberedTitle": "Editor",
+        "needsSelection": True,
+        "blocksAutomatic": True,
+    }
+
+
+@pytest.mark.frontend
 def test_remembered_title_wins_when_an_old_source_id_is_reused(page: Page) -> None:
     _install_screen_source_harness(
         page,
