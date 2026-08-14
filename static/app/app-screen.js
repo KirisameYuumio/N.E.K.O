@@ -134,6 +134,7 @@
             return true;
         } catch (error) {
             console.warn('[屏幕源] 无法保存窗口标题:', error);
+            clearRememberedWindowTitle();
             return false;
         }
     }
@@ -158,7 +159,11 @@
         var options = document.querySelectorAll('.screen-source-option');
         for (var i = 0; i < options.length; i += 1) {
             if (options[i].dataset.sourceId === selectedId) {
-                if (storeRememberedWindowTitle(options[i].dataset.sourceName || '')) {
+                var sourceTitle = normalizeRememberedWindowTitleForStorage(
+                    options[i].dataset.sourceName || ''
+                );
+                if (!sourceTitle) continue;
+                if (storeRememberedWindowTitle(sourceTitle)) {
                     trustedRememberedWindowSourceId = selectedId;
                     return true;
                 }

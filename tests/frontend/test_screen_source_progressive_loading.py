@@ -1606,6 +1606,86 @@ def test_window_selection_and_toggle_bound_the_remembered_title(page: Page) -> N
 
 
 @pytest.mark.frontend
+def test_new_window_selection_clears_stale_title_when_storage_write_fails(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "selectedScreenSourceId": "window:2",
+            "selectedScreenWindowTitle": "Editor",
+            "screenSourceTitleMatchEnabled": "true",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const originalSetItem = window.localStorage.setItem.bind(
+                window.localStorage
+            );
+            window.localStorage.setItem = (key, value) => {
+                if (key === 'selectedScreenWindowTitle') {
+                    throw new Error('quota exceeded');
+                }
+                originalSetItem(key, value);
+            };
+            await window.selectScreenSource('window:3', 'Browser', 'Browser');
+            return {
+                selectedId: window.appState.selectedScreenSourceId,
+                persistedId: window.__storedValues.get('selectedScreenSourceId'),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+            };
+        }"""
+    )
+
+    assert result == {
+        "selectedId": "window:3",
+        "persistedId": "window:3",
+        "rememberedTitle": None,
+    }
+
+
+@pytest.mark.frontend
+def test_enabling_remember_skips_stale_dom_option_without_source_title(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(page, source_enumeration_may_prompt=True)
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """async () => {
+            await window.selectScreenSource('window:2', 'Editor', 'Editor');
+            const staleOption = document.createElement('div');
+            staleOption.className = 'screen-source-option';
+            staleOption.dataset.sourceId = 'window:2';
+            document.body.insertBefore(
+                staleOption,
+                document.getElementById('live2d-popup-screen')
+            );
+            window.setScreenSourceTitleMatchEnabled(true);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            return {
+                enabled: window.isScreenSourceTitleMatchEnabled(),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+            };
+        }"""
+    )
+
+    assert result == {
+        "enabled": True,
+        "rememberedTitle": "Editor",
+    }
+
+
+@pytest.mark.frontend
 def test_enabling_remember_while_loading_commits_only_after_title_is_available(
     page: Page,
 ) -> None:
