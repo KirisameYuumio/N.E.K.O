@@ -2355,6 +2355,17 @@
 
         // 策略2: 后端不可用，尝试前端流（用户手势上下文，可弹 getDisplayMedia）
         var stream = await acquireOrReuseCachedStream({ allowPrompt: true });
+        if (stream && stream.rememberedWindowUnavailable) {
+            if (typeof window.showStatusToast === 'function') {
+                window.showStatusToast(
+                    window.t
+                        ? window.t('app.screenSource.rememberedWindowUnavailable')
+                        : '无法唯一找到记住的窗口，请重新选择屏幕来源',
+                    4000
+                );
+            }
+            return false;
+        }
         if (stream) {
             console.log('[主动视觉] 前端流获取/复用成功');
             return true;

@@ -655,6 +655,80 @@ def test_required_remembered_window_stream_does_not_fall_back_after_source_close
 
 
 @pytest.mark.frontend
+def test_derived_remembered_window_constraint_returns_reselection_after_source_closes(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const initial = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            window.__metadataSources = window.__metadataSources.filter(
+                (source) => source.id !== 'window:2'
+            );
+            window.__thumbnailResolve(window.__metadataSources);
+            let getUserMediaCalls = 0;
+            let getDisplayMediaCalls = 0;
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    getUserMedia() {
+                        getUserMediaCalls += 1;
+                        throw new Error('must not capture a fallback screen');
+                    },
+                    getDisplayMedia() {
+                        getDisplayMediaCalls += 1;
+                        throw new Error('must not open a fallback picker');
+                    },
+                },
+            });
+
+            const stream = await window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: true,
+            });
+            return {
+                initialStatus: initial.status,
+                rememberedWindowUnavailable: Boolean(
+                    stream && stream.rememberedWindowUnavailable
+                ),
+                selectedId: window.appState.selectedScreenSourceId,
+                getUserMediaCalls,
+                getDisplayMediaCalls,
+                captureCalls: window.__captureCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "initialStatus": "matched",
+        "rememberedWindowUnavailable": True,
+        "selectedId": None,
+        "getUserMediaCalls": 0,
+        "getDisplayMediaCalls": 0,
+        "captureCalls": [
+            {
+                "types": ["window", "screen"],
+                "thumbnailSize": {"width": 0, "height": 0},
+            },
+            {
+                "types": ["window", "screen"],
+                "thumbnailSize": {"width": 1, "height": 1},
+            },
+        ],
+    }
+
+
+@pytest.mark.frontend
 def test_capture_resolution_releases_cached_stream_when_title_restores_new_id(
     page: Page,
 ) -> None:

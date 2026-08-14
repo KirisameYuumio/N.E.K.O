@@ -3732,6 +3732,10 @@
                 if (typeof window.acquireOrReuseCachedStream === 'function') {
                     try {
                         var acqStream = await window.acquireOrReuseCachedStream({ allowPrompt: false });
+                        if (acqStream && acqStream.rememberedWindowUnavailable) {
+                            showRememberedWindowUnavailable();
+                            return null;
+                        }
                         if (acqStream) {
                             var isCached = (acqStream === S.screenCaptureStream);
                             try {
@@ -3923,6 +3927,10 @@
                     if (!dataUrl && typeof window.acquireOrReuseCachedStream === 'function') {
                         try {
                             acquiredStream = await window.acquireOrReuseCachedStream({ allowPrompt: true });
+                            if (acquiredStream && acquiredStream.rememberedWindowUnavailable) {
+                                showRememberedWindowUnavailable();
+                                return { rememberedWindowUnavailable: true };
+                            }
                         } catch (acqErr) {
                             if (acqErr && acqErr.name === 'NotAllowedError') throw acqErr;
                             console.warn('[截图] acquireOrReuseCachedStream 抛错:', acqErr);

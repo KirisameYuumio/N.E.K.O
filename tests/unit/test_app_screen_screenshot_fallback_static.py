@@ -154,5 +154,16 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
         "if (rememberedWindowCaptureConstrained)"
     ) < proactive_vision_once.index("var backendResult = await fetchBackendScreenshot()")
 
-    assert "var requiredSourceId = opts.requiredSourceId || null;" in acquire_once
+    assert "var titleResolution = await reconcileRememberedWindowSourceForCapture" in acquire_once
+    assert "titleResolution.sourceId" in acquire_once
+    assert "rememberedWindowUnavailable: true" in acquire_once
+    assert "titleResolution.status !== 'prompt-required'" in acquire_once
     assert "if (requiredSourceId) {" in acquire_once
+    assert "acqStream.rememberedWindowUnavailable" in recapture_once
+    assert "acquiredStream.rememberedWindowUnavailable" in screenshot_once
+    assert recapture_once.index("acqStream.rememberedWindowUnavailable") < recapture_once.index(
+        "var result = await window.fetchBackendScreenshot()"
+    )
+    assert screenshot_once.index(
+        "acquiredStream.rememberedWindowUnavailable"
+    ) < screenshot_once.index("var backendResult = await window.fetchBackendScreenshot()")
