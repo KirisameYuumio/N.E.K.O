@@ -179,7 +179,7 @@
         }
     }
 
-    function getScreenSourceMetadataWithTimeout(provider) {
+    function getScreenSourceMetadataWithTimeout(provider, sourceOptions) {
         var configuredTimeoutMs = Number(C && C.SCREEN_SOURCE_THUMBNAIL_TIMEOUT);
         var timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
             ? configuredTimeoutMs
@@ -187,7 +187,7 @@
         return window.invokeDesktopCaptureWithTimeout(
             provider,
             'getSources',
-            [{
+            [sourceOptions || {
                 types: ['window', 'screen'],
                 thumbnailSize: { width: 0, height: 0 }
             }],
@@ -938,6 +938,7 @@
             try {
                 var timedOut = false;
                 var acquiredSourceId = null;
+                var selectionClearedByThisAttempt = false;
                 var newStream = await Promise.race([
                     (async function () {
                         var captureSourceId = selectedSourceId;
@@ -946,10 +947,13 @@
                         // sharing dialog. Trust the source selected by the preceding
                         // user gesture and let getUserMedia report a stale id instead.
                         if (!desktopSourceEnumerationMayPrompt(desktopProvider)) {
-                            var currentSources = await desktopProvider.getSources({
+                            var currentSources = await getScreenSourceMetadataWithTimeout(desktopProvider, {
                                 types: ['window', 'screen'],
                                 thumbnailSize: { width: 1, height: 1 }
                             });
+                            if (timedOut || S.selectedScreenSourceId !== selectedSourceId) {
+                                return null;
+                            }
                             var sourceExists = currentSources.some(function (s) { return s.id === selectedSourceId; });
 
                             if (!sourceExists) {
@@ -959,6 +963,7 @@
                                 // 直接捕获 "Source not found") 和 Priority 2 的 Electron
                                 // getUserMedia（会跑到 500ms 超时），整条失败链路每次重放。
                                 clearSelectedScreenSource('getSources 未找到该源');
+                                selectionClearedByThisAttempt = true;
                                 if (requiredSourceId) {
                                     return unavailableRememberedWindowResult();
                                 }
@@ -982,9 +987,12 @@
                                 }
                             }
                         });
-                        // 超时后晚到的流需要立即释放，防止资源泄漏
-                        if (timedOut) {
-                            console.warn('[acquireStream] getUserMedia 在超时后返回，释放晚到的流');
+                        var selectionStillOwned = selectionClearedByThisAttempt
+                            ? S.selectedScreenSourceId == null
+                            : S.selectedScreenSourceId === selectedSourceId;
+                        // 超时或用户换源后晚到的流需要立即释放，防止资源泄漏及旧任务覆盖新选择。
+                        if (timedOut || !selectionStillOwned) {
+                            console.warn('[acquireStream] getUserMedia 在任务失效后返回，释放晚到的流');
                             stream.getTracks().forEach(function (t) { t.stop(); });
                             return null;
                         }
@@ -1045,6 +1053,9 @@
                     audio: false,
                 });
 
+                if (promptRequiredRememberedPicker && S.selectedScreenSourceId) {
+                    clearSelectedScreenSource('prompt picker replaced stale source');
+                }
                 if (opts.allowPrompt && titleResolution && titleResolution.hadRememberedTitle) {
                     rememberPromptConfirmedRememberedWindowStream(displayStream);
                 }
@@ -1794,7 +1805,10 @@
                     // Default to the first monitor when no source is persisted.
                     if (!selectedSourceId && isNativeFrameProvider(desktopProvider)) {
                         try {
-                            var initialScreens = await desktopProvider.getSources({ types: ['screen'] });
+                            var initialScreens = await getScreenSourceMetadataWithTimeout(
+                                desktopProvider,
+                                { types: ['screen'], thumbnailSize: { width: 0, height: 0 } }
+                            );
                             if (initialScreens && initialScreens.length > 0) {
                                 selectedSourceId = initialScreens[0].id;
                                 S.selectedScreenSourceId = selectedSourceId;
@@ -1812,10 +1826,7 @@
                         && typeof desktopProvider.getSources === 'function') {
                         // 验证选中的源是否仍然存在（窗口可能已关闭）
                         try {
-                            var currentSources = await desktopProvider.getSources({
-                                types: ['window', 'screen'],
-                                thumbnailSize: { width: 0, height: 0 }
-                            });
+                            var currentSources = await getScreenSourceMetadataWithTimeout(desktopProvider);
                             var titleResolution = reconcileRememberedWindowSource(currentSources);
                             selectedSourceId = S.selectedScreenSourceId;
                             var sourceStillExists = currentSources.some(function (s) { return s.id === selectedSourceId; });
@@ -1853,7 +1864,13 @@
                                 console.warn('[屏幕源] 记住的窗口标题无法唯一匹配，停止本次启动并等待用户重新选择');
                             }
                         } catch (validateErr) {
-                            console.warn('[屏幕源] 验证源可用性失败，继续尝试使用保存的源:', validateErr);
+                            if (hasRememberedWindowTitle) {
+                                selectedSourceId = null;
+                                rememberedWindowNeedsSelection = true;
+                                console.warn('[屏幕源] 记住的窗口验证失败，停止本次启动:', validateErr);
+                            } else {
+                                console.warn('[屏幕源] 验证源可用性失败，继续尝试使用保存的源:', validateErr);
+                            }
                         }
                         if (discardCancelledScreenSharingStart(attempt)) return;
                     }
@@ -1908,10 +1925,10 @@
                             // 一次 getDisplayMedia，让用户重新选择来源。
                             if (!sourceEnumerationMayPrompt) {
                                 try {
-                                    var fallbackSources = await desktopProvider.getSources({
-                                        types: ['screen'],
-                                        thumbnailSize: { width: 1, height: 1 }
-                                    });
+                                    var fallbackSources = await getScreenSourceMetadataWithTimeout(
+                                        desktopProvider,
+                                        { types: ['screen'], thumbnailSize: { width: 1, height: 1 } }
+                                    );
                                     if (discardCancelledScreenSharingStart(attempt)) return;
                                     if (fallbackSources.length > 0) {
                                         captureStream = rememberScreenSharingAttemptStream(attempt, await navigator.mediaDevices.getUserMedia({
@@ -1979,6 +1996,9 @@
                                 },
                                 audio: false,
                             }));
+                            if (forceRememberedWindowPicker && S.selectedScreenSourceId) {
+                                clearSelectedScreenSource('prompt picker replaced stale source');
+                            }
                             if (hasRememberedWindowTitle) {
                                 rememberPromptConfirmedRememberedWindowStream(captureStream);
                             }

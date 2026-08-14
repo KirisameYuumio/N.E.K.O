@@ -702,6 +702,8 @@ def test_prompt_required_user_acquisition_discards_unknown_cache_and_opens_picke
                 getUserMediaCalls,
                 getDisplayMediaCalls,
                 resolutionStatus: resolution.status,
+                selectedId: window.appState.selectedScreenSourceId,
+                storedId: window.__storedValues.get('selectedScreenSourceId') || null,
             };
         }"""
     )
@@ -711,6 +713,59 @@ def test_prompt_required_user_acquisition_discards_unknown_cache_and_opens_picke
         "getUserMediaCalls": 0,
         "getDisplayMediaCalls": 1,
         "resolutionStatus": "trusted-live-stream",
+        "selectedId": None,
+        "storedId": None,
+    }
+
+
+@pytest.mark.frontend
+def test_late_source_enumeration_cannot_clear_a_newer_selection(page: Page) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={"selectedScreenSourceId": "window:old"},
+    )
+
+    result = page.evaluate(
+        """async () => {
+            let getUserMediaCalls = 0;
+            window.__desktopProvider.getSources = () => new Promise((resolve) => {
+                setTimeout(() => resolve([
+                    { id: 'screen:1', name: 'Entire Screen' },
+                ]), 650);
+            });
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    async getUserMedia() {
+                        getUserMediaCalls += 1;
+                        return {
+                            active: true,
+                            getTracks: () => [],
+                            getVideoTracks: () => [],
+                        };
+                    },
+                },
+            });
+
+            const acquisition = window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: false,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 540));
+            window.appState.selectedScreenSourceId = 'window:new';
+            window.__storedValues.set('selectedScreenSourceId', 'window:new');
+            await acquisition;
+            await new Promise((resolve) => setTimeout(resolve, 180));
+            return {
+                selectedId: window.appState.selectedScreenSourceId,
+                storedId: window.__storedValues.get('selectedScreenSourceId') || null,
+                getUserMediaCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "selectedId": "window:new",
+        "storedId": "window:new",
+        "getUserMediaCalls": 0,
     }
 
 

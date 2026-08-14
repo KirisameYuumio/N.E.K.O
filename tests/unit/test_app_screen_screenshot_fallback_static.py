@@ -86,6 +86,12 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     assert start_once.index("sourceEnumerationMayPrompt && hasRememberedWindowTitle") < (
         start_once.index("var selectedSourceId = forceRememberedWindowPicker")
     )
+    assert "getScreenSourceMetadataWithTimeout(desktopProvider)" in start_once
+    validation_catch = start_once.split("} catch (validateErr) {", 1)[1].split(
+        "if (discardCancelledScreenSharingStart(attempt))", 1
+    )[0]
+    assert "if (hasRememberedWindowTitle)" in validation_catch
+    assert "rememberedWindowNeedsSelection = true;" in validation_catch
 
 
 @pytest.mark.unit
@@ -109,6 +115,8 @@ def test_remembered_metadata_promises_and_cached_constraints_are_bounded():
     assert acquire.count("isPromptConfirmedRememberedWindowStream(") == 1
     assert "promptRequiredRememberedPicker" in acquire
     assert "&& !promptRequiredRememberedPicker" in acquire
+    assert "timedOut || S.selectedScreenSourceId !== selectedSourceId" in acquire
+    assert "clearSelectedScreenSource('prompt picker replaced stale source')" in acquire
 
 
 @pytest.mark.unit
@@ -126,7 +134,7 @@ def test_remembered_window_manual_share_never_widens_after_capture_failure():
     assert "if (hasRememberedWindowTitle)" in capture_fallback
     assert "app.screenSource.rememberedWindowUnavailable" in capture_fallback
     assert capture_fallback.index("if (hasRememberedWindowTitle)") < capture_fallback.index(
-        "desktopProvider.getSources({"
+        "getScreenSourceMetadataWithTimeout("
     )
     assert capture_fallback.index("if (hasRememberedWindowTitle)") < capture_fallback.index(
         "navigator.mediaDevices.getDisplayMedia({"
