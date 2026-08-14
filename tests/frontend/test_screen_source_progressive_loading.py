@@ -670,6 +670,76 @@ def test_prompt_provider_reuses_only_registered_trusted_remembered_stream(
 
 
 @pytest.mark.frontend
+def test_prompt_provider_reuses_user_confirmed_remembered_picker_stream(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const track = {
+                readyState: 'live',
+                stop() {},
+                addEventListener() {},
+            };
+            const pickerStream = {
+                active: true,
+                getTracks: () => [track],
+                getVideoTracks: () => [track],
+            };
+            let getDisplayMediaCalls = 0;
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    async getDisplayMedia() {
+                        getDisplayMediaCalls += 1;
+                        return pickerStream;
+                    },
+                },
+            });
+
+            const acquired = await window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: true,
+            });
+            const resolution = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            const reused = await window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: false,
+            });
+            return {
+                acquiredPickerStream: acquired === pickerStream,
+                resolutionStatus: resolution.status,
+                resolutionSourceId: resolution.sourceId,
+                blocksAutomatic: window.appScreen
+                    .rememberedWindowResolutionBlocksAutomaticCapture(resolution),
+                reusedPickerStream: reused === pickerStream,
+                getDisplayMediaCalls,
+                captureCalls: window.__captureCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "acquiredPickerStream": True,
+        "resolutionStatus": "trusted-live-stream",
+        "resolutionSourceId": None,
+        "blocksAutomatic": False,
+        "reusedPickerStream": True,
+        "getDisplayMediaCalls": 1,
+        "captureCalls": [],
+    }
+
+
+@pytest.mark.frontend
 def test_required_remembered_window_stream_does_not_fall_back_after_source_closes(
     page: Page,
 ) -> None:
@@ -1052,6 +1122,139 @@ def test_window_selection_and_toggle_bound_the_remembered_title(page: Page) -> N
         "rememberedAfterWindow": "Editor",
         "enabledAfterDisable": False,
         "hasRememberedTitleAfterDisable": False,
+    }
+
+
+@pytest.mark.frontend
+def test_enabling_remember_while_loading_commits_only_after_title_is_available(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={"selectedScreenSourceId": "window:2"},
+    )
+    page.evaluate(
+        """() => {
+            let resolveMetadata;
+            window.__pendingMetadata = new Promise((resolve) => {
+                resolveMetadata = resolve;
+            });
+            window.__resolvePendingMetadata = resolveMetadata;
+            window.__desktopProvider.getSources = (options) => {
+                window.__captureCalls.push(options);
+                return window.__pendingMetadata;
+            };
+        }"""
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const popup = document.getElementById('live2d-popup-screen');
+            const renderPromise = window.renderFloatingScreenSourceList(popup);
+            window.setScreenSourceTitleMatchEnabled(true);
+            const enabledBeforeMetadata = window.isScreenSourceTitleMatchEnabled();
+            popup.remove();
+            window.__resolvePendingMetadata(window.__metadataSources);
+            const rendered = await renderPromise;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            return {
+                enabledBeforeMetadata,
+                enabledAfterMetadata: window.isScreenSourceTitleMatchEnabled(),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                rendered,
+                captureCalls: window.__captureCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "enabledBeforeMetadata": False,
+        "enabledAfterMetadata": True,
+        "rememberedTitle": "Editor",
+        "rendered": False,
+        "captureCalls": [
+            {
+                "types": ["window", "screen"],
+                "thumbnailSize": {"width": 0, "height": 0},
+            }
+        ],
+    }
+
+
+@pytest.mark.frontend
+def test_disabling_remember_cancels_pending_metadata_commit(page: Page) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={"selectedScreenSourceId": "window:2"},
+    )
+    page.evaluate(
+        """() => {
+            let resolveMetadata;
+            window.__pendingMetadata = new Promise((resolve) => {
+                resolveMetadata = resolve;
+            });
+            window.__resolvePendingMetadata = resolveMetadata;
+            window.__desktopProvider.getSources = () => window.__pendingMetadata;
+        }"""
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const popup = document.getElementById('live2d-popup-screen');
+            const renderPromise = window.renderFloatingScreenSourceList(popup);
+            window.setScreenSourceTitleMatchEnabled(true);
+            window.setScreenSourceTitleMatchEnabled(false);
+            window.__resolvePendingMetadata(window.__metadataSources);
+            await renderPromise;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            return {
+                enabled: window.isScreenSourceTitleMatchEnabled(),
+                hasRememberedTitle: window.__storedValues.has(
+                    'selectedScreenWindowTitle'
+                ),
+            };
+        }"""
+    )
+    assert result == {
+        "enabled": False,
+        "hasRememberedTitle": False,
+    }
+
+
+@pytest.mark.frontend
+def test_pending_remember_enable_is_bounded_by_metadata_timeout(page: Page) -> None:
+    _install_screen_source_harness(
+        page,
+        thumbnail_timeout_ms=25,
+        initial_storage={"selectedScreenSourceId": "window:2"},
+    )
+    page.evaluate(
+        """() => {
+            window.__desktopProvider.getSources = () => new Promise(() => {});
+        }"""
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const popup = document.getElementById('live2d-popup-screen');
+            const renderPromise = window.renderFloatingScreenSourceList(popup);
+            window.setScreenSourceTitleMatchEnabled(true);
+            const rendered = await renderPromise;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            return {
+                rendered,
+                enabled: window.isScreenSourceTitleMatchEnabled(),
+                hasRememberedTitle: window.__storedValues.has(
+                    'selectedScreenWindowTitle'
+                ),
+            };
+        }"""
+    )
+    assert result == {
+        "rendered": False,
+        "enabled": False,
+        "hasRememberedTitle": False,
     }
 
 

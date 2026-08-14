@@ -124,7 +124,7 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     ) < recapture_once.index("var selectedSourceId = S.selectedScreenSourceId;")
     assert "{ forceValidation: true }" in recapture_once
     assert recapture_once.index(
-        "rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)"
+        "rememberedWindowResolutionBlocksAutomaticCapture"
     ) < recapture_once.index("'captureSourceWithoutNeko'")
 
     screenshot_once = buttons_source.split(
@@ -151,7 +151,7 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     )[1].split("mod.captureProactiveChatScreenshotWithSource", 1)[0]
     assert proactive_once.index(
         ".reconcileRememberedWindowSourceForCapture("
-    ) < proactive_once.index("if (S.screenCaptureStream && S.screenCaptureStream.active)")
+    ) < proactive_once.index("var cachedStream = S.screenCaptureStream;")
     assert "{ forceValidation: true }" in proactive_once
     assert proactive_once.index(
         "rememberedWindowResolutionBlocksAutomaticCapture(rememberedWindowResolution)"
@@ -197,3 +197,52 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     assert screenshot_once.index(
         "if (rememberedWindowCaptureConstrained)"
     ) < screenshot_once.index("var backendResult = await window.fetchBackendScreenshot()")
+
+
+@pytest.mark.unit
+def test_automatic_capture_paths_enforce_remembered_constraints_before_fast_paths():
+    buttons_source = APP_BUTTONS_JS.read_text(encoding="utf-8")
+    proactive_source = APP_PROACTIVE_JS.read_text(encoding="utf-8")
+
+    recapture_once = buttons_source.split(
+        "async function recaptureWithoutNeko()", 1
+    )[1].split("var _captureScreenshotDataUrlBusy", 1)[0]
+    assert "rememberedWindowResolutionBlocksAutomaticCapture" in recapture_once
+    assert recapture_once.index(
+        "rememberedWindowResolutionBlocksAutomaticCapture"
+    ) < recapture_once.index("'captureSourceWithoutNeko'")
+
+    proactive_once = proactive_source.split(
+        "async function captureProactiveChatScreenshotWithSource()", 1
+    )[1].split("mod.captureProactiveChatScreenshotWithSource", 1)[0]
+    cached_fast_path = proactive_once.split(
+        "// 策略 0a:", 1
+    )[1].split("// 策略 0b:", 1)[0]
+    assert "requiredSourceId: rememberedWindowSourceId" in cached_fast_path
+    assert cached_fast_path.index("acquireOrReuseCachedStream({") < cached_fast_path.index(
+        "captureFrameFromStream(cachedStream"
+    )
+    native_fast_path = proactive_once.split(
+        "// 策略 0b:", 1
+    )[1].split("// 策略1:", 1)[0]
+    assert "canUseRememberedNativeSource" in native_fast_path
+    assert "S.selectedScreenSourceId === rememberedWindowSourceId" in native_fast_path
+
+
+@pytest.mark.unit
+def test_proactive_vision_remembered_window_acquires_stream_before_backend_shortcut():
+    proactive_source = APP_PROACTIVE_JS.read_text(encoding="utf-8")
+    acquire_once = proactive_source.split(
+        "async function acquireProactiveVisionStream()", 1
+    )[1].split("mod.acquireProactiveVisionStream", 1)[0]
+
+    assert "hasRememberedWindowTitlePreference" in acquire_once
+    assert acquire_once.index("hasRememberedWindowTitlePreference") < acquire_once.index(
+        "fetchBackendScreenshot()"
+    )
+    assert acquire_once.index("acquireOrReuseCachedStream({ allowPrompt: true })") < acquire_once.index(
+        "fetchBackendScreenshot()"
+    )
+    assert acquire_once.index("if (rememberedWindowCaptureConstrained)") < acquire_once.index(
+        "fetchBackendScreenshot()"
+    )

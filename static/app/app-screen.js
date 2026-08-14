@@ -24,10 +24,13 @@
     const MAX_REMEMBERED_WINDOW_TITLE_LENGTH = 512;
     var trustedRememberedWindowSourceId = null;
     var rememberedWindowCaptureReconcilePromise = null;
+    var screenSourceMetadataLoadPromise = null;
+    var screenSourceTitleMatchEnableGeneration = 0;
     // Associate only streams created for an explicit Electron desktop source
     // with that source ID. WeakMap does not retain streams after their normal
     // capture lifecycle ends, so this proof cannot grow into a strong registry.
     var screenCaptureStreamSourceIds = typeof WeakMap === 'function' ? new WeakMap() : null;
+    var promptConfirmedRememberedWindowStreams = typeof WeakSet === 'function' ? new WeakSet() : null;
 
     function rememberScreenCaptureStreamSource(stream, sourceId) {
         if (screenCaptureStreamSourceIds && stream && sourceId) {
@@ -39,6 +42,18 @@
     function screenCaptureStreamMatchesSource(stream, sourceId) {
         return !!(screenCaptureStreamSourceIds && stream && sourceId
             && screenCaptureStreamSourceIds.get(stream) === sourceId);
+    }
+
+    function rememberPromptConfirmedRememberedWindowStream(stream) {
+        if (promptConfirmedRememberedWindowStreams && stream) {
+            promptConfirmedRememberedWindowStreams.add(stream);
+        }
+        return stream;
+    }
+
+    function isPromptConfirmedRememberedWindowStream(stream) {
+        return !!(promptConfirmedRememberedWindowStreams && stream
+            && promptConfirmedRememberedWindowStreams.has(stream));
     }
 
     function hasLiveScreenCaptureTrack(stream) {
@@ -60,6 +75,12 @@
             return false;
         }
     }
+
+    function hasRememberedWindowTitlePreference() {
+        return isScreenSourceTitleMatchEnabled()
+            && !!normalizeScreenSourceTitle(readRememberedWindowTitle());
+    }
+    mod.hasRememberedWindowTitlePreference = hasRememberedWindowTitlePreference;
 
     function readRememberedWindowTitle() {
         try {
@@ -101,34 +122,108 @@
 
     function rememberCurrentlySelectedWindowFromDom() {
         var selectedId = S.selectedScreenSourceId;
-        if (!selectedId || !selectedId.startsWith('window:')) return;
+        if (!selectedId || !selectedId.startsWith('window:')) return false;
         var options = document.querySelectorAll('.screen-source-option');
         for (var i = 0; i < options.length; i += 1) {
             if (options[i].dataset.sourceId === selectedId) {
                 if (storeRememberedWindowTitle(options[i].dataset.sourceName || '')) {
                     trustedRememberedWindowSourceId = selectedId;
+                    return true;
                 }
-                return;
+                return false;
             }
+        }
+        return false;
+    }
+
+    function rememberCurrentlySelectedWindowFromSources(sources) {
+        var selectedId = S.selectedScreenSourceId;
+        if (!selectedId || !selectedId.startsWith('window:') || !Array.isArray(sources)) {
+            return false;
+        }
+        var selectedSource = sources.find(function (source) {
+            return source && source.id === selectedId && source.id.startsWith('window:');
+        });
+        if (!selectedSource || !storeRememberedWindowTitle(selectedSource.name || '')) {
+            return false;
+        }
+        trustedRememberedWindowSourceId = selectedId;
+        return true;
+    }
+
+    function commitScreenSourceTitleMatchEnabled() {
+        try {
+            localStorage.setItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY, 'true');
+            return true;
+        } catch (error) {
+            console.warn('[屏幕源] 无法保存标题匹配设置:', error);
+            return false;
         }
     }
 
+    function beginScreenSourceMetadataLoad(provider) {
+        var configuredTimeoutMs = Number(C && C.SCREEN_SOURCE_THUMBNAIL_TIMEOUT);
+        var timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+            ? configuredTimeoutMs
+            : 15000;
+        var timeoutId = null;
+        var providerPromise = Promise.resolve(provider.getSources({
+            types: ['window', 'screen'],
+            thumbnailSize: { width: 0, height: 0 }
+        }));
+        var boundedPromise = Promise.race([
+            providerPromise,
+            new Promise(function (_, reject) {
+                timeoutId = setTimeout(function () {
+                    reject(new Error('Screen source metadata timeout'));
+                }, timeoutMs);
+            })
+        ]).finally(function () {
+            if (timeoutId !== null) clearTimeout(timeoutId);
+        });
+        screenSourceMetadataLoadPromise = boundedPromise;
+        return boundedPromise;
+    }
+
     function setScreenSourceTitleMatchEnabled(enabled) {
-        try {
-            if (enabled) {
-                localStorage.setItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY, 'true');
-            } else {
-                localStorage.removeItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY);
+        screenSourceTitleMatchEnableGeneration += 1;
+        var enableGeneration = screenSourceTitleMatchEnableGeneration;
+        if (!enabled) {
+            try { localStorage.removeItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY); } catch (error) {
+                console.warn('[屏幕源] 无法保存标题匹配设置:', error);
             }
-        } catch (error) {
-            console.warn('[屏幕源] 无法保存标题匹配设置:', error);
-        }
-        if (enabled) {
-            rememberCurrentlySelectedWindowFromDom();
-        } else {
             clearRememberedWindowTitle();
+            updateScreenSourceTitleMatchToggleState();
+            return;
         }
-        updateScreenSourceTitleMatchToggleState();
+
+        // Commit the enabled flag only after the selected window title is
+        // available. During progressive loading, reuse the in-flight metadata
+        // request rather than issuing another enumeration (which may prompt).
+        try { localStorage.removeItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY); } catch (_) { }
+        if (rememberCurrentlySelectedWindowFromDom()) {
+            commitScreenSourceTitleMatchEnabled();
+            updateScreenSourceTitleMatchToggleState();
+            return;
+        }
+
+        var pendingMetadata = screenSourceMetadataLoadPromise;
+        if (!pendingMetadata) {
+            updateScreenSourceTitleMatchToggleState();
+            return;
+        }
+        Promise.resolve(pendingMetadata).then(function (sources) {
+            if (enableGeneration !== screenSourceTitleMatchEnableGeneration) return;
+            if (rememberCurrentlySelectedWindowFromSources(sources)) {
+                commitScreenSourceTitleMatchEnabled();
+            }
+        }).catch(function (error) {
+            console.warn('[屏幕源] 等待窗口标题元数据失败:', error);
+        }).finally(function () {
+            if (enableGeneration === screenSourceTitleMatchEnableGeneration) {
+                updateScreenSourceTitleMatchToggleState();
+            }
+        });
     }
 
     window.isScreenSourceTitleMatchEnabled = isScreenSourceTitleMatchEnabled;
@@ -399,6 +494,14 @@
             };
         }
         if (desktopSourceEnumerationMayPrompt(provider)) {
+            if (hasLiveScreenCaptureTrack(S.screenCaptureStream)
+                && isPromptConfirmedRememberedWindowStream(S.screenCaptureStream)) {
+                return {
+                    status: 'trusted-live-stream',
+                    sourceId: null,
+                    hadRememberedTitle: true
+                };
+            }
             if (S.selectedScreenSourceId
                 && trustedRememberedWindowSourceId === S.selectedScreenSourceId
                 && hasLiveScreenCaptureTrack(S.screenCaptureStream)
@@ -753,6 +856,9 @@
         var derivedRememberedWindowConstraint = !!(titleResolution
             && titleResolution.hadRememberedTitle
             && titleResolution.status !== 'prompt-required');
+        var promptConfirmedStreamConstraint = !!(titleResolution
+            && titleResolution.status === 'trusted-live-stream'
+            && isPromptConfirmedRememberedWindowStream(S.screenCaptureStream));
         var requiredSourceId = opts.requiredSourceId
             || (derivedRememberedWindowConstraint ? titleResolution.sourceId : null);
         function unavailableRememberedWindowResult() {
@@ -760,7 +866,8 @@
                 ? null
                 : { rememberedWindowUnavailable: true };
         }
-        if (derivedRememberedWindowConstraint && !requiredSourceId) {
+        if (derivedRememberedWindowConstraint && !requiredSourceId
+            && !promptConfirmedStreamConstraint) {
             return unavailableRememberedWindowResult();
         }
         if (requiredSourceId && S.selectedScreenSourceId !== requiredSourceId) {
@@ -773,6 +880,10 @@
             if (tracks.length > 0 && tracks.some(function (t) { return t.readyState === 'live'; })) {
                 if (requiredSourceId
                     && !screenCaptureStreamMatchesSource(S.screenCaptureStream, requiredSourceId)) {
+                    return unavailableRememberedWindowResult();
+                }
+                if (promptConfirmedStreamConstraint
+                    && !isPromptConfirmedRememberedWindowStream(S.screenCaptureStream)) {
                     return unavailableRememberedWindowResult();
                 }
                 S.screenCaptureStreamLastUsed = Date.now();
@@ -900,6 +1011,10 @@
                     video: { cursor: 'always', frameRate: { max: 1 } },
                     audio: false,
                 });
+
+                if (opts.allowPrompt && titleResolution && titleResolution.hadRememberedTitle) {
+                    rememberPromptConfirmedRememberedWindowStream(displayStream);
+                }
 
                 S.screenCaptureStream = displayStream;
                 S.screenCaptureStreamLastUsed = Date.now();
@@ -2229,10 +2344,15 @@
 
             // 第一阶段只枚举来源元数据。Electron 明确允许用 0x0 跳过每个窗口的
             // 缩略图捕获，名称返回后立即绘制，完整图片在第二阶段后台补齐。
-            var sources = await desktopProvider.getSources({
-                types: ['window', 'screen'],
-                thumbnailSize: { width: 0, height: 0 }
-            });
+            var metadataLoadPromise = beginScreenSourceMetadataLoad(desktopProvider);
+            var sources;
+            try {
+                sources = await metadataLoadPromise;
+            } finally {
+                if (screenSourceMetadataLoadPromise === metadataLoadPromise) {
+                    screenSourceMetadataLoadPromise = null;
+                }
+            }
 
             if (!isPopupAvailable()) return false;
 

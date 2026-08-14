@@ -2215,9 +2215,15 @@
             : null;
 
         // 策略 0a: 复用有效缓存流（避免打扰正在进行的屏幕共享）
-        if (S.screenCaptureStream && S.screenCaptureStream.active) {
+        var cachedStream = S.screenCaptureStream;
+        if (rememberedWindowCaptureConstrained) {
+            cachedStream = await acquireOrReuseCachedStream({
+                allowPrompt: false,
+                requiredSourceId: rememberedWindowSourceId
+            });
+        }
+        if (cachedStream && cachedStream.active) {
             try {
-                var cachedStream = S.screenCaptureStream;
                 var cachedSourceId = S.selectedScreenSourceId;
                 var tracks = cachedStream.getVideoTracks();
                 if (tracks.length > 0 && tracks.some(function (t) { return t.readyState === 'live'; })) {
@@ -2237,7 +2243,10 @@
         }
 
         // 策略 0b: 桌面壳直接捕获选中源（Electron / Tauri）
-        if (S.selectedScreenSourceId && desktopProvider
+        var canUseRememberedNativeSource = !rememberedWindowCaptureConstrained
+            || (!!rememberedWindowSourceId
+                && S.selectedScreenSourceId === rememberedWindowSourceId);
+        if (canUseRememberedNativeSource && S.selectedScreenSourceId && desktopProvider
             && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
             // 捕获前钉住源 ID：下面是异步的，事后再读会拿新源解释旧帧。
             var nativeSourceId = S.selectedScreenSourceId;
@@ -2346,6 +2355,34 @@
      * 开启时：优先测试后端 pyautogui（静默无弹窗），不可用则通过前端流获取（用户手势上下文可弹 getDisplayMedia）
      */
     async function acquireProactiveVisionStream() {
+        var rememberedWindowCaptureConstrained = !!(window.appScreen
+            && typeof window.appScreen.hasRememberedWindowTitlePreference === 'function'
+            && window.appScreen.hasRememberedWindowTitlePreference());
+
+        if (rememberedWindowCaptureConstrained) {
+            // This initializer runs from the user's toggle gesture. Establish a
+            // front-end stream now; accepting a backend desktop probe would make
+            // every later automatic frame stop at prompt-required instead.
+            var rememberedStream = await acquireOrReuseCachedStream({ allowPrompt: true });
+            if (rememberedStream && rememberedStream.rememberedWindowUnavailable) {
+                if (typeof window.showStatusToast === 'function') {
+                    window.showStatusToast(
+                        window.t
+                            ? window.t('app.screenSource.rememberedWindowUnavailable')
+                            : '无法唯一找到记住的窗口，请重新选择屏幕来源',
+                        4000
+                    );
+                }
+                return false;
+            }
+            if (rememberedStream) {
+                console.log('[主动视觉] 记忆窗口前端流获取/复用成功');
+                return true;
+            }
+            console.warn('[主动视觉] 无法为记忆窗口建立前端流');
+            return false;
+        }
+
         // 策略1: 测试后端 pyautogui 是否可用（静默，无弹窗）
         var backendResult = await fetchBackendScreenshot();
         if (backendResult.dataUrl) {

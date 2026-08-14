@@ -634,3 +634,113 @@ const settle = () => new Promise((r) => setImmediate(r));
     # Unknown stays unknown, and unknown means "behave as before the gate".
     assert out["stillFalse"] is False
     assert out["callsAfterTtl"] == 2
+
+
+# --------------------------------------------------------------------------
+# Remembered-window proactive acquisition boundaries
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_proactive_chat_does_not_read_an_unassociated_cached_stream():
+    proactive_src = APP_PROACTIVE_PATH.read_text(encoding="utf-8")
+    script = """
+const results = { acquireCalls: 0, frameCalls: 0, backendCalls: 0 };
+const oldStream = {
+  active: true,
+  getVideoTracks: () => [{ readyState: 'live' }],
+  getTracks: () => []
+};
+const S = {
+  screenCaptureStream: oldStream,
+  screenCaptureStreamLastUsed: null,
+  selectedScreenSourceId: 'window:2'
+};
+const window = {
+  appScreen: {
+    reconcileRememberedWindowSourceForCapture: async () => ({
+      status: 'matched',
+      sourceId: 'window:2',
+      hadRememberedTitle: true
+    }),
+    rememberedWindowResolutionBlocksAutomaticCapture: () => false
+  },
+  detectScreenshotCaptureType: () => null,
+  scheduleScreenCaptureIdleCheck: () => {},
+  maybeClearSourceOnNotFound: () => {}
+};
+const getDesktopProvider = () => null;
+const acquireOrReuseCachedStream = async (options) => {
+  results.acquireCalls += 1;
+  results.requiredSourceId = options.requiredSourceId;
+  return null;
+};
+const captureFrameFromStream = async () => {
+  results.frameCalls += 1;
+  return { dataUrl: 'data:image/jpeg;base64,WRONG' };
+};
+const fetchBackendScreenshot = async () => {
+  results.backendCalls += 1;
+  return { dataUrl: 'data:image/jpeg;base64,BACKEND' };
+};
+__RESOLVE__
+__CAPTURE__
+captureProactiveChatScreenshotWithSource().then((shot) => {
+  results.shot = shot;
+  console.log(JSON.stringify(results));
+});
+""".replace("__RESOLVE__", _fn(proactive_src, "resolveCaptureTypeFor")).replace(
+        "__CAPTURE__",
+        _fn(proactive_src, "captureProactiveChatScreenshotWithSource"),
+    )
+    out = _run(script)
+    assert out["acquireCalls"] == 2
+    assert out["requiredSourceId"] == "window:2"
+    assert out["frameCalls"] == 0
+    assert out["backendCalls"] == 0
+    assert out["shot"]["dataUrl"] is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("remembered", "expected_backend_calls", "expected_stream_calls"),
+    [(True, 0, 1), (False, 1, 0)],
+)
+def test_proactive_vision_initialization_prioritizes_remembered_stream(
+    remembered: bool,
+    expected_backend_calls: int,
+    expected_stream_calls: int,
+):
+    proactive_src = APP_PROACTIVE_PATH.read_text(encoding="utf-8")
+    script = """
+const results = { backendCalls: 0, streamCalls: 0 };
+const window = {
+  appScreen: {
+    hasRememberedWindowTitlePreference: () => __REMEMBERED__
+  },
+  showStatusToast: () => {},
+  t: () => ''
+};
+const fetchBackendScreenshot = async () => {
+  results.backendCalls += 1;
+  return { dataUrl: 'data:image/jpeg;base64,BACKEND' };
+};
+const acquireOrReuseCachedStream = async () => {
+  results.streamCalls += 1;
+  return { active: true };
+};
+__ACQUIRE__
+acquireProactiveVisionStream().then((success) => {
+  results.success = success;
+  console.log(JSON.stringify(results));
+});
+""".replace("__REMEMBERED__", str(remembered).lower()).replace(
+        "__ACQUIRE__",
+        _fn(proactive_src, "acquireProactiveVisionStream"),
+    )
+    out = _run(script)
+    assert out == {
+        "backendCalls": expected_backend_calls,
+        "streamCalls": expected_stream_calls,
+        "success": True,
+    }

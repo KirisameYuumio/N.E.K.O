@@ -3647,7 +3647,11 @@
                     { forceValidation: true }
                 );
             }
-            if (rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)) {
+            if (window.appScreen
+                && typeof window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture === 'function'
+                && window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture(
+                    rememberedWindowResolution
+                )) {
                 showRememberedWindowUnavailable();
                 return null;
             }
