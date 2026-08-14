@@ -90,6 +90,13 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     assert start_once.index("sourceEnumerationMayPrompt && hasRememberedWindowTitle") < (
         start_once.index("var selectedSourceId = forceRememberedWindowPicker")
     )
+    native_picker_guard = start_once.index("&& isNativeFrameProvider(desktopProvider))")
+    assert start_once.rfind(
+        "if (forceRememberedWindowPicker", 0, native_picker_guard
+    ) >= 0
+    assert native_picker_guard < start_once.index(
+        "if (!selectedSourceId && isNativeFrameProvider"
+    )
     assert "getScreenSourceMetadataWithTimeout(desktopProvider)" in start_once
     validation_catch = start_once.split("} catch (validateErr) {", 1)[1].split(
         "if (discardCancelledScreenSharingStart(attempt))", 1

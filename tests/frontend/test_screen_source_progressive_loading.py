@@ -770,6 +770,75 @@ def test_late_source_enumeration_cannot_clear_a_newer_selection(page: Page) -> N
 
 
 @pytest.mark.frontend
+def test_stale_remembered_reconciliation_cannot_clear_a_newer_selection(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            let resolveMetadata;
+            window.__desktopProvider.getSources = () => new Promise((resolve) => {
+                resolveMetadata = resolve;
+            });
+            const pending = window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            await window.selectScreenSource(
+                'window:new',
+                'Browser',
+                'Browser'
+            );
+            resolveMetadata([
+                {
+                    id: 'screen:1',
+                    name: 'Entire Screen',
+                    display_id: '1',
+                    thumbnail: null,
+                },
+                {
+                    id: 'window:2',
+                    name: 'Editor',
+                    display_id: '',
+                    thumbnail: null,
+                },
+            ]);
+            const resolution = await pending;
+            return {
+                status: resolution.status,
+                selectedId: window.appState.selectedScreenSourceId,
+                storedId: window.__storedValues.get('selectedScreenSourceId'),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                blocksAutomatic: window.appScreen
+                    .rememberedWindowResolutionBlocksAutomaticCapture(resolution),
+                needsSelection: window.appScreen
+                    .rememberedWindowResolutionNeedsSelection(resolution),
+            };
+        }"""
+    )
+    assert result == {
+        "status": "superseded",
+        "selectedId": "window:new",
+        "storedId": "window:new",
+        "rememberedTitle": "Browser",
+        "blocksAutomatic": True,
+        "needsSelection": True,
+    }
+
+
+@pytest.mark.frontend
 def test_prompt_native_provider_accepts_renderer_trusted_source_without_stream(
     page: Page,
 ) -> None:

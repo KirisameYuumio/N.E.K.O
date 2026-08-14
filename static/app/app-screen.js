@@ -26,6 +26,7 @@
     var rememberedWindowCaptureReconcilePromise = null;
     var screenSourceMetadataLoadPromise = null;
     var screenSourceTitleMatchEnableGeneration = 0;
+    var rememberedWindowStateGeneration = 0;
     // Associate only streams created for an explicit Electron desktop source
     // with that source ID. WeakMap does not retain streams after their normal
     // capture lifecycle ends, so this proof cannot grow into a strong registry.
@@ -110,6 +111,10 @@
         }
     }
 
+    function advanceRememberedWindowStateGeneration() {
+        rememberedWindowStateGeneration += 1;
+    }
+
     function normalizeRememberedWindowTitleForStorage(title) {
         var value = String(title || '').trim();
         return value && value.length <= MAX_REMEMBERED_WINDOW_TITLE_LENGTH
@@ -120,6 +125,7 @@
     function storeRememberedWindowTitle(title) {
         try {
             var value = normalizeRememberedWindowTitleForStorage(title);
+            advanceRememberedWindowStateGeneration();
             if (!value) {
                 localStorage.removeItem(SCREEN_SOURCE_WINDOW_TITLE_KEY);
                 return false;
@@ -133,6 +139,7 @@
     }
 
     function clearRememberedWindowTitle() {
+        advanceRememberedWindowStateGeneration();
         trustedRememberedWindowSourceId = null;
         try { localStorage.removeItem(SCREEN_SOURCE_WINDOW_TITLE_KEY); } catch (_) { }
     }
@@ -210,6 +217,7 @@
     }
 
     function setScreenSourceTitleMatchEnabled(enabled) {
+        advanceRememberedWindowStateGeneration();
         screenSourceTitleMatchEnableGeneration += 1;
         var enableGeneration = screenSourceTitleMatchEnableGeneration;
         if (!enabled) {
@@ -346,6 +354,7 @@
      * 过期 ID 去走必然失败的快路径。
      */
     function clearSelectedScreenSource(reason) {
+        advanceRememberedWindowStateGeneration();
         trustedRememberedWindowSourceId = null;
         if (S.selectedScreenSourceId == null) return;
         releaseCaptureForScreenSourceChange(S.selectedScreenSourceId, null);
@@ -441,6 +450,7 @@
                         S.selectedScreenSourceId,
                         titleMatches[0].id
                     );
+                    advanceRememberedWindowStateGeneration();
                     S.selectedScreenSourceId = titleMatches[0].id;
                     try { localStorage.setItem('selectedScreenSourceId', titleMatches[0].id); } catch (_) { }
                     pushSelectedSourceToMain(titleMatches[0].id);
@@ -494,6 +504,7 @@
         return !!(result && result.hadRememberedTitle
             && (result.status === 'missing'
                 || result.status === 'ambiguous'
+                || result.status === 'superseded'
                 || result.status === 'title-update-rejected'));
     }
     mod.rememberedWindowResolutionNeedsSelection = rememberedWindowResolutionNeedsSelection;
@@ -505,6 +516,7 @@
             || result.status === 'prompt-required'
             || result.status === 'provider-unavailable'
             || result.status === 'enumeration-failed'
+            || result.status === 'superseded'
             || result.status === 'title-update-rejected';
     }
     mod.rememberedWindowResolutionBlocksAutomaticCapture = rememberedWindowResolutionBlocksAutomaticCapture;
@@ -574,9 +586,23 @@
             return rememberedWindowCaptureReconcilePromise;
         }
 
-        rememberedWindowCaptureReconcilePromise = (async function () {
+        var reconciliationGeneration = rememberedWindowStateGeneration;
+        var reconciliationSelectedSourceId = S.selectedScreenSourceId;
+        var reconciliationRememberedTitle = readRememberedWindowTitle();
+        var reconciliationEnabled = isScreenSourceTitleMatchEnabled();
+        var reconciliationPromise = rememberedWindowCaptureReconcilePromise = (async function () {
             try {
                 var sources = await getScreenSourceMetadataWithTimeout(provider);
+                if (reconciliationGeneration !== rememberedWindowStateGeneration
+                    || reconciliationSelectedSourceId !== S.selectedScreenSourceId
+                    || reconciliationRememberedTitle !== readRememberedWindowTitle()
+                    || reconciliationEnabled !== isScreenSourceTitleMatchEnabled()) {
+                    return {
+                        status: 'superseded',
+                        sourceId: S.selectedScreenSourceId,
+                        hadRememberedTitle: hasRememberedWindowTitlePreference()
+                    };
+                }
                 return reconcileRememberedWindowSource(sources);
             } catch (error) {
                 console.warn('[屏幕源] 截图前按标题解析来源失败:', error);
@@ -588,9 +614,11 @@
             }
         })();
         try {
-            return await rememberedWindowCaptureReconcilePromise;
+            return await reconciliationPromise;
         } finally {
-            rememberedWindowCaptureReconcilePromise = null;
+            if (rememberedWindowCaptureReconcilePromise === reconciliationPromise) {
+                rememberedWindowCaptureReconcilePromise = null;
+            }
         }
     }
     mod.reconcileRememberedWindowSourceForCapture = reconcileRememberedWindowSourceForCapture;
@@ -623,11 +651,13 @@
     // 注意：storage 事件在写入它的那个窗口内部并不触发，所以不会产生回环。
     window.addEventListener('storage', function (e) {
         if (e.key === SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY) {
+            advanceRememberedWindowStateGeneration();
             trustedRememberedWindowSourceId = null;
             updateScreenSourceTitleMatchToggleState();
             return;
         }
         if (e.key === SCREEN_SOURCE_WINDOW_TITLE_KEY) {
+            advanceRememberedWindowStateGeneration();
             trustedRememberedWindowSourceId = null;
             return;
         }
@@ -635,6 +665,7 @@
         var newId = e.newValue || null;
         if (S.selectedScreenSourceId === newId) return;
         var oldId = S.selectedScreenSourceId;
+        advanceRememberedWindowStateGeneration();
         trustedRememberedWindowSourceId = null;
         S.selectedScreenSourceId = newId;
         try {
@@ -1840,6 +1871,18 @@
                         ? null
                         : (window.getSelectedScreenSourceId ? window.getSelectedScreenSourceId() : null);
 
+                    if (forceRememberedWindowPicker
+                        && isNativeFrameProvider(desktopProvider)) {
+                        window.showStatusToast(
+                            safeT(
+                                'app.screenSource.rememberedWindowUnavailable',
+                                '无法唯一找到记住的窗口，请重新选择屏幕来源'
+                            ),
+                            4000
+                        );
+                        return;
+                    }
+
                     // Native-frame shells do not expose Chromium's picker.
                     // Default to the first monitor when no source is persisted.
                     if (!selectedSourceId && isNativeFrameProvider(desktopProvider)) {
@@ -2304,6 +2347,7 @@
 
     // ======================== selectScreenSource ========================
     async function selectScreenSource(sourceId, sourceName, displayName) {
+        advanceRememberedWindowStateGeneration();
         S.selectedScreenSourceId = sourceId;
 
         var resolvedSourceName = displayName || sourceName || sourceId;
