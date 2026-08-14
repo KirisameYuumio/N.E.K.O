@@ -114,23 +114,45 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     assert screenshot_once.index(
         "rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)"
     ) < screenshot_once.index("captureDesktopRegionDirectly()")
+    assert "return { rememberedWindowUnavailable: true };" in screenshot_once
+
+    pending_once = buttons_source.split(
+        "mod.captureScreenshotToPendingList = async function captureScreenshotToPendingList()",
+        1,
+    )[1].split("screenshotButton.addEventListener", 1)[0]
+    assert pending_once.index("result.rememberedWindowUnavailable") < pending_once.index(
+        "app.screenshotCancelled"
+    )
 
     proactive_once = proactive_source.split(
         "async function captureProactiveChatScreenshotWithSource()", 1
     )[1].split("mod.captureProactiveChatScreenshotWithSource", 1)[0]
     assert proactive_once.index(
-        ".reconcileRememberedWindowSourceForCapture(desktopProvider)"
+        ".reconcileRememberedWindowSourceForCapture("
     ) < proactive_once.index("if (S.screenCaptureStream && S.screenCaptureStream.active)")
+    assert "{ forceValidation: true }" in proactive_once
     assert proactive_once.index(
-        "rememberedWindowResolutionNeedsSelection(rememberedWindowResolution)"
+        "rememberedWindowResolutionBlocksAutomaticCapture(rememberedWindowResolution)"
     ) < proactive_once.index("fetchBackendScreenshot()")
+    assert "requiredSourceId: rememberedWindowSourceId" in proactive_once
+    assert proactive_once.index("if (rememberedWindowCaptureConstrained)") < proactive_once.index(
+        "var backendResult = await fetchBackendScreenshot()"
+    )
 
     proactive_vision_once = proactive_source.split(
         "async function sendOneProactiveVisionFrame()", 1
     )[1].split("mod.sendOneProactiveVisionFrame", 1)[0]
     assert proactive_vision_once.index(
         "await window.appScreen"
-    ) < proactive_vision_once.index("acquireOrReuseCachedStream({ allowPrompt: false })")
+    ) < proactive_vision_once.index("acquireOrReuseCachedStream({")
+    assert "{ forceValidation: true }" in proactive_vision_once
     assert proactive_vision_once.index(
-        "rememberedWindowResolutionNeedsSelection(rememberedWindowResolution)"
+        "rememberedWindowResolutionBlocksAutomaticCapture(rememberedWindowResolution)"
     ) < proactive_vision_once.index("fetchBackendScreenshot()")
+    assert "requiredSourceId: rememberedWindowSourceId" in proactive_vision_once
+    assert proactive_vision_once.index(
+        "if (rememberedWindowCaptureConstrained)"
+    ) < proactive_vision_once.index("var backendResult = await fetchBackendScreenshot()")
+
+    assert "var requiredSourceId = opts.requiredSourceId || null;" in acquire_once
+    assert "if (requiredSourceId) {" in acquire_once

@@ -1920,14 +1920,22 @@
             if (window.appScreen
                 && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
                 rememberedWindowResolution = await window.appScreen
-                    .reconcileRememberedWindowSourceForCapture(desktopProvider);
+                    .reconcileRememberedWindowSourceForCapture(
+                        desktopProvider,
+                        { forceValidation: true }
+                    );
             }
             if (window.appScreen
-                && typeof window.appScreen.rememberedWindowResolutionNeedsSelection === 'function'
-                && window.appScreen.rememberedWindowResolutionNeedsSelection(rememberedWindowResolution)) {
-                console.warn('[ProactiveVision] 记住的窗口无法唯一恢复，跳过本帧');
+                && typeof window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture === 'function'
+                && window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture(rememberedWindowResolution)) {
+                console.warn('[ProactiveVision] 记住的窗口无法安全验证，跳过本帧');
                 return;
             }
+            var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution
+                && rememberedWindowResolution.hadRememberedTitle);
+            var rememberedWindowSourceId = rememberedWindowCaptureConstrained
+                ? rememberedWindowResolution.sourceId
+                : null;
 
             var dataUrl = null;
             // 这一帧来自哪种画面来源，决定 Avatar 坐标怎么映射到截图坐标系。
@@ -1937,7 +1945,10 @@
             var captureType = null;
 
             // 优先前端流（缓存流 → Electron源 → 不弹窗）
-            var stream = await acquireOrReuseCachedStream({ allowPrompt: false });
+            var stream = await acquireOrReuseCachedStream({
+                allowPrompt: false,
+                requiredSourceId: rememberedWindowSourceId
+            });
             if (stream) {
                 // 同上：抓帧是异步的，源 ID 要跟这条流一起钉住，事后再读可能已经换人。
                 // 必须在 acquireOrReuseCachedStream 之后取——它自己就会改写这个字段。
@@ -1999,6 +2010,10 @@
 
             // 后端 pyautogui 兜底
             if (!dataUrl) {
+                if (rememberedWindowCaptureConstrained) {
+                    console.warn('[ProactiveVision] 记忆窗口捕获失败，禁止回退整桌面');
+                    return;
+                }
                 var backendResult = await fetchBackendScreenshot();
                 dataUrl = backendResult.dataUrl;
                 if (dataUrl) {
@@ -2182,14 +2197,22 @@
         if (window.appScreen
             && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
             rememberedWindowResolution = await window.appScreen
-                .reconcileRememberedWindowSourceForCapture(desktopProvider);
+                .reconcileRememberedWindowSourceForCapture(
+                    desktopProvider,
+                    { forceValidation: true }
+                );
         }
         if (window.appScreen
-            && typeof window.appScreen.rememberedWindowResolutionNeedsSelection === 'function'
-            && window.appScreen.rememberedWindowResolutionNeedsSelection(rememberedWindowResolution)) {
-            console.warn('[主动搭话截图] 记住的窗口无法唯一恢复，跳过本次自动截图');
+            && typeof window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture === 'function'
+            && window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture(rememberedWindowResolution)) {
+            console.warn('[主动搭话截图] 记住的窗口无法安全验证，跳过本次自动截图');
             return { dataUrl: null, via: null, captureType: null };
         }
+        var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution
+            && rememberedWindowResolution.hadRememberedTitle);
+        var rememberedWindowSourceId = rememberedWindowCaptureConstrained
+            ? rememberedWindowResolution.sourceId
+            : null;
 
         // 策略 0a: 复用有效缓存流（避免打扰正在进行的屏幕共享）
         if (S.screenCaptureStream && S.screenCaptureStream.active) {
@@ -2241,7 +2264,10 @@
         }
 
         // 策略1: 缓存流 / Electron窗口ID / getDisplayMedia（非user gesture不弹窗）
-        var stream = await acquireOrReuseCachedStream({ allowPrompt: false });
+        var stream = await acquireOrReuseCachedStream({
+            allowPrompt: false,
+            requiredSourceId: rememberedWindowSourceId
+        });
         if (stream) {
             // 快照必须取在 acquireOrReuseCachedStream 之后——它自己就会改写这个字段。
             var streamSourceId = S.selectedScreenSourceId;
@@ -2262,7 +2288,10 @@
                 S.screenCaptureStreamLastUsed = null;
             }
             // 重试：会走 Electron sourceId 路径
-            stream = await acquireOrReuseCachedStream({ allowPrompt: false });
+            stream = await acquireOrReuseCachedStream({
+                allowPrompt: false,
+                requiredSourceId: rememberedWindowSourceId
+            });
             if (stream) {
                 var retrySourceId = S.selectedScreenSourceId;
                 frame = await captureFrameFromStream(stream, 0.85);
@@ -2284,6 +2313,10 @@
         }
 
         // 策略2: 后端 pyautogui 兜底
+        if (rememberedWindowCaptureConstrained) {
+            console.warn('[主动搭话截图] 记忆窗口捕获失败，禁止回退整桌面');
+            return { dataUrl: null, via: null, captureType: null };
+        }
         var backendResult = await fetchBackendScreenshot();
         if (backendResult.dataUrl) {
             console.log('[主动搭话截图] 后端截图成功');

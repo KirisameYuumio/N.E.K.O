@@ -3854,7 +3854,7 @@
                     }
                     if (rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)) {
                         showRememberedWindowUnavailable();
-                        return null;
+                        return { rememberedWindowUnavailable: true };
                     }
 
                     // Electron 桌面端优先交给 PC 壳的独立截图编辑窗口。它覆盖当前显示器，
@@ -4049,6 +4049,9 @@
                 window.showStatusToast(window.t ? window.t('app.capturing') : '\u6B63\u5728\u622A\u56FE...', 2000);
 
                 var result = await mod.captureScreenshotDataUrl();
+                if (result && result.rememberedWindowUnavailable) {
+                    return;
+                }
                 if (result && result.pinned) {
                     return;
                 }

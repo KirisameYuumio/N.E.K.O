@@ -340,23 +340,46 @@
     }
     mod.rememberedWindowResolutionNeedsSelection = rememberedWindowResolutionNeedsSelection;
 
+    function rememberedWindowResolutionBlocksAutomaticCapture(result) {
+        if (!result || !result.hadRememberedTitle) return false;
+        return result.status === 'missing'
+            || result.status === 'ambiguous'
+            || result.status === 'prompt-required'
+            || result.status === 'provider-unavailable'
+            || result.status === 'enumeration-failed';
+    }
+    mod.rememberedWindowResolutionBlocksAutomaticCapture = rememberedWindowResolutionBlocksAutomaticCapture;
+
     async function reconcileRememberedWindowSourceForCapture(provider, options) {
         provider = provider || resolveDesktopCaptureProvider();
         options = options || {};
         var rememberedTitle = readRememberedWindowTitle();
-        if (!isScreenSourceTitleMatchEnabled() || !normalizeScreenSourceTitle(rememberedTitle)) {
+        var hadRememberedTitle = !!normalizeScreenSourceTitle(rememberedTitle);
+        if (!isScreenSourceTitleMatchEnabled() || !hadRememberedTitle) {
             return { status: 'disabled-or-empty', sourceId: S.selectedScreenSourceId };
         }
         if (!options.forceValidation
             && S.selectedScreenSourceId
             && trustedRememberedWindowSourceId === S.selectedScreenSourceId) {
-            return { status: 'trusted-current', sourceId: S.selectedScreenSourceId };
+            return {
+                status: 'trusted-current',
+                sourceId: S.selectedScreenSourceId,
+                hadRememberedTitle: true
+            };
         }
         if (!provider || typeof provider.getSources !== 'function') {
-            return { status: 'provider-unavailable', sourceId: S.selectedScreenSourceId };
+            return {
+                status: 'provider-unavailable',
+                sourceId: S.selectedScreenSourceId,
+                hadRememberedTitle: true
+            };
         }
         if (desktopSourceEnumerationMayPrompt(provider)) {
-            return { status: 'prompt-required', sourceId: S.selectedScreenSourceId };
+            return {
+                status: 'prompt-required',
+                sourceId: S.selectedScreenSourceId,
+                hadRememberedTitle: true
+            };
         }
         if (rememberedWindowCaptureReconcilePromise) {
             return rememberedWindowCaptureReconcilePromise;
@@ -371,7 +394,11 @@
                 return reconcileRememberedWindowSource(sources);
             } catch (error) {
                 console.warn('[屏幕源] 截图前按标题解析来源失败:', error);
-                return { status: 'enumeration-failed', sourceId: S.selectedScreenSourceId };
+                return {
+                    status: 'enumeration-failed',
+                    sourceId: S.selectedScreenSourceId,
+                    hadRememberedTitle: true
+                };
             }
         })();
         try {
@@ -678,6 +705,7 @@
      * 统一的流获取函数：优先缓存流 → Electron sourceId → getDisplayMedia → null
      * @param {Object} opts
      * @param {boolean} opts.allowPrompt - 是否允许 getDisplayMedia 弹窗（用户手势上下文传true）
+     * @param {string} [opts.requiredSourceId] - 自动捕获必须保持的记忆窗口来源
      * @returns {Promise<MediaStream|null>}
      */
     async function acquireOrReuseCachedStream(opts) {
@@ -685,6 +713,10 @@
 
         var desktopProvider = resolveDesktopCaptureProvider();
         await reconcileRememberedWindowSourceForCapture(desktopProvider);
+        var requiredSourceId = opts.requiredSourceId || null;
+        if (requiredSourceId && S.selectedScreenSourceId !== requiredSourceId) {
+            return null;
+        }
 
         // 1. 缓存流有效且 tracks live → 直接返回（~0ms）
         if (S.screenCaptureStream && S.screenCaptureStream.active) {
@@ -723,12 +755,15 @@
                             var sourceExists = currentSources.some(function (s) { return s.id === selectedSourceId; });
 
                             if (!sourceExists) {
-                                console.warn('[acquireStream] 选中的源已不可用，尝试回退到全屏源');
+                                console.warn('[acquireStream] 选中的源已不可用');
                                 // 把失效的 ID 从 state / localStorage / 主进程一起清掉，
                                 // 否则下次截图还会拿这个过期 ID 去走 Priority 1 (主进程
                                 // 直接捕获 "Source not found") 和 Priority 2 的 Electron
                                 // getUserMedia（会跑到 500ms 超时），整条失败链路每次重放。
                                 clearSelectedScreenSource('getSources 未找到该源');
+                                if (requiredSourceId) {
+                                    return null;
+                                }
                                 var screenSources = currentSources.filter(function (s) { return s.id.startsWith('screen:'); });
                                 if (screenSources.length > 0) {
                                     captureSourceId = screenSources[0].id;
@@ -762,6 +797,10 @@
                 ]);
 
                 if (newStream) {
+                    if (requiredSourceId && S.selectedScreenSourceId !== requiredSourceId) {
+                        newStream.getTracks().forEach(function (track) { track.stop(); });
+                        return null;
+                    }
                     S.screenCaptureStream = newStream;
                     S.screenCaptureStreamLastUsed = Date.now();
                     S.screenCaptureAutoPromptFailed = false;
@@ -791,6 +830,9 @@
         }
 
         // 3. getDisplayMedia（仅 web/Electron 流 provider；Tauri 原生帧不支持 Chromium picker）
+        if (requiredSourceId) {
+            return null;
+        }
         if (opts.allowPrompt && !isNativeFrameProvider(desktopProvider)
             && !S.screenCaptureAutoPromptFailed &&
             navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {

@@ -536,6 +536,125 @@ def test_capture_resolution_restores_once_then_reuses_session_trust(
 
 
 @pytest.mark.frontend
+def test_prompt_required_remembered_window_blocks_only_automatic_capture(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const resolution = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                status: resolution.status,
+                hadRememberedTitle: resolution.hadRememberedTitle,
+                blocksAutomatic: window.appScreen
+                    .rememberedWindowResolutionBlocksAutomaticCapture(resolution),
+                needsManualSelection: window.appScreen
+                    .rememberedWindowResolutionNeedsSelection(resolution),
+                captureCalls: window.__captureCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "status": "prompt-required",
+        "hadRememberedTitle": True,
+        "blocksAutomatic": True,
+        "needsManualSelection": False,
+        "captureCalls": [],
+    }
+
+
+@pytest.mark.frontend
+def test_required_remembered_window_stream_does_not_fall_back_after_source_closes(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const initial = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            window.__metadataSources = window.__metadataSources.filter(
+                (source) => source.id !== 'window:2'
+            );
+            window.__thumbnailResolve(window.__metadataSources);
+            window.__cachedTrackStopped = false;
+            const endedTrack = {
+                readyState: 'ended',
+                stop() { window.__cachedTrackStopped = true; },
+            };
+            window.appState.screenCaptureStream = {
+                active: true,
+                getTracks: () => [endedTrack],
+                getVideoTracks: () => [endedTrack],
+            };
+            let getUserMediaCalls = 0;
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    getUserMedia() {
+                        getUserMediaCalls += 1;
+                        throw new Error('must not capture a fallback screen');
+                    },
+                },
+            });
+
+            const stream = await window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: false,
+                requiredSourceId: initial.sourceId,
+            });
+            return {
+                initialStatus: initial.status,
+                streamIsNull: stream === null,
+                selectedId: window.appState.selectedScreenSourceId,
+                cachedTrackStopped: window.__cachedTrackStopped,
+                getUserMediaCalls,
+                captureCalls: window.__captureCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "initialStatus": "matched",
+        "streamIsNull": True,
+        "selectedId": None,
+        "cachedTrackStopped": True,
+        "getUserMediaCalls": 0,
+        "captureCalls": [
+            {
+                "types": ["window", "screen"],
+                "thumbnailSize": {"width": 0, "height": 0},
+            },
+            {
+                "types": ["window", "screen"],
+                "thumbnailSize": {"width": 1, "height": 1},
+            },
+        ],
+    }
+
+
+@pytest.mark.frontend
 def test_capture_resolution_releases_cached_stream_when_title_restores_new_id(
     page: Page,
 ) -> None:
