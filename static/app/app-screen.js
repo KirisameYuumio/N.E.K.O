@@ -514,6 +514,8 @@
         return !!(result && result.hadRememberedTitle
             && (result.status === 'missing'
                 || result.status === 'ambiguous'
+                || result.status === 'provider-unavailable'
+                || result.status === 'enumeration-failed'
                 || result.status === 'superseded'
                 || result.status === 'title-update-rejected'));
     }

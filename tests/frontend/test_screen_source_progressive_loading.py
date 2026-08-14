@@ -577,6 +577,30 @@ def test_prompt_required_remembered_window_blocks_only_automatic_capture(
 
 
 @pytest.mark.frontend
+def test_failed_remembered_validation_requires_manual_reselection(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(page)
+
+    result = page.evaluate(
+        """() => ['provider-unavailable', 'enumeration-failed'].map((status) => ({
+            status,
+            needsSelection: window.appScreen
+                .rememberedWindowResolutionNeedsSelection({
+                    status,
+                    sourceId: 'window:stale',
+                    hadRememberedTitle: true,
+                }),
+        }))"""
+    )
+
+    assert result == [
+        {"status": "provider-unavailable", "needsSelection": True},
+        {"status": "enumeration-failed", "needsSelection": True},
+    ]
+
+
+@pytest.mark.frontend
 def test_remembered_window_reconciliation_timeout_releases_shared_request(
     page: Page,
 ) -> None:
