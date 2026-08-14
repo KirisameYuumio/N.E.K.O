@@ -363,10 +363,14 @@
      * 已不复存在（HWND 失效、窗口被关、屏幕被拔掉）时，防止下一次截图仍拿同一个
      * 过期 ID 去走必然失败的快路径。
      */
-    function clearSelectedScreenSource(reason) {
+    function clearSelectedScreenSource(reason, options) {
         advanceRememberedWindowStateGeneration();
         trustedRememberedWindowSourceId = null;
         if (S.selectedScreenSourceId == null) return;
+        options = options || {};
+        if (!options.preservePendingStart) {
+            cancelPendingScreenSharingStart();
+        }
         releaseCaptureForScreenSourceChange(S.selectedScreenSourceId, null);
         try {
             console.log('[屏幕源] 清除失效的选中源' + (reason ? ' (' + reason + ')' : ''), S.selectedScreenSourceId);
@@ -686,6 +690,7 @@
             }
         } catch (_) { }
         // 源切换时释放本窗口缓存的旧流或原生帧发送循环，强制下次用新源。
+        cancelPendingScreenSharingStart();
         releaseCaptureForScreenSourceChange(oldId, newId);
         console.log('[屏幕源] 从其它窗口同步了新选择:', newId);
         // 不要再写 localStorage 或 pushSelectedSourceToMain —— 源窗口已经做过了，
@@ -1120,7 +1125,10 @@
                 });
 
                 if (promptRequiredRememberedPicker && S.selectedScreenSourceId) {
-                    clearSelectedScreenSource('prompt picker replaced stale source');
+                    clearSelectedScreenSource(
+                        'prompt picker replaced stale source',
+                        { preservePendingStart: true }
+                    );
                 }
                 if (opts.allowPrompt && titleResolution && titleResolution.hadRememberedTitle) {
                     rememberPromptConfirmedRememberedWindowStream(displayStream);
@@ -2091,7 +2099,10 @@
                                 audio: false,
                             }));
                             if (forceRememberedWindowPicker && S.selectedScreenSourceId) {
-                                clearSelectedScreenSource('prompt picker replaced stale source');
+                                clearSelectedScreenSource(
+                                    'prompt picker replaced stale source',
+                                    { preservePendingStart: true }
+                                );
                             }
                             if (hasRememberedWindowTitle) {
                                 rememberPromptConfirmedRememberedWindowStream(captureStream);
@@ -2359,6 +2370,10 @@
 
     // ======================== selectScreenSource ========================
     async function selectScreenSource(sourceId, sourceName, displayName) {
+        var previousSourceId = S.selectedScreenSourceId;
+        if (previousSourceId !== sourceId) {
+            cancelPendingScreenSharingStart();
+        }
         advanceRememberedWindowStateGeneration();
         S.selectedScreenSourceId = sourceId;
 
@@ -2520,10 +2535,7 @@
 
             // 第一阶段只枚举来源元数据。Electron 明确允许用 0x0 跳过每个窗口的
             // 缩略图捕获，名称返回后立即绘制，完整图片在第二阶段后台补齐。
-            var metadataRememberedGeneration = rememberedWindowStateGeneration;
             var metadataSelectedSourceId = S.selectedScreenSourceId;
-            var metadataRememberedTitle = readRememberedWindowTitle();
-            var metadataRememberedEnabled = isScreenSourceTitleMatchEnabled();
             var metadataLoadPromise = beginScreenSourceMetadataLoad(desktopProvider);
             var sources;
             try {
@@ -2534,11 +2546,13 @@
                 }
             }
 
+            // Let callbacks already registered on the same metadata promise commit
+            // a pending Remember-window toggle before deciding whether the source
+            // snapshot itself is stale. Title/toggle changes can reuse these sources;
+            // only a different selected ID may refer to a source absent from them.
+            await Promise.resolve();
             if (!isPopupAvailable()) return false;
-            if (metadataRememberedGeneration !== rememberedWindowStateGeneration
-                || metadataSelectedSourceId !== S.selectedScreenSourceId
-                || metadataRememberedTitle !== readRememberedWindowTitle()
-                || metadataRememberedEnabled !== isScreenSourceTitleMatchEnabled()) {
+            if (metadataSelectedSourceId !== S.selectedScreenSourceId) {
                 return window.renderFloatingScreenSourceList(screenPopup, renderOptions);
             }
 

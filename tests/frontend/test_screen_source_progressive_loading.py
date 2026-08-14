@@ -1916,6 +1916,61 @@ def test_enabling_remember_while_loading_commits_only_after_title_is_available(
 
 
 @pytest.mark.frontend
+def test_enabling_remember_while_loading_reuses_completed_metadata(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={"selectedScreenSourceId": "window:2"},
+    )
+    page.evaluate(
+        """() => {
+            let resolveMetadata;
+            window.__pendingMetadata = new Promise((resolve) => {
+                resolveMetadata = resolve;
+            });
+            window.__resolvePendingMetadata = resolveMetadata;
+            window.__desktopProvider.getSources = (options) => {
+                window.__captureCalls.push(options);
+                if (options.thumbnailSize.width === 0) {
+                    return window.__pendingMetadata;
+                }
+                return Promise.resolve([]);
+            };
+        }"""
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const popup = document.getElementById('live2d-popup-screen');
+            const renderPromise = window.renderFloatingScreenSourceList(popup);
+            window.setScreenSourceTitleMatchEnabled(true);
+            window.__resolvePendingMetadata(window.__metadataSources);
+            const rendered = await renderPromise;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            return {
+                rendered,
+                enabled: window.isScreenSourceTitleMatchEnabled(),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                metadataCalls: window.__captureCalls.filter(
+                    (options) => options.thumbnailSize.width === 0
+                ).length,
+            };
+        }"""
+    )
+
+    assert result == {
+        "rendered": True,
+        "enabled": True,
+        "rememberedTitle": "Editor",
+        "metadataCalls": 1,
+    }
+
+
+@pytest.mark.frontend
 def test_disabling_remember_cancels_pending_metadata_commit(page: Page) -> None:
     _install_screen_source_harness(
         page,

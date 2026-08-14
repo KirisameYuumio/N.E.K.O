@@ -83,6 +83,7 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     assert "cachedTitleResolution.status === 'prompt-required'" in start_once
     assert "selectedSourceId = forceRememberedWindowPicker" in start_once
     assert "rememberPromptConfirmedRememberedWindowStream(captureStream)" in start_once
+    assert "{ preservePendingStart: true }" in start_once
     assert "requiredSourceId: cachedTitleResolution.sourceId" in start_once
     assert start_once.index("requiredSourceId: cachedTitleResolution.sourceId") < (
         start_once.index("if (captureStream == null)")
@@ -103,6 +104,30 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     )[0]
     assert "if (hasRememberedWindowTitle)" in validation_catch
     assert "rememberedWindowNeedsSelection = true;" in validation_catch
+
+
+@pytest.mark.unit
+def test_source_changes_cancel_pending_manual_share_before_stream_checks():
+    source = APP_SCREEN_JS.read_text(encoding="utf-8")
+    storage_sync = source.split(
+        "window.addEventListener('storage', function (e)", 1
+    )[1].split("function scheduleScreenCaptureIdleCheck", 1)[0]
+    clear_source = source.split(
+        "function clearSelectedScreenSource(reason, options)", 1
+    )[1].split("mod.clearSelectedScreenSource", 1)[0]
+    select_source = source.split(
+        "async function selectScreenSource(sourceId, sourceName, displayName)", 1
+    )[1].split("mod.selectScreenSource = selectScreenSource;", 1)[0]
+
+    assert storage_sync.index("cancelPendingScreenSharingStart();") < storage_sync.index(
+        "releaseCaptureForScreenSourceChange(oldId, newId);"
+    )
+    assert "if (!options.preservePendingStart)" in clear_source
+    assert "cancelPendingScreenSharingStart();" in clear_source
+    assert "cancelPendingScreenSharingStart();" in select_source
+    assert select_source.index("cancelPendingScreenSharingStart();") < (
+        select_source.index("S.selectedScreenSourceId = sourceId;")
+    )
 
 
 @pytest.mark.unit
@@ -127,7 +152,8 @@ def test_remembered_metadata_promises_and_cached_constraints_are_bounded():
     assert "promptRequiredRememberedPicker" in acquire
     assert "&& !promptRequiredRememberedPicker" in acquire
     assert "timedOut || S.selectedScreenSourceId !== selectedSourceId" in acquire
-    assert "clearSelectedScreenSource('prompt picker replaced stale source')" in acquire
+    assert "'prompt picker replaced stale source'" in acquire
+    assert "{ preservePendingStart: true }" in acquire
 
 
 @pytest.mark.unit
