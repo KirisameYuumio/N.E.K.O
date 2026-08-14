@@ -3544,12 +3544,6 @@
             return null;
         }
 
-        function rememberedWindowCaptureNeedsSelection(result) {
-            return !!(window.appScreen
-                && typeof window.appScreen.rememberedWindowResolutionNeedsSelection === 'function'
-                && window.appScreen.rememberedWindowResolutionNeedsSelection(result));
-        }
-
         function showRememberedWindowUnavailable() {
             if (typeof window.showStatusToast !== 'function') return;
             window.showStatusToast(
@@ -3658,8 +3652,15 @@
             var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution
                 && rememberedWindowResolution.hadRememberedTitle);
             var selectedSourceId = S.selectedScreenSourceId;
+            var rememberedWindowUsesTrustedLiveStream = !!(rememberedWindowCaptureConstrained
+                && rememberedWindowResolution.status === 'trusted-live-stream'
+                && !rememberedWindowResolution.sourceId);
+            if (rememberedWindowCaptureConstrained) {
+                selectedSourceId = rememberedWindowResolution.sourceId || null;
+            }
             if (desktopProvider
-                && typeof desktopProvider.captureSourceWithoutNeko === 'function') {
+                && typeof desktopProvider.captureSourceWithoutNeko === 'function'
+                && !rememberedWindowUsesTrustedLiveStream) {
                 var atomicFailed = false;
                 try {
                     var atomic = await window.captureDesktopSourceWithTimeout(
@@ -3866,73 +3867,85 @@
                                 { forceValidation: true }
                             );
                     }
-                    if (rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)) {
+                    var rememberedWindowCaptureBlocked = !!(window.appScreen
+                        && typeof window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture === 'function'
+                        && window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture(
+                            rememberedWindowResolution
+                        ));
+                    var rememberedWindowNeedsPromptPicker = !!(rememberedWindowCaptureBlocked
+                        && rememberedWindowResolution
+                        && rememberedWindowResolution.status === 'prompt-required');
+                    if (rememberedWindowCaptureBlocked && !rememberedWindowNeedsPromptPicker) {
                         showRememberedWindowUnavailable();
                         return { rememberedWindowUnavailable: true };
                     }
                     var rememberedWindowCaptureConstrained = !!(rememberedWindowResolution
                         && rememberedWindowResolution.hadRememberedTitle);
 
-                    // Electron 桌面端优先交给 PC 壳的独立截图编辑窗口。它覆盖当前显示器，
-                    // 不改变聊天框/Pet 窗口尺寸，也不会把冻结画面塞进聊天窗口内裁剪。
-                    var desktopRegionResult = await captureDesktopRegionDirectly();
-                    if (desktopRegionResult) {
-                        if (desktopRegionResult.canceled) {
-                            return null;
-                        }
-                        if (desktopRegionResult.pinned) {
-                            return {
-                                pinned: true,
-                                pinId: desktopRegionResult.pinId || null
-                            };
-                        }
-                        return {
-                            dataUrl: desktopRegionResult.dataUrl,
-                            originalDataUrl: desktopRegionResult.originalDataUrl || desktopRegionResult.dataUrl,
-                            avatarPos: desktopRegionResult.avatarPos || null
-                        };
-                    }
-
-                    // 浏览器/旧版 PC 壳没有独立编辑窗口时，macOS 仍可退回系统交互截图。
-                    if (typeof window.fetchBackendInteractiveScreenshot === 'function') {
-                        var interactiveBackendResult = await window.fetchBackendInteractiveScreenshot();
-                        if (interactiveBackendResult && interactiveBackendResult.canceled) {
-                            return null;
-                        }
-                        if (interactiveBackendResult && interactiveBackendResult.dataUrl) {
-                            return {
-                                dataUrl: interactiveBackendResult.dataUrl,
-                                originalDataUrl: interactiveBackendResult.dataUrl,
-                                avatarPos: null
-                            };
-                        }
-                    }
-
-                    var selectedSourceId = S.selectedScreenSourceId;
-                    if (selectedSourceId && desktopProvider
-                        && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
-                        try {
-                            var direct = await window.captureDesktopSourceWithTimeout(
-                                desktopProvider,
-                                'captureSourceAsDataUrl',
-                                selectedSourceId
-                            );
-                            if (direct && direct.success && direct.dataUrl) {
-                                dataUrl = direct.dataUrl;
-                                width = direct.width || 0;
-                                height = direct.height || 0;
-                                captureType = window.detectScreenshotCaptureType
-                                    ? window.detectScreenshotCaptureType(null, selectedSourceId)
-                                    : null;
-                                console.log('[截图] 主进程直接捕获成功:', selectedSourceId, width + 'x' + height);
-                            } else if (direct && direct.error) {
-                                console.warn('[截图] 主进程直接捕获失败:', direct.error);
-                                if (typeof window.maybeClearSourceOnNotFound === 'function') {
-                                    window.maybeClearSourceOnNotFound(direct, '主进程 capture-source-as-dataurl Source not found');
-                                }
+                    // prompt-backed remembered sources need a fresh user choice. Do not
+                    // let a persisted ID reach any native fast path before that picker.
+                    if (!rememberedWindowNeedsPromptPicker) {
+                        // Electron 桌面端优先交给 PC 壳的独立截图编辑窗口。它覆盖当前显示器，
+                        // 不改变聊天框/Pet 窗口尺寸，也不会把冻结画面塞进聊天窗口内裁剪。
+                        var desktopRegionResult = await captureDesktopRegionDirectly();
+                        if (desktopRegionResult) {
+                            if (desktopRegionResult.canceled) {
+                                return null;
                             }
-                        } catch (directErr) {
-                            console.warn('[截图] 主进程直接捕获抛错，将回退到流路径:', directErr);
+                            if (desktopRegionResult.pinned) {
+                                return {
+                                    pinned: true,
+                                    pinId: desktopRegionResult.pinId || null
+                                };
+                            }
+                            return {
+                                dataUrl: desktopRegionResult.dataUrl,
+                                originalDataUrl: desktopRegionResult.originalDataUrl || desktopRegionResult.dataUrl,
+                                avatarPos: desktopRegionResult.avatarPos || null
+                            };
+                        }
+
+                        // 浏览器/旧版 PC 壳没有独立编辑窗口时，macOS 仍可退回系统交互截图。
+                        if (typeof window.fetchBackendInteractiveScreenshot === 'function') {
+                            var interactiveBackendResult = await window.fetchBackendInteractiveScreenshot();
+                            if (interactiveBackendResult && interactiveBackendResult.canceled) {
+                                return null;
+                            }
+                            if (interactiveBackendResult && interactiveBackendResult.dataUrl) {
+                                return {
+                                    dataUrl: interactiveBackendResult.dataUrl,
+                                    originalDataUrl: interactiveBackendResult.dataUrl,
+                                    avatarPos: null
+                                };
+                            }
+                        }
+
+                        var selectedSourceId = S.selectedScreenSourceId;
+                        if (selectedSourceId && desktopProvider
+                            && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
+                            try {
+                                var direct = await window.captureDesktopSourceWithTimeout(
+                                    desktopProvider,
+                                    'captureSourceAsDataUrl',
+                                    selectedSourceId
+                                );
+                                if (direct && direct.success && direct.dataUrl) {
+                                    dataUrl = direct.dataUrl;
+                                    width = direct.width || 0;
+                                    height = direct.height || 0;
+                                    captureType = window.detectScreenshotCaptureType
+                                        ? window.detectScreenshotCaptureType(null, selectedSourceId)
+                                        : null;
+                                    console.log('[截图] 主进程直接捕获成功:', selectedSourceId, width + 'x' + height);
+                                } else if (direct && direct.error) {
+                                    console.warn('[截图] 主进程直接捕获失败:', direct.error);
+                                    if (typeof window.maybeClearSourceOnNotFound === 'function') {
+                                        window.maybeClearSourceOnNotFound(direct, '主进程 capture-source-as-dataurl Source not found');
+                                    }
+                                }
+                            } catch (directErr) {
+                                console.warn('[截图] 主进程直接捕获抛错，将回退到流路径:', directErr);
+                            }
                         }
                     }
 

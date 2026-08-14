@@ -1758,6 +1758,22 @@
                     captureStream = null;
                     forceRememberedWindowPicker = true;
                 }
+                if (captureStream != null
+                    && cachedTitleResolution
+                    && cachedTitleResolution.hadRememberedTitle
+                    && cachedTitleResolution.sourceId) {
+                    var verifiedCachedStream = await acquireOrReuseCachedStream({
+                        allowPrompt: false,
+                        requiredSourceId: cachedTitleResolution.sourceId
+                    });
+                    if (verifiedCachedStream !== captureStream) {
+                        releaseCachedScreenCaptureStream(captureStream);
+                        captureStream = (verifiedCachedStream
+                            && !verifiedCachedStream.rememberedWindowUnavailable)
+                            ? verifiedCachedStream
+                            : null;
+                    }
+                }
                 if (S.screenCaptureStream !== captureStream) {
                     captureStream = null;
                 }

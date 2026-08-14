@@ -2363,6 +2363,46 @@
             // This initializer runs from the user's toggle gesture. Establish a
             // front-end stream now; accepting a backend desktop probe would make
             // every later automatic frame stop at prompt-required instead.
+            var rememberedWindowResolution = null;
+            var desktopProvider = null;
+            if (window.appScreen
+                && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
+                desktopProvider = getDesktopProvider();
+                rememberedWindowResolution = await window.appScreen
+                    .reconcileRememberedWindowSourceForCapture(
+                        desktopProvider,
+                        { forceValidation: true }
+                    );
+            }
+            var trustedNativeRememberedSource = !!(rememberedWindowResolution
+                && rememberedWindowResolution.status === 'trusted-native-source'
+                && rememberedWindowResolution.sourceId
+                && rememberedWindowResolution.sourceId === S.selectedScreenSourceId
+                && desktopProvider
+                && desktopProvider.nativeFrameCapture
+                && typeof desktopProvider.captureSourceAsDataUrl === 'function');
+            if (trustedNativeRememberedSource) {
+                console.log('[主动视觉] 记忆窗口原生来源验证成功');
+                return true;
+            }
+            var rememberedWindowResolutionBlocked = !!(rememberedWindowResolution
+                && rememberedWindowResolution.status !== 'prompt-required'
+                && window.appScreen
+                && typeof window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture === 'function'
+                && window.appScreen.rememberedWindowResolutionBlocksAutomaticCapture(
+                    rememberedWindowResolution
+                ));
+            if (rememberedWindowResolutionBlocked) {
+                if (typeof window.showStatusToast === 'function') {
+                    window.showStatusToast(
+                        window.t
+                            ? window.t('app.screenSource.rememberedWindowUnavailable')
+                            : '无法唯一找到记住的窗口，请重新选择屏幕来源',
+                        4000
+                    );
+                }
+                return false;
+            }
             var rememberedStream = await acquireOrReuseCachedStream({ allowPrompt: true });
             if (rememberedStream && rememberedStream.rememberedWindowUnavailable) {
                 if (typeof window.showStatusToast === 'function') {

@@ -83,6 +83,10 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     assert "cachedTitleResolution.status === 'prompt-required'" in start_once
     assert "selectedSourceId = forceRememberedWindowPicker" in start_once
     assert "rememberPromptConfirmedRememberedWindowStream(captureStream)" in start_once
+    assert "requiredSourceId: cachedTitleResolution.sourceId" in start_once
+    assert start_once.index("requiredSourceId: cachedTitleResolution.sourceId") < (
+        start_once.index("if (captureStream == null)")
+    )
     assert start_once.index("sourceEnumerationMayPrompt && hasRememberedWindowTitle") < (
         start_once.index("var selectedSourceId = forceRememberedWindowPicker")
     )
@@ -171,9 +175,11 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     assert screenshot_once.index(
         ".reconcileRememberedWindowSourceForCapture("
     ) < screenshot_once.index("captureDesktopRegionDirectly()")
-    assert screenshot_once.index(
-        "rememberedWindowCaptureNeedsSelection(rememberedWindowResolution)"
-    ) < screenshot_once.index("captureDesktopRegionDirectly()")
+    assert "rememberedWindowResolutionBlocksAutomaticCapture" in screenshot_once
+    assert screenshot_once.index("var rememberedWindowCaptureBlocked") < (
+        screenshot_once.index("captureDesktopRegionDirectly()")
+    )
+    assert "rememberedWindowNeedsPromptPicker" in screenshot_once
     assert "return { rememberedWindowUnavailable: true };" in screenshot_once
 
     pending_once = buttons_source.split(
@@ -249,6 +255,8 @@ def test_automatic_capture_paths_enforce_remembered_constraints_before_fast_path
     assert recapture_once.index(
         "rememberedWindowResolutionBlocksAutomaticCapture"
     ) < recapture_once.index("'captureSourceWithoutNeko'")
+    assert "rememberedWindowUsesTrustedLiveStream" in recapture_once
+    assert "&& !rememberedWindowUsesTrustedLiveStream" in recapture_once
 
     proactive_once = proactive_source.split(
         "async function captureProactiveChatScreenshotWithSource()", 1
@@ -283,4 +291,8 @@ def test_proactive_vision_remembered_window_acquires_stream_before_backend_short
     )
     assert acquire_once.index("if (rememberedWindowCaptureConstrained)") < acquire_once.index(
         "fetchBackendScreenshot()"
+    )
+    assert "trusted-native-source" in acquire_once
+    assert acquire_once.index("trusted-native-source") < acquire_once.index(
+        "acquireOrReuseCachedStream({ allowPrompt: true })"
     )

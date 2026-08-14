@@ -744,3 +744,54 @@ acquireProactiveVisionStream().then((success) => {
         "streamCalls": expected_stream_calls,
         "success": True,
     }
+
+
+@pytest.mark.unit
+def test_proactive_vision_initialization_accepts_a_trusted_native_source_without_stream():
+    proactive_src = APP_PROACTIVE_PATH.read_text(encoding="utf-8")
+    script = """
+const results = { streamCalls: 0, reconcileCalls: 0 };
+const S = { selectedScreenSourceId: 'window:native' };
+const nativeProvider = {
+  nativeFrameCapture: true,
+  captureSourceAsDataUrl: async () => ({ success: true })
+};
+const window = {
+  appScreen: {
+    hasRememberedWindowTitlePreference: () => true,
+    reconcileRememberedWindowSourceForCapture: async () => {
+      results.reconcileCalls += 1;
+      return {
+        status: 'trusted-native-source',
+        sourceId: 'window:native',
+        hadRememberedTitle: true
+      };
+    },
+    rememberedWindowResolutionBlocksAutomaticCapture: () => false
+  },
+  showStatusToast: () => {},
+  t: () => ''
+};
+const getDesktopProvider = () => nativeProvider;
+const fetchBackendScreenshot = async () => {
+  throw new Error('trusted native initialization must not probe the backend');
+};
+const acquireOrReuseCachedStream = async () => {
+  results.streamCalls += 1;
+  return { rememberedWindowUnavailable: true };
+};
+__ACQUIRE__
+acquireProactiveVisionStream().then((success) => {
+  results.success = success;
+  console.log(JSON.stringify(results));
+});
+""".replace(
+        "__ACQUIRE__",
+        _fn(proactive_src, "acquireProactiveVisionStream"),
+    )
+    out = _run(script)
+    assert out == {
+        "streamCalls": 0,
+        "reconcileCalls": 1,
+        "success": True,
+    }
