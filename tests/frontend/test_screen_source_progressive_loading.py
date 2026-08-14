@@ -1314,6 +1314,69 @@ def test_trusted_window_rejects_an_overlong_live_title_without_dropping_memory(
 
 
 @pytest.mark.frontend
+def test_selecting_an_overlong_window_title_clears_the_previous_memory(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+    page.evaluate(
+        """() => {
+            window.__metadataSources.push({
+                id: 'window:3',
+                name: 'X'.repeat(513),
+                display_id: '',
+                thumbnail: null,
+            });
+        }"""
+    )
+
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """async () => {
+            document.querySelector(
+                '.screen-source-option[data-source-id="window:3"]'
+            ).click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const afterSelection = {
+                selectedId: window.appState.selectedScreenSourceId,
+                hasRememberedTitle: window.__storedValues.has(
+                    'selectedScreenWindowTitle'
+                ),
+            };
+            const resolution = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider,
+                    { forceValidation: true }
+                );
+            return {
+                afterSelection,
+                finalSelectedId: window.appState.selectedScreenSourceId,
+                resolutionStatus: resolution.status,
+            };
+        }"""
+    )
+    assert result == {
+        "afterSelection": {
+            "selectedId": "window:3",
+            "hasRememberedTitle": False,
+        },
+        "finalSelectedId": "window:3",
+        "resolutionStatus": "disabled-or-empty",
+    }
+
+
+@pytest.mark.frontend
 def test_remembered_title_wins_when_an_old_source_id_is_reused(page: Page) -> None:
     _install_screen_source_harness(
         page,
