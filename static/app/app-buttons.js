@@ -3618,12 +3618,16 @@
             //   隐藏所有 NEKO 窗口 → 等合成 → desktopCapturer 抓图 → 恢复窗口。
             //   把 hide/等待/抓图/show 全放主进程是因为渲染器端 setTimeout 在 Pet 窗口
             //   hide 后会被 backgroundThrottling 拖慢到秒级，且多次 IPC 之间有时序风险。
-            var selectedSourceId = S.selectedScreenSourceId;
             // 注意：即使没有预选源也要走原子化路径。原子化在主进程里把"含 Live2D 的 Pet 窗口"
             // 一起 hide 掉再抓屏，是唯一能真正抹掉立绘的途径；下面的 renderer fallback 只能
             // 对 Pet 的 DOM 做 visibility:hidden，盖不住 WebGL 合成层 —— 那正是"隐藏NEKO
             // 画面刷新了但立绘还在"的根因。主进程在 sourceId 缺省时会自行选择合适屏幕。
             var desktopProvider = getDesktopProvider();
+            if (window.appScreen
+                && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
+                await window.appScreen.reconcileRememberedWindowSourceForCapture(desktopProvider);
+            }
+            var selectedSourceId = S.selectedScreenSourceId;
             if (desktopProvider
                 && typeof desktopProvider.captureSourceWithoutNeko === 'function') {
                 var atomicFailed = false;
@@ -3849,8 +3853,12 @@
                         }
                     }
 
-                    var selectedSourceId = S.selectedScreenSourceId;
                     var desktopProvider = getDesktopProvider();
+                    if (window.appScreen
+                        && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
+                        await window.appScreen.reconcileRememberedWindowSourceForCapture(desktopProvider);
+                    }
+                    var selectedSourceId = S.selectedScreenSourceId;
                     if (selectedSourceId && desktopProvider
                         && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
                         try {

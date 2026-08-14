@@ -642,9 +642,12 @@ def test_screen_source_subwindow_header_has_remember_window_toggle(
             input.click();
             return {
                 controlText: control.textContent,
+                textI18nKey: control.querySelector('span').getAttribute('data-i18n'),
                 initiallyChecked,
                 checkedAfterClick: input.checked,
                 ariaLabel: input.getAttribute('aria-label'),
+                ariaI18nKey: input.getAttribute('data-i18n-aria'),
+                titleI18nKey: input.getAttribute('data-i18n-title'),
                 controlBeforeClose: Boolean(
                     control.compareDocumentPosition(closeButton)
                         & Node.DOCUMENT_POSITION_FOLLOWING
@@ -657,9 +660,12 @@ def test_screen_source_subwindow_header_has_remember_window_toggle(
 
     assert result == {
         "controlText": "app.screenSource.rememberWindow",
+        "textI18nKey": "app.screenSource.rememberWindow",
         "initiallyChecked": True,
         "checkedAfterClick": False,
         "ariaLabel": "app.screenSource.rememberWindow",
+        "ariaI18nKey": "app.screenSource.rememberWindow",
+        "titleI18nKey": "app.screenSource.rememberWindow",
         "controlBeforeClose": True,
         "setterCalls": [False],
         "enabledAfterClick": False,

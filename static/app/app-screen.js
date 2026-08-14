@@ -22,9 +22,11 @@
     const SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY = 'screenSourceTitleMatchEnabled';
     const SCREEN_SOURCE_WINDOW_TITLE_KEY = 'selectedScreenWindowTitle';
     const MAX_REMEMBERED_WINDOW_TITLE_LENGTH = 512;
+    var trustedRememberedWindowSourceId = null;
+    var rememberedWindowCaptureReconcilePromise = null;
 
     function normalizeScreenSourceTitle(value) {
-        return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+        return String(value || '').normalize('NFC').trim().replace(/\s+/g, ' ').toLowerCase();
     }
 
     function isScreenSourceTitleMatchEnabled() {
@@ -61,6 +63,7 @@
     }
 
     function clearRememberedWindowTitle() {
+        trustedRememberedWindowSourceId = null;
         try { localStorage.removeItem(SCREEN_SOURCE_WINDOW_TITLE_KEY); } catch (_) { }
     }
 
@@ -78,7 +81,9 @@
         var options = document.querySelectorAll('.screen-source-option');
         for (var i = 0; i < options.length; i += 1) {
             if (options[i].dataset.sourceId === selectedId) {
-                storeRememberedWindowTitle(options[i].dataset.sourceName || '');
+                if (storeRememberedWindowTitle(options[i].dataset.sourceName || '')) {
+                    trustedRememberedWindowSourceId = selectedId;
+                }
                 return;
             }
         }
@@ -198,6 +203,7 @@
      * 过期 ID 去走必然失败的快路径。
      */
     function clearSelectedScreenSource(reason) {
+        trustedRememberedWindowSourceId = null;
         if (S.selectedScreenSourceId == null) return;
         try {
             console.log('[屏幕源] 清除失效的选中源' + (reason ? ' (' + reason + ')' : ''), S.selectedScreenSourceId);
@@ -242,7 +248,17 @@
                     pushSelectedSourceToMain(titleMatches[0].id);
                     console.log('[屏幕源] 已通过唯一窗口标题恢复来源:', rememberedTitle);
                 }
+                trustedRememberedWindowSourceId = titleMatches[0].id;
                 result.status = 'matched';
+            } else if (titleMatches.length > 1
+                && selectedSource
+                && selectedSource.id === trustedRememberedWindowSourceId
+                && selectedSource.id.startsWith('window:')
+                && normalizeScreenSourceTitle(selectedSource.name) === normalizedRememberedTitle) {
+                // A source selected or uniquely resolved in this renderer session is
+                // safe to retain when a duplicate title appears later. Persisted or
+                // cross-renderer IDs remain untrusted because Electron may reuse them.
+                result.status = 'matched-trusted-current';
             } else {
                 if (S.selectedScreenSourceId != null) {
                     clearSelectedScreenSource(
@@ -257,7 +273,9 @@
 
         if (selectedSource) {
             if (selectedSource.id.startsWith('window:')) {
-                storeRememberedWindowTitle(selectedSource.name || '');
+                if (storeRememberedWindowTitle(selectedSource.name || '')) {
+                    trustedRememberedWindowSourceId = selectedSource.id;
+                }
                 result.status = 'adopted-current-window';
             } else {
                 clearRememberedWindowTitle();
@@ -273,6 +291,46 @@
         return result;
     }
     mod.reconcileRememberedWindowSource = reconcileRememberedWindowSource;
+
+    async function reconcileRememberedWindowSourceForCapture(provider) {
+        provider = provider || resolveDesktopCaptureProvider();
+        var rememberedTitle = readRememberedWindowTitle();
+        if (!isScreenSourceTitleMatchEnabled() || !normalizeScreenSourceTitle(rememberedTitle)) {
+            return { status: 'disabled-or-empty', sourceId: S.selectedScreenSourceId };
+        }
+        if (S.selectedScreenSourceId
+            && trustedRememberedWindowSourceId === S.selectedScreenSourceId) {
+            return { status: 'trusted-current', sourceId: S.selectedScreenSourceId };
+        }
+        if (!provider || typeof provider.getSources !== 'function') {
+            return { status: 'provider-unavailable', sourceId: S.selectedScreenSourceId };
+        }
+        if (desktopSourceEnumerationMayPrompt(provider)) {
+            return { status: 'prompt-required', sourceId: S.selectedScreenSourceId };
+        }
+        if (rememberedWindowCaptureReconcilePromise) {
+            return rememberedWindowCaptureReconcilePromise;
+        }
+
+        rememberedWindowCaptureReconcilePromise = (async function () {
+            try {
+                var sources = await provider.getSources({
+                    types: ['window', 'screen'],
+                    thumbnailSize: { width: 0, height: 0 }
+                });
+                return reconcileRememberedWindowSource(sources);
+            } catch (error) {
+                console.warn('[屏幕源] 截图前按标题解析来源失败:', error);
+                return { status: 'enumeration-failed', sourceId: S.selectedScreenSourceId };
+            }
+        })();
+        try {
+            return await rememberedWindowCaptureReconcilePromise;
+        } finally {
+            rememberedWindowCaptureReconcilePromise = null;
+        }
+    }
+    mod.reconcileRememberedWindowSourceForCapture = reconcileRememberedWindowSourceForCapture;
 
     // ======================== maybeClearSourceOnNotFound ========================
     /**
@@ -302,13 +360,19 @@
     // 注意：storage 事件在写入它的那个窗口内部并不触发，所以不会产生回环。
     window.addEventListener('storage', function (e) {
         if (e.key === SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY) {
+            trustedRememberedWindowSourceId = null;
             updateScreenSourceTitleMatchToggleState();
+            return;
+        }
+        if (e.key === SCREEN_SOURCE_WINDOW_TITLE_KEY) {
+            trustedRememberedWindowSourceId = null;
             return;
         }
         if (e.key !== 'selectedScreenSourceId') return;
         var newId = e.newValue || null;
         if (S.selectedScreenSourceId === newId) return;
         var oldId = S.selectedScreenSourceId;
+        trustedRememberedWindowSourceId = null;
         S.selectedScreenSourceId = newId;
         try {
             if (typeof updateScreenSourceListSelection === 'function') {
@@ -609,8 +673,9 @@
         // 2. Electron selectedScreenSourceId → getUserMedia(chromeMediaSource).
         // Native-frame providers such as Tauri do not expose a MediaStream and
         // must skip this Chromium-only branch.
-        var selectedSourceId = S.selectedScreenSourceId;
         var desktopProvider = resolveDesktopCaptureProvider();
+        await reconcileRememberedWindowSourceForCapture(desktopProvider);
+        var selectedSourceId = S.selectedScreenSourceId;
         if (selectedSourceId && desktopProvider && !isNativeFrameProvider(desktopProvider)) {
             try {
                 var timedOut = false;
@@ -1848,10 +1913,14 @@
 
         if (isScreenSourceTitleMatchEnabled()) {
             if (sourceId && sourceId.startsWith('window:')) {
-                storeRememberedWindowTitle(sourceName || '');
+                if (storeRememberedWindowTitle(sourceName || '')) {
+                    trustedRememberedWindowSourceId = sourceId;
+                }
             } else {
                 clearRememberedWindowTitle();
             }
+        } else {
+            trustedRememberedWindowSourceId = null;
         }
 
         // 同步到主进程，确保 setDisplayMediaRequestHandler 兜底也认这个选择
@@ -2203,6 +2272,14 @@
                 var titleFilterInput = document.createElement('input');
                 titleFilterInput.type = 'search';
                 titleFilterInput.className = 'screen-source-title-filter';
+                titleFilterInput.setAttribute(
+                    'data-i18n-placeholder',
+                    'app.screenSource.titleFilterPlaceholder'
+                );
+                titleFilterInput.setAttribute(
+                    'data-i18n-aria',
+                    'app.screenSource.titleFilterAriaLabel'
+                );
                 titleFilterInput.placeholder = window.t
                     ? window.t('app.screenSource.titleFilterPlaceholder')
                     : '筛选窗口标题';
@@ -2290,6 +2367,10 @@
 
                 noWindowMatchesItem = document.createElement('div');
                 noWindowMatchesItem.className = 'screen-source-no-window-matches';
+                noWindowMatchesItem.setAttribute(
+                    'data-i18n',
+                    'app.screenSource.noWindowMatches'
+                );
                 noWindowMatchesItem.textContent = window.t
                     ? window.t('app.screenSource.noWindowMatches')
                     : '没有匹配的窗口';

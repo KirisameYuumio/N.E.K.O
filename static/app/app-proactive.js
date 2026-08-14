@@ -2188,6 +2188,10 @@
 
         // 策略 0b: 桌面壳直接捕获选中源（Electron / Tauri）
         var desktopProvider = getDesktopProvider();
+        if (window.appScreen
+            && typeof window.appScreen.reconcileRememberedWindowSourceForCapture === 'function') {
+            await window.appScreen.reconcileRememberedWindowSourceForCapture(desktopProvider);
+        }
         if (S.selectedScreenSourceId && desktopProvider
             && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
             // 捕获前钉住源 ID：下面是异步的，事后再读会拿新源解释旧帧。

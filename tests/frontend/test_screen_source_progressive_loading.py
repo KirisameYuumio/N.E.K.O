@@ -289,6 +289,13 @@ def test_window_title_filter_is_local_and_keeps_screens_visible(page: Page) -> N
                 noMatchHidden: document.querySelector(
                     '.screen-source-no-window-matches'
                 ).hidden,
+                filterPlaceholderI18n: input.getAttribute(
+                    'data-i18n-placeholder'
+                ),
+                filterAriaI18n: input.getAttribute('data-i18n-aria'),
+                noMatchI18n: document.querySelector(
+                    '.screen-source-no-window-matches'
+                ).getAttribute('data-i18n'),
                 captureCalls: window.__captureCalls,
             };
         }"""
@@ -304,6 +311,9 @@ def test_window_title_filter_is_local_and_keeps_screens_visible(page: Page) -> N
         "filterBeforeScreens": True,
         "screenHiddenAfterNoMatch": False,
         "noMatchHidden": False,
+        "filterPlaceholderI18n": "app.screenSource.titleFilterPlaceholder",
+        "filterAriaI18n": "app.screenSource.titleFilterAriaLabel",
+        "noMatchI18n": "app.screenSource.noWindowMatches",
         "captureCalls": [
             {
                 "types": ["window", "screen"],
@@ -360,6 +370,34 @@ def test_remembered_title_restores_only_one_normalized_exact_match(
 
 
 @pytest.mark.frontend
+def test_remembered_title_normalizes_unicode_composition(page: Page) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Caf\u00e9",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+    page.evaluate(
+        """() => {
+            window.__metadataSources[1].id = 'window:unicode';
+            window.__metadataSources[1].name = 'Cafe\u0301';
+        }"""
+    )
+
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+    assert page.evaluate("window.appState.selectedScreenSourceId") == (
+        "window:unicode"
+    )
+
+
+@pytest.mark.frontend
 def test_remembered_title_does_not_guess_between_duplicate_windows(
     page: Page,
 ) -> None:
@@ -402,6 +440,98 @@ def test_remembered_title_does_not_guess_between_duplicate_windows(
         "hasStoredId": False,
         "rememberedTitle": "Editor",
         "selectedSourceCalls": ["window:stale", None],
+    }
+
+
+@pytest.mark.frontend
+def test_current_session_selection_survives_later_duplicate_title(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(page, source_enumeration_may_prompt=True)
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """async () => {
+            document.querySelector(
+                '.screen-source-option[data-source-id="window:2"]'
+            ).click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            window.setScreenSourceTitleMatchEnabled(true);
+            window.__metadataSources.push({
+                id: 'window:duplicate',
+                name: ' editor ',
+                display_id: '',
+                thumbnail: null,
+            });
+            await window.renderFloatingScreenSourceList(
+                document.getElementById('live2d-popup-screen')
+            );
+            return {
+                selectedId: window.appState.selectedScreenSourceId,
+                storedId: window.__storedValues.get('selectedScreenSourceId'),
+                selectedOptions: Array.from(document.querySelectorAll(
+                    '.screen-source-option.selected'
+                )).map((option) => option.dataset.sourceId),
+            };
+        }"""
+    )
+    assert result == {
+        "selectedId": "window:2",
+        "storedId": "window:2",
+        "selectedOptions": ["window:2"],
+    }
+
+
+@pytest.mark.frontend
+def test_capture_resolution_restores_once_then_reuses_session_trust(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+    page.evaluate(
+        """() => {
+            window.__metadataSources[1].id = 'window:current';
+        }"""
+    )
+
+    result = page.evaluate(
+        """async () => {
+            const first = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider
+                );
+            const second = await window.appScreen
+                .reconcileRememberedWindowSourceForCapture(
+                    window.__desktopProvider
+                );
+            return {
+                firstStatus: first.status,
+                secondStatus: second.status,
+                selectedId: window.appState.selectedScreenSourceId,
+                captureCalls: window.__captureCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "firstStatus": "matched",
+        "secondStatus": "trusted-current",
+        "selectedId": "window:current",
+        "captureCalls": [
+            {
+                "types": ["window", "screen"],
+                "thumbnailSize": {"width": 0, "height": 0},
+            }
+        ],
     }
 
 

@@ -4083,6 +4083,7 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
                         whiteSpace: 'nowrap'
                     });
                     var rememberText = document.createElement('span');
+                    rememberText.setAttribute('data-i18n', 'app.screenSource.rememberWindow');
                     rememberText.textContent = window.t
                         ? window.t('app.screenSource.rememberWindow')
                         : '记住窗口';
@@ -4093,6 +4094,8 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
                         }
                     );
                     rememberToggle.input.classList.add('neko-screen-source-title-match-toggle');
+                    rememberToggle.input.setAttribute('data-i18n-aria', 'app.screenSource.rememberWindow');
+                    rememberToggle.input.setAttribute('data-i18n-title', 'app.screenSource.rememberWindow');
                     rememberToggle.input.setAttribute('aria-label', rememberText.textContent);
                     rememberToggle.input.title = rememberText.textContent;
                     rememberWrap.appendChild(rememberText);

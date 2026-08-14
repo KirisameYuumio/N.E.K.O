@@ -4,6 +4,8 @@ import pytest
 
 
 APP_SCREEN_JS = Path(__file__).resolve().parents[2] / "static" / "app" / "app-screen.js"
+APP_BUTTONS_JS = Path(__file__).resolve().parents[2] / "static" / "app" / "app-buttons.js"
+APP_PROACTIVE_JS = Path(__file__).resolve().parents[2] / "static" / "app" / "app-proactive.js"
 
 
 @pytest.mark.unit
@@ -71,3 +73,38 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     assert "if (rememberedWindowNeedsSelection)" in start_once
     assert "app.screenSource.rememberedWindowUnavailable" in start_once
     assert "停止本次启动并等待用户重新选择" in start_once
+
+
+@pytest.mark.unit
+def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture():
+    screen_source = APP_SCREEN_JS.read_text(encoding="utf-8")
+    buttons_source = APP_BUTTONS_JS.read_text(encoding="utf-8")
+    proactive_source = APP_PROACTIVE_JS.read_text(encoding="utf-8")
+
+    acquire_once = screen_source.split(
+        "async function acquireOrReuseCachedStream(opts)", 1
+    )[1].split("mod.acquireOrReuseCachedStream = acquireOrReuseCachedStream;", 1)[0]
+    assert acquire_once.index(
+        "await reconcileRememberedWindowSourceForCapture(desktopProvider);"
+    ) < acquire_once.index("var selectedSourceId = S.selectedScreenSourceId;")
+
+    recapture_once = buttons_source.split(
+        "async function recaptureWithoutNeko()", 1
+    )[1].split("var _captureScreenshotDataUrlBusy", 1)[0]
+    assert recapture_once.index(
+        "await window.appScreen.reconcileRememberedWindowSourceForCapture"
+    ) < recapture_once.index("var selectedSourceId = S.selectedScreenSourceId;")
+
+    screenshot_once = buttons_source.split(
+        "mod.captureScreenshotDataUrl = async function captureScreenshotDataUrl()", 1
+    )[1].split("mod.captureScreenshotDataUrl", 1)[0]
+    assert screenshot_once.index(
+        "await window.appScreen.reconcileRememberedWindowSourceForCapture"
+    ) < screenshot_once.index("var selectedSourceId = S.selectedScreenSourceId;")
+
+    proactive_once = proactive_source.split(
+        "async function captureProactiveChatScreenshotWithSource()", 1
+    )[1].split("mod.captureProactiveChatScreenshotWithSource", 1)[0]
+    assert proactive_once.index(
+        "await window.appScreen.reconcileRememberedWindowSourceForCapture"
+    ) < proactive_once.index("var nativeSourceId = S.selectedScreenSourceId;")
