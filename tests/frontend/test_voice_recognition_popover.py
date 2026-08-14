@@ -191,10 +191,14 @@ def _install_voice_popover_harness(
     };
     let rememberWindowEnabled = true;
     window.__rememberWindowSetCalls = [];
+    window.__rememberWindowRootCalls = [];
     window.isScreenSourceTitleMatchEnabled = () => rememberWindowEnabled;
-    window.setScreenSourceTitleMatchEnabled = (enabled) => {
+    window.setScreenSourceTitleMatchEnabled = (enabled, sourceRoot) => {
         rememberWindowEnabled = enabled;
         window.__rememberWindowSetCalls.push(enabled);
+        window.__rememberWindowRootCalls.push(
+            sourceRoot ? sourceRoot.className : null
+        );
     };
 
     let micPermissionGranted = false;
@@ -653,6 +657,7 @@ def test_screen_source_subwindow_header_has_remember_window_toggle(
                         & Node.DOCUMENT_POSITION_FOLLOWING
                 ),
                 setterCalls: window.__rememberWindowSetCalls,
+                setterRootCalls: window.__rememberWindowRootCalls,
                 enabledAfterClick: test.rememberWindowEnabled(),
             };
         }"""
@@ -668,6 +673,7 @@ def test_screen_source_subwindow_header_has_remember_window_toggle(
         "titleI18nKey": "app.screenSource.rememberWindow",
         "controlBeforeClose": True,
         "setterCalls": [False],
+        "setterRootCalls": ["neko-mic-popup-screen-sources"],
         "enabledAfterClick": False,
     }
 

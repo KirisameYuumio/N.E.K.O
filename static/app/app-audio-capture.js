@@ -4090,7 +4090,7 @@ if (typeof micPopup.__nekoMicScrollbarCleanup === 'function') {
                     var rememberToggle = createVoiceSettingToggle(
                         window.isScreenSourceTitleMatchEnabled(),
                         function (enabled) {
-                            window.setScreenSourceTitleMatchEnabled(enabled);
+                            window.setScreenSourceTitleMatchEnabled(enabled, screenSourceList);
                         }
                     );
                     rememberToggle.input.classList.add('neko-screen-source-title-match-toggle');

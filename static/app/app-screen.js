@@ -158,10 +158,38 @@
         });
     }
 
-    function rememberCurrentlySelectedWindowFromDom() {
+    function isScreenSourceOptionVisible(option) {
+        if (!option || !option.isConnected) return false;
+        var node = option;
+        while (node && node !== document.documentElement) {
+            if (node.hidden) return false;
+            var style = typeof window.getComputedStyle === 'function'
+                ? window.getComputedStyle(node)
+                : node.style;
+            if (style && (style.display === 'none'
+                || style.visibility === 'hidden'
+                || style.opacity === '0')) {
+                return false;
+            }
+            node = node.parentElement;
+        }
+        return true;
+    }
+
+    function rememberCurrentlySelectedWindowFromDom(preferredRoot) {
         var selectedId = S.selectedScreenSourceId;
         if (!selectedId || !selectedId.startsWith('window:')) return false;
-        var options = document.querySelectorAll('.screen-source-option');
+        var options;
+        if (preferredRoot && typeof preferredRoot.querySelectorAll === 'function') {
+            options = preferredRoot.querySelectorAll('.screen-source-option');
+        } else {
+            var allOptions = Array.from(document.querySelectorAll('.screen-source-option'));
+            var visibleMatches = allOptions.filter(function (option) {
+                return option.dataset.sourceId === selectedId
+                    && isScreenSourceOptionVisible(option);
+            });
+            options = visibleMatches.length > 0 ? visibleMatches : allOptions;
+        }
         for (var i = 0; i < options.length; i += 1) {
             if (options[i].dataset.sourceId === selectedId) {
                 var sourceTitle = normalizeRememberedWindowTitleForStorage(
@@ -193,7 +221,26 @@
         return true;
     }
 
+    function invalidateUnverifiedCaptureBeforeRememberingWindow() {
+        cancelPendingScreenSharingStart();
+        var stream = S.screenCaptureStream;
+        if (!stream || screenCaptureStreamMatchesSource(stream, S.selectedScreenSourceId)) {
+            return;
+        }
+
+        stopScreening();
+        try {
+            var videoTrack = typeof stream.getVideoTracks === 'function'
+                ? stream.getVideoTracks()[0]
+                : null;
+            if (videoTrack) videoTrack.onended = null;
+        } catch (_) { }
+        releaseCachedScreenCaptureStream(stream);
+        resetScreenSharingControls();
+    }
+
     function commitScreenSourceTitleMatchEnabled() {
+        invalidateUnverifiedCaptureBeforeRememberingWindow();
         try {
             localStorage.setItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY, 'true');
             return true;
@@ -226,7 +273,7 @@
         return boundedPromise;
     }
 
-    function setScreenSourceTitleMatchEnabled(enabled) {
+    function setScreenSourceTitleMatchEnabled(enabled, sourceRoot) {
         advanceRememberedWindowStateGeneration();
         screenSourceTitleMatchEnableGeneration += 1;
         var enableGeneration = screenSourceTitleMatchEnableGeneration;
@@ -243,7 +290,7 @@
         // available. During progressive loading, reuse the in-flight metadata
         // request rather than issuing another enumeration (which may prompt).
         try { localStorage.removeItem(SCREEN_SOURCE_TITLE_MATCH_ENABLED_KEY); } catch (_) { }
-        if (rememberCurrentlySelectedWindowFromDom()) {
+        if (rememberCurrentlySelectedWindowFromDom(sourceRoot)) {
             commitScreenSourceTitleMatchEnabled();
             updateScreenSourceTitleMatchToggleState();
             return;

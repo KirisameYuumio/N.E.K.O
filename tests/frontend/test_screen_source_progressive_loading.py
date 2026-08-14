@@ -1859,6 +1859,112 @@ def test_enabling_remember_skips_stale_dom_option_without_source_title(
 
 
 @pytest.mark.frontend
+def test_enabling_remember_prefers_the_active_popup_title(page: Page) -> None:
+    _install_screen_source_harness(page, source_enumeration_may_prompt=True)
+    active_popup = page.locator("#live2d-popup-screen")
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """async () => {
+            await window.selectScreenSource('window:2', 'Editor', 'Editor');
+            const stalePopup = document.createElement('div');
+            stalePopup.style.display = 'none';
+            const staleOption = document.createElement('div');
+            staleOption.className = 'screen-source-option';
+            staleOption.dataset.sourceId = 'window:2';
+            staleOption.dataset.sourceName = 'Old Editor Title';
+            stalePopup.appendChild(staleOption);
+            document.body.insertBefore(
+                stalePopup,
+                document.getElementById('live2d-popup-screen')
+            );
+            window.setScreenSourceTitleMatchEnabled(
+                true,
+                document.getElementById('live2d-popup-screen')
+            );
+            return {
+                enabled: window.isScreenSourceTitleMatchEnabled(),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+            };
+        }"""
+    )
+
+    assert active_popup.is_visible()
+    assert result == {
+        "enabled": True,
+        "rememberedTitle": "Editor",
+    }
+
+
+@pytest.mark.frontend
+def test_enabling_remember_stops_an_unverified_active_stream(page: Page) -> None:
+    _install_screen_source_harness(page, source_enumeration_may_prompt=True)
+    assert page.evaluate(
+        """async () => window.renderFloatingScreenSourceList(
+            document.getElementById('live2d-popup-screen')
+        )"""
+    ) is True
+
+    result = page.evaluate(
+        """async () => {
+            await window.selectScreenSource('window:2', 'Editor', 'Editor');
+            const track = {
+                readyState: 'live',
+                onended: () => {},
+                stopCalls: 0,
+                stop() {
+                    this.stopCalls += 1;
+                    this.readyState = 'ended';
+                },
+            };
+            const stream = {
+                active: true,
+                getVideoTracks: () => [track],
+                getTracks: () => [track],
+            };
+            window.appState.screenCaptureStream = stream;
+            window.appState.videoSenderInterval = setInterval(() => {}, 60_000);
+            window.appState.screenCaptureStreamIdleTimer = setTimeout(
+                () => {},
+                60_000
+            );
+            window.setScreenSourceTitleMatchEnabled(
+                true,
+                document.getElementById('live2d-popup-screen')
+            );
+            return {
+                enabled: window.isScreenSourceTitleMatchEnabled(),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                streamCleared: window.appState.screenCaptureStream === null,
+                senderCleared: window.appState.videoSenderInterval === null,
+                idleTimerCleared:
+                    window.appState.screenCaptureStreamIdleTimer === null,
+                trackStopCalls: track.stopCalls,
+                trackOnEndedCleared: track.onended === null,
+            };
+        }"""
+    )
+
+    assert result == {
+        "enabled": True,
+        "rememberedTitle": "Editor",
+        "streamCleared": True,
+        "senderCleared": True,
+        "idleTimerCleared": True,
+        "trackStopCalls": 1,
+        "trackOnEndedCleared": True,
+    }
+
+
+@pytest.mark.frontend
 def test_enabling_remember_while_loading_commits_only_after_title_is_available(
     page: Page,
 ) -> None:
