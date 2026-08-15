@@ -375,6 +375,63 @@ def test_helper_pairs_capture_type_with_the_native_frame_it_grabbed():
 
 
 @pytest.mark.unit
+def test_remembered_native_frame_is_discarded_after_identity_change():
+    proactive_src = APP_PROACTIVE_PATH.read_text(encoding="utf-8")
+    script = """
+const results = { backendCalls: 0 };
+let rememberedGeneration = 1;
+const S = {
+  screenCaptureStream: null,
+  screenCaptureStreamLastUsed: null,
+  selectedScreenSourceId: 'window:9'
+};
+const window = {
+  appScreen: {
+    reconcileRememberedWindowSourceForCapture: async () => ({
+      status: 'matched',
+      sourceId: 'window:9',
+      hadRememberedTitle: true
+    }),
+    rememberedWindowResolutionBlocksAutomaticCapture: () => false,
+    captureRememberedWindowStateSnapshot: () => rememberedGeneration,
+    rememberedWindowStateMatchesSnapshot: (snapshot) => (
+      snapshot === rememberedGeneration
+    )
+  },
+  detectScreenshotCaptureType: () => null,
+  captureDesktopSourceWithTimeout: async () => {
+    S.selectedScreenSourceId = 'window:10';
+    rememberedGeneration += 1;
+    return { success: true, dataUrl: 'data:image/png;base64,STALE' };
+  },
+  maybeClearSourceOnNotFound: () => {},
+  scheduleScreenCaptureIdleCheck: () => {}
+};
+const getDesktopProvider = () => ({ captureSourceAsDataUrl: () => {} });
+const acquireOrReuseCachedStream = async () => null;
+const captureFrameFromStream = async () => null;
+const fetchBackendScreenshot = async () => {
+  results.backendCalls += 1;
+  return { dataUrl: 'data:image/jpeg;base64,BACKEND' };
+};
+__RESOLVE__
+__CAPTURE__
+captureProactiveChatScreenshotWithSource().then((shot) => {
+  results.shot = shot;
+  console.log(JSON.stringify(results));
+});
+""".replace("__RESOLVE__", _fn(proactive_src, "resolveCaptureTypeFor")).replace(
+        "__CAPTURE__",
+        _fn(proactive_src, "captureProactiveChatScreenshotWithSource"),
+    )
+    out = _run(script)
+    assert out == {
+        "backendCalls": 0,
+        "shot": {"dataUrl": None, "via": None, "captureType": None},
+    }
+
+
+@pytest.mark.unit
 def test_helper_marks_backend_fallback_as_full_screen():
     """pyautogui grabs the whole desktop, whatever stale source id is lying around."""
     out = _run(_helper_script(

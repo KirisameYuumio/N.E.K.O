@@ -2250,12 +2250,26 @@
             && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
             // 捕获前钉住源 ID：下面是异步的，事后再读会拿新源解释旧帧。
             var nativeSourceId = S.selectedScreenSourceId;
+            var nativeRememberedState = rememberedWindowCaptureConstrained
+                && window.appScreen
+                && typeof window.appScreen.captureRememberedWindowStateSnapshot === 'function'
+                    ? window.appScreen.captureRememberedWindowStateSnapshot()
+                    : null;
             try {
                 var direct = await window.captureDesktopSourceWithTimeout(
                     desktopProvider,
                     'captureSourceAsDataUrl',
                     nativeSourceId
                 );
+                if (nativeRememberedState
+                    && window.appScreen
+                    && typeof window.appScreen.rememberedWindowStateMatchesSnapshot === 'function'
+                    && !window.appScreen.rememberedWindowStateMatchesSnapshot(
+                        nativeRememberedState
+                    )) {
+                    console.warn('[主动搭话截图] 记忆来源在原生捕获期间变化，丢弃过期帧');
+                    return { dataUrl: null, via: null, captureType: null };
+                }
                 if (direct && direct.success && direct.dataUrl) {
                     console.log('[主动搭话截图] 主进程直接捕获成功:', nativeSourceId);
                     return {

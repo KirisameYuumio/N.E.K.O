@@ -131,6 +131,8 @@
             && snapshot.rememberedTitle === readRememberedWindowTitle()
             && snapshot.enabled === isScreenSourceTitleMatchEnabled();
     }
+    mod.captureRememberedWindowStateSnapshot = captureRememberedWindowStateSnapshot;
+    mod.rememberedWindowStateMatchesSnapshot = rememberedWindowStateMatchesSnapshot;
 
     function normalizeRememberedWindowTitleForStorage(title) {
         var value = String(title || '').trim();
@@ -532,6 +534,7 @@
                     S.selectedScreenSourceId = titleMatches[0].id;
                     try { localStorage.setItem('selectedScreenSourceId', titleMatches[0].id); } catch (_) { }
                     pushSelectedSourceToMain(titleMatches[0].id);
+                    updateScreenSourceListSelection();
                     console.log('[屏幕源] 已通过唯一窗口标题恢复来源:', rememberedTitle);
                 }
                 trustedRememberedWindowSourceId = titleMatches[0].id;
@@ -679,6 +682,13 @@
                 }
                 return reconcileRememberedWindowSource(sources);
             } catch (error) {
+                if (!rememberedWindowStateMatchesSnapshot(reconciliationState)) {
+                    return {
+                        status: 'superseded',
+                        sourceId: S.selectedScreenSourceId,
+                        hadRememberedTitle: hasRememberedWindowTitlePreference()
+                    };
+                }
                 console.warn('[屏幕源] 截图前按标题解析来源失败:', error);
                 return {
                     status: 'enumeration-failed',
@@ -1005,6 +1015,16 @@
 
         var desktopProvider = resolveDesktopCaptureProvider();
         var titleResolution = await reconcileRememberedWindowSourceForCapture(desktopProvider);
+        function unavailableRememberedWindowResult() {
+            return opts.requiredSourceId
+                ? null
+                : { rememberedWindowUnavailable: true };
+        }
+        if (titleResolution
+            && titleResolution.status !== 'prompt-required'
+            && rememberedWindowResolutionNeedsSelection(titleResolution)) {
+            return unavailableRememberedWindowResult();
+        }
         var derivedRememberedWindowConstraint = !!(titleResolution
             && titleResolution.hadRememberedTitle
             && titleResolution.status !== 'prompt-required');
@@ -1017,11 +1037,6 @@
             && opts.allowPrompt);
         var requiredSourceId = opts.requiredSourceId
             || (derivedRememberedWindowConstraint ? titleResolution.sourceId : null);
-        function unavailableRememberedWindowResult() {
-            return opts.requiredSourceId
-                ? null
-                : { rememberedWindowUnavailable: true };
-        }
         if (derivedRememberedWindowConstraint && !requiredSourceId
             && !promptConfirmedStreamConstraint) {
             return unavailableRememberedWindowResult();
