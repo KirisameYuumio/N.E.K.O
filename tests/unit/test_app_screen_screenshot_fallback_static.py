@@ -100,10 +100,22 @@ def test_manual_screen_share_resolves_remembered_title_before_capture():
     )
     assert "getScreenSourceMetadataWithTimeout(desktopProvider)" in start_once
     validation_catch = start_once.split("} catch (validateErr) {", 1)[1].split(
-        "if (discardCancelledScreenSharingStart(attempt))", 1
+        "if (rememberedWindowNeedsSelection)", 1
     )[0]
+    assert "if (discardCancelledScreenSharingStart(attempt)) return;" in validation_catch
+    assert "rememberedWindowStateMatchesSnapshot(" in validation_catch
     assert "if (hasRememberedWindowTitle)" in validation_catch
     assert "rememberedWindowNeedsSelection = true;" in validation_catch
+    metadata_validation = start_once.split(
+        "var manualValidationRememberedState = captureRememberedWindowStateSnapshot();",
+        1,
+    )[1].split("} catch (validateErr) {", 1)[0]
+    assert metadata_validation.index(
+        "if (discardCancelledScreenSharingStart(attempt)) return;"
+    ) < metadata_validation.index("reconcileRememberedWindowSource(currentSources)")
+    assert metadata_validation.index(
+        "rememberedWindowStateMatchesSnapshot("
+    ) < metadata_validation.index("reconcileRememberedWindowSource(currentSources)")
 
 
 @pytest.mark.unit

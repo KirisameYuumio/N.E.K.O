@@ -2009,8 +2009,17 @@
                         && desktopProvider && !sourceEnumerationMayPrompt
                         && typeof desktopProvider.getSources === 'function') {
                         // 验证选中的源是否仍然存在（窗口可能已关闭）
+                        var manualValidationRememberedState = captureRememberedWindowStateSnapshot();
                         try {
                             var currentSources = await getScreenSourceMetadataWithTimeout(desktopProvider);
+                            if (discardCancelledScreenSharingStart(attempt)) return;
+                            if (!rememberedWindowStateMatchesSnapshot(
+                                manualValidationRememberedState
+                            )) {
+                                attempt.cancelled = true;
+                                discardCancelledScreenSharingStart(attempt);
+                                return;
+                            }
                             var titleResolution = reconcileRememberedWindowSource(currentSources);
                             selectedSourceId = S.selectedScreenSourceId;
                             var sourceStillExists = currentSources.some(function (s) { return s.id === selectedSourceId; });
@@ -2048,6 +2057,14 @@
                                 console.warn('[屏幕源] 记住的窗口标题无法唯一匹配，停止本次启动并等待用户重新选择');
                             }
                         } catch (validateErr) {
+                            if (discardCancelledScreenSharingStart(attempt)) return;
+                            if (!rememberedWindowStateMatchesSnapshot(
+                                manualValidationRememberedState
+                            )) {
+                                attempt.cancelled = true;
+                                discardCancelledScreenSharingStart(attempt);
+                                return;
+                            }
                             if (hasRememberedWindowTitle) {
                                 selectedSourceId = null;
                                 rememberedWindowNeedsSelection = true;

@@ -942,6 +942,176 @@ def test_stale_remembered_reconciliation_cannot_clear_a_newer_selection(
 
 
 @pytest.mark.frontend
+def test_manual_share_skips_reconciliation_superseded_by_cross_renderer_selection(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            document.body.insertAdjacentHTML('beforeend', `
+                <button id="micButton"></button>
+                <button id="muteButton"></button>
+                <button id="screenButton"></button>
+                <button id="stopButton"></button>
+                <button id="resetSessionButton"></button>
+            `);
+            window.appState.isRecording = true;
+            window.appState.voiceChatActive = true;
+            window.appState.audioPlayerContext = { state: 'running' };
+            window.syncAudioGlobals = () => {};
+
+            let resolveMetadata;
+            let getUserMediaCalls = 0;
+            let stoppedTracks = 0;
+            window.__desktopProvider.getSources = () => new Promise((resolve) => {
+                resolveMetadata = resolve;
+            });
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    async getUserMedia() {
+                        getUserMediaCalls += 1;
+                        return {
+                            active: true,
+                            getTracks: () => [],
+                            getVideoTracks: () => [],
+                        };
+                    },
+                },
+            });
+
+            const sharing = window.startScreenSharing();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+
+            window.__storedValues.set('selectedScreenSourceId', 'window:new');
+            window.__storedValues.set('selectedScreenWindowTitle', 'Browser');
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'selectedScreenSourceId',
+                oldValue: 'window:2',
+                newValue: 'window:new',
+            }));
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'selectedScreenWindowTitle',
+                oldValue: 'Editor',
+                newValue: 'Browser',
+            }));
+            const newTrack = {
+                readyState: 'live',
+                stop() { stoppedTracks += 1; this.readyState = 'ended'; },
+                addEventListener() {},
+            };
+            const newCachedStream = {
+                active: true,
+                getTracks: () => [newTrack],
+                getVideoTracks: () => [newTrack],
+            };
+            window.appState.screenCaptureStream = newCachedStream;
+
+            resolveMetadata([
+                { id: 'window:2', name: 'Editor', display_id: '' },
+            ]);
+            await sharing;
+            return {
+                selectedId: window.appState.selectedScreenSourceId,
+                storedId: window.__storedValues.get('selectedScreenSourceId'),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                preservedNewCache:
+                    window.appState.screenCaptureStream === newCachedStream,
+                stoppedTracks,
+                getUserMediaCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "selectedId": "window:new",
+        "storedId": "window:new",
+        "rememberedTitle": "Browser",
+        "preservedNewCache": True,
+        "stoppedTracks": 0,
+        "getUserMediaCalls": 0,
+    }
+
+
+@pytest.mark.frontend
+def test_manual_share_skips_reconciliation_superseded_by_same_source_title_change(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            window.appState.isRecording = true;
+            window.appState.voiceChatActive = true;
+            window.appState.audioPlayerContext = { state: 'running' };
+            window.syncAudioGlobals = () => {};
+
+            let resolveMetadata;
+            let getUserMediaCalls = 0;
+            window.__desktopProvider.getSources = () => new Promise((resolve) => {
+                resolveMetadata = resolve;
+            });
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    async getUserMedia() {
+                        getUserMediaCalls += 1;
+                        return {
+                            active: true,
+                            getTracks: () => [],
+                            getVideoTracks: () => [],
+                        };
+                    },
+                },
+            });
+
+            const sharing = window.startScreenSharing();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            window.__storedValues.set('selectedScreenWindowTitle', 'Browser');
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'selectedScreenWindowTitle',
+                oldValue: 'Editor',
+                newValue: 'Browser',
+            }));
+            resolveMetadata([
+                { id: 'window:2', name: 'Editor', display_id: '' },
+            ]);
+            await sharing;
+            return {
+                selectedId: window.appState.selectedScreenSourceId,
+                storedId: window.__storedValues.get('selectedScreenSourceId'),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                getUserMediaCalls,
+            };
+        }"""
+    )
+    assert result == {
+        "selectedId": "window:2",
+        "storedId": "window:2",
+        "rememberedTitle": "Browser",
+        "getUserMediaCalls": 0,
+    }
+
+
+@pytest.mark.frontend
 def test_superseded_reconciliation_cannot_start_unvalidated_stream_capture(
     page: Page,
 ) -> None:
