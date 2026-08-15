@@ -588,6 +588,128 @@ def test_native_frame_keeps_the_source_it_was_captured_from():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("superseded_stage", ["stream", "native", "normalize"])
+def test_remembered_proactive_vision_discards_superseded_frames(superseded_stage: str):
+    """A frame completed after the remembered identity changes is not sendable."""
+    proactive_src = APP_PROACTIVE_PATH.read_text(encoding="utf-8")
+    script = r"""
+const results = { sent: [], cleared: 0 };
+const rememberedState = { generation: 1 };
+const supersededStage = '__STAGE__';
+const supersede = () => { rememberedState.generation += 1; };
+const window = {
+  appUtils: { isMobile: () => false },
+  appScreen: {
+    reconcileRememberedWindowSourceForCapture: async () => ({
+      status: 'matched', sourceId: 'window:2', hadRememberedTitle: true
+    }),
+    rememberedWindowResolutionBlocksAutomaticCapture: () => false,
+    captureRememberedWindowStateSnapshot: () => ({
+      generation: rememberedState.generation
+    }),
+    rememberedWindowStateMatchesSnapshot: (snapshot) =>
+      snapshot.generation === rememberedState.generation
+  },
+  detectScreenshotCaptureType: () => null,
+  captureDesktopSourceWithTimeout: async () => {
+    if (supersededStage === 'native') supersede();
+    return { success: true, dataUrl: 'data:image/png;base64,NATIVE' };
+  },
+  maybeClearSourceOnNotFound: () => { results.cleared += 1; }
+};
+const WebSocket = { OPEN: 1 };
+const S = {
+  isRecording: true,
+  socket: { readyState: 1, send: (payload) => results.sent.push(payload) },
+  screenCaptureStream: null,
+  screenCaptureStreamLastUsed: null,
+  selectedScreenSourceId: 'window:2'
+};
+let proactiveVisionFrameInFlight = false;
+const isProactiveVisionEnabledNow = () => true;
+const stopProactiveVisionDuringSpeech = () => {};
+const getDesktopProvider = () => ({
+  nativeFrameCapture: true,
+  captureSourceAsDataUrl: () => {}
+});
+const acquireOrReuseCachedStream = async () =>
+  supersededStage === 'stream' ? ({ active: true }) : null;
+const captureFrameFromStream = async () => {
+  supersede();
+  return { dataUrl: 'data:image/jpeg;base64,STREAM' };
+};
+const normalizeNativeCaptureDataUrlForStream = async () => {
+  if (supersededStage === 'normalize') supersede();
+  return 'data:image/jpeg;base64,NATIVE';
+};
+const fetchBackendScreenshot = async () => ({
+  dataUrl: 'data:image/jpeg;base64,BACKEND'
+});
+const buildStreamDataMessage = (dataUrl) => ({ data: dataUrl });
+__FRAME__
+sendOneProactiveVisionFrame().then(() => {
+  console.log(JSON.stringify(results));
+});
+""".replace("__STAGE__", superseded_stage).replace(
+        "__FRAME__", _fn(proactive_src, "sendOneProactiveVisionFrame")
+    )
+    out = _run(script)
+    assert out == {"sent": [], "cleared": 0}
+
+
+@pytest.mark.unit
+def test_superseded_native_failure_does_not_clear_new_remembered_source():
+    """A late Source-not-found result does not mutate the replacement identity."""
+    proactive_src = APP_PROACTIVE_PATH.read_text(encoding="utf-8")
+    script = r"""
+const results = { sent: [], cleared: 0 };
+let generation = 1;
+const window = {
+  appUtils: { isMobile: () => false },
+  appScreen: {
+    reconcileRememberedWindowSourceForCapture: async () => ({
+      status: 'matched', sourceId: 'window:2', hadRememberedTitle: true
+    }),
+    rememberedWindowResolutionBlocksAutomaticCapture: () => false,
+    captureRememberedWindowStateSnapshot: () => ({ generation }),
+    rememberedWindowStateMatchesSnapshot: (snapshot) => snapshot.generation === generation
+  },
+  detectScreenshotCaptureType: () => null,
+  captureDesktopSourceWithTimeout: async () => {
+    generation += 1;
+    S.selectedScreenSourceId = 'window:new';
+    return { success: false, error: 'Source not found' };
+  },
+  maybeClearSourceOnNotFound: () => { results.cleared += 1; }
+};
+const WebSocket = { OPEN: 1 };
+const S = {
+  isRecording: true,
+  socket: { readyState: 1, send: (payload) => results.sent.push(payload) },
+  screenCaptureStream: null,
+  screenCaptureStreamLastUsed: null,
+  selectedScreenSourceId: 'window:2'
+};
+let proactiveVisionFrameInFlight = false;
+const isProactiveVisionEnabledNow = () => true;
+const stopProactiveVisionDuringSpeech = () => {};
+const getDesktopProvider = () => ({ nativeFrameCapture: true, captureSourceAsDataUrl: () => {} });
+const acquireOrReuseCachedStream = async () => null;
+const captureFrameFromStream = async () => ({ dataUrl: null });
+const normalizeNativeCaptureDataUrlForStream = async () => null;
+const fetchBackendScreenshot = async () => ({ dataUrl: null });
+const buildStreamDataMessage = (dataUrl) => ({ data: dataUrl });
+__FRAME__
+sendOneProactiveVisionFrame().then(() => {
+  results.selectedSourceId = S.selectedScreenSourceId;
+  console.log(JSON.stringify(results));
+});
+""".replace("__FRAME__", _fn(proactive_src, "sendOneProactiveVisionFrame"))
+    out = _run(script)
+    assert out == {"sent": [], "cleared": 0, "selectedSourceId": "window:new"}
+
+
+@pytest.mark.unit
 def test_display_topology_change_is_picked_up_after_the_cache_ttl():
     """A monitor attached after startup must re-arm the gate, not stay cached forever.
 

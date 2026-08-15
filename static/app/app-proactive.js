@@ -1936,6 +1936,23 @@
             var rememberedWindowSourceId = rememberedWindowCaptureConstrained
                 ? rememberedWindowResolution.sourceId
                 : null;
+            var proactiveVisionRememberedState = window.appScreen
+                && typeof window.appScreen.captureRememberedWindowStateSnapshot === 'function'
+                    ? window.appScreen.captureRememberedWindowStateSnapshot()
+                    : null;
+            function proactiveVisionRememberedStateIsCurrent() {
+                return !proactiveVisionRememberedState
+                    || !window.appScreen
+                    || typeof window.appScreen.rememberedWindowStateMatchesSnapshot !== 'function'
+                    || window.appScreen.rememberedWindowStateMatchesSnapshot(
+                        proactiveVisionRememberedState
+                    );
+            }
+            function discardSupersededProactiveVisionFrame() {
+                if (proactiveVisionRememberedStateIsCurrent()) return false;
+                console.warn('[ProactiveVision] 记忆来源在帧捕获期间变化，丢弃过期帧');
+                return true;
+            }
 
             var dataUrl = null;
             // 这一帧来自哪种画面来源，决定 Avatar 坐标怎么映射到截图坐标系。
@@ -1949,11 +1966,13 @@
                 allowPrompt: false,
                 requiredSourceId: rememberedWindowSourceId
             });
+            if (discardSupersededProactiveVisionFrame()) return;
             if (stream) {
                 // 同上：抓帧是异步的，源 ID 要跟这条流一起钉住，事后再读可能已经换人。
                 // 必须在 acquireOrReuseCachedStream 之后取——它自己就会改写这个字段。
                 var streamSourceId = S.selectedScreenSourceId;
                 var frame = await captureFrameFromStream(stream, 0.8);
+                if (discardSupersededProactiveVisionFrame()) return;
                 if (frame && frame.dataUrl) {
                     dataUrl = frame.dataUrl;
                     captureType = window.detectScreenshotCaptureType(stream, streamSourceId);
@@ -1982,11 +2001,13 @@
                             'captureSourceAsDataUrl',
                             nativeSourceId
                         );
+                        if (discardSupersededProactiveVisionFrame()) return;
                         if (direct && direct.success && direct.dataUrl) {
                             // 桌面壳的 NativeImage.toDataURL() 通常出 PNG，而后端屏幕数据
                             // 校验只接受 data:image/jpeg;base64,（utils/screenshot_utils.py:120），
                             // 不转码会让整帧被判为「无效的屏幕数据格式」直接丢掉。
                             var nativeDataUrl = await normalizeNativeCaptureDataUrlForStream(direct.dataUrl);
+                            if (discardSupersededProactiveVisionFrame()) return;
                             if (nativeDataUrl) {
                                 dataUrl = nativeDataUrl;
                                 captureType = window.detectScreenshotCaptureType(null, nativeSourceId);
@@ -1997,6 +2018,7 @@
                             window.maybeClearSourceOnNotFound(direct, '主动视觉原生捕获源已失效');
                         }
                     } catch (directError) {
+                        if (discardSupersededProactiveVisionFrame()) return;
                         if (typeof window.maybeClearSourceOnNotFound === 'function') {
                             window.maybeClearSourceOnNotFound(
                                 { error: directError && directError.message },
@@ -2015,6 +2037,7 @@
                     return;
                 }
                 var backendResult = await fetchBackendScreenshot();
+                if (discardSupersededProactiveVisionFrame()) return;
                 dataUrl = backendResult.dataUrl;
                 if (dataUrl) {
                     // pyautogui 抓的是整屏桌面，与已选窗口源 / 缓存流都无关，必须显式
@@ -2036,6 +2059,7 @@
                 stopProactiveVisionDuringSpeech();
                 return;
             }
+            if (discardSupersededProactiveVisionFrame()) return;
             if (dataUrl && S.socket && S.socket.readyState === WebSocket.OPEN) {
                 var visionInputType = (window.appUtils && window.appUtils.isMobile) ? (window.appUtils.isMobile() ? 'camera' : 'screen') : 'screen';
                 // 与持续屏幕分享共用同一个构造函数，避免两条链路的 avatar_position 口径分叉。

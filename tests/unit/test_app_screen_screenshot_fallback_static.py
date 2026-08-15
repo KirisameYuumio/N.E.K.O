@@ -269,6 +269,20 @@ def test_one_shot_capture_paths_resolve_remembered_title_before_direct_capture()
     assert proactive_vision_once.index(
         "if (rememberedWindowCaptureConstrained)"
     ) < proactive_vision_once.index("var backendResult = await fetchBackendScreenshot()")
+    assert proactive_vision_once.index(
+        "captureRememberedWindowStateSnapshot()"
+    ) < proactive_vision_once.index("acquireOrReuseCachedStream({")
+    assert proactive_vision_once.index(
+        "discardSupersededProactiveVisionFrame()"
+    ) < proactive_vision_once.index("S.socket.send(JSON.stringify(")
+    assert proactive_vision_once.index(
+        "var direct = await window.captureDesktopSourceWithTimeout("
+    ) < proactive_vision_once.index(
+        "if (discardSupersededProactiveVisionFrame()) return;",
+        proactive_vision_once.index(
+            "var direct = await window.captureDesktopSourceWithTimeout("
+        ),
+    )
 
     assert "var titleResolution = await reconcileRememberedWindowSourceForCapture" in acquire_once
     assert "titleResolution.sourceId" in acquire_once
