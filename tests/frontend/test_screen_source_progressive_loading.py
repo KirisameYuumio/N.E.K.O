@@ -743,6 +743,85 @@ def test_prompt_required_user_acquisition_discards_unknown_cache_and_opens_picke
 
 
 @pytest.mark.frontend
+def test_prompt_picker_discards_stream_superseded_by_remembered_identity_change(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        source_enumeration_may_prompt=True,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:stale",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            let resolvePicker;
+            let stoppedTracks = 0;
+            const pickerTrack = {
+                readyState: 'live',
+                stop() { stoppedTracks += 1; this.readyState = 'ended'; },
+                addEventListener() {},
+            };
+            const pickerStream = {
+                active: true,
+                getTracks: () => [pickerTrack],
+                getVideoTracks: () => [pickerTrack],
+            };
+            Object.defineProperty(navigator, 'mediaDevices', {
+                configurable: true,
+                value: {
+                    getDisplayMedia() {
+                        return new Promise((resolve) => { resolvePicker = resolve; });
+                    },
+                },
+            });
+
+            const acquisition = window.appScreen.acquireOrReuseCachedStream({
+                allowPrompt: true,
+            });
+            await new Promise((resolve) => setTimeout(resolve, 0));
+
+            window.__storedValues.set('selectedScreenSourceId', 'window:new');
+            window.__storedValues.set('selectedScreenWindowTitle', 'Browser');
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'selectedScreenSourceId',
+                oldValue: null,
+                newValue: 'window:new',
+            }));
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'selectedScreenWindowTitle',
+                oldValue: 'Editor',
+                newValue: 'Browser',
+            }));
+            resolvePicker(pickerStream);
+            const acquired = await acquisition;
+
+            return {
+                unavailable: acquired && acquired.rememberedWindowUnavailable === true,
+                stoppedTracks,
+                selectedId: window.appState.selectedScreenSourceId,
+                storedId: window.__storedValues.get('selectedScreenSourceId'),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+                installedPicker: window.appState.screenCaptureStream === pickerStream,
+            };
+        }"""
+    )
+    assert result == {
+        "unavailable": True,
+        "stoppedTracks": 1,
+        "selectedId": "window:new",
+        "storedId": "window:new",
+        "rememberedTitle": "Browser",
+        "installedPicker": False,
+    }
+
+
+@pytest.mark.frontend
 def test_late_source_enumeration_cannot_clear_a_newer_selection(page: Page) -> None:
     _install_screen_source_harness(
         page,
@@ -938,6 +1017,69 @@ def test_popup_discards_metadata_superseded_by_cross_renderer_selection(
         "persistedId": "window:new",
         "rememberedTitle": "Browser",
         "renderedNewSource": True,
+    }
+
+
+@pytest.mark.frontend
+def test_popup_does_not_reconcile_metadata_superseded_by_same_source_title_change(
+    page: Page,
+) -> None:
+    _install_screen_source_harness(
+        page,
+        initial_storage={
+            "screenSourceTitleMatchEnabled": "true",
+            "selectedScreenWindowTitle": "Editor",
+            "selectedScreenSourceId": "window:2",
+        },
+    )
+
+    result = page.evaluate(
+        """async () => {
+            let resolveOldMetadata;
+            let metadataCalls = 0;
+            window.__desktopProvider.getSources = (options) => {
+                if (options.thumbnailSize.width !== 0) {
+                    return Promise.resolve([]);
+                }
+                metadataCalls += 1;
+                return new Promise((resolve) => {
+                    resolveOldMetadata = resolve;
+                });
+            };
+            const rendering = window.renderFloatingScreenSourceList(
+                document.getElementById('live2d-popup-screen')
+            );
+            await new Promise((resolve) => setTimeout(resolve, 0));
+
+            window.__storedValues.set('selectedScreenWindowTitle', 'Browser');
+            window.dispatchEvent(new StorageEvent('storage', {
+                key: 'selectedScreenWindowTitle',
+                oldValue: 'Editor',
+                newValue: 'Browser',
+            }));
+            resolveOldMetadata([
+                { id: 'screen:1', name: 'Entire Screen', display_id: '1' },
+                { id: 'window:2', name: 'Editor', display_id: '' },
+            ]);
+            const rendered = await rendering;
+            return {
+                rendered,
+                metadataCalls,
+                selectedId: window.appState.selectedScreenSourceId,
+                persistedId: window.__storedValues.get('selectedScreenSourceId'),
+                rememberedTitle: window.__storedValues.get(
+                    'selectedScreenWindowTitle'
+                ),
+            };
+        }"""
+    )
+
+    assert result == {
+        "rendered": True,
+        "metadataCalls": 1,
+        "selectedId": "window:2",
+        "persistedId": "window:2",
+        "rememberedTitle": "Browser",
     }
 
 

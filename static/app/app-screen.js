@@ -115,6 +115,23 @@
         rememberedWindowStateGeneration += 1;
     }
 
+    function captureRememberedWindowStateSnapshot() {
+        return {
+            generation: rememberedWindowStateGeneration,
+            selectedSourceId: S.selectedScreenSourceId,
+            rememberedTitle: readRememberedWindowTitle(),
+            enabled: isScreenSourceTitleMatchEnabled()
+        };
+    }
+
+    function rememberedWindowStateMatchesSnapshot(snapshot) {
+        return !!snapshot
+            && snapshot.generation === rememberedWindowStateGeneration
+            && snapshot.selectedSourceId === S.selectedScreenSourceId
+            && snapshot.rememberedTitle === readRememberedWindowTitle()
+            && snapshot.enabled === isScreenSourceTitleMatchEnabled();
+    }
+
     function normalizeRememberedWindowTitleForStorage(title) {
         var value = String(title || '').trim();
         return value && value.length <= MAX_REMEMBERED_WINDOW_TITLE_LENGTH
@@ -649,17 +666,11 @@
             return rememberedWindowCaptureReconcilePromise;
         }
 
-        var reconciliationGeneration = rememberedWindowStateGeneration;
-        var reconciliationSelectedSourceId = S.selectedScreenSourceId;
-        var reconciliationRememberedTitle = readRememberedWindowTitle();
-        var reconciliationEnabled = isScreenSourceTitleMatchEnabled();
+        var reconciliationState = captureRememberedWindowStateSnapshot();
         var reconciliationPromise = rememberedWindowCaptureReconcilePromise = (async function () {
             try {
                 var sources = await getScreenSourceMetadataWithTimeout(provider);
-                if (reconciliationGeneration !== rememberedWindowStateGeneration
-                    || reconciliationSelectedSourceId !== S.selectedScreenSourceId
-                    || reconciliationRememberedTitle !== readRememberedWindowTitle()
-                    || reconciliationEnabled !== isScreenSourceTitleMatchEnabled()) {
+                if (!rememberedWindowStateMatchesSnapshot(reconciliationState)) {
                     return {
                         status: 'superseded',
                         sourceId: S.selectedScreenSourceId,
@@ -1166,10 +1177,19 @@
             && !S.screenCaptureAutoPromptFailed &&
             navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
             try {
+                var promptPickerRememberedState = promptRequiredRememberedPicker
+                    ? captureRememberedWindowStateSnapshot()
+                    : null;
                 var displayStream = await navigator.mediaDevices.getDisplayMedia({
                     video: { cursor: 'always', frameRate: { max: 1 } },
                     audio: false,
                 });
+
+                if (promptPickerRememberedState
+                    && !rememberedWindowStateMatchesSnapshot(promptPickerRememberedState)) {
+                    releaseCachedScreenCaptureStream(displayStream);
+                    return unavailableRememberedWindowResult();
+                }
 
                 if (promptRequiredRememberedPicker && S.selectedScreenSourceId) {
                     clearSelectedScreenSource(
@@ -2138,6 +2158,9 @@
                     } else if (!isNativeFrameProvider(desktopProvider)) {
                         // 使用标准的getDisplayMedia（显示系统选择器）
                         try {
+                            var manualPickerRememberedState = forceRememberedWindowPicker
+                                ? captureRememberedWindowStateSnapshot()
+                                : null;
                             captureStream = rememberScreenSharingAttemptStream(attempt, await navigator.mediaDevices.getDisplayMedia({
                                 video: {
                                     cursor: 'always',
@@ -2145,6 +2168,15 @@
                                 },
                                 audio: false,
                             }));
+                            if (discardCancelledScreenSharingStart(attempt)) return;
+                            if (manualPickerRememberedState
+                                && !rememberedWindowStateMatchesSnapshot(
+                                    manualPickerRememberedState
+                                )) {
+                                attempt.cancelled = true;
+                                discardCancelledScreenSharingStart(attempt);
+                                return;
+                            }
                             if (forceRememberedWindowPicker && S.selectedScreenSourceId) {
                                 clearSelectedScreenSource(
                                     'prompt picker replaced stale source',
@@ -2582,7 +2614,7 @@
 
             // 第一阶段只枚举来源元数据。Electron 明确允许用 0x0 跳过每个窗口的
             // 缩略图捕获，名称返回后立即绘制，完整图片在第二阶段后台补齐。
-            var metadataSelectedSourceId = S.selectedScreenSourceId;
+            var metadataRememberedState = captureRememberedWindowStateSnapshot();
             var metadataLoadPromise = beginScreenSourceMetadataLoad(desktopProvider);
             var sources;
             try {
@@ -2595,13 +2627,17 @@
 
             // Let callbacks already registered on the same metadata promise commit
             // a pending Remember-window toggle before deciding whether the source
-            // snapshot itself is stale. Title/toggle changes can reuse these sources;
-            // only a different selected ID may refer to a source absent from them.
+            // snapshot itself is stale. Title/toggle changes can reuse these sources
+            // for rendering, but must not reconcile state from stale metadata. Only a
+            // different selected ID may refer to a source absent from this array.
             await Promise.resolve();
             if (!isPopupAvailable()) return false;
-            if (metadataSelectedSourceId !== S.selectedScreenSourceId) {
+            if (metadataRememberedState.selectedSourceId !== S.selectedScreenSourceId) {
                 return window.renderFloatingScreenSourceList(screenPopup, renderOptions);
             }
+            var metadataRememberedStateIsCurrent = rememberedWindowStateMatchesSnapshot(
+                metadataRememberedState
+            );
 
             screenPopup.innerHTML = '';
 
@@ -2623,7 +2659,9 @@
 
             // Electron 的 source ID 只适合当前枚举结果；显式开启“记住窗口”后，
             // 用规范化标题重新解析当前 ID。只有唯一精确匹配才恢复，避免同名窗口误选。
-            reconcileRememberedWindowSource(sources);
+            if (metadataRememberedStateIsCurrent) {
+                reconcileRememberedWindowSource(sources);
+            }
 
             function previewFrameStyles() {
                 return {
