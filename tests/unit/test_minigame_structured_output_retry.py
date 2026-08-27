@@ -14,22 +14,22 @@ async def test_structured_output_retry_uses_a_new_isolation_id_and_recovers():
     async def attempt_factory(attempt, isolation_id):
         attempts.append((attempt, isolation_id))
         if attempt == 1:
-            return {"mood": "unknown"}
-        return {"mood": "happy"}
+            return {"stance": "unknown"}
+        return {"stance": "ready"}
 
     def validator(value):
-        if value.get("mood") != "happy":
-            return value, [{"field": "mood", "reason": "unsupported_value"}]
+        if value.get("stance") != "ready":
+            return value, [{"field": "stance", "reason": "unsupported_value"}]
         return value, []
 
     result = await run_isolated_structured_output(attempt_factory, validator)
 
-    assert result.value == {"mood": "happy"}
+    assert result.value == {"stance": "ready"}
     assert result.attempts == 2
     assert result.recovered is True
     assert [attempt for attempt, _ in attempts] == [1, 2]
     assert attempts[0][1] != attempts[1][1]
-    assert result.failures[0].issues == ({"field": "mood", "reason": "unsupported_value"},)
+    assert result.failures[0].issues == ({"field": "stance", "reason": "unsupported_value"},)
 
 
 @pytest.mark.unit

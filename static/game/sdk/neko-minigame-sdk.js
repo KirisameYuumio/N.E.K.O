@@ -3882,9 +3882,38 @@
           invoke: (options) => transport.requestDialogue(trustedPayload, options),
         });
         const response = await normalizeTransportResponse(rawResponse);
+        let responseData = normalizeBoundedJson(response.data, 'dialogue response');
+        if (plainObject(responseData) && responseData.control !== undefined) {
+          if (!plainObject(responseData.control)) {
+            fail('invalid_contract', 'dialogue response control must be an object');
+          }
+          const controlEntries = Object.entries(responseData.control);
+          if (controlEntries.length > MAX_CONTRACTS_PER_KIND) {
+            fail('invalid_contract', 'dialogue response contains too many controls', {
+              limit: MAX_CONTRACTS_PER_KIND,
+            });
+          }
+          const validatedControls = {};
+          for (const [type, value] of controlEntries) {
+            const { schema } = declaredContractSchema(
+              'controls',
+              type,
+              'dialogue.response.control',
+            );
+            validatedControls[type] = normalizeContractPayload(
+              value,
+              schema,
+              `dialogue response control.${type}`,
+            );
+          }
+          responseData = Object.freeze({
+            ...responseData,
+            control: Object.freeze(validatedControls),
+          });
+        }
         return Object.freeze({
           ...response,
-          data: normalizeBoundedJson(response.data, 'dialogue response'),
+          data: responseData,
         });
       },
     });

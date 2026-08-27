@@ -4894,7 +4894,10 @@ async def test_route_start_activates_stt_gate_when_audio_already_active(monkeypa
     )
 
     assert result["ok"] is True
-    state = result["state"]
+    public_state = result["state"]
+    assert "preGameContext" not in public_state
+    assert "pre_game_context_error" not in public_state
+    state = gr_runtime._get_active_game_route_state("Lan", "soccer")
     assert state["before_game_external_mode"] == "audio"
     assert state["before_game_external_active"] is True
     assert state["game_started"] is False
@@ -4975,7 +4978,10 @@ async def test_route_start_accepts_neko_invite_context(monkeypatch):
     )
 
     assert result["ok"] is True
-    state = result["state"]
+    public_state = result["state"]
+    assert "preGameContext" not in public_state
+    assert "nekoInviteText" not in public_state
+    state = gr_runtime._get_active_game_route_state("Lan", "soccer")
     assert state["nekoInitiated"] is True
     assert state["nekoInviteText"] == "来踢球吧，玩家。"
     assert state["preGameContext"]["launchIntent"] == "neko_invite"
@@ -5147,7 +5153,9 @@ async def test_route_external_text_to_game_llm_defers_voice_to_frontend_arbiter(
     state["user_language"] = "zh-TW"
     state["user_language_source"] = "render"
 
-    async def fake_run_game_chat(game_type, session_id, event, *, prompt_locale=None):
+    async def fake_run_game_chat(
+        game_type, session_id, event, *, prompt_locale=None, **_route_kwargs
+    ):
         assert game_type == "soccer"
         assert session_id == "match_1"
         assert prompt_locale == "zh-TW"
@@ -5226,6 +5234,7 @@ async def test_external_route_refreshes_live_locale_before_prompt(
             event,
             *,
             prompt_locale=None,
+            **_route_kwargs,
         ):
             prompt_locales.append(prompt_locale)
             return {"line": "localized", "control": {}, "llm_source": {"provider": "fake"}}
@@ -5260,7 +5269,7 @@ async def test_route_external_text_uses_no_memory_input_type_when_game_memory_di
     state = gr_runtime._activate_game_route("soccer", "match_1", "Lan")
     _set_soccer_game_memory_policy(state, enabled=False)
 
-    async def fake_run_game_chat(game_type, session_id, event):
+    async def fake_run_game_chat(game_type, session_id, event, **_route_kwargs):
         assert event["kind"] == "user-text"
         assert event["soccerGameMemoryPlayerInteractionEnabled"] is False
         return {"line": "这句只在本局里回应。", "control": {}, "llm_source": {"provider": "fake"}}
@@ -5347,7 +5356,9 @@ async def test_route_external_voice_transcript_to_game_llm(monkeypatch):
     state["user_language"] = "zh-TW"
     state["user_language_source"] = "session"
 
-    async def fake_run_game_chat(game_type, session_id, event, *, prompt_locale=None):
+    async def fake_run_game_chat(
+        game_type, session_id, event, *, prompt_locale=None, **_route_kwargs
+    ):
         assert game_type == "soccer"
         assert session_id == "match_1"
         assert prompt_locale == "zh-TW"
@@ -5399,6 +5410,122 @@ async def test_route_external_voice_transcript_to_game_llm(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_external_voice_transcript_rejects_a_superseded_route_generation(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+    with reset_game_route_state():
+        original = gr_runtime._activate_game_route(
+            "example-game", "reused-session", "Lan"
+        )
+        original["_sdk_route_instance_id"] = "route-A"
+        replacement = gr_runtime._activate_game_route(
+            "example-game", "reused-session", "Lan"
+        )
+        replacement["_sdk_route_instance_id"] = "route-B"
+
+        handled = await gr_runtime.route_external_voice_transcript(
+            "Lan",
+            "this belongs to route A",
+            request_id="voice-route-a",
+            game_type="example-game",
+            session_id="reused-session",
+            expected_state=original,
+        )
+
+    assert handled is False
+    assert replacement["pending_outputs"] == []
+    assert mgr.mirrored == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_stream_audio_transcript_preserves_the_source_route_generation(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    state = gr_runtime._activate_game_route(
+        "example-game", "reused-session", "Lan"
+    )
+    state["_sdk_route_instance_id"] = "route-A"
+    captured = {}
+
+    async def fake_route_external_voice_transcript(
+        lanlan_name,
+        transcript,
+        *,
+        request_id=None,
+        game_type=None,
+        session_id=None,
+        expected_state=None,
+    ):
+        captured.update({
+            "lanlan_name": lanlan_name,
+            "transcript": transcript,
+            "request_id": request_id,
+            "game_type": game_type,
+            "session_id": session_id,
+            "expected_state": expected_state,
+        })
+        return True
+
+    _gr_patch_all(
+        monkeypatch,
+        "route_external_voice_transcript",
+        fake_route_external_voice_transcript,
+    )
+
+    handled = await gr_runtime.route_external_stream_message(
+        "Lan",
+        {
+            "input_type": "audio",
+            "transcript": "source-bound transcript",
+            "request_id": "voice-route-a",
+        },
+        expected_state=state,
+    )
+
+    assert handled is True
+    assert captured == {
+        "lanlan_name": "Lan",
+        "transcript": "source-bound transcript",
+        "request_id": "voice-route-a",
+        "game_type": "example-game",
+        "session_id": "reused-session",
+        "expected_state": state,
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_voice_transcript_endpoint_rejects_a_stale_route_instance(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    route_voice = AsyncMock(return_value=True)
+    _gr_patch_all(monkeypatch, "route_external_voice_transcript", route_voice)
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route(
+            "example-game", "reused-session", "Lan"
+        )
+        state["_sdk_route_instance_id"] = "route-B"
+        result = await gr_runtime.game_route_voice_transcript(
+            "example-game",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "reused-session",
+                "sdk_route_instance_id": "route-A",
+                "request_id": "voice-route-a",
+                "transcript": "stale source",
+            }),
+        )
+
+    assert result["ok"] is False
+    assert result["handled"] is False
+    assert result["reason"] == "route_instance_id_mismatch"
+    route_voice.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_route_external_voice_transcript_dedup_idempotent_on_request_id(monkeypatch):
     """The dedup must be a true idempotency check on request_id, not a
     "last seen" single slot:
@@ -5413,7 +5540,7 @@ async def test_route_external_voice_transcript_dedup_idempotent_on_request_id(mo
 
     chat_calls = []
 
-    async def fake_run_game_chat(game_type, session_id, event):
+    async def fake_run_game_chat(game_type, session_id, event, **_route_kwargs):
         chat_calls.append((event["userVoiceText"], event.get("requestId")))
         return {"line": "好。", "control": {}, "llm_source": {"provider": "fake"}}
 
@@ -5451,7 +5578,7 @@ async def test_route_external_voice_transcript_dedup_ttl_evicts(monkeypatch):
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     gr_runtime._activate_game_route("soccer", "match_1", "Lan")
 
-    async def fake_run_game_chat(game_type, session_id, event):
+    async def fake_run_game_chat(game_type, session_id, event, **_route_kwargs):
         return {"line": "好。", "control": {}, "llm_source": {"provider": "fake"}}
 
     _gr_patch_all(monkeypatch, "_run_game_chat", fake_run_game_chat)
@@ -5492,7 +5619,7 @@ async def test_route_external_voice_transcript_dedup_membership_check_before_lru
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     gr_runtime._activate_game_route("soccer", "match_1", "Lan")
 
-    async def fake_run_game_chat(game_type, session_id, event):
+    async def fake_run_game_chat(game_type, session_id, event, **_route_kwargs):
         return {"line": "好。", "control": {}, "llm_source": {"provider": "fake"}}
 
     _gr_patch_all(monkeypatch, "_run_game_chat", fake_run_game_chat)
@@ -5533,7 +5660,7 @@ async def test_route_external_voice_transcript_dedup_no_request_id_fallback_wind
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     gr_runtime._activate_game_route("soccer", "match_1", "Lan")
 
-    async def fake_run_game_chat(game_type, session_id, event):
+    async def fake_run_game_chat(game_type, session_id, event, **_route_kwargs):
         return {"line": "好。", "control": {}, "llm_source": {"provider": "fake"}}
 
     _gr_patch_all(monkeypatch, "_run_game_chat", fake_run_game_chat)
@@ -6723,7 +6850,7 @@ async def test_game_end_under_10s_skips_archive_without_suppressing_user_reply_m
     _set_soccer_game_memory_policy(state, enabled=True)
     _mark_game_started(state, elapsed_ms=5_000)
 
-    async def fake_run_game_chat(_game_type, _session_id, event):
+    async def fake_run_game_chat(_game_type, _session_id, event, **_route_kwargs):
         assert event["kind"] == "user-voice"
         assert "skipOrdinaryMemory" not in event
         return {"line": "先热身一下。", "control": {}, "llm_source": {"provider": "fake"}}

@@ -18,9 +18,9 @@ continue to own their schemas and validators.
   only when a game needs them.
 * `quick-lines` is a separate optional capability layered on `dialogue`; a
   manifest that requests it must also request `dialogue`. The first-phase
-  same-origin host grants it only to built-in games with a registered host
-  quick-line dictionary, so generic games cannot receive a route that will
-  always answer `unsupported`.
+  same-origin host grants it only when the host launch registration allows it
+  and the bootstrap injected a quick-line provider. The common host contains no
+  game names or dictionaries.
 * Once a game uses `voice-input`, `speech-output`, `audio`, or
   `avatar-renderer`, it must use the official SDK implementation. A game cannot
   replace those capabilities with its own microphone, project-voice/TTS route,
@@ -32,7 +32,7 @@ The current first-phase transport is a trusted same-origin adapter. Public game
 code does not receive the transport internals, so the host can later replace it
 with an iframe or Electron bridge without changing game calls. The public entry
 header, this document, and `neko-minigame-sdk.d.ts` are the contract locations;
-games must not infer public behavior from soccer or other internal source files.
+games must not infer public behavior from existing internal game source files.
 
 ## Connecting a game
 
@@ -54,9 +54,14 @@ const game = await NekoMiniGame.connect({
 game identity/version, selects protocol v1, reports its host version and either
 a `registered` or explicit `development` identity, and grants only reviewed
 capabilities. Unknown or disabled formal games are rejected; a game cannot mark
-itself as a development build. The current soccer adapter represents a built-in
-registered game, while a future marketplace/isolated host can perform registry,
-integrity and launch-ticket checks behind the same handshake.
+itself as a development build. Before loading the internal same-origin adapter,
+the trusted host bootstrap places reviewed entries in
+`__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__`. The adapter consumes and deletes that
+bootstrap value once, retains immutable records only in its closure, and
+intersects each record's allowlist with locally available providers. The game
+factory cannot inject or replace a registration or capability provider. A
+future marketplace/isolated host can perform registry, integrity and
+launch-ticket checks behind the same handshake without changing game code.
 
 Unknown optional capabilities are not granted and appear in
 `game.capabilities.unavailable`. Missing required capabilities reject the
@@ -98,7 +103,7 @@ const game = await NekoMiniGame.connect({
         required: ['player', 'opponent'],
       },
     },
-    controls: { mood: ['calm', 'happy', 'angry'] },
+    controls: { stance: ['ready', 'paused'] },
     results: {
       match: {
         type: 'object',
@@ -115,8 +120,8 @@ await game.events.emit('round-started', { round: 1 });
 await game.state.update('score', { player: 2, opponent: 1 });
 await game.results.submit('match', { winner: 'player' });
 
-const unsubscribeMood = game.controls.on('mood', ({ payload }) => {
-  applyGameMood(payload);
+const unsubscribeStance = game.controls.on('stance', ({ payload }) => {
+  applyGameStance(payload);
 });
 ```
 
@@ -222,6 +227,12 @@ message and does not persist this one-shot message list as host dialogue history
 Provider, model, API key, launch ticket and top-level raw history remain
 host-controlled.
 
+When a dialogue response includes a `control` object, every key must be declared
+under `manifest.contracts.controls` and every value is validated against that
+key's schema before the result reaches game code. Undeclared or invalid controls
+reject with `invalid_contract`; the host does not interpret them as built-in
+game rules.
+
 `dialogue.request()` does not inject request-scoped host context. A game that
 needs host context must first use `context.read()` and deliberately place the
 sanitized result in its own ordered messages. Provider-specific message ordering
@@ -248,11 +259,11 @@ value explicitly in its own sequence. Neither mode can replace the protected
 host prefix or remove N.E.K.O character rules and watermarks.
 
 Games that submit anything to long-term memory declare `memory`. Before calling
-`runtime.start()`, their opening screen must show a clear, default-off consent
-control equivalent to soccer's “本局对话进入记忆” switch and pass the user's
-choice to `game.memory.configureConsent(boolean)`. The SDK locks that choice at
-the first start attempt; it cannot be changed during the round. A new runtime
-session resets it to disabled.
+`runtime.start()`, their opening screen must show a clear, default-off
+“include this round in memory” consent control and pass the user's choice to
+`game.memory.configureConsent(boolean)`. The SDK locks that choice at the first
+start attempt; it cannot be changed during the round. A new runtime session
+resets it to disabled.
 
 ```js
 await game.memory.configureConsent(memoryCheckbox.checked);
@@ -278,10 +289,10 @@ host namespaces all keys by registered game identity and enforces its own total
 quota; the SDK bounds keys, individual JSON values and pending operations:
 
 ```js
-await game.storage.set('settings/difficulty', { level: 3 });
-const saved = await game.storage.get('settings/difficulty');
+await game.storage.set('settings/pacing', { level: 3 });
+const saved = await game.storage.get('settings/pacing');
 const keys = await game.storage.list({ prefix: 'settings/', limit: 50 });
-await game.storage.delete('settings/difficulty');
+await game.storage.delete('settings/pacing');
 ```
 
 `storage.clear()` affects only the current game's namespace and requires the
@@ -341,7 +352,7 @@ anti-tamper checks and cross-device persistence behind that unchanged facade.
 
 Loading masks and dialogue bubbles are optional renderers. A game may mount the
 SDK defaults or render the same state with its own DOM, Canvas or engine UI.
-The default components do not impose soccer's layout or art direction: they use
+The default components do not impose a particular game's layout or art direction: they use
 system colors, native progress/checkbox controls, accessible live regions and
 CSS custom properties prefixed with `--neko-game-`.
 

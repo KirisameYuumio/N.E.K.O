@@ -1566,12 +1566,23 @@ class TurnMixin:
             and self.websocket.client_state == self.websocket.client_state.CONNECTED
         ):
             try:
-                await self.websocket.send_json({
+                message = {
                     "type": "user_transcript",
                     "text": clean,
                     "source": source,
                     "request_id": request_id,
-                })
+                }
+                if isinstance(metadata, dict):
+                    route_identity = {
+                        "game_type": metadata.get("game_type") or metadata.get("kind"),
+                        "session_id": metadata.get("session_id"),
+                        "sdk_route_instance_id": metadata.get("sdk_route_instance_id"),
+                    }
+                    for key, raw_value in route_identity.items():
+                        value = str(raw_value or "").strip()
+                        if value:
+                            message[key] = value
+                await self.websocket.send_json(message)
             except Exception as e:
                 logger.error(f"⚠️ mirror_user_input frontend dispatch failed: {e}")
 

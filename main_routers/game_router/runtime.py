@@ -239,6 +239,7 @@ _SDK_GAME_CONTEXT_SCOPES = frozenset({
 })
 _SDK_GAME_CONTEXT_SCOPE_LIMIT = 16
 _SDK_GAME_MEMORY_MAX_BYTES = 256 * 1024
+_SDK_AUTHOR_CONTROL_MAX_BYTES = 64 * 1024
 _SDK_GAME_MEMORY_SUBMISSION_LIMIT = 16
 _SDK_GAME_SPEECH_PENDING_LIMIT = 4
 _SDK_GAME_SPEECH_PRELOAD_TIMEOUT_SECONDS = 300.0
@@ -473,9 +474,60 @@ def _get_badminton_quick_lines_fallback(language: str | None = None) -> Dict[str
 def _public_route_state(state: dict | None) -> dict:
     if not state:
         return {"game_route_active": False}
-    public = {k: v for k, v in state.items() if not str(k).startswith("_")}
-    public["dialog_count"] = len(public.get("game_dialog_log") or [])
-    public["pending_output_count"] = len(public.get("pending_outputs") or [])
+    # Lifecycle responses are deliberately narrower than the internal route
+    # state. In particular, preGameContext may contain recent dialogue/memory
+    # and is only available through the capability-gated context endpoint.
+    lifecycle_fields = (
+        "game_type",
+        "session_id",
+        "lanlan_name",
+        "game_route_active",
+        "before_game_external_mode",
+        "before_game_external_active",
+        "game_external_voice_route_active",
+        "game_external_text_route_active",
+        "game_input_mode",
+        "activation_source",
+        "external_suspended_by_game",
+        "should_resume_external_on_exit",
+        "game_memory_enabled",
+        "game_memory_player_interaction_enabled",
+        "game_memory_event_reply_enabled",
+        "game_memory_archive_enabled",
+        "game_memory_postgame_context_enabled",
+        "game_memory_tail_count",
+        "soccer_game_memory_enabled",
+        "soccer_game_memory_player_interaction_enabled",
+        "soccer_game_memory_event_reply_enabled",
+        "soccer_game_memory_archive_enabled",
+        "soccer_game_memory_postgame_context_enabled",
+        "badminton_game_memory_enabled",
+        "badminton_game_memory_player_interaction_enabled",
+        "badminton_game_memory_event_reply_enabled",
+        "badminton_game_memory_archive_enabled",
+        "badminton_game_memory_postgame_context_enabled",
+        "game_started",
+        "game_started_at",
+        "game_started_elapsed_ms",
+        "game_exit_started_elapsed_ms",
+        "accidental_game_entry_exit",
+        "created_at",
+        "last_activity",
+        "heartbeat_enabled",
+        "last_heartbeat_at",
+        "heartbeat_interval_seconds",
+        "heartbeat_timeout_seconds",
+        "hidden_heartbeat_timeout_seconds",
+        "page_visible",
+        "visibility_state",
+        "mode",
+        "nekoInitiated",
+        "user_language",
+        "user_language_source",
+    )
+    public = {key: state[key] for key in lifecycle_fields if key in state}
+    public["dialog_count"] = len(state.get("game_dialog_log") or [])
+    public["pending_output_count"] = len(state.get("pending_outputs") or [])
     return public
 
 
@@ -686,6 +738,53 @@ def _parse_control_instructions(reply: str, game_type: str = "soccer") -> Dict[s
     }
 
 
+def _parse_author_managed_control_instructions(reply: str) -> Dict[str, Any]:
+    """Parse a game-neutral author-managed line plus trailing JSON control.
+
+    The server deliberately does not recognize football/badminton fields here.
+    The public SDK validates the returned control against the manifest contract
+    before dispatching it to game code.
+    """
+    text = str(reply or "").strip()
+    lines = text.split("\n")
+    line_text = text
+    control: dict[str, Any] = {}
+
+    candidates: list[tuple[int, str]] = []
+    if len(lines) > 1:
+        candidates.append((text.rfind(lines[-1]), lines[-1].strip()))
+    json_start = text.rfind("{")
+    if json_start >= 0:
+        candidates.append((json_start, text[json_start:].strip()))
+
+    seen_offsets: set[int] = set()
+    for offset, candidate in candidates:
+        if offset in seen_offsets or not candidate.startswith("{") or not candidate.endswith("}"):
+            continue
+        seen_offsets.add(offset)
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        try:
+            control = _sdk_bounded_json_copy(
+                parsed,
+                field="author_control",
+                maximum_bytes=_SDK_AUTHOR_CONTROL_MAX_BYTES,
+            )
+        except ValueError:
+            control = {}
+        line_text = text[:offset].strip()
+        break
+
+    return {
+        "line": _sanitize_game_visible_line(line_text),
+        "control": control,
+    }
+
+
 def _strip_ssml_like_tags(text: str) -> str:
     """Remove known SSML tags before handing text to TTS."""
     line = str(text or "")
@@ -721,6 +820,8 @@ async def _run_game_chat(
     postgame_meta_out: Optional[Dict[str, Any]] = None,
     prompt_locale: str | None = None,
     author_prompt: Dict[str, Any] | None = None,
+    expected_route_state: dict | None = None,
+    expected_route_instance_id: str = "",
 ) -> Dict[str, Any]:
     """Run A-layer game LLM for both HTTP game events and hijacked external text.
 
@@ -778,12 +879,16 @@ async def _run_game_chat(
         sensitive_possible=isinstance(event, dict) and any(event.get(key) for key in ("textRaw", "userText", "userVoiceText")),
     )
 
-    if game_type == "soccer" and isinstance(event, dict):
+    if normalized_author_prompt is None and game_type == "soccer" and isinstance(event, dict):
         balance_hint = _build_soccer_balance_hint(event)
         if balance_hint:
             event = dict(event)
             event['balanceHint'] = balance_hint
-    elif _is_badminton_game_type(game_type) and isinstance(event, dict):
+    elif (
+        normalized_author_prompt is None
+        and _is_badminton_game_type(game_type)
+        and isinstance(event, dict)
+    ):
         route_state = _find_game_route_state_for_session(game_type, session_id, lanlan_name)
         event_mode = _normalize_badminton_mode(event.get("mode") or (route_state.get("mode") if isinstance(route_state, dict) else ""))
         if event_mode == "duel":
@@ -801,6 +906,15 @@ async def _run_game_chat(
     # since nothing else in the lifecycle would close it.
     if not allow_postgame:
         pre_state = _find_game_route_state_for_session(game_type, session_id, lanlan_name)
+        if expected_route_state is not None and (
+            pre_state is not expected_route_state
+            or (
+                expected_route_instance_id
+                and str((pre_state or {}).get("_sdk_route_instance_id") or "")
+                != expected_route_instance_id
+            )
+        ):
+            return {"line": "", "control": {}, "skipped": "route_superseded"}
         if isinstance(pre_state, dict) and (
             pre_state.get("_exit_flow_started")
             or pre_state.get("game_route_active") is False
@@ -821,6 +935,12 @@ async def _run_game_chat(
         if not isinstance(pre_state, dict) or (
             pre_state.get("game_route_active") is not True
             or str(pre_state.get("session_id") or "") != str(session_id or "")
+            or (expected_route_state is not None and pre_state is not expected_route_state)
+            or (
+                expected_route_instance_id
+                and str(pre_state.get("_sdk_route_instance_id") or "")
+                != expected_route_instance_id
+            )
         ):
             return {"line": "", "control": {}, "skipped": "route_inactive"}
 
@@ -863,26 +983,35 @@ async def _run_game_chat(
                     "prompt_mode": "author-managed",
                 },
             )
-            return {"error": f"LLM 调用失败: {exc}", "line": "", "control": {}}
+            return {
+                "error": "provider_unavailable",
+                "reason": "provider_error",
+                "error_type": type(exc).__name__,
+                "line": "",
+                "control": {},
+            }
 
         post_state = _find_game_route_state_for_session(game_type, session_id, lanlan_name)
         if not isinstance(post_state, dict) or (
             post_state.get("game_route_active") is not True
             or str(post_state.get("session_id") or "") != str(session_id or "")
+            or post_state is not pre_state
+            or (expected_route_state is not None and post_state is not expected_route_state)
+            or (
+                expected_route_instance_id
+                and str(post_state.get("_sdk_route_instance_id") or "")
+                != expected_route_instance_id
+            )
         ):
-            return {"line": "", "control": {}, "skipped": "route_inactive"}
+            skipped = (
+                "route_inactive"
+                if isinstance(post_state, dict)
+                and post_state.get("game_route_active") is not True
+                else "route_superseded"
+            )
+            return {"line": "", "control": {}, "skipped": skipped}
 
-        result = _parse_control_instructions(author_result["reply"], game_type=game_type)
-        if game_type == "soccer" and isinstance(event, dict):
-            result = _apply_soccer_anger_pressure_cap(result, event)
-        elif (
-            _is_badminton_game_type(game_type)
-            and isinstance(event, dict)
-            and _normalize_badminton_mode(event.get("mode")) == "duel"
-        ):
-            result = _apply_badminton_anger_pressure_cap(result, event)
-        if isinstance(event, dict) and event.get("balanceHint"):
-            result["balance_hint"] = event["balanceHint"]
+        result = _parse_author_managed_control_instructions(author_result["reply"])
         total_elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
         result["metrics"] = {
             "llm_ms": author_result["llm_ms"],
@@ -960,6 +1089,15 @@ async def _run_game_chat(
         # has already been written.
         if not allow_postgame:
             route_state = _find_game_route_state_for_session(game_type, session_id, lanlan_name)
+            if expected_route_state is not None and (
+                route_state is not expected_route_state
+                or (
+                    expected_route_instance_id
+                    and str((route_state or {}).get("_sdk_route_instance_id") or "")
+                    != expected_route_instance_id
+                )
+            ):
+                return {"line": "", "control": {}, "skipped": "route_superseded"}
             if isinstance(route_state, dict) and (
                 route_state.get("_exit_flow_started")
                 or route_state.get("game_route_active") is False
@@ -1399,6 +1537,10 @@ async def _run_author_managed_game_chat_request(
         prompt_locale=prompt_locale,
         lanlan_name=lanlan_name,
         author_prompt=author_prompt,
+        expected_route_state=state,
+        expected_route_instance_id=str(
+            (state or {}).get("_sdk_route_instance_id") or ""
+        ),
     )
     return _record_game_chat_result(state, authoritative_session_id, event, result)
 
@@ -1692,6 +1834,7 @@ async def game_route_start(game_type: str, request: Request):
                         request_id=request_id,
                         game_type=game_type,
                         session_id=session_id,
+                        expected_state=state,
                     )
                 mgr._takeover_active = True
                 mgr._takeover_input_dispatcher = _takeover_dispatcher
@@ -2196,12 +2339,12 @@ async def game_route_voice_transcript(game_type: str, request: Request):
     if not lanlan_name:
         return {"ok": False, "reason": "missing_lanlan_name"}
 
-    session_id = str(data.get("session_id") or "")
-    state = _get_active_game_route_state(lanlan_name, game_type)
-    if not state:
-        return {"ok": True, "handled": False, "reason": "game_route_inactive"}
-    if session_id and session_id != str(state.get("session_id") or ""):
-        return {"ok": True, "handled": False, "reason": "session_id_mismatch"}
+    _resolved_name, session_id, state, route_error = _sdk_active_route_from_payload(
+        game_type,
+        {**data, "lanlan_name": lanlan_name},
+    )
+    if route_error is not None:
+        return {**route_error, "handled": False}
 
     _absorb_request_language(data, lanlan_name)
     _update_game_route_language_from_payload(state, data)
@@ -2218,6 +2361,7 @@ async def game_route_voice_transcript(game_type: str, request: Request):
         request_id=str(data.get("request_id") or "") or None,
         game_type=game_type,
         session_id=session_id or None,
+        expected_state=state,
     )
     return {"ok": True, "handled": handled, "state": _public_route_state(state)}
 
@@ -2899,35 +3043,18 @@ def _build_external_voice_event(state: dict, text: str) -> dict:
 
 def _build_external_user_event(state: dict, text: str, *, kind: str, source: str) -> dict:
     current_state = state.get("last_state") if isinstance(state.get("last_state"), dict) else {}
-    score = current_state.get("score") if isinstance(current_state.get("score"), dict) else {"player": 0, "ai": 0}
-    try:
-        score_diff = int(score.get("ai", 0)) - int(score.get("player", 0))
-    except (TypeError, ValueError):
-        score_diff = 0
     event_type = "user_text" if kind == "user-text" else "user_voice"
-    game_type = _normalize_game_memory_type(state.get("game_type") or "soccer")
+    game_type = _normalize_game_memory_type(state.get("game_type"))
     policy = _game_memory_policy(game_type, state)
     fields = _game_memory_policy_fields(game_type)
     master = policy[fields[0]]
     player_interaction = policy[fields[1]]
     event_reply = policy[fields[2]]
-    return {
+    event = {
         "kind": kind,
         "lanlan_name": state.get("lanlan_name") or "",
         "type": event_type,
         "source": source,
-        "badmintonGameMemoryEnabled": master,
-        "badminton_game_memory_enabled": master,
-        "badmintonGameMemoryPlayerInteractionEnabled": player_interaction,
-        "badminton_game_memory_player_interaction_enabled": player_interaction,
-        "badmintonGameMemoryEventReplyEnabled": event_reply,
-        "badminton_game_memory_event_reply_enabled": event_reply,
-        "soccerGameMemoryEnabled": master,
-        "soccer_game_memory_enabled": master,
-        "soccerGameMemoryPlayerInteractionEnabled": player_interaction,
-        "soccer_game_memory_player_interaction_enabled": player_interaction,
-        "soccerGameMemoryEventReplyEnabled": event_reply,
-        "soccer_game_memory_event_reply_enabled": event_reply,
         "gameMemoryEnabled": player_interaction,
         "game_memory_enabled": player_interaction,
         "gameMemoryPlayerInteractionEnabled": player_interaction,
@@ -2937,20 +3064,40 @@ def _build_external_user_event(state: dict, text: str, *, kind: str, source: str
         "textRaw": text,
         "userText": text if kind == "user-text" else "",
         "userVoiceText": text if kind == "user-voice" else "",
-        "round": current_state.get("round"),
-        "mood": current_state.get("mood"),
-        "score": score,
-        "scoreDiff": score_diff,
-        "difficulty": current_state.get("difficulty"),
         "currentState": current_state,
         "pendingItems": [{
             "type": event_type,
             "kind": kind,
             "textRaw": text,
             "snapshot": current_state,
-            "round": current_state.get("round"),
         }],
     }
+    if game_type in {"soccer", "badminton"}:
+        event.update({
+            f"{game_type}GameMemoryEnabled": master,
+            f"{game_type}_game_memory_enabled": master,
+            f"{game_type}GameMemoryPlayerInteractionEnabled": player_interaction,
+            f"{game_type}_game_memory_player_interaction_enabled": player_interaction,
+            f"{game_type}GameMemoryEventReplyEnabled": event_reply,
+            f"{game_type}_game_memory_event_reply_enabled": event_reply,
+        })
+        score = current_state.get("score") if isinstance(current_state.get("score"), dict) else {
+            "player": 0,
+            "ai": 0,
+        }
+        try:
+            score_diff = int(score.get("ai", 0)) - int(score.get("player", 0))
+        except (TypeError, ValueError):
+            score_diff = 0
+        event.update({
+            "round": current_state.get("round"),
+            "mood": current_state.get("mood"),
+            "score": score,
+            "scoreDiff": score_diff,
+            "difficulty": current_state.get("difficulty"),
+        })
+        event["pendingItems"][0]["round"] = current_state.get("round")
+    return event
 
 
 async def _route_external_transcript_to_game(
@@ -3038,7 +3185,7 @@ async def _route_external_transcript_to_game(
     mgr = get_session_manager().get(lanlan_name)
     game_type = str(state.get("game_type") or "soccer")
     session_id = str(state.get("session_id") or "default")
-    memory_enabled = _game_memory_player_interaction_enabled(state)
+    memory_enabled = _game_memory_player_interaction_enabled(state, game_type)
     _append_game_session_debug_log(
         game_type,
         session_id,
@@ -3057,9 +3204,11 @@ async def _route_external_transcript_to_game(
         sensitive_possible=True,
     )
     memory_fields = _game_memory_policy_fields(game_type)
-    memory_player_camel_key = _game_memory_camel_key(
-        _normalize_game_memory_type(game_type),
-        memory_fields[1],
+    normalized_memory_type = _normalize_game_memory_type(game_type)
+    memory_player_camel_key = (
+        _game_memory_camel_key(normalized_memory_type, memory_fields[1])
+        if normalized_memory_type in {"soccer", "badminton"}
+        else "gameMemoryPlayerInteractionEnabled"
     )
     memory_player_snake_key = memory_fields[1]
     _append_route_activation(
@@ -3069,14 +3218,18 @@ async def _route_external_transcript_to_game(
         {"request_id": request_id or ""},
     )
     if mgr and hasattr(mgr, "mirror_user_input"):
+        mirror_metadata = build_mirror_meta(
+            source=source,
+            kind=game_type,
+            session_id=session_id,
+            event={"memory_enabled": memory_enabled},
+        )
+        route_instance_id = str(state.get("_sdk_route_instance_id") or "")
+        if route_instance_id:
+            mirror_metadata["sdk_route_instance_id"] = route_instance_id
         await mgr.mirror_user_input(
             text,
-            metadata=build_mirror_meta(
-                source=source,
-                kind=game_type,
-                session_id=session_id,
-                event={"memory_enabled": memory_enabled},
-            ),
+            metadata=mirror_metadata,
             request_id=request_id,
             input_type=(
                 MIRROR_USER_VOICE_TRANSCRIPT_INPUT_TYPE
@@ -3140,6 +3293,10 @@ async def _route_external_transcript_to_game(
         game_type,
         session_id,
         event,
+        expected_route_state=state,
+        expected_route_instance_id=str(
+            state.get("_sdk_route_instance_id") or ""
+        ),
         **game_chat_kwargs,
     )
     result_ts = time.time()
@@ -3196,6 +3353,7 @@ async def route_external_voice_transcript(
     request_id: str | None = None,
     game_type: str | None = None,
     session_id: str | None = None,
+    expected_state: dict | None = None,
 ) -> bool:
     """Route a voice transcript into the active game route, if any.
 
@@ -3204,7 +3362,7 @@ async def route_external_voice_transcript(
     ``main_logic → main_routers`` import.
     """
     state = _get_active_game_route_state(lanlan_name, game_type)
-    if not state:
+    if not state or (expected_state is not None and state is not expected_state):
         return False
     if session_id and str(state.get("session_id") or "") != str(session_id):
         return False
@@ -3338,6 +3496,7 @@ async def route_external_stream_message(
                 request_id=request_id,
                 game_type=game_type,
                 session_id=str(state.get("session_id") or ""),
+                expected_state=state,
             )
         _append_route_activation(state, "external_voice_hijacked_by_game", "voice")
         if not state.get("_voice_stt_gate_active_notified"):

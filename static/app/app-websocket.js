@@ -2732,7 +2732,10 @@
                             detail: {
                                 requestId: resolveAssistantRequestId(response.request_id, response.meta),
                                 text: normalizedVoiceTranscript,
-                                source: 'voice'
+                                source: String(response.source || 'voice'),
+                                gameType: String(response.game_type || ''),
+                                sessionId: String(response.session_id || ''),
+                                routeInstanceId: String(response.sdk_route_instance_id || '')
                             }
                         }));
                     }
@@ -3219,11 +3222,11 @@
                         var transcriptionProvider = (statusDetails && statusDetails.provider) || '';
                         var transcriptionReady = !!(statusDetails && statusDetails.ready === true);
                         S.gameRouteActive = true;
-                        S.gameRouteGameType = (statusDetails && statusDetails.game_type) || 'soccer';
+                        S.gameRouteGameType = (statusDetails && statusDetails.game_type) || '';
                         S.gameRouteLanlanName = (statusDetails && statusDetails.lanlan_name) || '';
                         S.gameRouteSessionId = (statusDetails && statusDetails.session_id) || '';
                         S.gameRouteInstanceId = (statusDetails && statusDetails.sdk_route_instance_id) || S.gameRouteInstanceId || '';
-                        S.gameVoiceSttGameType = (statusDetails && statusDetails.game_type) || 'soccer';
+                        S.gameVoiceSttGameType = (statusDetails && statusDetails.game_type) || '';
                         S.gameVoiceSttSessionId = (statusDetails && statusDetails.session_id) || '';
                         // The route-resolution status may have arrived before
                         // this game-takeover edge. Preserve that authoritative
@@ -4805,7 +4808,7 @@
                             console.log(`[GameWindow] 忽略过期窗口事件 | action=${detail.action} incoming=${incomingGameSessionId} current=${currentGameSessionId}`);
                         } else if (detail.action === 'opened') {
                             S.gameRouteActive = true;
-                            S.gameRouteGameType = detail.gameType || 'soccer';
+                            S.gameRouteGameType = detail.gameType || '';
                             S.gameRouteLanlanName = detail.lanlanName || '';
                             S.gameRouteSessionId = incomingGameSessionId || '';
                             S.gameRouteInstanceId = incomingGameRouteInstanceId || '';

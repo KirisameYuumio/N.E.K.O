@@ -59,7 +59,7 @@ async function main() {
         ok: true,
         outputs: [{
           ts: 123,
-          result: { control: { mood: 'happy' } },
+          result: { control: { stance: 'ready' } },
         }],
       });
     }
@@ -94,6 +94,30 @@ async function main() {
       constructor(type, options = {}) { this.type = type; this.detail = options.detail; }
     },
   };
+  const defaultCapabilities = [
+    'runtime', 'dialogue', 'logging', 'voice-input', 'speech-output',
+    'context-read', 'memory', 'storage', 'leaderboard-local', 'quick-lines',
+  ];
+  windowMock.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ = Object.fromEntries(
+    [...[
+      'example-game',
+      'waiting-lock-game',
+      'third-party-game',
+      'no-lock-game',
+      'logger-one',
+      'logger-two',
+    ], ...Array.from({ length: 70 }, (_unused, index) => `overflow-game-${index}`)]
+      .map((gameId) => [gameId, {
+      mode: gameId === 'example-game' ? 'registered' : 'development',
+      gameId,
+      publisherId: 'test-host',
+      version: '1.0.0',
+      allowedCapabilities: defaultCapabilities,
+      capabilityProviders: gameId === 'example-game' ? {
+        quickLines: async () => jsonResponse({ ok: true, lines: ['ready'] }),
+      } : {},
+    }]),
+  );
   global.window = windowMock;
 
   const sourcePath = path.resolve(
@@ -101,18 +125,47 @@ async function main() {
     '../../static/game/sdk/neko-minigame-same-origin-host.js',
   );
   vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
+  assert(windowMock.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ === undefined,
+    'host launch registrations remained mutable after adapter bootstrap');
 
-  const host = window.createNekoMiniGameSameOriginHost({
-    gameType: 'soccer',
+  const createHost = (options = {}) => window.createNekoMiniGameSameOriginHost(options);
+  let missingRegistrationError = null;
+  try {
+    window.createNekoMiniGameSameOriginHost({
+      gameType: 'forged-game',
+      fetchImpl,
+      windowImpl: windowMock,
+      navigatorImpl: windowMock.navigator,
+    });
+  } catch (error) { missingRegistrationError = error; }
+  assert(missingRegistrationError?.code === 'game_unregistered',
+    'a game minted a registered host identity without a launch registration');
+  let overflowRegistrationError = null;
+  try {
+    window.createNekoMiniGameSameOriginHost({
+      gameType: 'overflow-game-69',
+      fetchImpl,
+      windowImpl: windowMock,
+      navigatorImpl: windowMock.navigator,
+    });
+  } catch (error) { overflowRegistrationError = error; }
+  assert(overflowRegistrationError?.code === 'game_unregistered',
+    'the host launch registry exceeded its page-lifetime capacity bound');
+
+  const host = createHost({
+    gameType: 'example-game',
     sessionId: 'client-session',
     fetchImpl,
     windowImpl: windowMock,
     navigatorImpl: windowMock.navigator,
+    capabilityProviders: {
+      quickLines: async () => jsonResponse({ ok: true, lines: ['forged'] }),
+    },
   });
   const handshake = host.connectGame({
     protocolVersions: ['1'],
     manifest: {
-      id: 'soccer',
+      id: 'example-game',
       version: '1.0.0',
       requiredCapabilities: ['runtime', 'logging'],
       optionalCapabilities: [
@@ -125,7 +178,7 @@ async function main() {
   assert(handshake.grantedCapabilities.includes('memory'),
     'same-origin host did not grant its memory adapter');
   assert(handshake.grantedCapabilities.includes('quick-lines'),
-    'registered soccer quick-lines were not granted');
+    'host-provided quick-lines were not granted');
   assert(handshake.grantedCapabilities.includes('storage')
     && handshake.grantedCapabilities.includes('leaderboard-local'),
   'cross-window-safe local leaderboard capability was not granted');
@@ -187,15 +240,11 @@ async function main() {
     'opening-screen memory consent was not attached to route start');
   assert(host.sessionId === 'server-session' && host.routeLanlanName === 'Server Neko',
     'authoritative route identity did not replace the provisional host identity');
-  await host.evaluatePassiveGuard({
-    session_id: 'attacker-session',
-    lanlan_name: 'Attacker Neko',
-    event: { kind: 'idle' },
-  });
-  const passiveGuardCall = calls.find((call) => call.url.endsWith('/passive-guard'));
-  assert(passiveGuardCall.body.session_id === 'server-session'
-    && passiveGuardCall.body.lanlan_name === 'Server Neko',
-  'passive guard trusted application-supplied route identity');
+  assert(typeof host.evaluatePassiveGuard === 'undefined',
+    'the game-specific PassiveGuard leaked into the public same-origin host');
+  const quickLinesResponse = await host.getQuickLines({ event: { kind: 'prepare' } });
+  assert((await quickLinesResponse.json()).lines[0] === 'ready',
+    'quick-lines did not use the host-owned provider');
 
   await host.publishGameProtocol('event', {
     protocolVersion: '1',
@@ -291,8 +340,8 @@ async function main() {
   const controls = [];
   host.startGameControlBridge({ onControl: (control) => controls.push(control) });
   await host.drain({ session_id: 'attacker-session' });
-  assert(controls.length === 1 && controls[0].type === 'mood'
-    && controls[0].payload === 'happy',
+  assert(controls.length === 1 && controls[0].type === 'stance'
+    && controls[0].payload === 'ready',
   'route outputs were not converted into SDK control envelopes');
   assert(controls[0].sessionId === 'server-session',
     'control envelope did not carry the authoritative route session');
@@ -302,7 +351,7 @@ async function main() {
   const millisecondControls = [];
   host.stopGameControlBridge();
   host.startGameControlBridge({ onControl: (control) => millisecondControls.push(control) });
-  host._dispatchGameControls([{ ts: 1700000000123, control: { mood: 'happy' } }]);
+  host._dispatchGameControls([{ ts: 1700000000123, control: { stance: 'ready' } }]);
   assert(millisecondControls[0].timestamp === 1700000000123,
     'millisecond control timestamps were changed during normalization');
 
@@ -314,7 +363,7 @@ async function main() {
   windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
     detail: {
       type: 'game_voice_control_state',
-      game_type: 'soccer',
+      game_type: 'example-game',
       session_id: 'server-session',
       reason: 'state-sync',
     },
@@ -325,7 +374,7 @@ async function main() {
   windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
     detail: {
       type: 'game_voice_control_state',
-      game_type: 'soccer',
+      game_type: 'example-game',
       session_id: 'server-session',
       route_active: false,
       active: false,
@@ -340,7 +389,7 @@ async function main() {
     windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
       detail: {
         type: 'game_voice_control_state',
-        game_type: 'soccer',
+        game_type: 'example-game',
         session_id: 'server-session',
         sdk_route_instance_id: event.detail.sdk_route_instance_id,
         request_id: event.detail.request_id,
@@ -358,6 +407,15 @@ async function main() {
     'same-document voice fallback request did not complete without BroadcastChannel');
   assert(sameDocumentResponse.sdk_route_instance_id === 'route-instance-a',
     'same-document voice request did not preserve the route generation');
+  const originalStorageSetItem = windowMock.localStorage.setItem;
+  windowMock.localStorage.setItem = () => { throw new Error('storage blocked'); };
+  const storageBlockedResponse = await host.requestVoiceControl('query', {
+    timeoutMs: 500,
+    sdkRouteInstanceId: 'route-instance-a',
+  });
+  windowMock.localStorage.setItem = originalStorageSetItem;
+  assert(storageBlockedResponse.reason === 'queried',
+    'same-document voice fallback was skipped when localStorage failed');
   windowMock.removeEventListener('neko-game-voice-control-message', sameDocumentController);
   const voiceAbortController = new AbortController();
   const cancelledVoiceRequest = host.requestVoiceControl('query', {
@@ -387,7 +445,7 @@ async function main() {
     const response = {
       type: 'game_voice_control_state',
       message_id: 'dual-response-1',
-      game_type: 'soccer',
+      game_type: 'example-game',
       session_id: 'server-session',
       sdk_route_instance_id: event.detail.sdk_route_instance_id,
       request_id: event.detail.request_id,
@@ -444,8 +502,8 @@ async function main() {
     }
     return jsonResponse({ ok: true });
   };
-  const limitedHost = window.createNekoMiniGameSameOriginHost({
-    gameType: 'soccer',
+  const limitedHost = createHost({
+    gameType: 'example-game',
     protocolQueueLimit: 2,
     fetchImpl: limitedFetch,
     windowImpl: windowMock,
@@ -487,7 +545,7 @@ async function main() {
       },
     },
   };
-  const waitingLockHost = window.createNekoMiniGameSameOriginHost({
+  const waitingLockHost = createHost({
     gameType: 'waiting-lock-game',
     fetchImpl,
     windowImpl: windowMock,
@@ -504,7 +562,7 @@ async function main() {
     && waitingLockHost._pendingStorageLockControllers.size === 0,
   'trusted host disposal did not abort and release its pending Web Lock request');
 
-  const genericHost = window.createNekoMiniGameSameOriginHost({
+  const genericHost = createHost({
     gameType: 'third-party-game',
     fetchImpl,
     windowImpl: windowMock,
@@ -523,7 +581,7 @@ async function main() {
     && !genericHandshake.grantedCapabilities.includes('quick-lines'),
   'generic games received a quick-lines route without a registered dictionary');
 
-  const noLockHost = window.createNekoMiniGameSameOriginHost({
+  const noLockHost = createHost({
     gameType: 'no-lock-game',
     fetchImpl,
     windowImpl: windowMock,
@@ -544,13 +602,13 @@ async function main() {
 
   const originalConsoleWarn = windowMock.console.warn;
   const originalConsoleError = windowMock.console.error;
-  const loggerHostOne = window.createNekoMiniGameSameOriginHost({
+  const loggerHostOne = createHost({
     gameType: 'logger-one',
     fetchImpl,
     windowImpl: windowMock,
     navigatorImpl: windowMock.navigator,
   });
-  const loggerHostTwo = window.createNekoMiniGameSameOriginHost({
+  const loggerHostTwo = createHost({
     gameType: 'logger-two',
     fetchImpl,
     windowImpl: windowMock,

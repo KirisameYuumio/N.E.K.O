@@ -18,6 +18,7 @@ async function main() {
   const posted = [];
   let nextIntervalId = 1;
   let channelClosed = false;
+  let failLocalStorageWrites = false;
   const localValues = new Map();
 
   const addEventListener = (type, handler) => {
@@ -40,11 +41,16 @@ async function main() {
     gameVoiceTranscriptionReason: 'voice_inactive',
     voiceInputRouteBlocked: false,
   };
+  let holdMicStart = false;
   const micButton = {
     disabled: false,
     classList: { contains: () => false },
     clickCount: 0,
-    click() { this.clickCount += 1; appState.isRecording = true; },
+    click() {
+      this.clickCount += 1;
+      if (holdMicStart) appState.voiceStartPending = true;
+      else appState.isRecording = true;
+    },
   };
   const documentMock = {
     getElementById(id) { return id === 'micButton' ? micButton : null; },
@@ -84,7 +90,10 @@ async function main() {
   global.BroadcastChannel = BroadcastChannelMock;
   global.localStorage = {
     getItem(key) { return localValues.has(key) ? localValues.get(key) : null; },
-    setItem(key, value) { localValues.set(key, String(value)); },
+    setItem(key, value) {
+      if (failLocalStorageWrites) throw new Error('storage unavailable');
+      localValues.set(key, String(value));
+    },
     removeItem(key) { localValues.delete(key); },
   };
   global.setInterval = (callback, delay) => {
@@ -200,7 +209,14 @@ async function main() {
   'resolved native Core transcription state was not forwarded to the game');
 
   const transcriptListener = listeners.get('neko:user-voice-content-received')?.values().next().value;
-  transcriptListener({ detail: { requestId: 'voice-final-1', text: '  hello game  ', source: 'voice' } });
+  transcriptListener({ detail: {
+    requestId: 'voice-final-1',
+    text: '  hello game  ',
+    source: 'voice',
+    gameType: 'soccer',
+    sessionId: 'soccer-runtime',
+    routeInstanceId: 'route-instance-b',
+  } });
   assert(posted.some((message) => message.type === 'game_voice_transcript'
     && message.game_type === 'soccer'
     && message.session_id === 'soccer-runtime'
@@ -209,6 +225,16 @@ async function main() {
     && message.text === 'hello game'),
   'final normalized transcript was not relayed to the active game route');
   const transcriptCount = posted.filter((message) => message.type === 'game_voice_transcript').length;
+  transcriptListener({ detail: {
+    requestId: 'stale-voice',
+    text: 'old route text',
+    source: 'voice',
+    gameType: 'soccer',
+    sessionId: 'soccer-runtime',
+    routeInstanceId: 'route-instance-a',
+  } });
+  assert(posted.filter((message) => message.type === 'game_voice_transcript').length === transcriptCount,
+    'a stale route transcript was relabeled as the active route');
   appState.gameRouteActive = false;
   transcriptListener({ detail: { requestId: 'inactive-voice', text: 'must not escape' } });
   assert(posted.filter((message) => message.type === 'game_voice_transcript').length === transcriptCount,
@@ -228,6 +254,34 @@ async function main() {
   assert(!appState.isRecording, 'stop request did not use the official microphone teardown');
   assert(posted.some((message) => message.request_id === 'stop-1' && message.reason === 'stopped' && !message.active),
     'stop request did not acknowledge the confirmed inactive state');
+
+  holdMicStart = true;
+  channel.onmessage({ data: {
+    type: 'game_voice_control_request',
+    sender_id: 'soccer-window',
+    request_id: 'superseded-start',
+    action: 'start',
+    game_type: 'soccer',
+    session_id: 'soccer-runtime',
+    sdk_route_instance_id: 'route-instance-b',
+  } });
+  await flush();
+  routeWindowListener({ detail: {
+    action: 'opened',
+    gameType: 'soccer',
+    sessionId: 'soccer-runtime',
+    routeInstanceId: 'route-instance-c',
+  } });
+  appState.voiceStartPending = false;
+  appState.isRecording = true;
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  holdMicStart = false;
+  assert(appState.isRecording === false,
+    `a superseded route start left the replacement route microphone active: ${JSON.stringify(posted.slice(-8))}`);
+  assert(posted.some((message) => message.request_id === 'superseded-start'
+    && message.reason === 'route_superseded'
+    && message.sdk_route_instance_id === 'route-instance-b'),
+  'a voice command crossing route generations did not return the frozen route identity');
 
   channel.onmessage({ data: {
     type: 'game_voice_control_request',
@@ -253,6 +307,7 @@ async function main() {
   };
   addEventListener('neko-game-voice-control-message', sameDocumentObserver);
   channel.failPosts = true;
+  failLocalStorageWrites = true;
   windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
     detail: {
       type: 'game_voice_control_request',
@@ -261,12 +316,13 @@ async function main() {
       action: 'query',
       game_type: 'soccer',
       session_id: 'soccer-runtime',
-      sdk_route_instance_id: 'route-instance-b',
+      sdk_route_instance_id: 'route-instance-c',
     },
   }));
   await flush();
   assert(sameDocumentResponses.some((message) => message.request_id === 'same-document-query'),
-    'same-document fallback request was not answered after BroadcastChannel failure');
+    'same-document fallback request was not answered after channel and storage failure');
+  failLocalStorageWrites = false;
   removeEventListener('neko-game-voice-control-message', sameDocumentObserver);
 
   const dispose = listeners.get('pagehide')?.values().next().value;

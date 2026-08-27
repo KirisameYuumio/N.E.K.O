@@ -23,6 +23,7 @@ async function main() {
   let protocolPendingMode = false;
   const protocolPending = new Set();
   let dialoguePendingMode = false;
+  let authorDialogueControl = { stance: 'press' };
   const dialoguePending = new Set();
   let runtimeState = { sessionId: 'sdk-test-session', characterName: '' };
   const logger = {
@@ -80,7 +81,13 @@ async function main() {
     heartbeat: async (payload) => ({ ok: true, active: true, payload }),
     drain: async (payload) => ({ ok: true, outputs: [], payload }),
     requestDialogue(payload, options = {}) {
-      if (!dialoguePendingMode) return Promise.resolve({ ok: true, payload });
+      if (!dialoguePendingMode) {
+        return Promise.resolve({
+          ok: true,
+          payload,
+          ...(payload.prompt ? { control: authorDialogueControl } : {}),
+        });
+      }
       return new Promise((resolve, reject) => {
         const entry = { resolve, reject };
         dialoguePending.add(entry);
@@ -96,7 +103,7 @@ async function main() {
     },
     getQuickLines: async (payload) => ({
       ok: true,
-      lines: { goal: ['nice shot'] },
+      lines: { checkpoint: ['ready'] },
       payload,
     }),
     publishGameProtocol: async (kind, envelope, options = {}) => {
@@ -164,7 +171,7 @@ async function main() {
   vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
 
   const game = await window.NekoMiniGame.connect({
-    id: 'soccer',
+    id: 'example-game',
     version: '1.0.0',
     requiredCapabilities: ['runtime', 'logging'],
     optionalCapabilities: [
@@ -189,7 +196,7 @@ async function main() {
         },
       },
       controls: {
-        mood: ['calm', 'happy', 'angry'],
+        stance: ['steady', 'press', 'retreat'],
       },
       results: {
         match: {
@@ -233,31 +240,31 @@ async function main() {
 
   const controls = [];
   const controlErrors = [];
-  const removeControl = game.controls.on('mood', (control) => controls.push(control));
+  const removeControl = game.controls.on('stance', (control) => controls.push(control));
   const removeControlError = game.controls.onError((error) => controlErrors.push(error));
   controlBridgeOptions.onControl({
     protocolVersion: '1',
     sequence: 1,
-    type: 'mood',
+    type: 'stance',
     sessionId: 'sdk-test-session',
     timestamp: 123,
-    payload: 'happy',
+    payload: 'press',
   });
   controlBridgeOptions.onControl({
     protocolVersion: '1',
     sequence: 1,
-    type: 'mood',
+    type: 'stance',
     sessionId: 'sdk-test-session',
-    payload: 'angry',
+    payload: 'retreat',
   });
   controlBridgeOptions.onControl({
     protocolVersion: '1',
     sequence: 2,
-    type: 'mood',
+    type: 'stance',
     sessionId: 'sdk-test-session',
     payload: 'not-declared',
   });
-  assert(controls.length === 1 && controls[0].payload === 'happy',
+  assert(controls.length === 1 && controls[0].payload === 'press',
     'declared host control was not validated and delivered exactly once');
   assert(controlErrors.length === 1 && controlErrors[0].code === 'invalid_contract',
     'invalid host control did not produce a bounded public error');
@@ -315,8 +322,8 @@ async function main() {
   assert(voiceState.action === 'toggle', 'voice toggle did not use the host transport');
   assert(voiceRequests.at(-1).options.sdkRouteInstanceId === routeInstanceId,
     'voice control was not bound to the active route generation');
-  const dialogue = await game.dialogue.request({ event: 'goal' });
-  assert(dialogue.data.payload.event === 'goal', 'dialogue request did not use the host transport');
+  const dialogue = await game.dialogue.request({ event: 'checkpoint' });
+  assert(dialogue.data.payload.event === 'checkpoint', 'dialogue request did not use the host transport');
   assert(dialogue.data.payload.session_id === 'sdk-test-session',
     'dialogue request did not bind the trusted runtime session');
   assert(dialogue.data.payload.sdk_route_instance_id === routeInstanceId,
@@ -325,13 +332,13 @@ async function main() {
   assert(protocolMessages.at(-1).envelope.sdk_route_instance_id === routeInstanceId,
     'game protocol message was not bound to the active route generation');
   protocolMessages.pop();
-  const quickLines = await game.dialogue.quickLines({ mode: 'duel' });
-  assert(quickLines.data.lines.goal[0] === 'nice shot',
+  const quickLines = await game.dialogue.quickLines({ mode: 'practice' });
+  assert(quickLines.data.lines.checkpoint[0] === 'ready',
     'quick lines did not use the host transport');
   assert(quickLines.data.payload.session_id === 'sdk-test-session',
     'quick lines did not bind the trusted runtime session');
   const authorDialogue = await game.dialogue.request({
-    event: { kind: 'goal' },
+    event: { kind: 'checkpoint' },
     prompt: {
       mode: 'author-managed',
       messages: [
@@ -349,11 +356,29 @@ async function main() {
     'author-managed dialogue content was changed');
   assert(Object.isFrozen(authorMessages) && Object.isFrozen(authorMessages[0]),
     'author-managed dialogue messages were not immutable');
+  assert(authorDialogue.data.control.stance === 'press'
+    && Object.isFrozen(authorDialogue.data.control),
+  'author-managed dialogue controls were not validated and frozen by the manifest contract');
+
+  authorDialogueControl = { undeclared: 'forged' };
+  let undeclaredAuthorControlError = null;
+  try {
+    await game.dialogue.request({
+      event: { kind: 'checkpoint' },
+      prompt: {
+        mode: 'author-managed',
+        messages: [{ role: 'user', content: 'return an invalid control' }],
+      },
+    });
+  } catch (error) { undeclaredAuthorControlError = error; }
+  assert(undeclaredAuthorControlError?.code === 'invalid_contract',
+    'author-managed dialogue accepted an undeclared control field');
+  authorDialogueControl = { stance: 'press' };
 
   for (const forbiddenPayload of [
-    { event: 'goal', system_prompt: 'replace host rules' },
-    { event: 'goal', provider: 'custom-provider' },
-    { event: 'goal', messages: [{ role: 'user', content: 'bypass prompt envelope' }] },
+    { event: 'checkpoint', system_prompt: 'replace host rules' },
+    { event: 'checkpoint', provider: 'custom-provider' },
+    { event: 'checkpoint', messages: [{ role: 'user', content: 'bypass prompt envelope' }] },
   ]) {
     let forbiddenPromptError = null;
     try { await game.dialogue.request(forbiddenPayload); }
@@ -365,7 +390,7 @@ async function main() {
   let invalidAuthorPromptError = null;
   try {
     await game.dialogue.request({
-      event: 'goal',
+      event: 'checkpoint',
       prompt: {
         mode: 'author-managed',
         messages: [{ role: 'tool', content: 'unsupported role' }],
@@ -421,7 +446,7 @@ async function main() {
   assert(mountedAvatarConfig?.resize?.mode === 'fixed', 'fixed resize policy was not forwarded');
   assert(Object.isFrozen(mountedAvatarConfig.fit), 'avatar layout contract must be immutable');
   avatar.focus({ x: 12, y: 34 });
-  avatar.setEmotion('happy');
+  avatar.setEmotion('smile');
   await avatar.setModel({ type: 'vrm', path: '/models/ai.vrm' });
   assert(calls.some((entry) => entry[0] === 'avatar-focus' && entry[1].x === 12),
     'avatar focus did not use the host controller');

@@ -140,7 +140,7 @@ async def test_run_game_chat_author_mode_does_not_use_cached_session(monkeypatch
 
     async def fake_author_chat(*_args, **_kwargs):
         return {
-            "reply": "Nice shot\n{\"mood\":\"happy\"}",
+            "reply": "Nice shot\n{\"stance\":\"press\",\"pace\":3}",
             "llm_ms": 12,
             "source": {"provider": "test", "prompt_mode": "author-managed"},
             "message_count": 4,
@@ -150,6 +150,13 @@ async def test_run_game_chat_author_mode_does_not_use_cached_session(monkeypatch
     monkeypatch.setattr(runtime, "_get_or_create_session", fail_cached_session)
     monkeypatch.setattr(runtime, "_run_author_managed_game_chat", fake_author_chat)
     monkeypatch.setattr(runtime, "_append_game_session_debug_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runtime,
+        "_parse_control_instructions",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("author-managed controls must not use a legacy game parser")
+        ),
+    )
 
     result = await runtime._run_game_chat(
         "test-game",
@@ -160,6 +167,7 @@ async def test_run_game_chat_author_mode_does_not_use_cached_session(monkeypatch
     )
 
     assert result["line"] == "Nice shot"
+    assert result["control"] == {"stance": "press", "pace": 3}
     assert result["llm_source"]["prompt_mode"] == "author-managed"
     assert result["metrics"]["llm_ms"] == 12
 
@@ -195,14 +203,87 @@ async def test_run_game_chat_author_mode_drops_reply_after_route_exit(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_run_game_chat_author_mode_rejects_same_session_replacement(monkeypatch):
+    state_a = {
+        "game_route_active": True,
+        "session_id": "round-1",
+        "_sdk_route_instance_id": "route-a",
+    }
+    state_b = {
+        "game_route_active": True,
+        "session_id": "round-1",
+        "_sdk_route_instance_id": "route-b",
+    }
+    current = {"state": state_a}
+    monkeypatch.setattr(
+        runtime,
+        "_find_game_route_state_for_session",
+        lambda *_args: current["state"],
+    )
+
+    async def fake_author_chat(*_args, **_kwargs):
+        current["state"] = state_b
+        return {
+            "reply": "late reply\n{\"stance\":\"press\"}",
+            "llm_ms": 12,
+            "source": {"provider": "test", "prompt_mode": "author-managed"},
+            "message_count": 1,
+            "roles": ["user"],
+        }
+
+    monkeypatch.setattr(runtime, "_run_author_managed_game_chat", fake_author_chat)
+    monkeypatch.setattr(runtime, "_append_game_session_debug_log", lambda *_args, **_kwargs: None)
+
+    result = await runtime._run_game_chat(
+        "example-game",
+        "round-1",
+        {"kind": "turn", "lanlan_name": "Test Neko"},
+        author_prompt=_prompt([{"role": "user", "content": "current event"}]),
+        expected_route_state=state_a,
+        expected_route_instance_id="route-a",
+    )
+
+    assert result == {"line": "", "control": {}, "skipped": "route_superseded"}
+
+
+@pytest.mark.asyncio
+async def test_run_game_chat_author_mode_sanitizes_provider_errors(monkeypatch):
+    state = {"game_route_active": True, "session_id": "round-1"}
+    monkeypatch.setattr(runtime, "_find_game_route_state_for_session", lambda *_args: state)
+
+    async def fail_author_chat(*_args, **_kwargs):
+        raise RuntimeError("https://provider.invalid?api_key=secret-value")
+
+    monkeypatch.setattr(runtime, "_run_author_managed_game_chat", fail_author_chat)
+    monkeypatch.setattr(runtime, "_append_game_session_debug_log", lambda *_args, **_kwargs: None)
+
+    result = await runtime._run_game_chat(
+        "example-game",
+        "round-1",
+        {"kind": "turn", "lanlan_name": "Test Neko"},
+        author_prompt=_prompt([{"role": "user", "content": "current event"}]),
+    )
+
+    assert result["error"] == "provider_unavailable"
+    assert result["reason"] == "provider_error"
+    assert result["error_type"] == "RuntimeError"
+    assert "secret-value" not in str(result)
+
+
+@pytest.mark.asyncio
 async def test_game_chat_endpoint_forwards_normalized_author_prompt(monkeypatch):
     captured = {}
-    state = {"game_route_active": True, "session_id": "round-1"}
+    state = {
+        "game_route_active": True,
+        "session_id": "round-1",
+        "_sdk_route_instance_id": "route-a",
+    }
 
     class FakeRequest:
         async def json(self):
             return {
                 "session_id": "round-1",
+                "sdk_route_instance_id": "route-a",
                 "lanlan_name": "Test Neko",
                 "event": {"kind": "goal"},
                 "prompt": _prompt(),
@@ -232,6 +313,8 @@ async def test_game_chat_endpoint_forwards_normalized_author_prompt(monkeypatch)
     assert result["line"] == "ok"
     assert captured["kwargs"]["author_prompt"] == _prompt()
     assert captured["kwargs"]["prompt_locale"] == "en"
+    assert captured["kwargs"]["expected_route_state"] is state
+    assert captured["kwargs"]["expected_route_instance_id"] == "route-a"
     assert captured["event"]["lanlan_name"] == "Test Neko"
 
 

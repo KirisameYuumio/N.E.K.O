@@ -105,28 +105,35 @@
                 channel = null;
             }
         }
+        var serialized = '';
         try {
-            var serialized = JSON.stringify(message);
+            serialized = JSON.stringify(message);
             localStorage.setItem(STORAGE_KEY, serialized);
-            if (typeof window.dispatchEvent === 'function' && typeof window.CustomEvent === 'function') {
-                window.dispatchEvent(new window.CustomEvent(WINDOW_EVENT, {
-                    detail: JSON.parse(serialized)
-                }));
-            }
             if (ephemeral) {
                 localStorage.removeItem(STORAGE_KEY);
-                return true;
+                posted = true;
+            } else {
+                setTimeout(function () {
+                    try {
+                        if (localStorage.getItem(STORAGE_KEY) === serialized) {
+                            localStorage.removeItem(STORAGE_KEY);
+                        }
+                    } catch (_) {}
+                }, 0);
+                posted = true;
             }
-            setTimeout(function () {
-                try {
-                    if (localStorage.getItem(STORAGE_KEY) === serialized) {
-                        localStorage.removeItem(STORAGE_KEY);
-                    }
-                } catch (_) {}
-            }, 0);
-            posted = true;
         } catch (error) {
             if (!posted) console.warn('[GameVoiceControl] state transport unavailable:', error);
+        }
+        try {
+            if (typeof window.dispatchEvent === 'function' && typeof window.CustomEvent === 'function') {
+                window.dispatchEvent(new window.CustomEvent(WINDOW_EVENT, {
+                    detail: serialized ? JSON.parse(serialized) : Object.assign({}, message)
+                }));
+                posted = true;
+            }
+        } catch (error) {
+            if (!posted) console.warn('[GameVoiceControl] same-document transport unavailable:', error);
         }
         return posted;
     }
@@ -166,6 +173,15 @@
         if (requestedSessionId && route.sessionId && requestedSessionId !== route.sessionId) return false;
         var requestedRouteInstanceId = String(request.sdk_route_instance_id || '');
         return !route.routeInstanceId || requestedRouteInstanceId === route.routeInstanceId;
+    }
+
+    function routeSnapshotIsCurrent(snapshot) {
+        var route = currentRoute();
+        return route.active === true
+            && snapshot
+            && route.gameType === snapshot.gameType
+            && route.sessionId === snapshot.sessionId
+            && route.routeInstanceId === snapshot.routeInstanceId;
     }
 
     function voiceStartSettled() {
@@ -235,8 +251,9 @@
             });
             return;
         }
+        var acceptedRoute = currentRoute();
         if (action === 'query') {
-            broadcastState({ ok: true, reason: 'state', request_id: requestId }, true);
+            broadcastState({ ok: true, reason: 'state', request_id: requestId }, true, acceptedRoute);
             return;
         }
         if (commandInFlight) {
@@ -245,22 +262,51 @@
         }
 
         commandInFlight = true;
-        broadcastState({ ok: true, reason: 'working', request_id: requestId }, true);
+        broadcastState({ ok: true, reason: 'working', request_id: requestId }, true, acceptedRoute);
         try {
+            var voiceWasActive = S.isRecording === true
+                || S.voiceStartPending === true
+                || window.isMicStarting === true;
             var effectiveAction = action === 'toggle'
                 ? ((S.isRecording === true || S.voiceStartPending === true || window.isMicStarting === true) ? 'stop' : 'start')
                 : action;
             var ok = effectiveAction === 'start'
                 ? await startOfficialVoiceSession()
                 : await stopOfficialVoiceSession();
+            if (!routeSnapshotIsCurrent(acceptedRoute)) {
+                // The microphone is process-global. If route A was superseded
+                // while its command awaited settlement, restore the state seen
+                // before A's command once, then report only to A's identity.
+                var voiceIsActive = S.isRecording === true
+                    || S.voiceStartPending === true
+                    || window.isMicStarting === true;
+                if (voiceWasActive !== voiceIsActive) {
+                    if (voiceWasActive) await startOfficialVoiceSession();
+                    else await stopOfficialVoiceSession();
+                }
+                broadcastState({
+                    ok: false,
+                    reason: 'route_superseded',
+                    request_id: requestId,
+                    available: false,
+                    active: false,
+                    starting: false
+                }, true, {
+                    active: false,
+                    gameType: acceptedRoute.gameType,
+                    sessionId: acceptedRoute.sessionId,
+                    routeInstanceId: acceptedRoute.routeInstanceId
+                });
+                return;
+            }
             broadcastState({
                 ok: ok,
                 reason: ok ? (effectiveAction === 'start' ? 'started' : 'stopped') : (effectiveAction + '_failed'),
                 request_id: requestId
-            }, true);
+            }, true, acceptedRoute);
         } catch (error) {
             console.warn('[GameVoiceControl] host command failed:', error);
-            broadcastState({ ok: false, reason: 'command_failed', request_id: requestId }, true);
+            broadcastState({ ok: false, reason: 'command_failed', request_id: requestId }, true, acceptedRoute);
         } finally {
             commandInFlight = false;
             broadcastState({}, true);
@@ -373,6 +419,12 @@
         var detail = event && event.detail ? event.detail : {};
         var transcript = String(detail.text || '').trim();
         if (!route.active || !transcript) return;
+        var sourceGameType = String(detail.gameType || '');
+        var sourceSessionId = String(detail.sessionId || '');
+        var sourceRouteInstanceId = String(detail.routeInstanceId || '');
+        if (!sourceGameType || !sourceSessionId) return;
+        if (sourceGameType !== route.gameType || sourceSessionId !== route.sessionId) return;
+        if (route.routeInstanceId && sourceRouteInstanceId !== route.routeInstanceId) return;
         postMessage({
             type: 'game_voice_transcript',
             sender_id: senderId,

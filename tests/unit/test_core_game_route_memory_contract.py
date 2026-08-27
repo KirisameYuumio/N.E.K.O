@@ -577,17 +577,80 @@ async def test_disabled_tts_does_not_wait_for_an_unsupported_completion_boundary
 )
 def test_local_cosyvoice_completion_requires_a_websocket_url(configured_url, expected):
     mgr = _make_manager()
-    mgr._config_manager = SimpleNamespace(
-        get_model_api_config=lambda slot: {"base_url": configured_url} if slot == "tts_custom" else {},
-    )
 
     supported = core_module.LLMSessionManager._tts_worker_supports_completion(
         mgr,
         object(),
         "local_cosyvoice",
+        {"base_url": configured_url},
     )
 
     assert supported is expected
+
+
+@pytest.mark.unit
+def test_local_cosyvoice_completion_uses_the_selected_worker_config():
+    mgr = _make_manager()
+    mgr._config_manager = SimpleNamespace(
+        get_model_api_config=lambda slot: {
+            "base_url": "wss://custom.example.test/cosy"
+            if slot == "tts_custom"
+            else "https://default.example.test/tts"
+        },
+    )
+
+    assert core_module.LLMSessionManager._tts_worker_supports_completion(
+        mgr,
+        object(),
+        "local_cosyvoice",
+        mgr._config_manager.get_model_api_config("tts_default"),
+    ) is False
+    assert core_module.LLMSessionManager._tts_worker_supports_completion(
+        mgr,
+        object(),
+        "local_cosyvoice",
+        mgr._config_manager.get_model_api_config("tts_custom"),
+    ) is True
+
+
+@pytest.mark.unit
+def test_resolve_tts_worker_spec_returns_the_selected_route_config(monkeypatch):
+    mgr = _make_manager()
+    default_config = {
+        "base_url": "https://default.example.test/tts",
+        "api_key": "default-key",
+    }
+    custom_config = {
+        "base_url": "wss://custom.example.test/cosy",
+        "api_key": "custom-key",
+    }
+    mgr.voice_id = "default-voice"
+    mgr.core_api_type = "openai"
+    mgr._tts_excluded_provider_keys = frozenset()
+    mgr._config_manager = SimpleNamespace(
+        get_core_config=lambda: {"DISABLE_TTS": False},
+        get_model_api_config=lambda slot: (
+            custom_config if slot == "tts_custom" else default_config
+        ),
+    )
+    mgr._effective_tts_route = lambda: ("default-voice", False)
+    selected_worker = object()
+    monkeypatch.setattr(
+        tts_runtime_module._core_facade,
+        "get_tts_worker",
+        lambda **_kwargs: (selected_worker, None, "local_cosyvoice"),
+    )
+
+    resolved = core_module.LLMSessionManager._resolve_tts_worker_spec(mgr)
+
+    assert resolved == (
+        selected_worker,
+        "default-key",
+        "default-voice",
+        "local_cosyvoice",
+        False,
+        default_config,
+    )
 
 
 @pytest.mark.unit
@@ -721,6 +784,7 @@ async def test_game_speech_preload_captures_audio_without_sending_playback():
         "voice",
         None,
         False,
+        {},
     )
     try:
         result = await core_module.LLMSessionManager.preload_game_speech_audio(
@@ -778,6 +842,7 @@ async def test_game_speech_preload_cancellation_stops_and_releases_worker():
         "voice",
         None,
         False,
+        {},
     )
     task = asyncio.create_task(
         core_module.LLMSessionManager.preload_game_speech_audio(
@@ -900,6 +965,37 @@ async def test_mirror_assistant_output_can_finalize_user_reply_turn():
         "data": "turn end",
         "request_id": "req-user",
         "meta": metadata,
+    }]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mirror_user_input_propagates_the_source_route_identity():
+    mgr = _make_manager()
+    mgr.websocket = _FakeConnectedWebSocket()
+
+    await core_module.LLMSessionManager.mirror_user_input(
+        mgr,
+        "source-bound transcript",
+        metadata={
+            "source": "external_voice_route",
+            "kind": "example-game",
+            "session_id": "reused-session",
+            "sdk_route_instance_id": "route-A",
+        },
+        request_id="voice-route-a",
+        input_type="mirror_voice_transcript",
+        send_to_frontend=True,
+    )
+
+    assert mgr.websocket.sent == [{
+        "type": "user_transcript",
+        "text": "source-bound transcript",
+        "source": "external_voice_route",
+        "request_id": "voice-route-a",
+        "game_type": "example-game",
+        "session_id": "reused-session",
+        "sdk_route_instance_id": "route-A",
     }]
 
 

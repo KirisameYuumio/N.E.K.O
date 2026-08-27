@@ -186,7 +186,7 @@ async function main() {
     text: '  SDK 语音输出测试  ',
     requestId: 'request-1',
     source: 'quick-line',
-    eventKey: 'goal:happy',
+    eventKey: 'checkpoint:ready',
     priority: 7,
     relativeGain: 1.5,
     interruptExisting: true,
@@ -286,7 +286,7 @@ async function main() {
   const mappedState = states.at(-1);
   assert(mappedState.priority === 7 && mappedState.requestId === 'request-1',
     'speech request metadata was not correlated with playback state');
-  assert(mappedState.eventKey === 'goal:happy', 'speech event key was not retained');
+  assert(mappedState.eventKey === 'checkpoint:ready', 'speech event key was not retained');
   assert(mappedState.ignored_large_field === undefined,
     'unknown host playback fields escaped the bounded public state');
   bridgeOptions.onState({

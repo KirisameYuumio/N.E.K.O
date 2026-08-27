@@ -38,6 +38,8 @@
   const GAME_STORAGE_KEY_LIMIT = 256;
   const GAME_STORAGE_VALUE_BYTES = 64 * 1024;
   const GAME_STORAGE_TOTAL_BYTES = 1024 * 1024;
+  const HOST_LAUNCH_REGISTRY_LIMIT = 64;
+  const HOST_REGISTRATION_CAPABILITY_LIMIT = 32;
   const GLOBAL_CONSOLE_CAPTURE_REGISTRIES = new WeakMap();
 
   class NekoMiniGameHostError extends Error {
@@ -76,10 +78,94 @@
       : unescape(encodeURIComponent(text)).length;
   }
 
+  function normalizeLaunchRegistration(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const gameId = String(value.gameId || '').trim();
+    const version = String(value.version || '').trim();
+    const mode = String(value.mode || '').trim();
+    if (
+      !gameId
+      || gameId.length > 128
+      || !version
+      || version.length > 64
+      || !['registered', 'development'].includes(mode)
+    ) return null;
+    const allowedCapabilities = Object.freeze([
+      ...new Set(
+        (Array.isArray(value.allowedCapabilities) ? value.allowedCapabilities : [])
+          .map((name) => String(name || '').trim())
+          .filter((name) => Boolean(name) && name.length <= 64),
+      ),
+    ].slice(0, HOST_REGISTRATION_CAPABILITY_LIMIT));
+    return Object.freeze({
+      mode,
+      gameId,
+      publisherId: (
+        String(value.publisherId || '').trim().slice(0, 128)
+        || (mode === 'development' ? 'local-development' : 'unknown-publisher')
+      ),
+      version,
+      allowedCapabilities,
+    });
+  }
+
+  function consumeHostLaunchRegistry() {
+    const rawRegistry = window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__;
+    try { delete window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__; }
+    catch (_) { window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ = undefined; }
+    const registrations = new Map();
+    const capabilityProviders = new Map();
+    if (!rawRegistry || typeof rawRegistry !== 'object' || Array.isArray(rawRegistry)) {
+      return { registrations, capabilityProviders };
+    }
+    for (const [key, rawRegistration] of Object.entries(rawRegistry)) {
+      if (registrations.size >= HOST_LAUNCH_REGISTRY_LIMIT) break;
+      const registration = normalizeLaunchRegistration(rawRegistration);
+      if (!registration || registration.gameId !== String(key || '').trim()) continue;
+      registrations.set(registration.gameId, registration);
+      const rawProviders = rawRegistration.capabilityProviders;
+      capabilityProviders.set(registration.gameId, Object.freeze({
+        quickLines: typeof rawProviders?.quickLines === 'function'
+          ? rawProviders.quickLines
+          : null,
+      }));
+    }
+    return { registrations, capabilityProviders };
+  }
+
+  // Consumed exactly once before game code can connect. The exported factory
+  // can select host-owned records/providers but cannot add, replace, or mutate
+  // them.
+  const HOST_BOOTSTRAP = consumeHostLaunchRegistry();
+
   class NekoMiniGameSameOriginHost {
     constructor(options = {}) {
-      this.gameType = String(options.gameType || '').trim();
-      this.gameVersion = String(options.gameVersion || DEFAULT_GAME_VERSION);
+      // The internal host bootstrap owns this immutable record. A game manifest
+      // may request an identity/capability, but cannot mint a registered result
+      // from its own values. A future marketplace can replace the bootstrap's
+      // resolver without changing the public game handshake.
+      this._launchRegistration = normalizeLaunchRegistration(options.launchRegistration);
+      if (!this._launchRegistration) {
+        throw new NekoMiniGameHostError(
+          'game_unregistered',
+          'A host-issued launchRegistration is required',
+          { operation: 'construct' },
+        );
+      }
+      const requestedGameType = String(options.gameType || '').trim();
+      const requestedGameVersion = String(options.gameVersion || '').trim();
+      if (
+        (requestedGameType && requestedGameType !== this._launchRegistration.gameId)
+        || (requestedGameVersion && requestedGameVersion !== this._launchRegistration.version)
+      ) {
+        throw new NekoMiniGameHostError(
+          'game_unregistered',
+          'The requested game identity does not match the host launch registration',
+          { operation: 'construct' },
+        );
+      }
+      this.gameType = this._launchRegistration.gameId;
+      this.gameVersion = this._launchRegistration.version || DEFAULT_GAME_VERSION;
       this.source = String(options.source || '').trim() || `${this.gameType}_demo`;
       this.displayName = String(options.displayName || '').trim() || this.gameType || 'Mini-game';
       if (!this.gameType) {
@@ -97,6 +183,14 @@
       this._console = this._window.console || console;
       this._avatarHost = options.avatarHost || null;
       this._audioHost = options.audioHost || null;
+      const capabilityProviders = options.capabilityProviders && typeof options.capabilityProviders === 'object'
+        ? options.capabilityProviders
+        : {};
+      this._capabilityProviders = Object.freeze({
+        quickLines: typeof capabilityProviders.quickLines === 'function'
+          ? capabilityProviders.quickLines
+          : null,
+      });
       this._disposed = false;
       this._memoryConsentEnabled = false;
       this._controlBridge = {
@@ -242,7 +336,8 @@
           message: `The ${this.displayName} host does not support the requested SDK protocol`,
         };
       }
-      if (String(manifest.id || '') !== this.gameType || String(manifest.version || '') !== this.gameVersion) {
+      const registration = this._launchRegistration;
+      if (String(manifest.id || '') !== registration.gameId || String(manifest.version || '') !== registration.version) {
         return {
           accepted: false,
           code: 'game_unregistered',
@@ -256,14 +351,7 @@
       const locallyAvailable = new Set([
         'runtime',
         'dialogue',
-        ...(
-          this.gameType === 'soccer'
-          || this.gameType === 'badminton'
-          || this.gameType === 'badminton_solo'
-          || this.gameType === 'badminton_duel'
-            ? ['quick-lines']
-            : []
-        ),
+        ...(this._capabilityProviders.quickLines ? ['quick-lines'] : []),
         'logging',
         'voice-input',
         'speech-output',
@@ -274,17 +362,20 @@
         ...(this._avatarHost ? ['avatar-renderer'] : []),
         ...(this._audioHost ? ['audio'] : []),
       ]);
+      const allowedCapabilities = new Set(registration.allowedCapabilities);
       return {
         accepted: true,
         protocolVersion: SDK_PROTOCOL_VERSION,
         hostVersion: TRUSTED_HOST_VERSION,
         registration: {
-          mode: 'registered',
-          gameId: this.gameType,
-          publisherId: 'neko-project',
-          version: this.gameVersion,
+          mode: registration.mode,
+          gameId: registration.gameId,
+          publisherId: registration.publisherId,
+          version: registration.version,
         },
-        grantedCapabilities: [...new Set(requested)].filter((name) => locallyAvailable.has(name)),
+        grantedCapabilities: [...new Set(requested)].filter((name) => (
+          locallyAvailable.has(name) && allowedCapabilities.has(name)
+        )),
       };
     }
 
@@ -724,25 +815,42 @@
     }
 
     getQuickLines(payload, options = {}) {
-      return this._post(this._gameEndpoint('quick-lines'), this._trustedRuntimePayload(payload), {
-        timeoutMs: 15000,
-        operation: 'quick_lines',
-        ...options,
-      });
+      if (this._disposed) {
+        return Promise.reject(this._hostError(
+          'disposed',
+          `${this.displayName} host adapter has been disposed`,
+          { operation: 'quick_lines' },
+        ));
+      }
+      if (options.signal?.aborted) {
+        return Promise.reject(this._hostError(
+          'cancelled',
+          'The quick-lines request was cancelled',
+          { operation: 'quick_lines' },
+        ));
+      }
+      if (!this._capabilityProviders.quickLines) {
+        return Promise.reject(this._hostError(
+          'capability_unavailable',
+          'The host did not register a quick-lines provider for this game',
+          { operation: 'quick_lines' },
+        ));
+      }
+      return Promise.resolve(this._capabilityProviders.quickLines(
+        this._trustedRuntimePayload(payload),
+        options,
+        Object.freeze({
+          gameId: this.gameType,
+          version: this.gameVersion,
+          sessionId: this.sessionId,
+        }),
+      ));
     }
 
     requestDialogue(payload, options = {}) {
       return this._post(this._gameEndpoint('chat'), this._trustedRuntimePayload(payload), {
         timeoutMs: 60000,
         operation: 'dialogue',
-        ...options,
-      });
-    }
-
-    evaluatePassiveGuard(payload, options = {}) {
-      return this._post(this._gameEndpoint('passive-guard'), this._trustedRuntimePayload(payload), {
-        timeoutMs: 15000,
-        operation: 'passive_guard',
         ...options,
       });
     }
@@ -1179,7 +1287,12 @@
       this._window.addEventListener('storage', bridge.storageHandler);
       bridge.windowEventHandler = (event) => acceptMessage(event?.detail, 'same_document');
       this._window.addEventListener(VOICE_CONTROL_WINDOW_EVENT, bridge.windowEventHandler);
-      return !!bridge.channel || typeof this._window.localStorage !== 'undefined';
+      let storageAvailable = false;
+      try { storageAvailable = typeof this._window.localStorage !== 'undefined'; }
+      catch (_) { storageAvailable = false; }
+      const sameDocumentAvailable = typeof this._window.dispatchEvent === 'function'
+        && typeof (this._window.CustomEvent || globalThis.CustomEvent) === 'function';
+      return !!bridge.channel || storageAvailable || sameDocumentAvailable;
     }
 
     _postVoiceControlMessage(payload) {
@@ -1199,15 +1312,10 @@
           bridge.channel = null;
         }
       }
+      let serialized = '';
       try {
-        const serialized = JSON.stringify(message);
+        serialized = JSON.stringify(message);
         this._window.localStorage.setItem(bridge.storageKey, serialized);
-        const CustomEventImpl = this._window.CustomEvent || globalThis.CustomEvent;
-        if (typeof this._window.dispatchEvent === 'function' && typeof CustomEventImpl === 'function') {
-          this._window.dispatchEvent(new CustomEventImpl(VOICE_CONTROL_WINDOW_EVENT, {
-            detail: JSON.parse(serialized),
-          }));
-        }
         this._window.setTimeout(() => {
           try {
             if (this._window.localStorage.getItem(bridge.storageKey) === serialized) {
@@ -1218,6 +1326,17 @@
         posted = true;
       } catch (error) {
         if (!posted) bridge.onError?.(error, 'local_storage');
+      }
+      try {
+        const CustomEventImpl = this._window.CustomEvent || globalThis.CustomEvent;
+        if (typeof this._window.dispatchEvent === 'function' && typeof CustomEventImpl === 'function') {
+          this._window.dispatchEvent(new CustomEventImpl(VOICE_CONTROL_WINDOW_EVENT, {
+            detail: serialized ? JSON.parse(serialized) : { ...message },
+          }));
+          posted = true;
+        }
+      } catch (error) {
+        if (!posted) bridge.onError?.(error, 'same_document');
       }
       return posted;
     }
@@ -2375,7 +2494,12 @@
   }
 
   window.createNekoMiniGameSameOriginHost = function createNekoMiniGameSameOriginHost(options = {}) {
-    return new NekoMiniGameSameOriginHost(options);
+    const gameType = String(options.gameType || '').trim();
+    return new NekoMiniGameSameOriginHost({
+      ...options,
+      launchRegistration: HOST_BOOTSTRAP.registrations.get(gameType) || null,
+      capabilityProviders: HOST_BOOTSTRAP.capabilityProviders.get(gameType) || null,
+    });
   };
   window.NekoMiniGameHostError = NekoMiniGameHostError;
 })();

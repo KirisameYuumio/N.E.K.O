@@ -471,7 +471,7 @@ class TtsRuntimeMixin:
         core_config = self._config_manager.get_core_config()
         route_voice_id = self.voice_id or ""
         if core_config.get("DISABLE_TTS", False):
-            return dummy_tts_worker, "", route_voice_id, None, True
+            return dummy_tts_worker, "", route_voice_id, None, True, {}
         route_voice_id, has_custom = self._effective_tts_route()
         worker, api_key_override, provider_key = _core_facade.get_tts_worker(
             core_api_type=self.core_api_type,
@@ -487,7 +487,7 @@ class TtsRuntimeMixin:
         api_key = self.resolve_tts_api_key(
             provider_key, api_key_override, tts_config
         )
-        return worker, api_key, route_voice_id, provider_key, False
+        return worker, api_key, route_voice_id, provider_key, False, dict(tts_config or {})
 
     @staticmethod
     def _normalize_game_speech_preload_text(clean_text: str, *, normalize_spaces: bool) -> str:
@@ -592,7 +592,7 @@ class TtsRuntimeMixin:
                         )
                 if not pending_lines:
                     return summarize(results_by_index)
-                worker, api_key, route_voice_id, provider_key, disabled = (
+                worker, api_key, route_voice_id, provider_key, disabled, _tts_config = (
                     self._resolve_tts_worker_spec()
                 )
                 if disabled:
@@ -942,13 +942,17 @@ class TtsRuntimeMixin:
             return "", False
         return self.voice_id or "", self._has_custom_tts()
 
-    def _tts_worker_supports_completion(self, tts_worker, provider_key: str | None) -> bool:
+    def _tts_worker_supports_completion(
+        self,
+        tts_worker,
+        provider_key: str | None,
+        tts_config: dict | None,
+    ) -> bool:
         if tts_worker is dummy_tts_worker:
             return False
         if provider_key != "local_cosyvoice":
             return True
-        local_config = self._config_manager.get_model_api_config("tts_custom")
-        local_base_url = str(local_config.get("base_url") or "").strip().lower()
+        local_base_url = str((tts_config or {}).get("base_url") or "").strip().lower()
         return local_base_url.startswith(("ws://", "wss://"))
 
     def _start_tts_thread(self, *, preserve_provider_exclusions: bool = False):
@@ -967,7 +971,7 @@ class TtsRuntimeMixin:
             self._tts_fallback_uses_default_voice = False
 
         # 检查是否禁用了 TTS
-        tts_worker, api_key, route_voice_id, provider_key, disabled = (
+        tts_worker, api_key, route_voice_id, provider_key, disabled, tts_config = (
             self._resolve_tts_worker_spec()
         )
         if disabled:
@@ -975,6 +979,7 @@ class TtsRuntimeMixin:
         self._tts_completion_supported = self._tts_worker_supports_completion(
             tts_worker,
             provider_key,
+            tts_config,
         )
         self._tts_audio_output_supported = self._tts_completion_supported
 
