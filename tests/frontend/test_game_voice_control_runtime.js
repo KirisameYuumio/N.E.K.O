@@ -92,6 +92,18 @@ async function main() {
   assert(listeners.get('neko:user-voice-content-received')?.size === 1,
     'final transcript relay listener was not installed');
 
+  const routeWindowListener = listeners.get('neko-game-window-state-change')?.values().next().value;
+  appState.gameRouteActive = false;
+  appState.gameRouteGameType = '';
+  appState.gameRouteSessionId = '';
+  routeWindowListener({ detail: { action: 'opened', sessionId: 'missing-type' } });
+  assert(appState.gameRouteGameType === '',
+    'host voice bridge invented a soccer identity for a route without game_type');
+  routeWindowListener({ detail: { action: 'closed', sessionId: 'missing-type' } });
+  appState.gameRouteActive = true;
+  appState.gameRouteGameType = 'soccer';
+  appState.gameRouteSessionId = 'soccer-runtime';
+
   channel.onmessage({ data: {
     type: 'game_voice_control_request',
     sender_id: 'soccer-window',

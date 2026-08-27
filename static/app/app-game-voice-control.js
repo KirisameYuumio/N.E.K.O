@@ -263,7 +263,7 @@
         var incomingSessionId = String(detail.sessionId || '');
         if (action === 'opened') {
             S.gameRouteActive = true;
-            S.gameRouteGameType = String(detail.gameType || 'soccer');
+            S.gameRouteGameType = String(detail.gameType || '');
             S.gameRouteLanlanName = String(detail.lanlanName || '');
             S.gameRouteSessionId = incomingSessionId;
         } else if (action === 'closed') {
