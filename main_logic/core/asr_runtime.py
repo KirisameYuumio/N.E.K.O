@@ -53,6 +53,7 @@ from main_logic.voice_turn.audio_input import (
     ProcessedVoiceFrame,
     VoiceInputAudioPipeline,
 )
+from utils.game_route_state import get_active_game_route_generation_identity
 from main_logic import core as _core_facade
 
 from ._shared import logger
@@ -297,6 +298,9 @@ class AsrRuntimeMixin:
         registry = VoiceInputRegistry()
         core_chat = CoreChatVoiceInputConsumer(
             session_ref=lambda: getattr(self, "session", None),
+            game_route_identity=lambda: get_active_game_route_generation_identity(
+                str(getattr(self, "lanlan_name", "core"))
+            ),
             on_prepare=lambda token, context: self._prepare_core_voice_turn(
                 token,
                 session_ref=context.session_ref,
@@ -306,6 +310,7 @@ class AsrRuntimeMixin:
             on_final_event=lambda event, context: self._dispatch_core_asr_transcript(
                 event,
                 session_ref=context.session_ref,
+                source_game_route_identity=context.source_game_route_identity,
             ),
             on_cancelled_event=self._cancel_core_chat_voice_turn,
         )
@@ -2566,6 +2571,7 @@ class AsrRuntimeMixin:
         event: VoiceTranscriptEvent,
         *,
         session_ref: object | None = None,
+        source_game_route_identity: tuple[str, str, str] | None = None,
     ) -> None:
         token = event.turn_token.ingress
         external_turn_id = f"asr-{token.session_epoch}-{event.turn_token.turn_id}"
@@ -2589,11 +2595,18 @@ class AsrRuntimeMixin:
                 # next turn.
                 await self._send_core_asr_preview_clear(external_turn_id)
                 return
+            transcript_kwargs = {
+                "is_voice_source": True,
+                "source": "independent_asr",
+                "metadata": {"provider": event.provider},
+            }
+            if source_game_route_identity is not None:
+                transcript_kwargs["source_game_route_identity"] = (
+                    source_game_route_identity
+                )
             accepted = await self.handle_input_transcript(
                 event.text,
-                is_voice_source=True,
-                source="independent_asr",
-                metadata={"provider": event.provider},
+                **transcript_kwargs,
             )
             def route_still_core() -> bool:
                 """The route-identity half, re-checkable across an await.

@@ -131,6 +131,11 @@ class LLMSessionManager(
         # one completion slot.  The slot is resolved by audio_done and cleared
         # on timeout, interruption, or teardown, so it cannot grow per request.
         self._game_speech_completion_waiter: tuple[str, asyncio.Future] | None = None
+        # Delivery result for that same serialized speech.  A fixed single
+        # slot is enough because the game router never permits two audible
+        # game speeches to wait concurrently.  Cleared with the waiter on
+        # completion, cancellation, timeout, pipeline reset, or teardown.
+        self._game_speech_delivery_state: tuple[str, bool] | None = None
         # Exact SDK playback correlation for the one serialized audible game
         # speech.  Cleared with audio_done, interruption, or TTS teardown.
         self._game_speech_correlation: tuple[str, str] | None = None

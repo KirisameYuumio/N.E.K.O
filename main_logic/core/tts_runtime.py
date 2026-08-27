@@ -121,14 +121,41 @@ class TtsRuntimeMixin:
         """Create the single bounded completion slot used by game speech."""
         self._cancel_game_speech_completion_wait()
         future = asyncio.get_running_loop().create_future()
-        self._game_speech_completion_waiter = (str(speech_id or ""), future)
+        speech_key = str(speech_id or "")
+        self._game_speech_completion_waiter = (speech_key, future)
+        self._game_speech_delivery_state = (speech_key, True)
         return future
+
+    def _mark_game_speech_delivery_failed(self, speech_id: object) -> None:
+        """Latch a failed chunk/done delivery for the current bounded slot."""
+        speech_key = str(speech_id or "")
+        slot = getattr(self, "_game_speech_delivery_state", None)
+        if slot and slot[0] == speech_key:
+            self._game_speech_delivery_state = (speech_key, False)
+        elif slot is None and speech_key:
+            # Cache-capture tests and legacy callers may stream without the
+            # HTTP completion waiter. Keep the same single bounded failure
+            # latch until their matching audio_done arrives.
+            self._game_speech_delivery_state = (speech_key, False)
+
+    def _game_speech_delivery_succeeded(self, speech_id: object) -> bool:
+        slot = getattr(self, "_game_speech_delivery_state", None)
+        if not slot or slot[0] != str(speech_id or ""):
+            return True
+        return bool(slot[1])
+
+    def _clear_game_speech_delivery_state(self, speech_id: object | None = None) -> None:
+        slot = getattr(self, "_game_speech_delivery_state", None)
+        if speech_id is not None and slot and slot[0] != str(speech_id or ""):
+            return
+        self._game_speech_delivery_state = None
 
     def _resolve_game_speech_completion_wait(self, speech_id: object, completed: bool) -> None:
         slot = getattr(self, "_game_speech_completion_waiter", None)
         if not slot or slot[0] != str(speech_id or ""):
             return
         self._game_speech_completion_waiter = None
+        self._clear_game_speech_delivery_state(speech_id)
         future = slot[1]
         if not future.done():
             future.set_result(bool(completed))
@@ -136,6 +163,7 @@ class TtsRuntimeMixin:
     def _cancel_game_speech_completion_wait(self) -> None:
         slot = getattr(self, "_game_speech_completion_waiter", None)
         self._game_speech_completion_waiter = None
+        self._clear_game_speech_delivery_state(slot[0] if slot else None)
         if slot and not slot[1].done():
             slot[1].set_result(False)
 
@@ -180,6 +208,7 @@ class TtsRuntimeMixin:
             slot = getattr(self, "_game_speech_completion_waiter", None)
             if slot and slot[0] == str(speech_id or "") and slot[1] is future:
                 self._game_speech_completion_waiter = None
+                self._clear_game_speech_delivery_state(speech_id)
                 if not future.done():
                     future.set_result(False)
 
@@ -1608,6 +1637,7 @@ class TtsRuntimeMixin:
                         # parallel failures from one reply can share one user notice.
                         pending_failed_speech_id = str(speech_id or "")
                         GAME_SPEECH_AUDIO_CACHE.fail_capture(self, speech_id)
+                        self._mark_game_speech_delivery_failed(speech_id)
                     if speech_id == getattr(self, "_tts_replay_speech_id", None):
                         # marker 排在该句所有音频之后；只有音频实际送达前端才推进边界。
                         # 失败句若已播放过前缀也整体跳过，避免 fallback 从句首重念；
@@ -1623,14 +1653,22 @@ class TtsRuntimeMixin:
                         # await 才能保证这条收尾信号排在该 sid 的所有
                         # __audio__/裸 bytes 之后。fire-and-forget 会插到尾音
                         # 前面，前端提前收尾——正是本信号要解决的问题。
-                        GAME_SPEECH_AUDIO_CACHE.complete_capture(
-                            self,
-                            data[1],
-                            self.current_game_speech_audio_runtime_signature(),
-                        )
-                        await self.send_audio_done(data[1])
-                        self._resolve_game_speech_completion_wait(data[1], True)
-                        completed_speech_id = str(data[1] or "")
+                        speech_id = data[1]
+                        done_sent = await self.send_audio_done(speech_id)
+                        if not done_sent:
+                            self._mark_game_speech_delivery_failed(speech_id)
+                        delivered = self._game_speech_delivery_succeeded(speech_id)
+                        if delivered:
+                            GAME_SPEECH_AUDIO_CACHE.complete_capture(
+                                self,
+                                speech_id,
+                                self.current_game_speech_audio_runtime_signature(),
+                            )
+                        else:
+                            GAME_SPEECH_AUDIO_CACHE.fail_capture(self, speech_id)
+                        self._resolve_game_speech_completion_wait(speech_id, delivered)
+                        self._clear_game_speech_delivery_state(speech_id)
+                        completed_speech_id = str(speech_id or "")
                         if completed_speech_id:
                             completed_keys = {
                                 key for key in notified_error_keys
@@ -1705,6 +1743,7 @@ class TtsRuntimeMixin:
                         )
                         pending_failed_speech_id = ""
                         GAME_SPEECH_AUDIO_CACHE.fail_capture(self, error_speech_id)
+                        self._mark_game_speech_delivery_failed(error_speech_id)
                         logger.error(f"TTS Worker Error: {error_msg}")
 
                         # A configured endpoint failure is observable in the
@@ -1837,6 +1876,7 @@ class TtsRuntimeMixin:
                             pass
                     else:
                         GAME_SPEECH_AUDIO_CACHE.fail_capture(self, speech_id)
+                        self._mark_game_speech_delivery_failed(speech_id)
                         self._discard_pending_ai_voice_echo()
                     continue
 
@@ -1851,6 +1891,7 @@ class TtsRuntimeMixin:
                     self._tts_replay_sentence_audio_emitted = True
                 else:
                     GAME_SPEECH_AUDIO_CACHE.fail_capture(self, implicit_speech_id)
+                    self._mark_game_speech_delivery_failed(implicit_speech_id)
                 self._discard_pending_ai_voice_echo()
             except asyncio.CancelledError:
                 logger.info("🎧 tts_response_handler cancelled")

@@ -119,7 +119,7 @@ async function main() {
     'runtime', 'dialogue', 'logging', 'voice-input', 'speech-output',
     'context-read', 'memory', 'storage', 'leaderboard-local', 'quick-lines',
   ];
-  windowMock.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ = Object.fromEntries(
+  const hostLaunchRegistrations = Object.fromEntries(
     [...[
       'example-game',
       'waiting-lock-game',
@@ -141,13 +141,25 @@ async function main() {
   );
   global.window = windowMock;
 
+  const bootstrapPath = path.resolve(
+    __dirname,
+    '../../static/game/sdk/neko-minigame-same-origin-bootstrap.js',
+  );
   const sourcePath = path.resolve(
     __dirname,
     '../../static/game/sdk/neko-minigame-same-origin-host.js',
   );
-  vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
+  vm.runInThisContext(fs.readFileSync(bootstrapPath, 'utf8'), { filename: bootstrapPath });
+  await windowMock.bootstrapNekoMiniGameSameOriginHost({
+    registrations: hostLaunchRegistrations,
+    loadAdapter: async () => {
+      vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
+    },
+  });
   assert(windowMock.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ === undefined,
     'host launch registrations remained mutable after adapter bootstrap');
+  assert(windowMock.bootstrapNekoMiniGameSameOriginHost === undefined,
+    'the one-shot host registry producer remained callable by game code');
 
   const createHost = (options = {}) => window.createNekoMiniGameSameOriginHost(options);
   let missingRegistrationError = null;

@@ -16,6 +16,8 @@ PR #1125), plus three PR #1127 follow-up tests:
 from __future__ import annotations
 
 import asyncio
+import gc
+import weakref
 
 import pytest
 
@@ -30,6 +32,26 @@ from .game_route_test_helpers import (
     gr_patch_all as _gr_patch_all,
     reset_game_route_state,
 )
+
+
+def test_route_lock_registries_release_idle_historical_keys() -> None:
+    route_key = grs._route_state_key("LockGcLan", "example-lock-gc")
+    route_lock = grs._get_route_lock(*route_key)
+    supersede_lock = grs._get_supersede_lock("LockGcLan")
+    route_ref = weakref.ref(route_lock)
+    supersede_ref = weakref.ref(supersede_lock)
+
+    assert grs._get_route_lock(*route_key) is route_lock
+    assert grs._get_supersede_lock("LockGcLan") is supersede_lock
+
+    del route_lock
+    del supersede_lock
+    gc.collect()
+
+    assert route_ref() is None
+    assert supersede_ref() is None
+    assert route_key not in grs._route_state_locks
+    assert "LockGcLan" not in grs._route_supersede_locks
 
 
 class _FakeOmniSession:
@@ -1374,9 +1396,8 @@ async def test_character_switch_finalize_blocks_concurrent_route_start_for_same_
     _gr_patch_all(monkeypatch, "_build_soccer_pregame_context", _fake_pregame)
 
     with reset_game_route_state():
-        # Drop any leftover supersede / route locks so this test starts
-        # fresh — locks live across tests because they're a process-global
-        # registry by design (see comment on ``_route_state_locks``).
+        # Drop any lock still strongly referenced by a concurrently active
+        # test helper so this test starts from an explicit fresh boundary.
         from utils import game_route_state as grs_mod
         grs_mod._route_supersede_locks.pop("Lan", None)
         grs_mod._route_state_locks.pop(grs_mod._route_state_key("Lan", "soccer"), None)

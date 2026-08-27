@@ -2660,26 +2660,41 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
     )
     finalize_raw = data.get("finalize_turn")
     finalize_turn = _game_route_event_has_user_input(event) if finalize_raw is None else finalize_raw is not False
-    result = await _mirror_game_assistant_text(
-        mgr,
-        line,
-        request_id=str(data.get("request_id") or "") or None,
-        game_type=game_type,
-        session_id=session_id,
-        source=str(data.get("source") or "game_llm"),
-        turn_id=str(data.get("turn_id") or "") or None,
-        event=event,
-        finalize_turn=finalize_turn,
-    )
-    if result.get("ok") and str(event.get("kind") or "") == "opening-line":
+    # The route lock is the irreversible publish boundary.  Lifecycle
+    # teardown/start/finalize uses the same per-slot lock, so the frozen route
+    # either remains authoritative through both chat publication and optional
+    # turn-end, or loses before anything is emitted.  A post-await check alone
+    # can only protect the dialog append; it cannot retract a websocket/sync
+    # message already sent by mirror_assistant_output().
+    route_lock = _get_route_lock(lanlan_name, game_type)
+    async with route_lock:
         current_state = _get_active_game_route_state(lanlan_name, game_type)
         current_route_instance_id = str(
             (current_state or {}).get("_sdk_route_instance_id") or ""
         )
-        if (
+        if not (
             current_state is source_state
             and current_route_instance_id == source_route_instance_id
         ):
+            return {
+                "ok": False,
+                "reason": "route_superseded",
+                "mirrored": False,
+                "lanlan_name": lanlan_name,
+                "method": "project_text_mirror",
+            }
+        result = await _mirror_game_assistant_text(
+            mgr,
+            line,
+            request_id=str(data.get("request_id") or "") or None,
+            game_type=game_type,
+            session_id=session_id,
+            source=str(data.get("source") or "game_llm"),
+            turn_id=str(data.get("turn_id") or "") or None,
+            event=event,
+            finalize_turn=finalize_turn,
+        )
+        if result.get("ok") and str(event.get("kind") or "") == "opening-line":
             _append_game_dialog(current_state, {
                 "type": "assistant",
                 "source": "opening_line",
@@ -3369,6 +3384,7 @@ async def route_external_voice_transcript(
     request_id: str | None = None,
     game_type: str | None = None,
     session_id: str | None = None,
+    sdk_route_instance_id: str | None = None,
     expected_state: dict | None = None,
 ) -> bool:
     """Route a voice transcript into the active game route, if any.
@@ -3381,6 +3397,10 @@ async def route_external_voice_transcript(
     if not state or (expected_state is not None and state is not expected_state):
         return False
     if session_id and str(state.get("session_id") or "") != str(session_id):
+        return False
+    if sdk_route_instance_id is not None and str(
+        state.get("_sdk_route_instance_id") or ""
+    ) != str(sdk_route_instance_id or ""):
         return False
     return await _route_external_transcript_to_game(
         lanlan_name,

@@ -184,6 +184,32 @@ def _begin_turn(client) -> None:
     client._current_turn_host_id = client._read_host_turn_id()
 
 
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_input_transcript_keeps_route_captured_at_voice_ingress():
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._remember_input_route_identity()
+    current_route[0] = ("example-game", "session-b", "route-b")
+
+    await client._deliver_input_transcript("hello")
+
+    assert delivered == [
+        ("hello", ("example-game", "session-a", "route-a")),
+    ]
+    assert client._input_route_identity_captured is False
+    assert client._input_route_identity is None
+
+
 # ---------------------------------------------------------------------------
 # Contract 3 first: the shape of an ordinary turn is the baseline everything
 # else is measured against.

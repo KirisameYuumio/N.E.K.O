@@ -56,6 +56,9 @@ from .game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE
 from main_logic import core as _core_facade
 
 
+_SOURCE_GAME_ROUTE_IDENTITY_UNSET = object()
+
+
 class TurnMixin:
     """Conversation turn pipeline methods (see module docstring)."""
 
@@ -1138,6 +1141,7 @@ class TurnMixin:
         is_voice_source: bool = True,
         source: str | None = None,
         metadata: dict | None = None,
+        source_game_route_identity: Any = _SOURCE_GAME_ROUTE_IDENTITY_UNSET,
     ):
         """Sync transcript text into queues/cache and push it to the frontend.
 
@@ -1154,11 +1158,36 @@ class TurnMixin:
         transcript_text = transcript.strip()
         record_transcript_text = transcript_text
         voice_rms_recorded = False
-        source_game_route_identity = (
-            get_active_game_route_generation_identity(self.lanlan_name)
-            if is_voice_source
-            else None
+        source_identity_was_explicit = (
+            source_game_route_identity is not _SOURCE_GAME_ROUTE_IDENTITY_UNSET
         )
+        if not is_voice_source:
+            source_game_route_identity = None
+        elif source_game_route_identity is _SOURCE_GAME_ROUTE_IDENTITY_UNSET:
+            # Compatibility for direct callers that do not have an ingress
+            # token. Realtime and independent-ASR production paths pass the
+            # identity captured when the utterance began.
+            source_game_route_identity = get_active_game_route_generation_identity(
+                self.lanlan_name
+            )
+        elif not (
+            source_game_route_identity is None
+            or (
+                isinstance(source_game_route_identity, tuple)
+                and len(source_game_route_identity) == 3
+            )
+        ):
+            source_game_route_identity = None
+
+        # A final can arrive after the utterance's route was replaced.  The
+        # production voice paths provide an ingress snapshot, so never let an
+        # A utterance enter B's takeover dispatcher or ordinary chat state.
+        if is_voice_source and source_identity_was_explicit:
+            current_route_identity = get_active_game_route_generation_identity(
+                self.lanlan_name
+            )
+            if source_game_route_identity != current_route_identity:
+                return False
 
         # 更新用户活动时间戳（用于主动搭话检测）。先捕获「转写到达时刻」局部变量，
         # 下面 last_user_message_time 复用同一时刻——若 takeover dispatcher 注册，

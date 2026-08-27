@@ -6555,6 +6555,11 @@ async def test_project_mirror_assistant_uses_text_only_mirror(monkeypatch):
         "_sdk_active_route_from_payload",
         lambda _game_type, _data: ("Lan", "match_1", route_state, None),
     )
+    _gr_patch_all(
+        monkeypatch,
+        "_get_active_game_route_state",
+        lambda _lanlan, _game_type=None: route_state,
+    )
 
     result = await gr_runtime.game_project_mirror_assistant(
         "soccer",
@@ -6685,6 +6690,11 @@ async def test_project_mirror_assistant_finalizes_user_reply_by_default(monkeypa
         "_sdk_active_route_from_payload",
         lambda _game_type, _data: ("Lan", "match_1", route_state, None),
     )
+    _gr_patch_all(
+        monkeypatch,
+        "_get_active_game_route_state",
+        lambda _lanlan, _game_type=None: route_state,
+    )
 
     result = await gr_runtime.game_project_mirror_assistant(
         "soccer",
@@ -6774,7 +6784,7 @@ async def test_project_mirror_assistant_records_opening_line_in_game_log(monkeyp
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_project_mirror_assistant_does_not_record_opening_line_on_replacement_route(
+async def test_project_mirror_assistant_serializes_publish_before_replacement_route(
     monkeypatch,
 ):
     entered = asyncio.Event()
@@ -6788,14 +6798,20 @@ async def test_project_mirror_assistant_does_not_record_opening_line_on_replacem
             return {"ok": True, "mirrored": True, "method": "project_text_mirror"}
 
     mgr = BlockingMirrorManager()
-    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
-    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"MirrorLockLan": mgr})
+    _gr_patch_all(
+        monkeypatch,
+        "_get_current_character_info",
+        lambda: {"lanlan_name": "MirrorLockLan"},
+    )
 
     with reset_game_route_state():
-        route_a = gr_runtime._activate_game_route("example-game", "reused-session", "Lan")
+        route_a = gr_runtime._activate_game_route(
+            "example-mirror-lock", "reused-session", "MirrorLockLan"
+        )
         route_a["_sdk_route_instance_id"] = "route-A"
         task = asyncio.create_task(gr_runtime.game_project_mirror_assistant(
-            "example-game",
+            "example-mirror-lock",
             _FakeRequest({
                 "line": "route A opening",
                 "session_id": "reused-session",
@@ -6804,12 +6820,74 @@ async def test_project_mirror_assistant_does_not_record_opening_line_on_replacem
             }),
         ))
         await entered.wait()
-        route_b = gr_runtime._activate_game_route("example-game", "reused-session", "Lan")
-        route_b["_sdk_route_instance_id"] = "route-B"
+        route_lock = gr_runtime._get_route_lock(
+            "MirrorLockLan", "example-mirror-lock"
+        )
+        replacement_started = asyncio.Event()
+
+        async def replace_route():
+            replacement_started.set()
+            async with route_lock:
+                route_b = gr_runtime._activate_game_route(
+                    "example-mirror-lock", "reused-session", "MirrorLockLan"
+                )
+                route_b["_sdk_route_instance_id"] = "route-B"
+                return route_b
+
+        replacement_task = asyncio.create_task(replace_route())
+        await replacement_started.wait()
+        await asyncio.sleep(0)
+        assert replacement_task.done() is False
         release.set()
         result = await task
+        route_b = await replacement_task
 
         assert result["ok"] is True
+        assert route_a["game_dialog_log"][0]["line"] == "route A opening"
+        assert route_b["game_dialog_log"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_mirror_assistant_drops_route_replaced_before_publish_lock(
+    monkeypatch,
+):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"MirrorStaleLan": mgr})
+
+    with reset_game_route_state():
+        route_a = gr_runtime._activate_game_route(
+            "example-mirror-stale", "reused-session", "MirrorStaleLan"
+        )
+        route_a["_sdk_route_instance_id"] = "route-A"
+        route_lock = gr_runtime._get_route_lock(
+            "MirrorStaleLan", "example-mirror-stale"
+        )
+        await route_lock.acquire()
+        try:
+            task = asyncio.create_task(gr_runtime.game_project_mirror_assistant(
+                "example-mirror-stale",
+                _FakeRequest({
+                    "line": "stale route A opening",
+                    "lanlan_name": "MirrorStaleLan",
+                    "session_id": "reused-session",
+                    "sdk_route_instance_id": "route-A",
+                    "event": {"kind": "opening-line"},
+                }),
+            ))
+            await asyncio.sleep(0)
+            route_b = gr_runtime._activate_game_route(
+                "example-mirror-stale", "reused-session", "MirrorStaleLan"
+            )
+            route_b["_sdk_route_instance_id"] = "route-B"
+        finally:
+            route_lock.release()
+
+        result = await task
+
+        assert result["ok"] is False
+        assert result["reason"] == "route_superseded"
+        assert mgr.assistant_mirrored == []
         assert route_a["game_dialog_log"] == []
         assert route_b["game_dialog_log"] == []
 

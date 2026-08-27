@@ -619,8 +619,13 @@ class _GeminiMixin:
                         # after SDK transcription or a quiet gap proves this is not a canceled tail.
                         self._interrupted = False
                         # 在AI开始响应前，发送累积的用户输入
-                        if self._gemini_user_transcript and self.on_input_transcript:
-                            await self.on_input_transcript(self._gemini_user_transcript)
+                        if self._gemini_user_transcript and (
+                            self.on_input_transcript
+                            or self.on_input_transcript_with_route
+                        ):
+                            await self._deliver_input_transcript(
+                                self._gemini_user_transcript
+                            )
                             self._gemini_user_transcript = ""  # 清空累积
                         self._gemini_user_transcript_after_interrupt = False
                         self._is_first_text_chunk = True  # 重置第一个 chunk 标记
@@ -707,8 +712,10 @@ class _GeminiMixin:
                     # 被中断时也发送已累积的用户输入
                     if self._gemini_user_transcript:
                         self._gemini_user_transcript_after_interrupt = True
-                        if self.on_input_transcript:
-                            await self.on_input_transcript(self._gemini_user_transcript)
+                        if self.on_input_transcript or self.on_input_transcript_with_route:
+                            await self._deliver_input_transcript(
+                                self._gemini_user_transcript
+                            )
                         self._gemini_user_transcript = ""
                     logger.info("Gemini response was interrupted by user")
 

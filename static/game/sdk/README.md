@@ -54,14 +54,17 @@ const game = await NekoMiniGame.connect({
 game identity/version, selects protocol v1, reports its host version and either
 a `registered` or explicit `development` identity, and grants only reviewed
 capabilities. Unknown or disabled formal games are rejected; a game cannot mark
-itself as a development build. Before loading the internal same-origin adapter,
-the trusted host bootstrap places reviewed entries in
-`__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__`. The adapter consumes and deletes that
-bootstrap value once, retains immutable records only in its closure, and
-intersects each record's allowlist with locally available providers. The game
-factory cannot inject or replace a registration or capability provider. A
-future marketplace/isolated host can perform registry, integrity and
-launch-ticket checks behind the same handshake without changing game code.
+itself as a development build. Before any game bundle, the trusted page host
+loads `neko-minigame-same-origin-bootstrap.js` and calls its one-shot
+`bootstrapNekoMiniGameSameOriginHost({ registrations })` with reviewed server
+registry entries or explicit local-development entries. The bootstrap installs
+a bounded immutable handoff, loads `neko-minigame-same-origin-host.js`, and then
+removes itself. The adapter consumes and deletes the handoff once, retains
+immutable records only in its closure, and intersects each record's allowlist
+with locally available providers. The game factory cannot inject or replace a
+registration or capability provider. A future marketplace/isolated host can
+produce the same launch registrations after registry, integrity and
+launch-ticket checks without changing game code.
 
 Unknown optional capabilities are not granted and appear in
 `game.capabilities.unavailable`. Missing required capabilities reject the

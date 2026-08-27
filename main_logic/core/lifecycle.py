@@ -41,6 +41,7 @@ from utils.gptsovits_config import is_gsv_disabled_voice_id
 from config.prompts.prompts_sys import get_context_summary_ready
 from utils.config_manager import _as_bool, ensure_default_yui_voice_for_free_api
 from utils.language_utils import normalize_language_code, get_global_language_full
+from utils.game_route_state import get_active_game_route_generation_identity
 from queue import Empty
 from uuid import uuid4
 import httpx
@@ -1583,6 +1584,10 @@ class LifecycleMixin:
                 on_sid_rotate=self.rotate_speech_id_for_response_done,
                 get_host_turn_id=self.read_current_speech_id,
                 on_input_transcript=self.handle_input_transcript,
+                on_input_transcript_with_route=self.handle_input_transcript,
+                get_input_route_identity=lambda: get_active_game_route_generation_identity(
+                    self.lanlan_name
+                ),
                 on_output_transcript=self.handle_output_transcript,
                 on_connection_error=self.handle_connection_error,
                 on_response_done=self.handle_response_complete,
@@ -1894,6 +1899,10 @@ class LifecycleMixin:
                     on_sid_rotate=self.rotate_speech_id_for_response_done,
                     get_host_turn_id=self.read_current_speech_id,
                     on_input_transcript=self.handle_input_transcript,
+                    on_input_transcript_with_route=self.handle_input_transcript,
+                    get_input_route_identity=lambda: get_active_game_route_generation_identity(
+                        self.lanlan_name
+                    ),
                     on_output_transcript=self.handle_output_transcript,
                     on_connection_error=self.handle_connection_error,
                     on_response_done=self.handle_response_complete,

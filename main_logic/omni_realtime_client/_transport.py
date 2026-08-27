@@ -66,6 +66,7 @@ _STUCK_RELEASE_STEP_TIMEOUT = 0.5
 # arrives right behind its original, so this only has to outlive the events
 # interleaved between them; it is a leak guard, not a history.
 _USAGE_RECORDED_ID_LIMIT = 32
+_INPUT_ROUTE_IDENTITY_ITEM_LIMIT = 8
 
 # `error` 事件的致命性判定是一串子串匹配（'429' / '1008' / '503' / 'quota' ...）。它
 # 过去匹配在 `str(event['error'])` 上，也就是整个 dict 的 repr —— 里面回显着我们自己
@@ -128,6 +129,61 @@ class RealtimeImagePayloadTooLargeError(RuntimeError):
 class _TransportMixin:
     _WS_FRAME_LIMIT = OMNI_WS_FRAME_LIMIT_BYTES  # safe threshold below 256KB server cap
 
+    def _clear_input_route_identities(self) -> None:
+        self._input_route_identity_captured = False
+        self._input_route_identity = None
+        self._input_route_identity_by_item.clear()
+
+    def _remember_input_route_identity(self, item_id: object = None) -> None:
+        """Snapshot the active game generation at actual voice ingress."""
+        identity = None
+        reader = getattr(self, "get_input_route_identity", None)
+        if callable(reader):
+            try:
+                candidate = reader()
+                if (
+                    isinstance(candidate, tuple)
+                    and len(candidate) == 3
+                ):
+                    identity = tuple(str(part or "") for part in candidate)
+            except Exception:
+                identity = None
+        item_key = str(item_id or "").strip()
+        if item_key:
+            identities = self._input_route_identity_by_item
+            identities.pop(item_key, None)
+            identities[item_key] = identity
+            while len(identities) > _INPUT_ROUTE_IDENTITY_ITEM_LIMIT:
+                identities.pop(next(iter(identities)))
+            return
+        self._input_route_identity = identity
+        self._input_route_identity_captured = True
+
+    def _take_input_route_identity(self, item_id: object = None):
+        item_key = str(item_id or "").strip()
+        if item_key and item_key in self._input_route_identity_by_item:
+            return self._input_route_identity_by_item.pop(item_key)
+        identity = (
+            self._input_route_identity
+            if self._input_route_identity_captured
+            else None
+        )
+        self._input_route_identity = None
+        self._input_route_identity_captured = False
+        return identity
+
+    async def _deliver_input_transcript(self, transcript: str, *, item_id: object = None) -> None:
+        identity = self._take_input_route_identity(item_id)
+        routed_callback = getattr(self, "on_input_transcript_with_route", None)
+        if callable(routed_callback):
+            await routed_callback(
+                transcript,
+                source_game_route_identity=identity,
+            )
+            return
+        if self.on_input_transcript:
+            await self.on_input_transcript(transcript)
+
     async def connect(self, instructions: str, native_audio=True) -> None:
         """Establish WebSocket connection with the Realtime API."""
         # Validate turn_detection_mode BEFORE any side effect (websockets.connect,
@@ -141,6 +197,7 @@ class _TransportMixin:
         # new session's first tool calls look like a burst. Cleared before the
         # provider branch so it covers both Gemini and the WS providers.
         self._recent_tool_call_times = []
+        self._clear_input_route_identities()
 
         # Same reason, same lifetime: response ids are scoped to a connection,
         # so a provider that restarts its numbering (or simply reuses an id)
@@ -649,6 +706,7 @@ class _TransportMixin:
                     self._user_recent_activity_time = current_time
                     if self._speech_detect_start == 0.0:
                         self._speech_detect_start = current_time
+                        self._remember_input_route_identity()
                     elif current_time - self._speech_detect_start >= self._speech_sustain_threshold:
                         self._client_vad_last_speech_time = current_time
                         self._client_vad_active = True
@@ -660,6 +718,8 @@ class _TransportMixin:
                 if len(samples) > 0:
                     rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
                     if rms > self._client_vad_threshold:
+                        if not self._client_vad_active:
+                            self._remember_input_route_identity()
                         self._client_vad_last_speech_time = current_time
                         self._client_vad_active = True
                         # RMS 噪音率高，但若 RNNoise 不可用（16kHz/移动端），
@@ -2018,6 +2078,7 @@ class _TransportMixin:
                     self._speech_started_total += 1
                     logger.info("Speech detected")
                     self._response_arbiter.notify_server_vad_started()
+                    self._remember_input_route_identity(event.get("item_id"))
                     self._audio_in_buffer = True
                     # 重置静默计时器
                     self._last_speech_time = time.time()
@@ -2064,8 +2125,11 @@ class _TransportMixin:
                 elif event_type == "conversation.item.input_audio_transcription.completed":
                     self._print_input_transcript = True
                     transcript = event.get("transcript", "")
-                    if self.on_input_transcript:
-                        await self.on_input_transcript(transcript)
+                    if self.on_input_transcript or self.on_input_transcript_with_route:
+                        await self._deliver_input_transcript(
+                            transcript,
+                            item_id=event.get("item_id"),
+                        )
                 elif event_type in ["response.audio_transcript.done", "response.output_audio_transcript.done"]:
                     self._print_input_transcript = False
                     # [ISSUE4b] Voice-without-text fix. Audio deltas and transcript
@@ -2242,6 +2306,7 @@ class _TransportMixin:
         """
 
         self._connection_generation += 1
+        self._clear_input_route_identities()
         self._close_task = None
         self._failed_transport_close_task = None
         self._gemini_close_task = None

@@ -368,6 +368,43 @@ async def test_disconnected_websocket_does_not_kill_the_handler(monkeypatch):
     assert still_running, "一次发送失败不能让 tts_response_handler 退出"
 
 
+async def test_game_completion_is_false_when_audio_chunk_delivery_failed(monkeypatch):
+    monkeypatch.setattr(tts_runtime_module.logger, "warning", lambda *_a, **_k: None)
+
+    class _ChunkFailureWebsocket(_RecordingWebsocket):
+        async def send_bytes(self, payload):
+            del payload
+            raise RuntimeError("audio socket failed")
+
+    ws = _ChunkFailureWebsocket()
+    mgr = _make_mgr(ws)
+    completion = LLMSessionManager._begin_game_speech_completion_wait(mgr, "sid-1")
+    task = await _start_handler(
+        mgr,
+        ("__audio__", "sid-1", b"pcm"),
+        ("__audio_done__", "sid-1"),
+    )
+    try:
+        assert await asyncio.wait_for(completion, timeout=2.0) is False
+        assert getattr(mgr, "_game_speech_delivery_state", None) is None
+        assert not task.done()
+    finally:
+        await _stop(task)
+
+
+async def test_game_completion_is_false_when_audio_done_delivery_failed(monkeypatch):
+    monkeypatch.setattr(tts_runtime_module.logger, "warning", lambda *_a, **_k: None)
+    mgr = _make_mgr(_RecordingWebsocket(connected=False))
+    completion = LLMSessionManager._begin_game_speech_completion_wait(mgr, "sid-1")
+    task = await _start_handler(mgr, ("__audio_done__", "sid-1"))
+    try:
+        assert await asyncio.wait_for(completion, timeout=2.0) is False
+        assert getattr(mgr, "_game_speech_delivery_state", None) is None
+        assert not task.done()
+    finally:
+        await _stop(task)
+
+
 @pytest.mark.parametrize("has_socket", [False, True])
 async def test_send_audio_done_never_raises_when_socket_is_unusable(has_socket, monkeypatch):
     monkeypatch.setattr(tts_runtime_module.logger, "warning", lambda *_a, **_k: None)
