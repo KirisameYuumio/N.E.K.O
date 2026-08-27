@@ -179,6 +179,8 @@
         onTranscript: null,
         onError: null,
         lastState: null,
+        seenMessageIds: new Set(),
+        seenMessageOrder: [],
       };
       this._logger = {
         enabled: false,
@@ -1106,6 +1108,15 @@
 
       const acceptMessage = (data, source) => {
         if (!data || !['game_voice_control_state', 'game_voice_transcript'].includes(data.type)) return;
+        const messageId = String(data.message_id || data.storage_nonce || '');
+        if (messageId) {
+          if (bridge.seenMessageIds.has(messageId)) return;
+          bridge.seenMessageIds.add(messageId);
+          bridge.seenMessageOrder.push(messageId);
+          while (bridge.seenMessageOrder.length > 128) {
+            bridge.seenMessageIds.delete(bridge.seenMessageOrder.shift());
+          }
+        }
         if (String(data.game_type || '') !== this.gameType) return;
         if (data.session_id && String(data.session_id) !== this.sessionId) return;
         if (data.type === 'game_voice_transcript') {
@@ -1159,15 +1170,23 @@
 
     _postVoiceControlMessage(payload) {
       const bridge = this._voiceControlBridge;
+      const messageId = String(payload?.message_id || (
+        `voice-message-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
+      ));
+      const message = { ...payload, message_id: messageId, storage_nonce: messageId };
+      let posted = false;
       if (bridge.channel) {
-        bridge.channel.postMessage(payload);
-        return true;
+        try {
+          bridge.channel.postMessage(message);
+          posted = true;
+        } catch (error) {
+          bridge.onError?.(error, 'broadcast_channel');
+          try { bridge.channel.close(); } catch (_) { /* unusable channel */ }
+          bridge.channel = null;
+        }
       }
       try {
-        const serialized = JSON.stringify({
-          ...payload,
-          storage_nonce: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-        });
+        const serialized = JSON.stringify(message);
         this._window.localStorage.setItem(bridge.storageKey, serialized);
         const CustomEventImpl = this._window.CustomEvent || globalThis.CustomEvent;
         if (typeof this._window.dispatchEvent === 'function' && typeof CustomEventImpl === 'function') {
@@ -1182,11 +1201,11 @@
             }
           } catch (_) { /* best-effort transient message cleanup */ }
         }, 0);
-        return true;
+        posted = true;
       } catch (error) {
-        bridge.onError?.(error, 'local_storage');
-        return false;
+        if (!posted) bridge.onError?.(error, 'local_storage');
       }
+      return posted;
     }
 
     requestVoiceControl(action = 'query', options = {}) {
@@ -1299,6 +1318,8 @@
       bridge.onTranscript = null;
       bridge.onError = null;
       bridge.lastState = null;
+      bridge.seenMessageIds.clear();
+      bridge.seenMessageOrder.length = 0;
     }
 
     isSpeechRecognitionSupported(options = {}) {
@@ -2196,13 +2217,23 @@
         captureRegistry.warnWrapper = (...args) => {
           captureRegistry.originalWarn?.apply(consoleObject, args);
           for (const host of Array.from(captureRegistry.hosts)) {
-            host.log('warning', 'frontend', 'console_warn', args.map((item) => String(item)).join(' '), { args }, true);
+            try {
+              const message = args.map((item) => {
+                try { return String(item); } catch (_) { return '[unprintable]'; }
+              }).join(' ');
+              host.log('warning', 'frontend', 'console_warn', message, { args }, true);
+            } catch (_) { /* global console capture must never change caller control flow */ }
           }
         };
         captureRegistry.errorWrapper = (...args) => {
           captureRegistry.originalError?.apply(consoleObject, args);
           for (const host of Array.from(captureRegistry.hosts)) {
-            host.log('error', 'frontend', 'console_error', args.map((item) => String(item)).join(' '), { args }, true);
+            try {
+              const message = args.map((item) => {
+                try { return String(item); } catch (_) { return '[unprintable]'; }
+              }).join(' ');
+              host.log('error', 'frontend', 'console_error', message, { args }, true);
+            } catch (_) { /* global console capture must never change caller control flow */ }
           }
         };
         GLOBAL_CONSOLE_CAPTURE_REGISTRIES.set(consoleObject, captureRegistry);

@@ -104,7 +104,9 @@ function createTransport({ server = false, shared = null } = {}) {
     getRuntimeState() { return runtimeState; },
     applyRuntimeState(state) { runtimeState = { ...runtimeState, ...state }; return runtimeState; },
     resetRuntime() { return runtimeState; },
-    async start() { return { ok: true, state: { session_id: runtimeState.sessionId } }; },
+    async start() {
+      return { ok: true, state: { game_route_active: true, session_id: runtimeState.sessionId } };
+    },
     async end() { return { ok: true, state: { session_id: runtimeState.sessionId } }; },
     async heartbeat() { return { ok: true, active: true }; },
     async drain() { return { ok: true, outputs: [] }; },

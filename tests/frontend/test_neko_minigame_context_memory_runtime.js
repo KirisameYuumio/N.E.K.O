@@ -84,7 +84,9 @@ function createTransport(options = {}) {
       };
       return runtimeState;
     },
-    async start(payload) { return { ok: true, payload }; },
+    async start(payload) {
+      return { ok: true, state: { game_route_active: true }, payload };
+    },
     async end(payload) { return { ok: true, payload }; },
     async heartbeat() { return { ok: true, active: true }; },
     async drain() { return { ok: true, outputs: [] }; },

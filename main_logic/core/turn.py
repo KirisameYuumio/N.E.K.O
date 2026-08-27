@@ -1723,6 +1723,8 @@ class TurnMixin:
         interrupt_audio: bool = False,
         playback_gain: float = 1.0,
         reuse_synthesized_audio: bool = False,
+        wait_for_audio_completion: bool = False,
+        audio_completion_timeout: float = 45.0,
     ) -> dict:
         """Mirror an assistant line + play it through the project TTS pipeline.
 
@@ -1822,32 +1824,65 @@ class TurnMixin:
         await self.ensure_tts_pipeline_alive()
         audio_queued = False
         capture_started = False
-        if reuse_synthesized_audio:
-            capture_started = GAME_SPEECH_AUDIO_CACHE.begin_capture(
-                self,
-                turn_id,
-                cache_key,
-                runtime_signature,
-            )
-        if self.tts_thread and self.tts_thread.is_alive():
-            async with self.tts_cache_lock:
-                if self.tts_ready:
-                    self._enqueue_tts_text_chunk(turn_id, clean)
-                else:
-                    self.tts_pending_chunks.append((turn_id, clean))
-                status = self._request_tts_done_locked()
-                audio_queued = status in {"queued", "deferred", "already"}
-        if capture_started and not audio_queued:
-            GAME_SPEECH_AUDIO_CACHE.fail_capture(self, turn_id)
-        if emit_turn_end_after:
-            await self.emit_mirror_turn_end(
-                metadata=metadata,
-                request_id=request_id,
-                log_context="mirror speech",
-            )
+        completion_future = (
+            self._begin_game_speech_completion_wait(turn_id)
+            if wait_for_audio_completion
+            else None
+        )
+        try:
+            if reuse_synthesized_audio:
+                capture_started = GAME_SPEECH_AUDIO_CACHE.begin_capture(
+                    self,
+                    turn_id,
+                    cache_key,
+                    runtime_signature,
+                )
+            if self.tts_thread and self.tts_thread.is_alive():
+                async with self.tts_cache_lock:
+                    if self.tts_ready:
+                        self._enqueue_tts_text_chunk(turn_id, clean)
+                    else:
+                        self.tts_pending_chunks.append((turn_id, clean))
+                    status = self._request_tts_done_locked()
+                    audio_queued = status in {"queued", "deferred", "already"}
+            if capture_started and not audio_queued:
+                GAME_SPEECH_AUDIO_CACHE.fail_capture(self, turn_id)
+            if emit_turn_end_after:
+                await self.emit_mirror_turn_end(
+                    metadata=metadata,
+                    request_id=request_id,
+                    log_context="mirror speech",
+                )
+        except BaseException:
+            if completion_future is not None:
+                self._cancel_game_speech_completion_wait()
+            raise
+
+        audio_completed = False
+        if completion_future is not None and audio_queued:
+            try:
+                audio_completed = await self._wait_for_game_speech_completion(
+                    turn_id,
+                    completion_future,
+                    audio_completion_timeout,
+                )
+            except asyncio.CancelledError:
+                # The HTTP caller can disconnect while the worker still owns
+                # unscoped audio.  Stop and drain it before the router lock is
+                # released, then preserve cancellation for the request task.
+                await self._clear_tts_pipeline()
+                raise
+            if not audio_completed:
+                # Do not release the game-router serialization lock while an
+                # unscoped worker could still emit bytes for this speech ID.
+                await self._clear_tts_pipeline()
+        elif completion_future is not None:
+            self._cancel_game_speech_completion_wait()
 
         return {
-            "ok": True,
+            "ok": not (wait_for_audio_completion and audio_queued and not audio_completed),
+            **({"reason": "audio_completion_timeout"}
+               if wait_for_audio_completion and audio_queued and not audio_completed else {}),
             "method": "project_tts",
             "cache_status": (
                 "miss" if capture_started
@@ -1857,6 +1892,7 @@ class TurnMixin:
             "speech_id": turn_id,
             "audio_sent": audio_queued,
             "audio_queued": audio_queued,
+            "audio_completed": audio_completed if wait_for_audio_completion else None,
             "turn_end_emitted": bool(emit_turn_end_after),
             "interrupt_audio": bool(interrupt_audio),
             "playback_gain": normalized_playback_gain,

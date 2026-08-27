@@ -26,6 +26,8 @@
     var transcriptionStateHandler = null;
     var voiceTranscriptHandler = null;
     var channel = null;
+    var seenMessageIds = new Set();
+    var seenMessageOrder = [];
 
     if (!S) {
         console.warn('[GameVoiceControl] appState unavailable; host bridge not started');
@@ -83,10 +85,18 @@
 
     function postMessage(payload, ephemeral) {
         if (disposed) return false;
+        var messageId = String(payload && payload.message_id || (
+            'voice-message-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9)
+        ));
+        var message = Object.assign({}, payload || {}, {
+            message_id: messageId,
+            storage_nonce: messageId
+        });
+        var posted = false;
         if (channel) {
             try {
-                channel.postMessage(payload);
-                return true;
+                channel.postMessage(message);
+                posted = true;
             } catch (error) {
                 console.warn('[GameVoiceControl] BroadcastChannel post failed; falling back:', error);
                 try { channel.close(); } catch (_) { /* unusable channel */ }
@@ -94,9 +104,7 @@
             }
         }
         try {
-            var serialized = JSON.stringify(Object.assign({
-                storage_nonce: Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
-            }, payload || {}));
+            var serialized = JSON.stringify(message);
             localStorage.setItem(STORAGE_KEY, serialized);
             if (typeof window.dispatchEvent === 'function' && typeof window.CustomEvent === 'function') {
                 window.dispatchEvent(new window.CustomEvent(WINDOW_EVENT, {
@@ -114,11 +122,11 @@
                     }
                 } catch (_) {}
             }, 0);
-            return true;
+            posted = true;
         } catch (error) {
-            console.warn('[GameVoiceControl] state transport unavailable:', error);
-            return false;
+            if (!posted) console.warn('[GameVoiceControl] state transport unavailable:', error);
         }
+        return posted;
     }
 
     function broadcastState(extra, force, routeOverride) {
@@ -254,6 +262,15 @@
     }
 
     function acceptMessage(message) {
+        var messageId = String(message && (message.message_id || message.storage_nonce) || '');
+        if (messageId) {
+            if (seenMessageIds.has(messageId)) return;
+            seenMessageIds.add(messageId);
+            seenMessageOrder.push(messageId);
+            while (seenMessageOrder.length > 128) {
+                seenMessageIds.delete(seenMessageOrder.shift());
+            }
+        }
         void handleRequest(message);
     }
 
@@ -383,6 +400,8 @@
             try { channel.close(); } catch (_) {}
             channel = null;
         }
+        seenMessageIds.clear();
+        seenMessageOrder.length = 0;
         window.removeEventListener('pagehide', dispose);
         window.removeEventListener('beforeunload', dispose);
     }

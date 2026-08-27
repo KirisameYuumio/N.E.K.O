@@ -42,7 +42,8 @@ async function main() {
   const micButton = {
     disabled: false,
     classList: { contains: () => false },
-    click() { appState.isRecording = true; },
+    clickCount: 0,
+    click() { this.clickCount += 1; appState.isRecording = true; },
   };
   const documentMock = {
     getElementById(id) { return id === 'micButton' ? micButton : null; },
@@ -136,16 +137,22 @@ async function main() {
     sessionId: 'soccer-runtime',
   } });
 
-  channel.onmessage({ data: {
+  const duplicatedStartRequest = {
     type: 'game_voice_control_request',
     sender_id: 'soccer-window',
     request_id: 'start-1',
+    message_id: 'duplicate-start-message',
     action: 'start',
     game_type: 'soccer',
     session_id: 'soccer-runtime',
-  } });
+  };
+  channel.onmessage({ data: duplicatedStartRequest });
+  windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
+    detail: duplicatedStartRequest,
+  }));
   await flush();
-  assert(appState.isRecording, 'start request did not use the official microphone button');
+  assert(appState.isRecording && micButton.clickCount === 1,
+    'dual voice transports executed the same start command more than once');
   assert(posted.some((message) => message.request_id === 'start-1' && message.reason === 'started' && message.active),
     'start request did not acknowledge the confirmed active state');
   assert(posted.some((message) => message.request_id === 'start-1'
@@ -153,6 +160,9 @@ async function main() {
     && message.transcription_mode === 'backend_pending'
     && message.ready === false),
   'start response did not expose the host-owned pending transcription contract');
+  assert(posted.filter((message) => message.request_id === 'start-1'
+    && message.reason === 'started').length === 1,
+  'dual voice transports emitted duplicate command completion states');
 
   appState.gameVoiceTranscriptionMode = 'native_core';
   appState.gameVoiceTranscriptionProvider = 'free';

@@ -1698,6 +1698,15 @@
     let runtimeRouteEstablished = false;
     let runtimeEventSequence = 0;
     let runtimeConfig = null;
+
+    function requireActiveRuntimeRoute(operation) {
+      if (!runtimeRouteEstablished || !['running', 'degraded'].includes(runtimePhase)) {
+        fail('invalid_state', `${operation} requires an active runtime route`, {
+          operation,
+          state: runtimePhase,
+        });
+      }
+    }
     const heartbeatLifecycle = {
       timer: null,
       controller: null,
@@ -2743,6 +2752,12 @@
         if (runtimePhase === 'starting' || runtimePhase === 'running' || runtimePhase === 'ending') {
           fail('busy', 'The runtime lifecycle is already active', { state: runtimePhase });
         }
+        if (runtimeRouteEstablished) {
+          fail('invalid_state', 'The established runtime route must be ended before starting again', {
+            operation: 'runtime.start',
+            state: runtimePhase,
+          });
+        }
         if (memoryPendingRequests.size) {
           fail('busy', 'Memory consent configuration is still pending', {
             operation: 'runtime.start',
@@ -2761,13 +2776,21 @@
           ));
           if (!isRuntimeOperationCurrent(operation)) return response;
           const data = response.data || {};
-          if (response.ok && data.ok !== false) {
-            if (data.state && typeof data.state === 'object') transport.applyRuntimeState(data.state);
+          const routeState = data.state && typeof data.state === 'object' ? data.state : null;
+          const routeActive = routeState?.game_route_active === true || data.active === true;
+          if (response.ok && data.ok !== false && routeActive) {
+            if (routeState) transport.applyRuntimeState(routeState);
             runtimeRouteEstablished = true;
             setRuntimePhase('running', 'start-accepted');
             if (isRuntimeOperationCurrent(operation) && runtimePhase === 'running') {
               startRuntimeMonitoring();
             }
+          } else if (response.ok && data.ok !== false) {
+            if (routeState) transport.applyRuntimeState(routeState);
+            runtimeRouteEstablished = false;
+            stopRuntimeMonitoring();
+            setRuntimePhase('inactive', 'start-inactive');
+            await publishRuntimeEvent('runtime-inactive', data, { waitForHandlers: true });
           } else {
             setRuntimePhase('degraded', 'start-rejected');
             if (isRuntimeOperationCurrent(operation) && runtimePhase === 'degraded') {
@@ -2970,11 +2993,12 @@
       },
       async submit(value, requestOptions = {}) {
         requireCapability('memory', 'memory.submit');
-        if (!memoryConsentLocked || !['running', 'degraded'].includes(runtimePhase)) {
+        if (!memoryConsentLocked) {
           fail('session_invalid', 'Memory can only be submitted during an active game runtime', {
             operation: 'memory.submit',
           });
         }
+        requireActiveRuntimeRoute('memory.submit');
         if (!memoryConsentEnabled) {
           fail('consent_required', 'This game session did not receive memory consent', {
             operation: 'memory.submit',
@@ -3608,6 +3632,7 @@
       get pendingCount() { return dialoguePendingRequests.size; },
       async quickLines(payload = {}, requestOptions = {}) {
         requireCapability('quick-lines', 'dialogue.quickLines');
+        requireActiveRuntimeRoute('dialogue.quickLines');
         if (typeof transport.getQuickLines !== 'function') {
           fail('transport_unavailable', 'The host does not support dialogue quick lines');
         }
@@ -3636,9 +3661,7 @@
       },
       async request(payload = {}, requestOptions = {}) {
         requireCapability('dialogue', 'dialogue.request');
-        if (!runtimeRouteEstablished || !['running', 'degraded'].includes(runtimePhase)) {
-          fail('invalid_state', 'dialogue.request requires an active runtime route');
-        }
+        requireActiveRuntimeRoute('dialogue.request');
         if (!plainObject(payload)) fail('invalid_request', 'dialogue payload must be an object');
         const { prompt: rawPrompt, ...payloadWithoutPrompt } = payload;
         assertNoForbiddenDialogueFields(payloadWithoutPrompt);
@@ -3776,9 +3799,7 @@
 
     async function requestSpeechOutput(requestInput, requestOptions = {}) {
       requireCapability('speech-output', 'speech.speak');
-      if (!runtimeRouteEstablished || !['running', 'degraded'].includes(runtimePhase)) {
-        fail('invalid_state', 'speech.speak requires an active runtime route');
-      }
+      requireActiveRuntimeRoute('speech.speak');
       if (!speechBridgeStarted) {
         fail('transport_unavailable', 'The host speech output bridge is unavailable');
       }
@@ -3825,6 +3846,7 @@
 
     async function mirrorSpeechOutput(requestInput, requestOptions = {}) {
       requireCapability('speech-output', 'speech.mirror');
+      requireActiveRuntimeRoute('speech.mirror');
       if (!speechBridgeStarted) {
         fail('transport_unavailable', 'The host speech output bridge is unavailable');
       }
@@ -4076,6 +4098,8 @@
         let raw;
         try {
           raw = await transport.mountAvatar(config);
+        } catch (error) {
+          throw normalizeTransportError(error, 'avatar.mount');
         } finally {
           avatarMountsPending -= 1;
         }
@@ -4100,36 +4124,47 @@
           }
         }
 
+        function callController(method, invoke) {
+          requireController(method);
+          try {
+            const result = invoke();
+            if (result && typeof result.then === 'function') {
+              return Promise.resolve(result).catch((error) => {
+                throw normalizeTransportError(error, `avatar.${method}`);
+              });
+            }
+            return result;
+          } catch (error) {
+            throw normalizeTransportError(error, `avatar.${method}`);
+          }
+        }
+
         return Object.freeze({
           config,
           get disposed() { return controllerState.disposed || disposed || disposing; },
           async setModel(modelInput) {
-            requireController('setModel');
-            return raw.setModel(normalizeAvatarModel(modelInput));
+            return callController('setModel', () => raw.setModel(normalizeAvatarModel(modelInput)));
           },
           focus(pointInput) {
-            requireController('focus');
-            return raw.focus(normalizeAvatarFocus(pointInput));
+            return callController('focus', () => raw.focus(normalizeAvatarFocus(pointInput)));
           },
           setEmotion(name) {
-            requireController('setEmotion');
-            const emotion = String(name || '').trim();
-            if (!emotion || emotion.length > 64) {
-              fail('invalid_request', 'avatar emotion name is required');
-            }
-            return raw.setEmotion(emotion);
+            return callController('setEmotion', () => {
+              const emotion = String(name || '').trim();
+              if (!emotion || emotion.length > 64) {
+                fail('invalid_request', 'avatar emotion name is required');
+              }
+              return raw.setEmotion(emotion);
+            });
           },
           pause() {
-            requireController('pause');
-            return raw.pause();
+            return callController('pause', () => raw.pause());
           },
           resume() {
-            requireController('resume');
-            return raw.resume();
+            return callController('resume', () => raw.resume());
           },
           getState() {
-            requireController('getState');
-            const state = raw.getState();
+            const state = callController('getState', () => raw.getState());
             return state && typeof state === 'object' ? Object.freeze({ ...state }) : Object.freeze({});
           },
           dispose() { disposeAvatarController(controllerState); },

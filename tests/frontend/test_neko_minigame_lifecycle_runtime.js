@@ -135,7 +135,7 @@ async function main() {
       return runtimeState;
     },
     async start(payload) {
-      return { ok: true, state: { lanlan_name: 'Yui' }, payload };
+      return { ok: true, state: { game_route_active: true, lanlan_name: 'Yui' }, payload };
     },
     async heartbeat(payload) {
       heartbeatCalls += 1;
@@ -483,7 +483,7 @@ async function main() {
   const staleStart = staleSuccessGame.runtime.start({});
   await Promise.resolve();
   const staleEnd = staleSuccessGame.runtime.end({});
-  blockedStaleStart.resolve({ ok: true, state: { lanlan_name: 'stale' } });
+  blockedStaleStart.resolve({ ok: true, state: { game_route_active: true, lanlan_name: 'stale' } });
   await staleStart;
   assert(staleSuccessGame.runtime.state === 'ending' && staleSuccessEnvironment.intervals.size === 0,
     'stale successful start completion replaced the newer lifecycle state');
@@ -600,9 +600,13 @@ async function main() {
     'page exit during runtime start left listeners resident');
 
   const routeTruthEnvironment = createEnvironment();
-  let acceptRouteStart = false;
+  let routeStartMode = 'reject';
+  let routeStartCalls = 0;
   let dialogueCalls = 0;
+  let quickLineCalls = 0;
   let speechCalls = 0;
+  let speechMirrorCalls = 0;
+  let memorySubmitCalls = 0;
   const routeTruthTransport = {
     ...transport,
     logger: logger(),
@@ -610,14 +614,22 @@ async function main() {
     getRuntimeState() { return { sessionId: 'route-truth-session', characterName: 'Yui' }; },
     applyRuntimeState() { return { sessionId: 'route-truth-session', characterName: 'Yui' }; },
     async start() {
-      return acceptRouteStart
-        ? { ok: true, state: { session_id: 'route-truth-session', lanlan_name: 'Yui' } }
+      routeStartCalls += 1;
+      if (routeStartMode === 'throw') throw Object.assign(new Error('start failed'), { code: 'network_error' });
+      if (routeStartMode === 'inactive') {
+        return { ok: true, state: { game_route_active: false, session_id: 'route-truth-session' } };
+      }
+      return routeStartMode === 'active'
+        ? { ok: true, state: { game_route_active: true, session_id: 'route-truth-session', lanlan_name: 'Yui' } }
         : { ok: false, reason: 'start-rejected' };
     },
     async end() { return { ok: false, reason: 'end-rejected' }; },
     async heartbeat() { return { ok: true, active: true }; },
     async drain() { return { ok: true, outputs: [] }; },
     async requestDialogue() { dialogueCalls += 1; return { ok: true, line: 'route active' }; },
+    async getQuickLines() { quickLineCalls += 1; return { ok: true, lines: {} }; },
+    async configureGameMemoryConsent() { return { ok: true }; },
+    async submitGameMemory() { memorySubmitCalls += 1; return { ok: true, accepted: true }; },
     startSpeechOutputBridge() { return true; },
     stopSpeechOutputBridge() {},
     async preloadSpeechOutput() { return { ok: true, results: [] }; },
@@ -625,40 +637,89 @@ async function main() {
       speechCalls += 1;
       return { ok: true, speech_id: 'route-truth-speech' };
     },
+    async mirrorSpeechOutput() { speechMirrorCalls += 1; return { ok: true, mirrored: true }; },
     dispose() {},
   };
   const routeTruthGame = await window.NekoMiniGame.connect({
     id: 'lifecycle-route-truth',
     version: '1.0.0',
-    requiredCapabilities: ['runtime', 'logging', 'dialogue', 'speech-output'],
+    requiredCapabilities: ['runtime', 'logging', 'dialogue', 'quick-lines', 'speech-output', 'memory'],
   }, {
     transport: routeTruthTransport,
     windowImpl: routeTruthEnvironment.windowImpl,
     documentImpl: routeTruthEnvironment.documentImpl,
   });
+  await routeTruthGame.memory.configureConsent(true);
   await routeTruthGame.runtime.start({});
-  let rejectedStartDialogueError = null;
-  let rejectedStartSpeechError = null;
-  try { await routeTruthGame.dialogue.request({ event: 'after-rejected-start' }); }
-  catch (error) { rejectedStartDialogueError = error; }
-  try { await routeTruthGame.speech.speak({ text: 'after rejected start' }); }
-  catch (error) { rejectedStartSpeechError = error; }
-  assert(rejectedStartDialogueError?.code === 'invalid_state'
-    && rejectedStartSpeechError?.code === 'invalid_state'
-    && dialogueCalls === 0
-    && speechCalls === 0,
-  'a rejected runtime start was treated as an established route');
+  const activeOnlyCalls = [
+    () => routeTruthGame.dialogue.request({ event: 'after-rejected-start' }),
+    () => routeTruthGame.dialogue.quickLines({ kind: 'goal' }),
+    () => routeTruthGame.speech.speak({ text: 'after rejected start' }),
+    () => routeTruthGame.speech.mirror({ text: 'after rejected start' }),
+    () => routeTruthGame.memory.submit({ summary: 'after rejected start' }),
+  ];
+  for (const invoke of activeOnlyCalls) {
+    let routeError = null;
+    try { await invoke(); } catch (error) { routeError = error; }
+    assert(routeError?.code === 'invalid_state',
+      'a rejected runtime start permitted an active-route capability');
+  }
+  assert(dialogueCalls === 0 && quickLineCalls === 0 && speechCalls === 0
+    && speechMirrorCalls === 0 && memorySubmitCalls === 0,
+  'a rejected runtime start reached an active-route transport');
 
-  acceptRouteStart = true;
+  routeStartMode = 'throw';
+  let failedStartError = null;
+  try { await routeTruthGame.runtime.start({}); } catch (error) { failedStartError = error; }
+  assert(failedStartError?.code === 'network_error', 'failed start did not preserve its transport error');
+  for (const invoke of activeOnlyCalls) {
+    let routeError = null;
+    try { await invoke(); } catch (error) { routeError = error; }
+    assert(routeError?.code === 'invalid_state',
+      'a failed runtime start permitted an active-route capability');
+  }
+
+  routeStartMode = 'active';
   await routeTruthGame.runtime.start({});
   await routeTruthGame.runtime.end({});
   assert(routeTruthGame.runtime.state === 'degraded',
     'a rejected runtime end did not remain retryable');
   await routeTruthGame.dialogue.request({ event: 'after-rejected-end' });
+  await routeTruthGame.dialogue.quickLines({ kind: 'goal' });
   await routeTruthGame.speech.speak({ text: 'after rejected end' });
-  assert(dialogueCalls === 1 && speechCalls === 1,
+  await routeTruthGame.speech.mirror({ text: 'after rejected end' });
+  await routeTruthGame.memory.submit({ summary: 'after rejected end' });
+  assert(dialogueCalls === 1 && quickLineCalls === 1 && speechCalls === 1
+    && speechMirrorCalls === 1 && memorySubmitCalls === 1,
     'a failed runtime end discarded a route that may still be active');
+  const startsBeforeInvalidRetry = routeStartCalls;
+  let establishedStartError = null;
+  try { await routeTruthGame.runtime.start({}); } catch (error) { establishedStartError = error; }
+  assert(establishedStartError?.code === 'invalid_state'
+    && routeStartCalls === startsBeforeInvalidRetry,
+  'a failed-end established route permitted a second start');
   routeTruthGame.dispose();
+
+  const inactiveStartEnvironment = createEnvironment();
+  routeStartMode = 'inactive';
+  const inactiveStartGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-route-inactive-start',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging', 'dialogue'],
+  }, {
+    transport: routeTruthTransport,
+    windowImpl: inactiveStartEnvironment.windowImpl,
+    documentImpl: inactiveStartEnvironment.documentImpl,
+  });
+  await inactiveStartGame.runtime.start({});
+  assert(inactiveStartGame.runtime.state === 'inactive',
+    'an inactive successful start response entered running');
+  let inactiveDialogueError = null;
+  try { await inactiveStartGame.dialogue.request({ event: 'inactive-start' }); }
+  catch (error) { inactiveDialogueError = error; }
+  assert(inactiveDialogueError?.code === 'invalid_state',
+    'an inactive successful start response established a route');
+  inactiveStartGame.dispose();
 
   process.stdout.write('mini-game lifecycle runtime test passed\n');
 }

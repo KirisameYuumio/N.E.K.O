@@ -78,7 +78,7 @@ async function main() {
     }),
     start: async () => ({
       ok: true,
-      state: { session_id: 'speech-session-1', lanlan_name: '测试猫娘' },
+      state: { game_route_active: true, session_id: 'speech-session-1', lanlan_name: '测试猫娘' },
     }),
     heartbeat: async () => ({ ok: true, active: true }),
     drain: async () => ({ ok: true, outputs: [] }),

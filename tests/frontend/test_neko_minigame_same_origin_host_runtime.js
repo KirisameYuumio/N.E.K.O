@@ -343,6 +343,47 @@ async function main() {
   assert(!listeners.has('neko-game-voice-control-message'),
     'same-document voice fallback listener was not released');
 
+  const dualChannelMessages = [];
+  let dualChannel = null;
+  class DualVoiceChannelMock {
+    constructor() { dualChannel = this; this.onmessage = null; }
+    postMessage(message) { dualChannelMessages.push(message); }
+    close() {}
+  }
+  let dualFallbackRequests = 0;
+  let dualStateDeliveries = 0;
+  const dualController = (event) => {
+    if (event?.detail?.type !== 'game_voice_control_request') return;
+    dualFallbackRequests += 1;
+    const response = {
+      type: 'game_voice_control_state',
+      message_id: 'dual-response-1',
+      game_type: 'soccer',
+      session_id: 'server-session',
+      request_id: event.detail.request_id,
+      reason: 'dual-queried',
+      ok: true,
+    };
+    windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
+      detail: response,
+    }));
+    dualChannel.onmessage({ data: response });
+  };
+  windowMock.addEventListener('neko-game-voice-control-message', dualController);
+  host.startVoiceControlBridge({
+    BroadcastChannelImpl: DualVoiceChannelMock,
+    onState: () => { dualStateDeliveries += 1; },
+  });
+  const dualResponse = await host.requestVoiceControl('query', { timeoutMs: 500 });
+  assert(dualResponse.reason === 'dual-queried'
+    && dualChannelMessages.some((message) => message.type === 'game_voice_control_request')
+    && dualFallbackRequests === 1,
+  'voice control did not publish the same request over channel and fallback paths');
+  assert(dualStateDeliveries === 1,
+    'voice control delivered one response more than once across dual transports');
+  host.stopVoiceControlBridge();
+  windowMock.removeEventListener('neko-game-voice-control-message', dualController);
+
   let recognitionAbortCalls = 0;
   class RecognitionMock {
     start() {}
@@ -486,6 +527,21 @@ async function main() {
   assert(sharedCaptureRegistry === loggerHostTwo._logger.consoleCaptureRegistry
     && sharedCaptureRegistry.hosts.size === 2,
   'same-document hosts did not share one bounded console capture registry');
+  const throwingValue = new Proxy({}, {
+    get(_target, property) {
+      if (property === Symbol.toPrimitive || property === 'toString') {
+        return () => { throw new Error('cannot stringify'); };
+      }
+      return undefined;
+    },
+  });
+  let consoleCaptureError = null;
+  try {
+    windowMock.console.warn(Object.create(null), throwingValue);
+    windowMock.console.error(throwingValue);
+  } catch (error) { consoleCaptureError = error; }
+  assert(consoleCaptureError === null,
+    'global console capture changed caller control flow for unprintable values');
   loggerHostOne.dispose();
   windowMock.console.warn('capture remains after first dispose');
   windowMock.console.error('capture remains after first dispose');

@@ -117,6 +117,51 @@ class TtsRuntimeMixin:
         if gains is not None:
             gains.clear()
 
+    def _begin_game_speech_completion_wait(self, speech_id: object) -> asyncio.Future:
+        """Create the single bounded completion slot used by game speech."""
+        self._cancel_game_speech_completion_wait()
+        future = asyncio.get_running_loop().create_future()
+        self._game_speech_completion_waiter = (str(speech_id or ""), future)
+        return future
+
+    def _resolve_game_speech_completion_wait(self, speech_id: object, completed: bool) -> None:
+        slot = getattr(self, "_game_speech_completion_waiter", None)
+        if not slot or slot[0] != str(speech_id or ""):
+            return
+        self._game_speech_completion_waiter = None
+        future = slot[1]
+        if not future.done():
+            future.set_result(bool(completed))
+
+    def _cancel_game_speech_completion_wait(self) -> None:
+        slot = getattr(self, "_game_speech_completion_waiter", None)
+        self._game_speech_completion_waiter = None
+        if slot and not slot[1].done():
+            slot[1].set_result(False)
+
+    async def _wait_for_game_speech_completion(
+        self,
+        speech_id: object,
+        future: asyncio.Future,
+        timeout: float,
+    ) -> bool:
+        """Wait with a hard lifetime and release the slot on every exit path."""
+        try:
+            return bool(await asyncio.wait_for(
+                asyncio.shield(future),
+                timeout=max(0.1, min(float(timeout), 55.0)),
+            ))
+        except asyncio.TimeoutError:
+            return False
+        except asyncio.CancelledError:
+            raise
+        finally:
+            slot = getattr(self, "_game_speech_completion_waiter", None)
+            if slot and slot[0] == str(speech_id or "") and slot[1] is future:
+                self._game_speech_completion_waiter = None
+                if not future.done():
+                    future.set_result(False)
+
     def _get_text_guard_max_length(self) -> int:
         """Read the user-configured reply token cap.
         Unit: tiktoken (o200k_base) tokens. 0 = unlimited (returns 999999).
@@ -749,6 +794,7 @@ class TtsRuntimeMixin:
         # 调用方在本函数返回后的重复清零保留不动：那是给 sleep 窗口内被并发
         # 置回 True 的情况兜底，与这里要修的取消残留是两件事。
         self._tts_done_queued_for_turn = False
+        self._cancel_game_speech_completion_wait()
         GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
         if self.tts_thread and self.tts_thread.is_alive():
             while not self.tts_response_queue.empty():
@@ -1046,6 +1092,7 @@ class TtsRuntimeMixin:
         accidentally killing resources that have been recreated by a
         concurrent start_session.
         """
+        self._cancel_game_speech_completion_wait()
         if handler_task_ref and not handler_task_ref.done():
             handler_task_ref.cancel()
             try:
@@ -1507,6 +1554,7 @@ class TtsRuntimeMixin:
                             self.current_game_speech_audio_runtime_signature(),
                         )
                         await self.send_audio_done(data[1])
+                        self._resolve_game_speech_completion_wait(data[1], True)
                         completed_speech_id = str(data[1] or "")
                         if completed_speech_id:
                             completed_keys = {

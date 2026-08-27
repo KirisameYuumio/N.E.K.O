@@ -4449,11 +4449,13 @@ async def test_passive_guard_requires_matching_active_route_before_llm(monkeypat
 
         accepted = await gr_runtime.game_passive_guard(
             "soccer",
-            _FakeRequest({"session_id": "match_1", "lanlan_name": "Lan"}),
+            _FakeRequest({"sessionId": "match_1", "lanlan_name": "Lan"}),
         )
 
     assert accepted["ok"] is True
     assert len(llm_calls) == 1
+    assert llm_calls[0][0]["session_id"] == "match_1"
+    assert llm_calls[0][0]["lanlan_name"] == "Lan"
 
 
 @pytest.mark.unit
@@ -5690,6 +5692,8 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
         "interrupt_audio": False,
         "playback_gain": 1.0,
         "reuse_synthesized_audio": False,
+        "wait_for_audio_completion": True,
+        "audio_completion_timeout": 45.0,
     })]
 
 
@@ -5729,6 +5733,8 @@ async def test_project_speak_can_skip_text_mirror_for_frontend_arbiter(monkeypat
         "interrupt_audio": False,
         "playback_gain": 1.0,
         "reuse_synthesized_audio": False,
+        "wait_for_audio_completion": True,
+        "audio_completion_timeout": 45.0,
     })]
 
 
@@ -5769,6 +5775,8 @@ async def test_project_speak_forwards_interrupt_audio(monkeypatch):
         "interrupt_audio": True,
         "playback_gain": 1.0,
         "reuse_synthesized_audio": False,
+        "wait_for_audio_completion": True,
+        "audio_completion_timeout": 45.0,
     })]
 
 
@@ -5792,6 +5800,8 @@ async def test_project_speak_forwards_synthesized_audio_reuse_opt_in(monkeypatch
 
     assert result["ok"] is True
     assert mgr.spoken[0][1]["reuse_synthesized_audio"] is True
+    assert mgr.spoken[0][1]["wait_for_audio_completion"] is True
+    assert mgr.spoken[0][1]["audio_completion_timeout"] == 45.0
 
 
 @pytest.mark.unit

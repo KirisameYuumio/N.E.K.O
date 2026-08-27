@@ -357,6 +357,90 @@ async def test_mirror_assistant_speech_replays_opted_in_cached_audio_without_req
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_game_speech_waits_for_matching_audio_done_before_returning():
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+
+    task = asyncio.create_task(core_module.LLMSessionManager.mirror_assistant_speech(
+        mgr,
+        "等语音完整结束",
+        metadata=_soccer_mirror_meta({"kind": "completion-wait"}),
+        mirror_text=False,
+        emit_turn_end_after=False,
+        wait_for_audio_completion=True,
+        audio_completion_timeout=1.0,
+    ))
+    for _ in range(20):
+        if getattr(mgr, "_game_speech_completion_waiter", None):
+            break
+        await asyncio.sleep(0)
+
+    slot = mgr._game_speech_completion_waiter
+    assert slot is not None
+    assert task.done() is False
+    speech_id = mgr.tts_request_queue.messages[0][0]
+    assert slot[0] == speech_id
+
+    core_module.LLMSessionManager._resolve_game_speech_completion_wait(
+        mgr, speech_id, True
+    )
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert result["ok"] is True
+    assert result["audio_completed"] is True
+    assert mgr._game_speech_completion_waiter is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_speech_timeout_clears_pipeline_before_returning():
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+    mgr._clear_tts_pipeline = AsyncMock()
+
+    result = await core_module.LLMSessionManager.mirror_assistant_speech(
+        mgr,
+        "超时后清理旧语音",
+        metadata=_soccer_mirror_meta({"kind": "completion-timeout"}),
+        mirror_text=False,
+        emit_turn_end_after=False,
+        wait_for_audio_completion=True,
+        audio_completion_timeout=0.01,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "audio_completion_timeout"
+    assert result["audio_completed"] is False
+    mgr._clear_tts_pipeline.assert_awaited_once()
+    assert mgr._game_speech_completion_waiter is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_tts_audio_done_resolves_game_speech_completion_slot():
+    mgr = _make_manager()
+    mgr.tts_response_queue = queue.Queue()
+    mgr.current_game_speech_audio_runtime_signature = lambda: "voice-signature"
+    mgr.send_audio_done = AsyncMock(return_value=True)
+    future = core_module.LLMSessionManager._begin_game_speech_completion_wait(
+        mgr, "game-speech-1"
+    )
+    mgr.tts_response_queue.put(("__audio_done__", "game-speech-1"))
+
+    task = asyncio.create_task(core_module.LLMSessionManager.tts_response_handler(mgr))
+    assert await asyncio.wait_for(future, timeout=1) is True
+    task.cancel()
+    cancelled_result = await asyncio.gather(task, return_exceptions=True)
+
+    assert isinstance(cancelled_result[0], asyncio.CancelledError)
+    mgr.send_audio_done.assert_awaited_once_with("game-speech-1")
+    assert mgr._game_speech_completion_waiter is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_speech_preload_captures_audio_without_sending_playback():
     GAME_SPEECH_AUDIO_CACHE.clear()
     mgr = _make_manager()
@@ -2462,9 +2546,14 @@ async def test_clear_tts_pipeline_drops_only_unplayed_echo_cache(monkeypatch):
     mgr._pending_ai_voice_echo_chunks.append(("old-speech", "还没来得及播放的队列文本"))
     mgr._confirmed_ai_voice_echo_audio_speech_ids.add("old-speech")
     mgr.tts_pending_chunks = [("sid-old", "pending text")]
+    completion_future = core_module.LLMSessionManager._begin_game_speech_completion_wait(
+        mgr, "sid-old"
+    )
 
     await core_module.LLMSessionManager._clear_tts_pipeline(mgr)
 
+    assert await completion_future is False
+    assert mgr._game_speech_completion_waiter is None
     assert mgr.tts_request_queue.messages == [("__interrupt__", None)]
     assert mgr.tts_pending_chunks == []
     assert mgr._pending_ai_voice_echo_text == ""

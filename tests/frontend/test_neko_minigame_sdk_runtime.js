@@ -12,6 +12,8 @@ async function main() {
   let voiceStopped = 0;
   let disposed = 0;
   let avatarDisposed = 0;
+  let avatarMountFailure = false;
+  let avatarFocusFailure = false;
   let mountedAvatarConfig = null;
   const handshakeRequests = [];
   const protocolMessages = [];
@@ -68,7 +70,11 @@ async function main() {
       };
       return runtimeState;
     },
-    start: async (payload) => ({ ok: true, payload }),
+    start: async (payload) => ({
+      ok: true,
+      state: { game_route_active: true, session_id: runtimeState.sessionId },
+      payload,
+    }),
     end: async (payload) => ({ ok: true, payload }),
     heartbeat: async (payload) => ({ ok: true, active: true, payload }),
     drain: async (payload) => ({ ok: true, outputs: [], payload }),
@@ -122,10 +128,18 @@ async function main() {
     requestVoiceControl: async (action) => ({ ok: true, action }),
     stopVoiceControlBridge() { voiceStopped += 1; },
     async mountAvatar(config) {
+      if (avatarMountFailure) {
+        throw Object.assign(new Error('viewport unavailable'), { code: 'viewport_unavailable' });
+      }
       mountedAvatarConfig = config;
       return {
         async setModel(model) { calls.push(['avatar-model', model]); },
-        focus(point) { calls.push(['avatar-focus', point]); },
+        focus(point) {
+          if (avatarFocusFailure) {
+            throw Object.assign(new Error('avatar host busy'), { code: 'busy' });
+          }
+          calls.push(['avatar-focus', point]);
+        },
         setEmotion(name) { calls.push(['avatar-emotion', name]); },
         pause() { calls.push(['avatar-pause']); },
         resume() { calls.push(['avatar-resume']); },
@@ -400,6 +414,31 @@ async function main() {
   assert(avatarLimitError?.code === 'busy', 'avatar renderer growth was not bounded');
   boundedAvatars[0].dispose();
   assert(game.avatar.activeCount === 7, 'explicit avatar disposal did not release its slot');
+  avatarMountFailure = true;
+  let avatarMountTransportError = null;
+  try {
+    await game.avatar.mount({
+      slot: 'failed-host-mount',
+      model: { type: 'vrm', path: '/models/failed.vrm' },
+      viewport: { mode: 'fixed', width: 200, height: 300 },
+      resize: { mode: 'fixed' },
+    });
+  } catch (error) { avatarMountTransportError = error; }
+  avatarMountFailure = false;
+  assert(avatarMountTransportError instanceof window.NekoMiniGame.Error
+    && avatarMountTransportError.code === 'request_failed'
+    && avatarMountTransportError.details.operation === 'avatar.mount'
+    && game.avatar.activeCount === 7,
+  'avatar mount leaked a host error or retained a failed controller');
+  avatarFocusFailure = true;
+  let avatarControllerTransportError = null;
+  try { boundedAvatars[1].focus({ x: 1, y: 2 }); }
+  catch (error) { avatarControllerTransportError = error; }
+  avatarFocusFailure = false;
+  assert(avatarControllerTransportError instanceof window.NekoMiniGame.Error
+    && avatarControllerTransportError.code === 'busy'
+    && avatarControllerTransportError.details.operation === 'avatar.focus',
+  'avatar controller leaked a host-specific error');
 
   const stateListeners = [];
   for (let index = 0; index < 32; index += 1) {

@@ -127,6 +127,10 @@ class LLMSessionManager(
         self._game_speech_preload_pending_batches = 0
         self._game_speech_preload_cancel_epoch = 0
         self._game_speech_preload_active_workers: dict[Thread, Queue] = {}
+        # Mini-game audible speech is serialized by the game router through
+        # one completion slot.  The slot is resolved by audio_done and cleared
+        # on timeout, interruption, or teardown, so it cannot grow per request.
+        self._game_speech_completion_waiter: tuple[str, asyncio.Future] | None = None
         self._speech_output_total = 0  # diagnostic: chunks actually sent to frontend playback
         self._last_speech_output_time = 0.0
         self._last_speech_output_bytes = 0

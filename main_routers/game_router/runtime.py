@@ -1359,8 +1359,11 @@ async def game_passive_guard(game_type: str, request: Request):
             "recommendedAction": "observe_more",
             "exitPromptType": "none",
         }
+    normalized_data = dict(data)
+    normalized_data["session_id"] = session_id
+    normalized_data["lanlan_name"] = lanlan_name
     try:
-        return await _run_soccer_passive_guard_ai(data, lanlan_name)
+        return await _run_soccer_passive_guard_ai(normalized_data, lanlan_name)
     except asyncio.TimeoutError:
         logger.warning("🎮 PassiveGuard 响应超时: sid=%s", session_id)
         return {"ok": False, "reason": "timeout", "recommendedAction": "observe_more", "exitPromptType": "none"}
@@ -2118,6 +2121,8 @@ async def _speak_game_line_via_project_tts(
             interrupt_audio=interrupt_audio,
             playback_gain=playback_gain,
             reuse_synthesized_audio=reuse_synthesized_audio,
+            wait_for_audio_completion=True,
+            audio_completion_timeout=45.0,
         )
     except Exception as exc:
         return {
