@@ -4,7 +4,9 @@
  * The trusted page template must emit a JSON script with id
  * `neko-minigame-host-launch` immediately before loading this file. This file
  * consumes and removes that host-owned node synchronously, installs the
- * bounded one-shot handoff, and loads the internal adapter before game code.
+ * bounded immutable script-scoped handoff, and loads the internal adapter
+ * before game code. The adapter script node is removed after load so the
+ * non-configurable handoff is released with its DOM owner.
  */
 (() => {
   'use strict';
@@ -68,11 +70,14 @@
       script.async = false;
       Object.defineProperty(script, 'nekoHostLaunchRegistry', {
         value: registrations,
-        configurable: true,
+        writable: false,
+        configurable: false,
       });
       const releaseLaunchBinding = () => {
-        try { delete script.nekoHostLaunchRegistry; }
-        catch (_) { /* the adapter already consumed the immutable binding */ }
+        script.onload = null;
+        script.onerror = null;
+        try { script.remove?.(); }
+        catch (_) { /* the adapter script is already detached */ }
       };
       script.onload = () => {
         releaseLaunchBinding();

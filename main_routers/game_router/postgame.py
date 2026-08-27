@@ -53,6 +53,7 @@ from .game_context import (
 )
 from .route_lifecycle import (
     _cancel_game_context_organizer_before_disabled_archive,
+    _push_game_speech_cancel,
     _push_game_window_state_change,
     _settle_game_context_organizer_before_archive,
 )
@@ -92,28 +93,46 @@ _GAME_SPEECH_CANCEL_SETTLE_SECONDS = 2.0
 
 
 async def _cancel_route_game_speech(state: dict, mgr: Any) -> None:
-    """Cancel and boundedly settle the one speech task owned by this route."""
+    """Cancel backend and browser audio owned by this route's latest speech."""
     task = state.pop("_sdk_active_speech_task", None)
-    if not isinstance(task, asyncio.Task) or task.done() or task is asyncio.current_task():
-        return
-    task.cancel()
-    done, _ = await asyncio.wait({task}, timeout=_GAME_SPEECH_CANCEL_SETTLE_SECONDS)
-    if task in done:
-        try:
-            task.result()
-        except (asyncio.CancelledError, Exception):
-            pass
-        return
-    clear_pipeline = getattr(mgr, "_clear_tts_pipeline", None)
-    if callable(clear_pipeline):
-        try:
-            await asyncio.wait_for(
-                clear_pipeline(),
-                timeout=_GAME_SPEECH_CANCEL_SETTLE_SECONDS,
-            )
-        except (TimeoutError, asyncio.CancelledError, Exception) as exc:
-            logger.warning("⚠️ 游戏路由退出时清理超时语音失败: %s", exc)
-    logger.warning("⚠️ 游戏路由退出时语音任务未在上限内结束")
+    correlation_id = str(
+        state.pop("_sdk_active_speech_correlation_id", "") or ""
+    )[:128]
+    if (
+        isinstance(task, asyncio.Task)
+        and not task.done()
+        and task is not asyncio.current_task()
+    ):
+        task.cancel()
+        done, _ = await asyncio.wait(
+            {task},
+            timeout=_GAME_SPEECH_CANCEL_SETTLE_SECONDS,
+        )
+        if task in done:
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            clear_pipeline = getattr(mgr, "_clear_tts_pipeline", None)
+            if callable(clear_pipeline):
+                try:
+                    await asyncio.wait_for(
+                        clear_pipeline(),
+                        timeout=_GAME_SPEECH_CANCEL_SETTLE_SECONDS,
+                    )
+                except (TimeoutError, asyncio.CancelledError, Exception) as exc:
+                    logger.warning("⚠️ 游戏路由退出时清理超时语音失败: %s", exc)
+            logger.warning("⚠️ 游戏路由退出时语音任务未在上限内结束")
+
+    await _push_game_speech_cancel(
+        mgr,
+        lanlan_name=str(state.get("lanlan_name") or ""),
+        game_type=str(state.get("game_type") or ""),
+        session_id=str(state.get("session_id") or ""),
+        route_instance_id=str(state.get("_sdk_route_instance_id") or ""),
+        speech_correlation_id=correlation_id,
+    )
 
 
 def _normalize_postgame_options(raw: Any, *, reason: str) -> dict:

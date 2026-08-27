@@ -5,6 +5,9 @@
  * intentionally allowed to know the current mini-game REST endpoints while
  * games are moved away from direct host requests. Game rules, state and UI
  * must stay outside this file and be supplied as plain payloads/callbacks.
+ * Fixed same-origin BroadcastChannels are trusted delivery fallbacks, not an
+ * isolation boundary. Untrusted games require a future private iframe/Electron
+ * transport and must not be loaded into this phase-one host.
  */
 (() => {
   'use strict';
@@ -398,6 +401,26 @@
       };
     }
 
+    _requireGrantedCapability(name, operation) {
+      if (!this._grantedCapabilities.has(String(name || ''))) {
+        throw this._hostError(
+          'capability_denied',
+          `${String(name || 'Unknown')} capability was not granted to this launch`,
+          { operation: String(operation || name || 'capability') },
+        );
+      }
+    }
+
+    _requireAnyGrantedCapability(names, operation) {
+      const requested = Array.isArray(names) ? names : [names];
+      if (requested.some((name) => this._grantedCapabilities.has(String(name || '')))) return;
+      throw this._hostError(
+        'capability_denied',
+        `${requested.map((name) => String(name || '')).join(' or ')} capability was not granted to this launch`,
+        { operation: String(operation || 'capability') },
+      );
+    }
+
     _canUseGameStorage() {
       try {
         const storage = this._window.localStorage;
@@ -419,6 +442,7 @@
     }
 
     async runGameStorageExclusive(lockNameInput, callback, options = {}) {
+      this._requireGrantedCapability('leaderboard-local', 'game_storage_lock');
       if (this._disposed) {
         throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`, {
           operation: 'game_storage_lock',
@@ -494,6 +518,7 @@
     }
 
     requestGameStorage(operationInput, payload = {}, options = {}) {
+      this._requireAnyGrantedCapability(['storage', 'leaderboard-local'], 'game_storage');
       if (options.signal?.aborted) {
         throw this._hostError('cancelled', 'Game storage request was cancelled', {
           operation: 'game_storage',
@@ -617,6 +642,7 @@
     }
 
     async mountAvatar(config) {
+      this._requireGrantedCapability('avatar-renderer', 'avatar.mount');
       if (this._disposed) {
         throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`, {
           operation: 'avatar.mount',
@@ -631,6 +657,7 @@
     }
 
     mountAudio(config) {
+      this._requireGrantedCapability('audio', 'audio.mount');
       if (this._disposed) {
         throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`, {
           operation: 'audio.mount',
@@ -815,6 +842,7 @@
     }
 
     async getCharacter(lanlanName = '') {
+      this._requireGrantedCapability('avatar-renderer', 'character');
       const url = new URL(this._gameEndpoint('character'), this._window.location.origin);
       if (lanlanName && lanlanName !== this.source) {
         url.searchParams.set('lanlan_name', lanlanName);
@@ -834,6 +862,7 @@
     }
 
     getQuickLines(payload, options = {}) {
+      this._requireGrantedCapability('quick-lines', 'quick_lines');
       if (this._disposed) {
         return Promise.reject(this._hostError(
           'disposed',
@@ -867,6 +896,7 @@
     }
 
     requestDialogue(payload, options = {}) {
+      this._requireGrantedCapability('dialogue', 'dialogue');
       return this._post(this._gameEndpoint('chat'), this._trustedRuntimePayload(payload), {
         timeoutMs: 60000,
         operation: 'dialogue',
@@ -875,6 +905,7 @@
     }
 
     start(payload, options = {}) {
+      this._requireGrantedCapability('runtime', 'route_start');
       return this._post(this._gameEndpoint('route/start'), {
         ...this._trustedRuntimePayload(payload),
         game_memory_enabled: this._memoryConsentEnabled,
@@ -891,6 +922,7 @@
     }
 
     heartbeat(payload, options = {}) {
+      this._requireGrantedCapability('runtime', 'route_heartbeat');
       return this._post(this._gameEndpoint('route/heartbeat'), this._trustedRuntimePayload(payload), {
         timeoutMs: DEFAULT_HEARTBEAT_TIMEOUT_MS,
         operation: 'route_heartbeat',
@@ -899,6 +931,7 @@
     }
 
     async drain(payload, options = {}) {
+      this._requireGrantedCapability('runtime', 'route_drain');
       const trustedPayload = this._trustedRuntimePayload(payload);
       const sourceRoute = Object.freeze({
         sessionId: String(trustedPayload.session_id || ''),
@@ -921,6 +954,7 @@
     }
 
     publishGameProtocol(kind, envelope = {}, options = {}) {
+      this._requireGrantedCapability('runtime', 'game_protocol');
       if (this._disposed) {
         return Promise.reject(this._hostError(
           'disposed',
@@ -962,6 +996,7 @@
     }
 
     startGameControlBridge(options = {}) {
+      this._requireGrantedCapability('runtime', 'game_control_bridge');
       if (this._disposed) return false;
       this._controlBridge.active = true;
       this._controlBridge.onControl = typeof options.onControl === 'function'
@@ -1012,6 +1047,7 @@
     }
 
     readGameContext(payload, options = {}) {
+      this._requireGrantedCapability('context-read', 'context_read');
       return this._postWithCsrf(
         this._gameEndpoint('context/read'),
         this._trustedRuntimePayload(payload),
@@ -1020,6 +1056,7 @@
     }
 
     configureGameMemoryConsent(payload = {}, options = {}) {
+      this._requireGrantedCapability('memory', 'memory_consent');
       if (options.signal?.aborted) {
         throw this._hostError('cancelled', 'Memory consent request was cancelled', {
           operation: 'memory_consent',
@@ -1040,6 +1077,7 @@
     }
 
     submitGameMemory(payload, options = {}) {
+      this._requireGrantedCapability('memory', 'memory_submit');
       return this._postWithCsrf(
         this._gameEndpoint('memory/submit'),
         this._trustedRuntimePayload(payload),
@@ -1048,6 +1086,7 @@
     }
 
     submitVoiceTranscript(payload, options = {}) {
+      this._requireGrantedCapability('voice-input', 'voice_transcript');
       return this._post(this._gameEndpoint('route/voice-transcript'), this._trustedRuntimePayload(payload), {
         timeoutMs: 15000,
         operation: 'voice_transcript',
@@ -1056,6 +1095,7 @@
     }
 
     sendRealtimeContext(payload, options = {}) {
+      this._requireGrantedCapability('runtime', 'realtime_context');
       return this._post(this._gameEndpoint('realtime-context'), this._trustedRuntimePayload(payload), {
         timeoutMs: 15000,
         operation: 'realtime_context',
@@ -1065,6 +1105,7 @@
     }
 
     mirrorAssistant(payload, options = {}) {
+      this._requireGrantedCapability('dialogue', 'mirror_assistant');
       return this._post(this._gameEndpoint('mirror-assistant'), this._trustedRuntimePayload(payload), {
         timeoutMs: 15000,
         operation: 'mirror_assistant',
@@ -1073,6 +1114,7 @@
     }
 
     speak(payload, options = {}) {
+      this._requireGrantedCapability('speech-output', 'speech_speak');
       return this._post(this._gameEndpoint('speak'), this._trustedRuntimePayload(payload), {
         timeoutMs: 60000,
         operation: 'speak',
@@ -1081,14 +1123,17 @@
     }
 
     requestSpeechOutput(payload, options = {}) {
+      this._requireGrantedCapability('speech-output', 'speech_output');
       return this.speak(payload, options);
     }
 
     mirrorSpeechOutput(payload, options = {}) {
+      this._requireGrantedCapability('speech-output', 'speech_mirror');
       return this.mirrorAssistant(payload, options);
     }
 
     preloadSpeechOutput(payload, options = {}) {
+      this._requireGrantedCapability('speech-output', 'speech_preload');
       return this._postWithCsrf(this._gameEndpoint('speech/preload'), this._trustedRuntimePayload(payload), {
         timeoutMs: 180000,
         operation: 'speech_preload',
@@ -1157,6 +1202,7 @@
     }
 
     startSpeechPlaybackBridge(options = {}) {
+      this._requireGrantedCapability('speech-output', 'speech_playback_bridge');
       this.stopSpeechPlaybackBridge();
       const bridge = this._speechPlaybackBridge;
       const storageKey = String(options.storageKey || 'neko_speech_playback_state');
@@ -1225,6 +1271,7 @@
     }
 
     startSpeechOutputBridge(options = {}) {
+      this._requireGrantedCapability('speech-output', 'speech_output_bridge');
       if (this._disposed) {
         throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`, {
           operation: 'speech_output_bridge',
@@ -1247,6 +1294,7 @@
     }
 
     startVoiceControlBridge(options = {}) {
+      this._requireGrantedCapability('voice-input', 'voice_control_bridge');
       this.stopVoiceControlBridge('restarted');
       if (this._disposed) throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`);
       const bridge = this._voiceControlBridge;
@@ -1503,6 +1551,7 @@
     }
 
     isSpeechRecognitionSupported(options = {}) {
+      this._requireGrantedCapability('voice-input', 'speech_recognition');
       const RecognitionImpl = options.RecognitionImpl ||
         this._window.SpeechRecognition ||
         this._window.webkitSpeechRecognition;
@@ -1510,6 +1559,7 @@
     }
 
     startSpeechRecognition(name, options = {}) {
+      this._requireGrantedCapability('voice-input', 'speech_recognition');
       const slotName = String(name || '').trim();
       if (!slotName) throw this._hostError('invalid_request', 'Speech recognition slot name is required');
       if (this._disposed) throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`);
@@ -1686,6 +1736,7 @@
     }
 
     postLog(payload, mutationHeaders = {}) {
+      this._requireGrantedCapability('logging', 'logging');
       let body = '';
       try {
         body = jsonBody(payload, mutationHeaders);
@@ -1902,6 +1953,7 @@
     }
 
     enableLog(payload, mutationHeaders = {}) {
+      this._requireGrantedCapability('logging', 'logging');
       return this._post('/api/game/logs/enable', jsonBody(payload, mutationHeaders), {
         headers: mutationHeaders,
         keepalive: true,
@@ -2477,6 +2529,7 @@
     }
 
     async end(payload, options = {}) {
+      this._requireGrantedCapability('runtime', 'route_end');
       void this.flushLogger({ final: true });
       const trustedPayload = typeof payload === 'string'
         ? payload

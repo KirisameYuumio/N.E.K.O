@@ -21,6 +21,7 @@ from main_routers.game_router import balance as gr_balance
 from main_routers.game_router import char_info as gr_char_info
 from main_routers.game_router import game_context as gr_game_context
 from main_routers.game_router import logs as gr_logs
+from main_routers.game_router import postgame as gr_postgame
 from main_routers.game_router import pregame as gr_pregame
 from main_routers.game_router import runtime as gr_runtime
 from main_routers.game_router import route_lifecycle as gr_route_lifecycle
@@ -486,6 +487,69 @@ async def test_game_window_state_change_carries_the_route_generation():
         "sdk_route_instance_id": "route-instance-b",
         "sdk_voice_control_credential": "ab" * 24,
     })
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_speech_cancel_carries_exact_route_and_correlation_identity():
+    class ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    websocket = SimpleNamespace(
+        client_state=ConnectedState(),
+        send_json=AsyncMock(),
+    )
+    manager = SimpleNamespace(websocket=websocket)
+
+    await gr_route_lifecycle._push_game_speech_cancel(
+        manager,
+        lanlan_name="Lan",
+        game_type="neutral-sdk-game",
+        session_id="session-1",
+        route_instance_id="route-instance-b",
+        speech_correlation_id="speech-correlation-b",
+    )
+
+    websocket.send_json.assert_awaited_once_with({
+        "type": "game_route_speech_cancel",
+        "lanlan_name": "Lan",
+        "game_type": "neutral-sdk-game",
+        "session_id": "session-1",
+        "sdk_route_instance_id": "route-instance-b",
+        "sdk_speech_correlation_id": "speech-correlation-b",
+    })
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_speech_cleanup_releases_browser_audio_after_backend_task_done(
+    monkeypatch,
+):
+    pushed = AsyncMock()
+    monkeypatch.setattr(gr_postgame, "_push_game_speech_cancel", pushed)
+    state = {
+        "lanlan_name": "Lan",
+        "game_type": "neutral-sdk-game",
+        "session_id": "session-1",
+        "_sdk_route_instance_id": "route-instance-b",
+        "_sdk_active_speech_correlation_id": "speech-correlation-b",
+    }
+
+    manager = SimpleNamespace()
+    await gr_postgame._cancel_route_game_speech(state, manager)
+
+    assert "_sdk_active_speech_correlation_id" not in state
+    pushed.assert_awaited_once_with(
+        manager,
+        lanlan_name="Lan",
+        game_type="neutral-sdk-game",
+        session_id="session-1",
+        route_instance_id="route-instance-b",
+        speech_correlation_id="speech-correlation-b",
+    )
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_delayed_old_route_end_does_not_close_reused_session_generation(monkeypatch):
@@ -6184,7 +6248,7 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
     _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
 
     with reset_game_route_state():
-        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        state = gr_runtime._activate_game_route("soccer", "match_1", "Lan")
         result = await gr_runtime.game_project_speak(
             "soccer",
             _FakeRequest({
@@ -6197,6 +6261,7 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
         )
 
     assert result["ok"] is True
+    assert state["_sdk_active_speech_correlation_id"] == "sdk-correlation-1"
     assert result["method"] == "project_tts"
     assert result["voice_source"]["provider"] == "project_tts"
     assert mgr.render_language_at_mirror == ["ja"]
@@ -6401,6 +6466,30 @@ async def test_project_speech_preload_rejects_a_stale_active_route_generation(mo
     assert result["method"] == "project_tts_preload"
     assert mgr.preloaded == []
     assert mgr.render_language_at_mirror == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speech_preload_allows_a_new_preroute_after_completed_generation(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("example-game", "reused-session", "Lan")
+        state["_sdk_route_instance_id"] = "completed-route"
+        state["game_route_active"] = False
+        result = await gr_runtime.game_project_speech_preload(
+            "example-game",
+            _FakeRequest({
+                "lines": ["next round preload"],
+                "session_id": "reused-session",
+                "sdk_route_instance_id": "",
+            }),
+        )
+
+    assert result["ok"] is True
+    assert mgr.preloaded == [["next round preload"]]
 
 
 @pytest.mark.unit

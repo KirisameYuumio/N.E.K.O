@@ -581,7 +581,11 @@ def _sdk_active_route_from_payload(game_type: str, data: dict) -> tuple[str, str
             "reason": "session_id_mismatch",
             "state": _public_route_state(state),
         }
-    route_instance_error = _sdk_route_instance_error(state, data)
+    route_instance_error = (
+        _sdk_route_instance_error(state, data)
+        if state and state.get("game_route_active")
+        else None
+    )
     if route_instance_error is not None:
         return lanlan_name, session_id, state, route_instance_error
     return lanlan_name, session_id, state, None
@@ -2858,7 +2862,16 @@ async def game_project_speak(game_type: str, request: Request):
                     result = stale_response
                 else:
                     speech_task = asyncio.current_task()
+                    speech_correlation_id = str(
+                        data.get("sdk_speech_correlation_id") or ""
+                    )[:128]
                     state["_sdk_active_speech_task"] = speech_task
+                    if speech_correlation_id:
+                        state["_sdk_active_speech_correlation_id"] = (
+                            speech_correlation_id
+                        )
+                    else:
+                        state.pop("_sdk_active_speech_correlation_id", None)
                     try:
                         result = await _speak_game_line_via_project_tts(
                             mgr,
@@ -2871,9 +2884,7 @@ async def game_project_speak(game_type: str, request: Request):
                             interrupt_audio=interrupt_audio,
                             playback_gain=playback_gain,
                             reuse_synthesized_audio=reuse_synthesized_audio,
-                            speech_correlation_id=str(
-                                data.get("sdk_speech_correlation_id") or ""
-                            )[:128],
+                            speech_correlation_id=speech_correlation_id,
                             event=_attach_game_memory_flag_to_event(
                                 data.get("event") if isinstance(data.get("event"), dict) else {},
                                 state,

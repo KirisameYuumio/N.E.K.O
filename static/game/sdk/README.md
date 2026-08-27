@@ -28,11 +28,16 @@ continue to own their schemas and validators.
 * Capabilities are granted at `connect()` time and remain fixed for the client
   lifetime.
 
-The current first-phase transport is a trusted same-origin adapter. Public game
-code does not receive the transport internals, so the host can later replace it
-with an iframe or Electron bridge without changing game calls. The public entry
-header, this document, and `neko-minigame-sdk.d.ts` are the contract locations;
-games must not infer public behavior from existing internal game source files.
+The current first-phase transport is a trusted same-origin adapter. Every page
+that shares the origin is inside the same trust boundary: the fixed
+`BroadcastChannel` fallbacks used for voice control and transcripts provide
+delivery, not confidentiality or isolation from another same-origin page. Do
+not load unreviewed or adversarial game code into this phase-one host. Public
+game code does not receive the transport internals, so a future untrusted-game
+container can replace them with a private iframe or Electron bridge without
+changing game calls. The public entry header, this document, and
+`neko-minigame-sdk.d.ts` are the contract locations; games must not infer public
+behavior from existing internal game source files.
 
 ## Connecting a game
 
@@ -60,14 +65,22 @@ template emits a non-executable JSON script named
 `neko-minigame-same-origin-bootstrap.js`. The bootstrap synchronously consumes
 and removes that host-owned node; game code receives a readiness promise and
 the resulting factory, but no callable registration producer. It then attaches
-a bounded immutable handoff only to the adapter script element and loads
-`neko-minigame-same-origin-host.js`. The adapter consumes and deletes that
-script-scoped handoff once, seals the resulting factory against replacement, and retains
-immutable records only in its closure, and intersects each record's allowlist
-with locally available providers. The game factory cannot inject or replace a
-registration or capability provider. A future marketplace/isolated host can
-produce the same launch registrations after registry, integrity and
-launch-ticket checks without changing game code.
+a bounded non-writable, non-configurable handoff only to the adapter script
+element and loads `neko-minigame-same-origin-host.js`. The adapter consumes that
+script-scoped handoff once; the bootstrap removes the entire script node after
+load instead of leaving a mutable registry property. The adapter seals the
+resulting factory against replacement, retains immutable records only in its
+closure, and intersects each record's allowlist with locally available
+providers. The game factory cannot inject or replace a registration or
+capability provider. A future marketplace/isolated host can produce the same
+launch registrations after registry, integrity and launch-ticket checks without
+changing game code.
+
+The phase-one voice credential is intentionally not returned by public active
+route state. If the trusted main host page reloads during an active game route,
+voice control stays unavailable until that route is restarted. A future private
+transport may add a scoped reconnect ticket; do not restore this by publishing
+the bearer credential in public route state or shared storage.
 
 ```html
 <script id="neko-minigame-host-launch" type="application/json">

@@ -2890,6 +2890,29 @@
                         window.appAudioPlayback.noteAssistantAudioStreamClosed(response.speech_id);
                     }
 
+                // -------- game_route_speech_cancel --------
+                // Route teardown may happen after the backend has finished
+                // producing audio while the browser still has decoded or
+                // scheduled chunks. The correlation id is request-unique: a
+                // delayed cancel cannot clear newer ordinary/game speech.
+                } else if (response.type === 'game_route_speech_cancel') {
+                    var cancelledCorrelationId = String(
+                        response.sdk_speech_correlation_id || ''
+                    );
+                    if (
+                        cancelledCorrelationId
+                        && cancelledCorrelationId === S.currentPlayingSpeechCorrelationId
+                    ) {
+                        logAssistantLifecycle('ws:game_route_speech_cancel', {
+                            speechId: S.currentPlayingSpeechId || null,
+                            correlationId: cancelledCorrelationId
+                        });
+                        applyUserActivityCancel(
+                            S.currentPlayingSpeechId || null,
+                            'game_route_end'
+                        );
+                    }
+
                 // -------- cozy_audio --------
                 } else if (response.type === 'cozy_audio') {
                     console.log(window.t('console.newAudioHeaderReceived'));
@@ -3166,8 +3189,7 @@
                             return;
                         }
                         if (
-                            endedRouteInstanceId
-                            && currentRouteInstanceId
+                            currentRouteInstanceId
                             && endedRouteInstanceId !== currentRouteInstanceId
                         ) {
                             console.log(`[GameVoiceSTT] 忽略过期的 GAME_ROUTE_ENDED | ended_route=${endedRouteInstanceId} current_route=${currentRouteInstanceId}`);
@@ -4801,8 +4823,7 @@
                                 (incomingGameSessionId
                                     && currentGameSessionId
                                     && incomingGameSessionId !== currentGameSessionId)
-                                || (incomingGameRouteInstanceId
-                                    && currentGameRouteInstanceId
+                                || (currentGameRouteInstanceId
                                     && incomingGameRouteInstanceId !== currentGameRouteInstanceId)
                             );
                         if (isStaleGameWindowEvent) {

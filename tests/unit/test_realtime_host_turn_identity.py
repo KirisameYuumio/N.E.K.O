@@ -212,7 +212,7 @@ async def test_input_transcript_keeps_route_captured_at_voice_ingress():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_server_vad_binds_route_captured_before_audio_processing_await():
+async def test_server_vad_binds_route_captured_at_speech_onset_before_audio_processing_await():
     current_route = [("example-game", "session-a", "route-a")]
     delivered = []
     processing_started = asyncio.Event()
@@ -234,7 +234,8 @@ async def test_server_vad_binds_route_captured_before_audio_processing_await():
     client._audio_processor = object()
     client.process_audio_chunk_async = blocked_audio_processing
 
-    ingress = asyncio.create_task(client.stream_audio(bytes(960)))
+    loud_frame = (1000).to_bytes(2, "little", signed=True) * 480
+    ingress = asyncio.create_task(client.stream_audio(loud_frame))
     await asyncio.wait_for(processing_started.wait(), timeout=1)
     current_route[0] = ("example-game", "session-b", "route-b")
     processing_release.set()
@@ -245,6 +246,40 @@ async def test_server_vad_binds_route_captured_before_audio_processing_await():
 
     assert delivered == [
         ("hello", ("example-game", "session-a", "route-a")),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_server_vad_does_not_capture_route_from_idle_silence():
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def discard_audio(_chunk):
+        return b""
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._audio_processor = object()
+    client.process_audio_chunk_async = discard_audio
+
+    await client.stream_audio(bytes(960))
+    assert client._input_route_identity_captured is False
+
+    current_route[0] = ("example-game", "session-b", "route-b")
+    loud_frame = (1000).to_bytes(2, "little", signed=True) * 480
+    await client.stream_audio(loud_frame)
+    client._bind_input_route_identity_to_item("provider-item-b")
+    await client._deliver_input_transcript("hello", item_id="provider-item-b")
+
+    assert delivered == [
+        ("hello", ("example-game", "session-b", "route-b")),
     ]
 
 

@@ -17,6 +17,33 @@ APP_AUDIO_CAPTURE_PATH = Path(__file__).resolve().parents[2] / "static" / "app" 
 APP_BUTTONS_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-buttons.js"
 
 
+def test_game_route_close_events_require_matching_generation_when_one_is_active():
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+
+    assert re.search(
+        r"currentRouteInstanceId\s*&&\s*"
+        r"endedRouteInstanceId !== currentRouteInstanceId",
+        source,
+    )
+    assert re.search(
+        r"currentGameRouteInstanceId\s*&&\s*"
+        r"incomingGameRouteInstanceId !== currentGameRouteInstanceId",
+        source,
+    )
+
+
+def test_game_route_speech_cancel_is_scoped_to_the_sdk_correlation_id():
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    block = _block_after(
+        source,
+        "} else if (response.type === 'game_route_speech_cancel') {",
+    )
+
+    assert "response.sdk_speech_correlation_id" in block
+    assert "cancelledCorrelationId === S.currentPlayingSpeechCorrelationId" in block
+    assert "applyUserActivityCancel(" in block
+
+
 def _block_after(js: str, opener: str) -> str:
     """Return the brace-balanced body that follows ``opener``.
 

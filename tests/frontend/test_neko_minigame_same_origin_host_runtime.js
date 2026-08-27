@@ -158,12 +158,26 @@ async function main() {
     },
     remove() { this.removed = true; },
   };
+  let adapterScript = null;
+  let launchBindingWasImmutable = false;
   windowMock.document = {
     currentScript: null,
     getElementById(id) { return id === 'neko-minigame-host-launch' ? launchNode : null; },
-    createElement() { return {}; },
+    createElement() {
+      return { remove() { this.removed = true; } };
+    },
     head: {
       appendChild(script) {
+        adapterScript = script;
+        const descriptor = Object.getOwnPropertyDescriptor(script, 'nekoHostLaunchRegistry');
+        try {
+          Object.defineProperty(script, 'nekoHostLaunchRegistry', {
+            value: { forged: true },
+          });
+        } catch (_) {
+          launchBindingWasImmutable = descriptor?.configurable === false
+            && descriptor?.writable === false;
+        }
         windowMock.document.currentScript = script;
         try {
           vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
@@ -183,6 +197,8 @@ async function main() {
   vm.runInThisContext(fs.readFileSync(bootstrapPath, 'utf8'), { filename: bootstrapPath });
   await windowMock.nekoMiniGameSameOriginHostReady;
   assert(launchNode.removed === true, 'trusted launch node was not consumed before game code');
+  assert(launchBindingWasImmutable === true && adapterScript?.removed === true,
+    'adapter launch binding was mutable or its script node remained resident after consumption');
   assert(windowMock.bootstrapNekoMiniGameSameOriginHost === undefined,
     'game code received a public registration producer');
   const trustedFactory = windowMock.createNekoMiniGameSameOriginHost;
@@ -248,7 +264,7 @@ async function main() {
       version: '1.0.0',
       requiredCapabilities: ['runtime', 'logging'],
       optionalCapabilities: [
-        'dialogue', 'quick-lines', 'context-read', 'memory', 'storage', 'leaderboard-local',
+        'dialogue', 'quick-lines', 'context-read', 'memory', 'storage', 'leaderboard-local', 'speech-output',
         'voice-input',
       ],
     },
@@ -338,11 +354,49 @@ async function main() {
   });
   assert(!ungrantedHandshake.grantedCapabilities.includes('voice-input'),
     'an unrequested voice capability was granted');
+  const callsBeforeDeniedCapabilities = calls.length;
+  const deniedCapabilityOperations = [
+    () => ungrantedHost.readGameContext({ scopes: ['character-public'] }),
+    () => ungrantedHost.configureGameMemoryConsent({ enabled: true }),
+    () => ungrantedHost.requestGameStorage('set', { key: 'denied', value: true }),
+    () => ungrantedHost.requestDialogue({ event: { kind: 'denied' } }),
+    () => ungrantedHost.getQuickLines({ event: { kind: 'denied' } }),
+    () => ungrantedHost.speak({ line: 'denied' }),
+    () => ungrantedHost.submitVoiceTranscript({ transcript: 'denied' }),
+    () => ungrantedHost.mountAvatar({}),
+    () => ungrantedHost.mountAudio({}),
+    () => ungrantedHost.postLog({ event: 'denied' }),
+  ];
+  for (const invoke of deniedCapabilityOperations) {
+    let deniedError = null;
+    try { await invoke(); } catch (error) { deniedError = error; }
+    assert(deniedError?.code === 'capability_denied',
+      'direct host transport bypassed a negotiated capability');
+  }
+  assert(calls.length === callsBeforeDeniedCapabilities
+    && windowMock.localStorage.getItem(`${ungrantedHost._gameStoragePrefix()}denied`) == null,
+  'a denied direct host operation produced a fetch or storage side effect');
   await ungrantedHost.start({ sdk_voice_control_credential: 'f'.repeat(48) });
   const ungrantedStart = calls.filter((call) => call.url.endsWith('/route/start')).at(-1);
   assert(ungrantedStart.body.sdk_voice_control_credential === '',
     'an ungranted game smuggled its own voice credential into route start');
   ungrantedHost.dispose();
+
+  const disconnectedHost = createHost({
+    gameType: 'third-party-game',
+    sessionId: 'disconnected-session',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  const callsBeforeDisconnectedStart = calls.length;
+  let disconnectedStartError = null;
+  try { await disconnectedHost.start({}); }
+  catch (error) { disconnectedStartError = error; }
+  assert(disconnectedStartError?.code === 'capability_denied'
+    && calls.length === callsBeforeDisconnectedStart,
+  'a host operation was usable before capability negotiation');
+  disconnectedHost.dispose();
   assert(host.sessionId === 'server-session' && host.routeLanlanName === 'Server Neko',
     'authoritative route identity did not replace the provisional host identity');
   assert(typeof host.evaluatePassiveGuard === 'undefined',
@@ -631,6 +685,12 @@ async function main() {
     windowImpl: windowMock,
     navigatorImpl: windowMock.navigator,
   });
+  limitedHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'example-game', version: '1.0.0', requiredCapabilities: ['runtime'], optionalCapabilities: [],
+    },
+  });
   const limitedFirst = limitedHost.publishGameProtocol('event', {
     protocolVersion: '1', sequence: 1, type: 'first', payload: {},
   });
@@ -672,6 +732,12 @@ async function main() {
     fetchImpl,
     windowImpl: windowMock,
     navigatorImpl: waitingLockNavigator,
+  });
+  waitingLockHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'waiting-lock-game', version: '1.0.0', requiredCapabilities: ['leaderboard-local'], optionalCapabilities: [],
+    },
   });
   const waitingLock = waitingLockHost.runGameStorageExclusive('leaderboards/main', async () => true)
     .catch((error) => error);
@@ -736,6 +802,14 @@ async function main() {
     windowImpl: windowMock,
     navigatorImpl: windowMock.navigator,
   });
+  for (const loggerHost of [loggerHostOne, loggerHostTwo]) {
+    loggerHost.connectGame({
+      protocolVersions: ['1'],
+      manifest: {
+        id: loggerHost.gameType, version: '1.0.0', requiredCapabilities: ['logging'], optionalCapabilities: [],
+      },
+    });
+  }
   loggerHostOne.configureLogger();
   loggerHostTwo.configureLogger();
   const sharedCaptureRegistry = loggerHostOne._logger.consoleCaptureRegistry;

@@ -150,7 +150,7 @@ class _TransportMixin:
         return identity
 
     def _capture_input_route_identity(self) -> None:
-        """Snapshot the route owning the first frame in the current buffer."""
+        """Snapshot the route owning the first locally detected speech frame."""
         if self._input_route_identity_captured or bool(
             getattr(self, "_audio_in_buffer", False)
         ):
@@ -173,14 +173,14 @@ class _TransportMixin:
         self._input_route_identity_captured = True
 
     def _bind_input_route_identity_to_item(self, item_id: object = None) -> None:
-        """Bind a server-VAD item to the already captured audio-buffer owner."""
+        """Bind a server-VAD item to the captured speech owner when available."""
         item_key = str(item_id or "").strip()
         if not item_key:
             return
         identity = (
             self._input_route_identity
             if self._input_route_identity_captured
-            else None
+            else self._read_input_route_identity()
         )
         identities = self._input_route_identity_by_item
         identities.pop(item_key, None)
@@ -686,16 +686,15 @@ class _TransportMixin:
         if self._fatal_error_occurred:
             return
 
-        # Capture before RNNoise or any other await. Server-VAD reports the
-        # utterance later, after the active game route may already have changed.
-        self._capture_input_route_identity()
-
         current_time = time.time()
         # 本地音量判定：用原始输入做 RMS，避免 VAD 延迟时误清 buffer
         raw_samples = np.frombuffer(audio_chunk, dtype=np.int16)
         if len(raw_samples) > 0:
             local_rms = np.sqrt(np.mean(raw_samples.astype(np.float32) ** 2))
             if local_rms > self._client_vad_threshold:
+                # Capture on the first actual speech onset, before RNNoise or
+                # any other await. Idle silence must not pin an obsolete route.
+                self._capture_input_route_identity()
                 self._last_local_loud_time = current_time
 
         # Detect input sample rate based on chunk size
