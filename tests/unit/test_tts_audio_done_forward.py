@@ -174,11 +174,12 @@ async def test_per_speech_gain_is_forwarded_and_released_when_stream_closes():
 
 def test_per_speech_gain_registry_has_a_hard_capacity_and_clear_path():
     mgr = _make_mgr(_RecordingWebsocket())
+    max_items = 32
 
-    for index in range(tts_runtime_module._SPEECH_PLAYBACK_GAIN_MAX_ITEMS + 5):
+    for index in range(max_items + 5):
         mgr.remember_speech_playback_gain(f"sid-{index}", 2.0)
 
-    assert len(mgr._speech_playback_gains) == tts_runtime_module._SPEECH_PLAYBACK_GAIN_MAX_ITEMS
+    assert len(mgr._speech_playback_gains) == max_items
     assert mgr.speech_playback_gain("sid-0") == 1.0
     mgr.clear_speech_playback_gains()
     assert mgr._speech_playback_gains == {}

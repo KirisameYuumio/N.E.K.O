@@ -62,14 +62,6 @@ from .game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE
 from main_logic import core as _core_facade
 
 
-_SPEECH_PLAYBACK_GAIN_MAX_ITEMS = 32
-_GAME_SPEECH_PRELOAD_MAX_LINES = 32
-_GAME_SPEECH_PRELOAD_MAX_PENDING_BATCHES = 4
-_GAME_SPEECH_PRELOAD_READY_TIMEOUT_SECONDS = 30.0
-_GAME_SPEECH_PRELOAD_ITEM_TIMEOUT_SECONDS = 90.0
-_GAME_SPEECH_PRELOAD_POLL_SECONDS = 0.01
-
-
 class TtsRuntimeMixin:
     """TTS runtime methods (see module docstring)."""
 
@@ -87,6 +79,7 @@ class TtsRuntimeMixin:
 
     def remember_speech_playback_gain(self, speech_id, gain) -> float:
         """Remember a bounded per-speech mix override until its stream closes."""
+        max_items = 32
         normalized = self._normalize_speech_playback_gain(gain)
         key = str(speech_id or "")
         if not key:
@@ -100,7 +93,7 @@ class TtsRuntimeMixin:
         # Gain 1.0 is the implicit default and needs no resident entry.
         if normalized != 1.0:
             gains[key] = normalized
-            while len(gains) > _SPEECH_PLAYBACK_GAIN_MAX_ITEMS:
+            while len(gains) > max_items:
                 gains.popitem(last=False)
         return normalized
 
@@ -454,6 +447,11 @@ class TtsRuntimeMixin:
 
     async def preload_game_speech_audio(self, lines: list[str]) -> dict:
         """Silently synthesize bounded mini-game text into the reusable cache."""
+        max_lines = 32
+        max_pending_batches = 4
+        ready_timeout_seconds = 30.0
+        item_timeout_seconds = 90.0
+        poll_seconds = 0.01
         unique_lines: list[str] = []
         seen: set[str] = set()
         for value in list(lines or []):
@@ -464,11 +462,11 @@ class TtsRuntimeMixin:
             unique_lines.append(clean)
         if not unique_lines:
             return {"ok": False, "reason": "missing_lines", "results": []}
-        if len(unique_lines) > _GAME_SPEECH_PRELOAD_MAX_LINES:
+        if len(unique_lines) > max_lines:
             return {
                 "ok": False,
                 "reason": "too_many_lines",
-                "limit": _GAME_SPEECH_PRELOAD_MAX_LINES,
+                "limit": max_lines,
                 "results": [],
             }
 
@@ -478,7 +476,7 @@ class TtsRuntimeMixin:
             self._game_speech_preload_cancel_epoch = 0
             self._game_speech_preload_active_workers = {}
         pending = int(getattr(self, "_game_speech_preload_pending_batches", 0))
-        if pending >= _GAME_SPEECH_PRELOAD_MAX_PENDING_BATCHES:
+        if pending >= max_pending_batches:
             return {"ok": False, "reason": "busy", "results": []}
         self._game_speech_preload_pending_batches = pending + 1
         epoch = int(self._game_speech_preload_cancel_epoch)
@@ -564,13 +562,13 @@ class TtsRuntimeMixin:
                                 raise RuntimeError("tts_worker_stopped")
                             if time.monotonic() >= deadline:
                                 raise asyncio.TimeoutError
-                            await asyncio.sleep(_GAME_SPEECH_PRELOAD_POLL_SECONDS)
+                            await asyncio.sleep(poll_seconds)
 
                 try:
                     ready = False
                     ready_deadline = (
                         time.monotonic()
-                        + _GAME_SPEECH_PRELOAD_READY_TIMEOUT_SECONDS
+                        + ready_timeout_seconds
                     )
                     try:
                         while not ready:
@@ -637,7 +635,7 @@ class TtsRuntimeMixin:
                         failure_reason = "tts_incomplete"
                         item_deadline = (
                             time.monotonic()
-                            + _GAME_SPEECH_PRELOAD_ITEM_TIMEOUT_SECONDS
+                            + item_timeout_seconds
                         )
                         try:
                             while True:
