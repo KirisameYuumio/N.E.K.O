@@ -93,6 +93,13 @@
       this._avatarHost = options.avatarHost || null;
       this._audioHost = options.audioHost || null;
       this._disposed = false;
+      this._memoryConsentEnabled = false;
+      this._controlBridge = {
+        active: false,
+        sequence: 0,
+        onControl: null,
+        onError: null,
+      };
       this._nextRequestId = 0;
       this._pendingRequestLimit = boundedPositiveInteger(
         options.pendingRequestLimit,
@@ -225,9 +232,19 @@
       const locallyAvailable = new Set([
         'runtime',
         'dialogue',
+        ...(
+          this.gameType === 'soccer'
+          || this.gameType === 'badminton'
+          || this.gameType === 'badminton_solo'
+          || this.gameType === 'badminton_duel'
+            ? ['quick-lines']
+            : []
+        ),
         'logging',
         'voice-input',
         'speech-output',
+        'context-read',
+        'memory',
         ...(this._canUseGameStorage() ? ['storage', 'leaderboard-local'] : []),
         ...(this._avatarHost ? ['avatar-renderer'] : []),
         ...(this._audioHost ? ['audio'] : []),
@@ -532,14 +549,28 @@
         this._cancelVoiceControlRequests('cancelled');
         this._session.id = `${this.gameType}_${Date.now().toString(36)}`;
       }
+      this._memoryConsentEnabled = false;
       this._session.lanlanName = '';
       return { sessionId: this.sessionId, lanlanName: this.routeLanlanName };
     }
 
     applyRouteState(state = {}) {
+      const sessionId = String(state?.session_id || state?.sessionId || '').trim();
       const lanlanName = String(state?.lanlan_name || '').trim();
+      if (sessionId) this._session.id = sessionId;
       if (lanlanName) this._session.lanlanName = lanlanName;
       return { sessionId: this.sessionId, lanlanName: this.routeLanlanName };
+    }
+
+    _trustedRuntimePayload(payload = {}) {
+      const source = payload && typeof payload === 'object' && !Array.isArray(payload)
+        ? payload
+        : {};
+      return {
+        ...source,
+        session_id: this.sessionId,
+        ...(this.routeLanlanName ? { lanlan_name: this.routeLanlanName } : {}),
+      };
     }
 
     _post(path, payload, options = {}) {
@@ -554,6 +585,14 @@
         timeoutMs: options.timeoutMs,
         signal: options.signal,
       });
+    }
+
+    _postWithCsrf(path, payload, options = {}) {
+      return this.withCsrfRetry((headers) => this._post(path, jsonBody(payload, headers), {
+        ...options,
+        headers: { ...headers, ...(options.headers || {}) },
+        credentials: options.credentials || 'same-origin',
+      }));
     }
 
     async getCharacter(lanlanName = '') {
@@ -576,7 +615,7 @@
     }
 
     getQuickLines(payload, options = {}) {
-      return this._post(this._gameEndpoint('quick-lines'), payload, {
+      return this._post(this._gameEndpoint('quick-lines'), this._trustedRuntimePayload(payload), {
         timeoutMs: 15000,
         operation: 'quick_lines',
         ...options,
@@ -584,7 +623,7 @@
     }
 
     requestDialogue(payload, options = {}) {
-      return this._post(this._gameEndpoint('chat'), payload, {
+      return this._post(this._gameEndpoint('chat'), this._trustedRuntimePayload(payload), {
         timeoutMs: 60000,
         operation: 'dialogue',
         ...options,
@@ -600,7 +639,10 @@
     }
 
     start(payload, options = {}) {
-      return this._post(this._gameEndpoint('route/start'), payload, {
+      return this._post(this._gameEndpoint('route/start'), {
+        ...this._trustedRuntimePayload(payload),
+        game_memory_enabled: this._memoryConsentEnabled,
+      }, {
         timeoutMs: 60000,
         operation: 'route_start',
         ...options,
@@ -608,23 +650,117 @@
     }
 
     heartbeat(payload, options = {}) {
-      return this._post(this._gameEndpoint('route/heartbeat'), payload, {
+      return this._post(this._gameEndpoint('route/heartbeat'), this._trustedRuntimePayload(payload), {
         timeoutMs: DEFAULT_HEARTBEAT_TIMEOUT_MS,
         operation: 'route_heartbeat',
         ...options,
       });
     }
 
-    drain(payload, options = {}) {
-      return this._post(this._gameEndpoint('route/drain'), payload, {
+    async drain(payload, options = {}) {
+      const response = await this._post(
+        this._gameEndpoint('route/drain'),
+        this._trustedRuntimePayload(payload),
+        {
+          timeoutMs: 8000,
+          operation: 'route_drain',
+          ...options,
+        },
+      );
+      try {
+        const data = await response.clone().json();
+        this._dispatchGameControls(data?.outputs);
+      } catch (_) { /* the SDK still owns response validation */ }
+      return response;
+    }
+
+    publishGameProtocol(kind, envelope = {}, options = {}) {
+      return this._postWithCsrf(this._gameEndpoint('protocol'), this._trustedRuntimePayload({
+        ...envelope,
+        kind: String(kind || envelope.kind || ''),
+      }), {
         timeoutMs: 8000,
-        operation: 'route_drain',
+        operation: 'game_protocol',
         ...options,
       });
     }
 
+    startGameControlBridge(options = {}) {
+      if (this._disposed) return false;
+      this._controlBridge.active = true;
+      this._controlBridge.onControl = typeof options.onControl === 'function'
+        ? options.onControl
+        : null;
+      this._controlBridge.onError = typeof options.onError === 'function'
+        ? options.onError
+        : null;
+      return true;
+    }
+
+    stopGameControlBridge() {
+      this._controlBridge.active = false;
+      this._controlBridge.onControl = null;
+      this._controlBridge.onError = null;
+    }
+
+    _dispatchGameControls(outputs) {
+      const bridge = this._controlBridge;
+      if (!bridge.active || !bridge.onControl || !Array.isArray(outputs)) return;
+      for (const output of outputs) {
+        const control = output?.control || output?.result?.control;
+        if (!control || typeof control !== 'object' || Array.isArray(control)) continue;
+        for (const [type, payload] of Object.entries(control).slice(0, 64)) {
+          bridge.sequence = (bridge.sequence % Number.MAX_SAFE_INTEGER) + 1;
+          try {
+            bridge.onControl({
+              protocolVersion: SDK_PROTOCOL_VERSION,
+              sequence: bridge.sequence,
+              type,
+              timestamp: Number(output?.ts || Date.now()),
+              sessionId: this.sessionId,
+              payload,
+            });
+          } catch (error) {
+            try { bridge.onError?.(error, 'runtime_output'); }
+            catch (_) { /* consumer error reporting must not break drain */ }
+          }
+        }
+      }
+    }
+
+    readGameContext(payload, options = {}) {
+      return this._post(
+        this._gameEndpoint('context/read'),
+        this._trustedRuntimePayload(payload),
+        { timeoutMs: 15000, operation: 'context_read', ...options },
+      );
+    }
+
+    configureGameMemoryConsent(payload = {}) {
+      const requestedSession = String(payload.session_id || payload.sessionId || '');
+      if (requestedSession && requestedSession !== this.sessionId) {
+        throw this._hostError('session_invalid', 'Memory consent belongs to another session', {
+          operation: 'memory_consent',
+        });
+      }
+      this._memoryConsentEnabled = payload.enabled === true;
+      return Promise.resolve({
+        ok: true,
+        enabled: this._memoryConsentEnabled,
+        session_id: this.sessionId,
+      });
+    }
+
+    submitGameMemory(payload, options = {}) {
+      return this._postWithCsrf(
+        this._gameEndpoint('memory/submit'),
+        this._trustedRuntimePayload(payload),
+        { timeoutMs: 15000, operation: 'memory_submit', ...options },
+      );
+    }
+
     submitVoiceTranscript(payload, options = {}) {
-      return this._post(this._gameEndpoint('route/voice-transcript'), payload, {
+      return this._post(this._gameEndpoint('route/voice-transcript'), this._trustedRuntimePayload(payload), {
         timeoutMs: 15000,
         operation: 'voice_transcript',
         ...options,
@@ -632,7 +768,7 @@
     }
 
     sendRealtimeContext(payload, options = {}) {
-      return this._post(this._gameEndpoint('realtime-context'), payload, {
+      return this._post(this._gameEndpoint('realtime-context'), this._trustedRuntimePayload(payload), {
         timeoutMs: 15000,
         operation: 'realtime_context',
         ...options,
@@ -641,7 +777,7 @@
     }
 
     mirrorAssistant(payload, options = {}) {
-      return this._post(this._gameEndpoint('mirror-assistant'), payload, {
+      return this._post(this._gameEndpoint('mirror-assistant'), this._trustedRuntimePayload(payload), {
         timeoutMs: 15000,
         operation: 'mirror_assistant',
         ...options,
@@ -649,7 +785,7 @@
     }
 
     speak(payload, options = {}) {
-      return this._post(this._gameEndpoint('speak'), payload, {
+      return this._post(this._gameEndpoint('speak'), this._trustedRuntimePayload(payload), {
         timeoutMs: 60000,
         operation: 'speak',
         ...options,
@@ -665,7 +801,7 @@
     }
 
     preloadSpeechOutput(payload, options = {}) {
-      return this._post(this._gameEndpoint('speech/preload'), payload, {
+      return this._post(this._gameEndpoint('speech/preload'), this._trustedRuntimePayload(payload), {
         timeoutMs: 180000,
         operation: 'speech_preload',
         ...options,
@@ -801,10 +937,15 @@
       }
       this.startSpeechPlaybackBridge(options);
       const storageKey = String(options.storageKey || 'neko_speech_playback_state');
+      const messageType = String(options.messageType || 'speech_playback_state');
       try {
         const stored = JSON.parse(this._window.localStorage?.getItem(storageKey) || 'null');
-        if (stored && typeof stored === 'object') {
-          options.onState?.(stored, 'local_storage_initial');
+        if (stored && typeof stored === 'object' && stored.type === messageType) {
+          try {
+            this._speechPlaybackBridge.onState?.(stored, 'local_storage_initial');
+          } catch (error) {
+            this._speechPlaybackBridge.onError?.(error, 'local_storage_initial');
+          }
         }
       } catch (_) { /* ignore malformed state from unrelated/older writers */ }
       return true;
@@ -1915,7 +2056,12 @@
 
     async end(payload, options = {}) {
       void this.flushLogger({ final: true });
-      const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
+      const trustedPayload = typeof payload === 'string'
+        ? payload
+        : this._trustedRuntimePayload(payload);
+      const body = typeof trustedPayload === 'string'
+        ? trustedPayload
+        : JSON.stringify(trustedPayload);
       if (options.signal?.aborted) {
         throw this._hostError('cancelled', `${this.displayName} host request was cancelled`, {
           operation: 'route_end',
@@ -1949,6 +2095,7 @@
       this.stopAllSpeechRecognition();
       this.stopSpeechPlaybackBridge();
       this.stopVoiceControlBridge('disposed');
+      this.stopGameControlBridge();
       try { this._avatarHost?.dispose?.(); }
       catch (error) { this._console.warn(`[${this.displayName}Host] avatar host dispose failed:`, error); }
       try { this._audioHost?.dispose?.(); }

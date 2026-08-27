@@ -167,18 +167,17 @@ class GameSpeechAudioCache:
     def append_unscoped_capture(self, owner: object, speech_id: object, chunk: object) -> bool:
         """Append legacy untagged audio only when its owner has one unambiguous capture."""
         owner_id = id(owner)
-        capture_id = self._capture_id(owner, speech_id)
         with self._lock:
             self._prune_locked(self._clock())
             owner_captures = [
                 key for key, capture in self._captures.items()
                 if capture.owner_id == owner_id
             ]
-            if owner_captures != [capture_id]:
+            if len(owner_captures) != 1:
                 for ambiguous_id in owner_captures:
                     self._remove_capture_locked(ambiguous_id)
                 return False
-            return self.append_capture(owner, speech_id, chunk)
+            return self.append_capture(owner, owner_captures[0][1], chunk)
 
     def fail_capture(self, owner: object, speech_id: object) -> bool:
         capture_id = self._capture_id(owner, speech_id)

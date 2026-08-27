@@ -93,6 +93,7 @@
   const SUPPORTED_CAPABILITIES = Object.freeze([
     'runtime',
     'dialogue',
+    'quick-lines',
     'logging',
     'voice-input',
     'avatar-renderer',
@@ -500,6 +501,9 @@
     }
     if (Object.keys(leaderboards).length && !requestsLeaderboard) {
       fail('invalid_manifest', 'manifest.leaderboards requires a leaderboard capability');
+    }
+    if (requestedCapabilities.has('quick-lines') && !requestedCapabilities.has('dialogue')) {
+      fail('invalid_manifest', 'quick-lines requires the dialogue capability');
     }
     const needsRuntime = requestedCapabilities.has('memory')
       || requestedCapabilities.has('context-read')
@@ -1036,6 +1040,8 @@
         ].every((method) => typeof transport[method] === 'function');
       case 'dialogue':
         return typeof transport.requestDialogue === 'function';
+      case 'quick-lines':
+        return typeof transport.getQuickLines === 'function';
       case 'logging':
         return !!transport.logger && [
           'log', 'info', 'warn', 'error', 'enable',
@@ -3562,7 +3568,7 @@
     const dialogue = Object.freeze({
       get pendingCount() { return dialoguePendingRequests.size; },
       async quickLines(payload = {}, requestOptions = {}) {
-        requireCapability('dialogue', 'dialogue.quickLines');
+        requireCapability('quick-lines', 'dialogue.quickLines');
         if (typeof transport.getQuickLines !== 'function') {
           fail('transport_unavailable', 'The host does not support dialogue quick lines');
         }

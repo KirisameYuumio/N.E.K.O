@@ -150,6 +150,7 @@ def _build_game_archive(state: dict) -> dict:
         ],
         "game_context_organizer": organizer,
         "game_context_degraded": organizer.get("degraded") is True,
+        "sdk_memory_submissions": list(state.get("_sdk_memory_submissions") or [])[-16:],
         "preGameContext": state.get("preGameContext") if isinstance(state.get("preGameContext"), dict) else {},
         "pre_game_context_source": str(state.get("pre_game_context_source") or ""),
         "pre_game_context_error": str(state.get("pre_game_context_error") or ""),
@@ -463,6 +464,10 @@ def _build_game_archive_memory_highlight_source(archive: dict) -> str:
             lines.append(labels["grouped_signals"].format(signals=signals_text))
         if context_summary or signals_text:
             lines.append(labels["selection_priority"])
+    sdk_memory_submissions = archive.get("sdk_memory_submissions")
+    if isinstance(sdk_memory_submissions, list) and sdk_memory_submissions:
+        lines.append("SDK-submitted visible game material:")
+        lines.append(json.dumps(sdk_memory_submissions[-16:], ensure_ascii=False))
     lines.append(labels["full_dialogues"])
     lines.extend(
         f"- {_dialog_memory_line(item, language)}"

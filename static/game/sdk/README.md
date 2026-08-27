@@ -13,9 +13,14 @@ continue to own their schemas and validators.
 
 * `logging` is mandatory for every game and must be declared in
   `requiredCapabilities`.
-* `runtime`, `dialogue`, `voice-input`, `speech-output`, `audio`,
+* `runtime`, `dialogue`, `quick-lines`, `voice-input`, `speech-output`, `audio`,
   `avatar-renderer`, `leaderboard-local`, and `leaderboard-server` are requested
   only when a game needs them.
+* `quick-lines` is a separate optional capability layered on `dialogue`; a
+  manifest that requests it must also request `dialogue`. The first-phase
+  same-origin host grants it only to built-in games with a registered host
+  quick-line dictionary, so generic games cannot receive a route that will
+  always answer `unsupported`.
 * Once a game uses `voice-input`, `speech-output`, `audio`, or
   `avatar-renderer`, it must use the official SDK implementation. A game cannot
   replace those capabilities with its own microphone, project-voice/TTS route,
@@ -38,7 +43,7 @@ const game = await NekoMiniGame.connect({
   protocolVersion: '1',
   requiredCapabilities: ['runtime', 'logging'],
   optionalCapabilities: [
-    'dialogue', 'voice-input', 'speech-output', 'audio', 'avatar-renderer',
+    'dialogue', 'quick-lines', 'voice-input', 'speech-output', 'audio', 'avatar-renderer',
   ],
 }, {
   transport: trustedHostTransport,
@@ -456,6 +461,14 @@ and keeps at most 64 request-to-playback metadata entries. The trusted host owns
 the project TTS route, provider and key selection, audio delivery, global voice
 volume, and playback-state bridge. Games never receive provider credentials,
 raw audio chunks, or host endpoints.
+
+The current project TTS worker protocol can emit legacy audio chunks without a
+speech identifier. The host therefore serializes accepted game speech per
+character and keeps at most four active-plus-waiting requests; excess work
+fails with `busy`. This prevents two workers from interleaving untagged chunks
+into the same playback/cache stream. `interruptExisting` is applied when the
+request reaches the front of that host queue; it is not a safe preemption API
+for an already running legacy worker.
 
 When a game must mirror an assistant line into the host conversation without
 playing or synthesizing audio, it uses the same official capability through

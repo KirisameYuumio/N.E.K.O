@@ -95,6 +95,29 @@ async function main() {
   assert(addedEvents.some((event) => event.type === 'electron-display-changed'),
     'host-window renderer lost its display listener');
 
+  const concurrentManager = new context.window.Live2DManager();
+  concurrentManager._startIdleFpsGovernor = () => {};
+  concurrentManager._stopIdleFpsGovernor = () => {};
+  const fixedInitialization = concurrentManager.initPIXI(
+    'avatar-canvas',
+    'avatar-container',
+    { width: 240, height: 360, resizeMode: 'fixed' },
+  );
+  let mismatchedInitializationError = null;
+  try {
+    await concurrentManager.initPIXI('avatar-canvas', 'avatar-container', {
+      resizeMode: 'host-window',
+    });
+  } catch (error) {
+    mismatchedInitializationError = error;
+  }
+  await fixedInitialization;
+  assert(/不能并发复用/.test(String(mismatchedInitializationError?.message || '')),
+    'concurrent initPIXI reused a promise created for a different resizeMode');
+  assert(concurrentManager.pixi_app.renderer.screen.width === 240
+    && concurrentManager.pixi_app.renderer.screen.height === 360,
+  'mismatched concurrent initPIXI changed the fixed renderer dimensions');
+
   process.stdout.write('Live2D fixed viewport runtime test passed\n');
 }
 

@@ -776,9 +776,10 @@
             }
             if (errorCode === 'no-speech') {
                 console.warn('[GameVoiceSTT][Diag] no-speech: 识别器启动了但没有形成可用语音。优先检查默认麦克风是否正确、是否有 audio/sound/speech start 日志。');
+            } else {
+                publishGameVoiceBrowserTranscriptionState(false, errorCode);
             }
             if (errorCode === 'not-allowed' || errorCode === 'service-not-allowed') {
-                publishGameVoiceBrowserTranscriptionState(false, errorCode);
                 if (typeof window.showStatusToast === 'function') {
                     window.showStatusToast(window.t ? window.t('app.gameVoiceSttMicPermissionDenied') : '游戏语音转写没有麦克风权限，请检查浏览器权限。', 4000);
                 }

@@ -6,6 +6,7 @@ declare namespace NekoMiniGame {
   type Capability =
     | 'runtime'
     | 'dialogue'
+    | 'quick-lines'
     | 'logging'
     | 'voice-input'
     | 'avatar-renderer'

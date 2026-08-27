@@ -63,6 +63,18 @@ def test_contracts_and_host_context_require_runtime(validator: Draft202012Valida
     assert_invalid(validator, memory_without_runtime)
 
 
+def test_quick_lines_requires_dialogue(validator: Draft202012Validator) -> None:
+    value = {
+        "id": "quick-lines-test",
+        "version": "1.0.0",
+        "requiredCapabilities": ["logging"],
+        "optionalCapabilities": ["quick-lines"],
+    }
+    assert_invalid(validator, value)
+    value["optionalCapabilities"].append("dialogue")
+    validator.validate(value)
+
+
 def test_contract_enum_values_match_declared_type(validator: Draft202012Validator) -> None:
     value = manifest()
     value["contracts"]["events"]["score"] = {

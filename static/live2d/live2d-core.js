@@ -151,6 +151,7 @@ class Live2DManager {
         this._modelLoadState = 'idle';
         this._isModelReadyForInteraction = false;
         this._initPIXIPromise = null;
+        this._initPIXIContext = null;
         this._lastPIXIContext = { canvasId: null, containerId: null };
         this._displayInfo = null;
         this._autoNamedHitAreaIds = new Set();
@@ -242,7 +243,27 @@ class Live2DManager {
         if (resizeMode === 'fixed' && (!(Number(options.width) > 0) || !(Number(options.height) > 0))) {
             throw new Error('Live2D fixed resizeMode 需要有效的 width 和 height');
         }
+        const requestedInitContext = {
+            canvasId,
+            containerId,
+            resizeMode,
+            width: resizeMode === 'fixed' ? Number(options.width) : null,
+            height: resizeMode === 'fixed' ? Number(options.height) : null,
+        };
         if (this._initPIXIPromise) {
+            const activeContext = this._initPIXIContext || {};
+            const contextMatches = (
+                activeContext.canvasId === requestedInitContext.canvasId
+                && activeContext.containerId === requestedInitContext.containerId
+                && activeContext.resizeMode === requestedInitContext.resizeMode
+                && activeContext.width === requestedInitContext.width
+                && activeContext.height === requestedInitContext.height
+            );
+            if (!contextMatches) {
+                throw new Error(
+                    `Live2D 正在按 ${activeContext.resizeMode || 'unknown'} 初始化，不能并发复用为 ${resizeMode}`
+                );
+            }
             return await this._initPIXIPromise;
         }
 
@@ -298,6 +319,7 @@ class Live2DManager {
         const pixiOptions = { ...options };
         delete pixiOptions.resizeMode;
 
+        this._initPIXIContext = requestedInitContext;
         this._initPIXIPromise = (async () => {
             try {
                 // 桌宠窗口继续按物理屏幕初始化；手机网页必须按真实视口初始化。
@@ -509,6 +531,7 @@ class Live2DManager {
             return await this._initPIXIPromise;
         } finally {
             this._initPIXIPromise = null;
+            this._initPIXIContext = null;
         }
     }
 

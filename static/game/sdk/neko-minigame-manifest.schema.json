@@ -167,6 +167,38 @@
           }
         ]
       }
+    },
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "requiredCapabilities": { "contains": { "const": "quick-lines" } }
+            }
+          },
+          {
+            "required": ["optionalCapabilities"],
+            "properties": {
+              "optionalCapabilities": { "contains": { "const": "quick-lines" } }
+            }
+          }
+        ]
+      },
+      "then": {
+        "anyOf": [
+          {
+            "properties": {
+              "requiredCapabilities": { "contains": { "const": "dialogue" } }
+            }
+          },
+          {
+            "required": ["optionalCapabilities"],
+            "properties": {
+              "optionalCapabilities": { "contains": { "const": "dialogue" } }
+            }
+          }
+        ]
+      }
     }
   ],
   "$defs": {

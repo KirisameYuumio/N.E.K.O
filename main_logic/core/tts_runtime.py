@@ -542,6 +542,7 @@ class TtsRuntimeMixin:
                 normalize_spaces = not meta or meta.category != "ws_bistream"
                 request_queue = Queue()
                 response_queue = Queue()
+                capture_owner = object()
                 thread = Thread(
                     target=worker,
                     args=(request_queue, response_queue, api_key, route_voice_id),
@@ -622,7 +623,7 @@ class TtsRuntimeMixin:
                             continue
                         speech_id = f"game-preload-{hashlib.sha256(cache_key.encode()).hexdigest()[:16]}-{index}"
                         if not GAME_SPEECH_AUDIO_CACHE.begin_capture(
-                            self, speech_id, cache_key, runtime_signature
+                            capture_owner, speech_id, cache_key, runtime_signature
                         ):
                             results_by_index[index] = {
                                 "index": index,
@@ -650,12 +651,12 @@ class TtsRuntimeMixin:
                                     _, response_speech_id, audio = message
                                     if str(response_speech_id or "") == speech_id:
                                         GAME_SPEECH_AUDIO_CACHE.append_capture(
-                                            self, speech_id, audio
+                                            capture_owner, speech_id, audio
                                         )
                                     continue
                                 if isinstance(message, (bytes, bytearray, memoryview)):
                                     GAME_SPEECH_AUDIO_CACHE.append_capture(
-                                        self, speech_id, message
+                                        capture_owner, speech_id, message
                                     )
                                     continue
                                 if (
@@ -665,7 +666,7 @@ class TtsRuntimeMixin:
                                     and str(message[1] or "") == speech_id
                                 ):
                                     loaded = GAME_SPEECH_AUDIO_CACHE.complete_capture(
-                                        self,
+                                        capture_owner,
                                         speech_id,
                                         self.current_game_speech_audio_runtime_signature(),
                                     )
@@ -686,7 +687,7 @@ class TtsRuntimeMixin:
                             failure_reason = "tts_unavailable"
                         finally:
                             if not loaded:
-                                GAME_SPEECH_AUDIO_CACHE.fail_capture(self, speech_id)
+                                GAME_SPEECH_AUDIO_CACHE.fail_capture(capture_owner, speech_id)
                         results_by_index[index] = (
                             {"index": index, "status": "loaded"}
                             if loaded
@@ -701,9 +702,12 @@ class TtsRuntimeMixin:
                         request_queue.put((TTS_SHUTDOWN_SENTINEL, None))
                     except Exception:
                         pass
-                    await asyncio.to_thread(thread.join, 2.0)
-                    if not thread.is_alive():
-                        self._game_speech_preload_active_workers.pop(thread, None)
+                    try:
+                        await asyncio.to_thread(thread.join, 2.0)
+                    finally:
+                        if not thread.is_alive():
+                            self._game_speech_preload_active_workers.pop(thread, None)
+                        GAME_SPEECH_AUDIO_CACHE.discard_owner(capture_owner)
 
                 return summarize(results_by_index)
         except asyncio.CancelledError:

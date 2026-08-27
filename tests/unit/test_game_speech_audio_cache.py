@@ -125,6 +125,6 @@ def test_unscoped_audio_is_discarded_when_capture_identity_is_ambiguous() -> Non
     assert cache.stats()["captures"] == 0
 
     assert cache.begin_capture(owner, "only", "key-only", "voice")
-    assert cache.append_unscoped_capture(owner, "only", b"safe")
+    assert cache.append_unscoped_capture(owner, "legacy-worker-id", b"safe")
     assert cache.complete_capture(owner, "only", "voice")
     assert cache.get("key-only") == (b"safe",)

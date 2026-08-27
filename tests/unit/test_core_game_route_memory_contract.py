@@ -454,14 +454,27 @@ async def test_game_speech_preload_cancellation_stops_and_releases_worker():
             ["取消预载"],
         )
     )
-    await asyncio.sleep(0.05)
-    task.cancel()
-    result = await task
+    try:
+        for _ in range(100):
+            if getattr(mgr, "_game_speech_preload_active_workers", None):
+                break
+            await asyncio.sleep(0.01)
+        assert mgr._game_speech_preload_active_workers
+        task.cancel()
+        result = await task
 
-    assert result == {"ok": False, "reason": "cancelled", "results": []}
-    assert mgr._game_speech_preload_pending_batches == 0
-    assert mgr._game_speech_preload_active_workers == {}
-    assert GAME_SPEECH_AUDIO_CACHE.stats()["captures"] == 0
+        assert result == {"ok": False, "reason": "cancelled", "results": []}
+        assert mgr._game_speech_preload_pending_batches == 0
+        assert mgr._game_speech_preload_active_workers == {}
+        assert GAME_SPEECH_AUDIO_CACHE.stats()["captures"] == 0
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        GAME_SPEECH_AUDIO_CACHE.clear()
 
 
 @pytest.mark.unit

@@ -3193,6 +3193,9 @@
                         var transcriptionMode = (statusDetails && statusDetails.transcription_mode) || (
                             sttProvider === 'realtime' ? 'backend_pending' : 'browser_fallback'
                         );
+                        if (GAME_VOICE_TRANSCRIPTION_MODES.indexOf(transcriptionMode) === -1) {
+                            transcriptionMode = 'unavailable';
+                        }
                         var transcriptionProvider = (statusDetails && statusDetails.provider) || '';
                         var transcriptionReady = !!(statusDetails && statusDetails.ready === true);
                         S.gameRouteActive = true;
@@ -3233,7 +3236,7 @@
                             S.proactiveChatWasStoppedByGameRoute = !!S.proactiveChatEnabled;
                             window.stopProactiveChatSchedule();
                         }
-                        if (transcriptionMode !== 'browser_fallback') {
+                        if (['backend_pending', 'native_core', 'independent_asr'].indexOf(transcriptionMode) !== -1) {
                             if (typeof window.stopGameVoiceSttGate === 'function') {
                                 window.stopGameVoiceSttGate();
                             } else {

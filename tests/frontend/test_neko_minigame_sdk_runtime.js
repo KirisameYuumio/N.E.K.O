@@ -145,7 +145,9 @@ async function main() {
     id: 'soccer',
     version: '1.0.0',
     requiredCapabilities: ['runtime', 'logging'],
-    optionalCapabilities: ['dialogue', 'voice-input', 'avatar-renderer', 'not-installed'],
+    optionalCapabilities: [
+      'dialogue', 'quick-lines', 'voice-input', 'avatar-renderer', 'not-installed',
+    ],
     contracts: {
       events: {
         'round-started': {
@@ -494,6 +496,20 @@ async function main() {
     mandatoryError = error;
   }
   assert(mandatoryError?.code === 'invalid_manifest', 'official logging was not mandatory');
+
+  let quickLinesDependencyError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'quick-lines-without-dialogue',
+      version: '1',
+      requiredCapabilities: ['logging'],
+      optionalCapabilities: ['quick-lines'],
+    }, { transport });
+  } catch (error) {
+    quickLinesDependencyError = error;
+  }
+  assert(quickLinesDependencyError?.code === 'invalid_manifest',
+    'quick-lines was accepted without the dialogue capability');
 
   let versionError = null;
   try {

@@ -82,8 +82,14 @@
     function postMessage(payload, ephemeral) {
         if (disposed) return false;
         if (channel) {
-            channel.postMessage(payload);
-            return true;
+            try {
+                channel.postMessage(payload);
+                return true;
+            } catch (error) {
+                console.warn('[GameVoiceControl] BroadcastChannel post failed; falling back:', error);
+                try { channel.close(); } catch (_) { /* unusable channel */ }
+                channel = null;
+            }
         }
         try {
             var serialized = JSON.stringify(Object.assign({

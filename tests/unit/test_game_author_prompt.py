@@ -8,6 +8,9 @@ from fastapi import HTTPException
 
 from main_routers.game_router import author_prompt
 from main_routers.game_router import runtime
+from config.prompts.prompts_minigame_common import (
+    get_author_managed_dialogue_host_prompt,
+)
 
 
 def _prompt(messages=None):
@@ -55,6 +58,19 @@ def test_author_prompt_normalizer_enforces_total_bound():
     ]
     with pytest.raises(ValueError, match="total size"):
         author_prompt._normalize_author_managed_prompt(_prompt(messages))
+
+
+@pytest.mark.parametrize("locale", ["zh-CN", "zh-TW", "en", "ja", "ko", "ru", "pt", "es"])
+def test_author_host_prompt_keeps_game_identity_and_exact_watermark(locale):
+    prompt = get_author_managed_dialogue_host_prompt(locale).format(
+        game_type="test-game",
+        name="Test Neko",
+        master_name="Player",
+        personality="kind",
+    )
+
+    assert "test-game" in prompt
+    assert "======以上为" in prompt
 
 
 @pytest.mark.asyncio
@@ -217,6 +233,45 @@ async def test_game_chat_endpoint_forwards_normalized_author_prompt(monkeypatch)
     assert captured["kwargs"]["author_prompt"] == _prompt()
     assert captured["kwargs"]["prompt_locale"] == "en"
     assert captured["event"]["lanlan_name"] == "Test Neko"
+
+
+@pytest.mark.asyncio
+async def test_game_chat_endpoint_accepts_author_prompt_without_game_event(monkeypatch):
+    captured = {}
+    state = {"game_route_active": True, "session_id": "round-1"}
+
+    class FakeRequest:
+        async def json(self):
+            return {
+                "session_id": "round-1",
+                "lanlan_name": "Test Neko",
+                "prompt": _prompt([{"role": "user", "content": "reply to this"}]),
+            }
+
+    async def fake_run(game_type, session_id, event, **kwargs):
+        captured.update({
+            "game_type": game_type,
+            "session_id": session_id,
+            "event": event,
+            "kwargs": kwargs,
+        })
+        return {"line": "ok", "control": {}, "metrics": {"total_ms": 1}}
+
+    monkeypatch.setattr(runtime, "_resolve_lanlan_name", lambda value=None: str(value or "Test Neko"))
+    monkeypatch.setattr(runtime, "_get_active_game_route_state", lambda *_args: state)
+    monkeypatch.setattr(runtime, "_update_game_memory_enabled_from_payload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime, "_attach_game_memory_flag_to_event", lambda event, *_args, **_kwargs: event)
+    monkeypatch.setattr(runtime, "_absorb_request_language", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime, "_update_game_route_language_from_payload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime, "_resolve_game_prompt_locale", lambda *_args, **_kwargs: "en")
+    monkeypatch.setattr(runtime, "_append_game_dialog", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime, "_run_game_chat", fake_run)
+
+    result = await runtime.game_chat("test-game", FakeRequest())
+
+    assert result["line"] == "ok"
+    assert captured["event"] == {"lanlan_name": "Test Neko"}
+    assert captured["kwargs"]["author_prompt"]["mode"] == "author-managed"
 
 
 @pytest.mark.asyncio

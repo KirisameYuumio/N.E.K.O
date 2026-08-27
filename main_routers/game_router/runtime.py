@@ -226,6 +226,24 @@ from utils.game_log import (
 )
 
 
+_SDK_GAME_PROTOCOL_VERSION = "1"
+_SDK_GAME_PROTOCOL_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9:-]{0,63}$")
+_SDK_GAME_PROTOCOL_MAX_BYTES = 256 * 1024
+_SDK_GAME_PROTOCOL_EVENT_LIMIT = 128
+_SDK_GAME_PROTOCOL_VALUE_LIMIT = 64
+_SDK_GAME_CONTEXT_SCOPES = frozenset({
+    "character-public",
+    "recent-chat-summary",
+    "current-state",
+    "pregame-context",
+})
+_SDK_GAME_CONTEXT_SCOPE_LIMIT = 16
+_SDK_GAME_MEMORY_MAX_BYTES = 256 * 1024
+_SDK_GAME_MEMORY_SUBMISSION_LIMIT = 16
+_SDK_GAME_SPEECH_PENDING_LIMIT = 4
+_SDK_GAME_SPEECH_PRELOAD_TIMEOUT_SECONDS = 300.0
+
+
 _EXTERNAL_VOICE_DEDUP_TTL_SECONDS = 30.0
 
 
@@ -378,6 +396,38 @@ def _public_route_state(state: dict | None) -> dict:
     public["dialog_count"] = len(public.get("game_dialog_log") or [])
     public["pending_output_count"] = len(public.get("pending_outputs") or [])
     return public
+
+
+def _sdk_bounded_json_copy(value: Any, *, field: str, maximum_bytes: int) -> Any:
+    """Return a detached JSON value while enforcing the public SDK byte bound."""
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field}_not_json") from exc
+    if len(encoded) > maximum_bytes:
+        raise ValueError(f"{field}_too_large")
+    return json.loads(encoded.decode("utf-8"))
+
+
+def _sdk_active_route_from_payload(game_type: str, data: dict) -> tuple[str, str, dict | None, dict | None]:
+    lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
+    session_id = str(data.get("session_id") or data.get("sessionId") or "").strip()
+    if not lanlan_name:
+        return "", session_id, None, {"ok": False, "reason": "missing_lanlan_name"}
+    state = _get_active_game_route_state(lanlan_name, game_type)
+    if not state:
+        return lanlan_name, session_id, None, {
+            "ok": False,
+            "reason": "game_route_inactive",
+        }
+    current_session_id = str(state.get("session_id") or "")
+    if not session_id or session_id != current_session_id:
+        return lanlan_name, session_id, state, {
+            "ok": False,
+            "reason": "session_id_mismatch",
+            "state": _public_route_state(state),
+        }
+    return lanlan_name, session_id, state, None
 
 
 def _game_route_stale_session_response(
@@ -599,8 +649,8 @@ async def _run_game_chat(
             "control": {},
         }
 
-    if not event:
-        return {"error": "缺少 event 字段"}
+    if not event and normalized_author_prompt is None:
+        return {"error": "缺少 event 字段", "line": "", "control": {}}
     lanlan_name = ""
     if isinstance(event, dict):
         lanlan_name = str(event.get("lanlan_name") or event.get("lanlanName") or "").strip()
@@ -1589,6 +1639,264 @@ async def game_route_drain(game_type: str, request: Request):
     return {"ok": True, "outputs": outputs, "state": _public_route_state(state)}
 
 
+@router.post("/{game_type}/protocol")
+async def game_sdk_protocol(game_type: str, request: Request):
+    """Accept one bounded v1 event/state/result envelope from a connected game."""
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "reason": "invalid_body"}
+    if not isinstance(data, dict):
+        return {"ok": False, "reason": "invalid_body"}
+
+    from ..system_router import _validate_local_mutation_request
+
+    validation_error = _validate_local_mutation_request(
+        request,
+        payload=data,
+        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
+    )
+    if validation_error is not None:
+        return validation_error
+
+    lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
+        game_type,
+        data,
+    )
+    if route_error is not None:
+        return route_error
+
+    protocol_version = str(
+        data.get("protocolVersion") or data.get("protocol_version") or ""
+    ).strip()
+    kind = str(data.get("kind") or "").strip()
+    message_type = str(data.get("type") or "").strip()
+    sequence = data.get("sequence")
+    envelope_session_id = str(data.get("sessionId") or session_id).strip()
+    if protocol_version != _SDK_GAME_PROTOCOL_VERSION:
+        return {"ok": False, "reason": "incompatible_version"}
+    if kind not in {"event", "state", "result"}:
+        return {"ok": False, "reason": "invalid_kind"}
+    if not _SDK_GAME_PROTOCOL_TYPE_PATTERN.fullmatch(message_type):
+        return {"ok": False, "reason": "invalid_type"}
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0:
+        return {"ok": False, "reason": "invalid_sequence"}
+    if envelope_session_id != session_id:
+        return {"ok": False, "reason": "session_id_mismatch"}
+    try:
+        payload = _sdk_bounded_json_copy(
+            data.get("payload"),
+            field="protocol_payload",
+            maximum_bytes=_SDK_GAME_PROTOCOL_MAX_BYTES,
+        )
+    except ValueError as exc:
+        return {"ok": False, "reason": str(exc)}
+
+    last_sequence = int(state.get("_sdk_protocol_last_sequence") or 0)
+    if sequence <= last_sequence:
+        return {"ok": False, "reason": "sequence_replayed", "last_sequence": last_sequence}
+    state["_sdk_protocol_last_sequence"] = sequence
+    record = {
+        "type": message_type,
+        "sequence": sequence,
+        "timestamp": data.get("timestamp"),
+        "payload": payload,
+    }
+    if kind == "event":
+        records = state.get("_sdk_protocol_events")
+        if not isinstance(records, list):
+            records = []
+            state["_sdk_protocol_events"] = records
+        records.append(record)
+        if len(records) > _SDK_GAME_PROTOCOL_EVENT_LIMIT:
+            del records[:-_SDK_GAME_PROTOCOL_EVENT_LIMIT]
+    else:
+        key = f"_sdk_protocol_{kind}s"
+        records = state.get(key)
+        if not isinstance(records, OrderedDict):
+            records = OrderedDict()
+            state[key] = records
+        records.pop(message_type, None)
+        records[message_type] = record
+        while len(records) > _SDK_GAME_PROTOCOL_VALUE_LIMIT:
+            records.popitem(last=False)
+    state["last_activity"] = time.time()
+    _append_game_session_debug_log(
+        game_type,
+        session_id,
+        lanlan_name=lanlan_name,
+        category="sdk_protocol",
+        event="sdk_protocol_accepted",
+        message="小游戏 SDK 协议消息已接收",
+        details={"kind": kind, "type": message_type, "sequence": sequence},
+    )
+    return {
+        "ok": True,
+        "accepted": True,
+        "kind": kind,
+        "type": message_type,
+        "sequence": sequence,
+        "session_id": session_id,
+    }
+
+
+@router.post("/{game_type}/context/read")
+async def game_sdk_context_read(game_type: str, request: Request):
+    """Return only reviewed, bounded host context scopes to a connected game."""
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "reason": "invalid_body"}
+    if not isinstance(data, dict):
+        return {"ok": False, "reason": "invalid_body"}
+    lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
+        game_type,
+        data,
+    )
+    if route_error is not None:
+        return route_error
+    raw_scopes = data.get("scopes")
+    if (
+        not isinstance(raw_scopes, list)
+        or not raw_scopes
+        or len(raw_scopes) > _SDK_GAME_CONTEXT_SCOPE_LIMIT
+    ):
+        return {"ok": False, "reason": "invalid_scopes"}
+    scopes: list[str] = []
+    for value in raw_scopes:
+        scope = str(value or "").strip()
+        if not _SDK_GAME_PROTOCOL_TYPE_PATTERN.fullmatch(scope):
+            return {"ok": False, "reason": "invalid_scope"}
+        if scope not in scopes:
+            scopes.append(scope)
+
+    available: dict[str, Any] = {}
+    unavailable: list[str] = []
+    for scope in scopes:
+        if scope not in _SDK_GAME_CONTEXT_SCOPES:
+            unavailable.append(scope)
+            continue
+        if scope == "character-public":
+            language, language_resolved = await _load_game_character_prompt_locale(lanlan_name)
+            available[scope] = {
+                "lanlan_name": lanlan_name,
+                "language": language,
+                "language_preference_resolved": language_resolved,
+                "game_type": game_type,
+            }
+        elif scope == "recent-chat-summary":
+            available[scope] = {
+                "summary": _normalize_short_text(
+                    state.get("game_context_summary"),
+                    max_chars=900,
+                ),
+            }
+        elif scope == "current-state":
+            available[scope] = state.get("last_state") if isinstance(state.get("last_state"), dict) else {}
+        elif scope == "pregame-context":
+            available[scope] = state.get("preGameContext") if isinstance(state.get("preGameContext"), dict) else {}
+    try:
+        bounded = _sdk_bounded_json_copy(
+            available,
+            field="context_response",
+            maximum_bytes=_SDK_GAME_PROTOCOL_MAX_BYTES,
+        )
+    except ValueError as exc:
+        return {"ok": False, "reason": str(exc)}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "scopes": bounded,
+        "unavailable_scopes": unavailable,
+    }
+
+
+@router.post("/{game_type}/memory/submit")
+async def game_sdk_memory_submit(game_type: str, request: Request):
+    """Accept bounded user-visible game material after host memory consent."""
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "reason": "invalid_body"}
+    if not isinstance(data, dict):
+        return {"ok": False, "reason": "invalid_body"}
+
+    from ..system_router import _validate_local_mutation_request
+
+    validation_error = _validate_local_mutation_request(
+        request,
+        payload=data,
+        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
+    )
+    if validation_error is not None:
+        return validation_error
+    lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
+        game_type,
+        data,
+    )
+    if route_error is not None:
+        return route_error
+    if not _game_memory_player_interaction_enabled(state, game_type):
+        return {"ok": False, "reason": "consent_required"}
+    submission = data.get("submission")
+    if not isinstance(submission, dict) or not submission:
+        return {"ok": False, "reason": "invalid_submission"}
+    if any(key not in {"events", "state", "result", "summary"} for key in submission):
+        return {"ok": False, "reason": "invalid_submission_field"}
+    if "events" in submission and (
+        not isinstance(submission.get("events"), list)
+        or len(submission.get("events") or []) > 64
+    ):
+        return {"ok": False, "reason": "invalid_events"}
+    try:
+        bounded = _sdk_bounded_json_copy(
+            submission,
+            field="memory_submission",
+            maximum_bytes=_SDK_GAME_MEMORY_MAX_BYTES,
+        )
+    except ValueError as exc:
+        return {"ok": False, "reason": str(exc)}
+
+    submissions = state.get("_sdk_memory_submissions")
+    if not isinstance(submissions, list):
+        submissions = []
+        state["_sdk_memory_submissions"] = submissions
+    submissions.append(bounded)
+    if len(submissions) > _SDK_GAME_MEMORY_SUBMISSION_LIMIT:
+        del submissions[:-_SDK_GAME_MEMORY_SUBMISSION_LIMIT]
+
+    if isinstance(bounded.get("state"), dict):
+        state["last_state"] = bounded["state"]
+    if bounded.get("summary") is not None:
+        summary = bounded["summary"]
+        if not isinstance(summary, str):
+            summary = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        state["game_context_summary"] = _normalize_short_text(summary, max_chars=900)
+    state["last_activity"] = time.time()
+    _append_game_session_debug_log(
+        game_type,
+        session_id,
+        lanlan_name=lanlan_name,
+        category="sdk_memory",
+        event="sdk_memory_submitted",
+        message="小游戏 SDK 可见记忆材料已提交",
+        details={
+            "submission_count": len(submissions),
+            "event_count": len(bounded.get("events") or []),
+            "has_state": isinstance(bounded.get("state"), dict),
+            "has_result": isinstance(bounded.get("result"), dict),
+            "has_summary": bounded.get("summary") is not None,
+        },
+        sensitive_possible=True,
+    )
+    return {
+        "ok": True,
+        "accepted": True,
+        "session_id": session_id,
+        "submission_count": len(submissions),
+    }
+
+
 @router.post("/{game_type}/route/voice-transcript")
 async def game_route_voice_transcript(game_type: str, request: Request):
     """Accept final text from an independent STT gate and route it into the game."""
@@ -2018,23 +2326,72 @@ async def game_project_speak(game_type: str, request: Request):
         },
         sensitive_possible=True,
     )
-    result = await _speak_game_line_via_project_tts(
-        mgr,
-        line,
-        request_id=str(data.get("request_id") or "") or None,
-        game_type=game_type,
-        session_id=session_id,
-        mirror_text=data.get("mirror_text", True) is not False,
-        emit_turn_end=data.get("emit_turn_end", True) is not False,
-        interrupt_audio=interrupt_audio,
-        playback_gain=playback_gain,
-        reuse_synthesized_audio=reuse_synthesized_audio,
-        event=_attach_game_memory_flag_to_event(
-            data.get("event") if isinstance(data.get("event"), dict) else {},
-            state,
-            game_type=game_type,
-        ),
-    )
+    pending_speech = int(getattr(mgr, "_sdk_game_speech_pending_count", 0) or 0)
+    if pending_speech >= _SDK_GAME_SPEECH_PENDING_LIMIT:
+        return {
+            "ok": False,
+            "reason": "busy",
+            "limit": _SDK_GAME_SPEECH_PENDING_LIMIT,
+            "audio_sent": False,
+            "lanlan_name": lanlan_name,
+            "method": "project_tts",
+        }
+    speech_lock = getattr(mgr, "_sdk_game_speech_output_lock", None)
+    if not isinstance(speech_lock, asyncio.Lock):
+        speech_lock = asyncio.Lock()
+        mgr._sdk_game_speech_output_lock = speech_lock
+    mgr._sdk_game_speech_pending_count = pending_speech + 1
+    try:
+        async with speech_lock:
+            # A request may have waited behind another TTS worker while the game
+            # route ended or was replaced. Recheck the authoritative route before
+            # launching a worker so stale queued speech can never leak into the
+            # next session.
+            current_state = _get_active_game_route_state(lanlan_name, game_type)
+            if state is not None and (
+                current_state is not state or not state.get("game_route_active")
+            ):
+                result = {
+                    "ok": False,
+                    "reason": "game_route_inactive",
+                    "audio_sent": False,
+                }
+            else:
+                stale_response = _game_route_stale_session_response(
+                    state,
+                    session_id,
+                    lanlan_name=lanlan_name,
+                    method="project_tts",
+                )
+                if stale_response:
+                    result = stale_response
+                else:
+                    result = await _speak_game_line_via_project_tts(
+                        mgr,
+                        line,
+                        request_id=str(data.get("request_id") or "") or None,
+                        game_type=game_type,
+                        session_id=session_id,
+                        mirror_text=data.get("mirror_text", True) is not False,
+                        emit_turn_end=data.get("emit_turn_end", True) is not False,
+                        interrupt_audio=interrupt_audio,
+                        playback_gain=playback_gain,
+                        reuse_synthesized_audio=reuse_synthesized_audio,
+                        event=_attach_game_memory_flag_to_event(
+                            data.get("event") if isinstance(data.get("event"), dict) else {},
+                            state,
+                            game_type=game_type,
+                        ),
+                    )
+    finally:
+        remaining = max(0, int(getattr(mgr, "_sdk_game_speech_pending_count", 1) or 1) - 1)
+        if remaining:
+            mgr._sdk_game_speech_pending_count = remaining
+        else:
+            try:
+                del mgr._sdk_game_speech_pending_count
+            except AttributeError:
+                pass
     result.setdefault("lanlan_name", lanlan_name)
     result.setdefault("method", "project_tts")
     result.setdefault("voice_source", {"provider": "project_tts", "method": "project_tts"})
@@ -2150,18 +2507,45 @@ async def game_project_speech_preload(game_type: str, request: Request):
     )
     preload_task = asyncio.create_task(preload(lines))
     is_disconnected = getattr(request, "is_disconnected", None)
-    if callable(is_disconnected):
+    preload_deadline = (
+        asyncio.get_running_loop().time()
+        + _SDK_GAME_SPEECH_PRELOAD_TIMEOUT_SECONDS
+    )
+    cancel_reason = ""
+    try:
         while not preload_task.done():
-            done, _ = await asyncio.wait({preload_task}, timeout=0.1)
-            if done:
-                break
-            if await is_disconnected():
+            remaining = preload_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                cancel_reason = "timeout"
                 preload_task.cancel()
                 break
-    try:
-        result = await preload_task
+            done, _ = await asyncio.wait(
+                {preload_task},
+                timeout=min(0.1, remaining),
+            )
+            if done:
+                break
+            if callable(is_disconnected) and await is_disconnected():
+                cancel_reason = "cancelled"
+                preload_task.cancel()
+                break
+        if cancel_reason:
+            try:
+                await preload_task
+            except asyncio.CancelledError:
+                pass
+            result = {"ok": False, "reason": cancel_reason, "results": []}
+        else:
+            result = await preload_task
     except asyncio.CancelledError:
+        preload_task.cancel()
+        try:
+            await preload_task
+        except asyncio.CancelledError:
+            pass
         result = {"ok": False, "reason": "cancelled", "results": []}
+    if not isinstance(result, dict):
+        result = {"ok": False, "reason": "invalid_preload_result", "results": []}
     result.setdefault("lanlan_name", lanlan_name)
     result.setdefault("method", "project_tts_preload")
     _append_game_session_debug_log(
@@ -3305,12 +3689,15 @@ async def game_character(game_type: str, request: Request = None):
                 # 已经选定回退模型，小游戏不能再自行选择另一只默认角色。
                 from ..characters_router import get_current_live2d_model
 
-                model_response = await get_current_live2d_model(current_name)
-                response_body = getattr(model_response, 'body', b'')
-                if response_body:
-                    model_payload = json.loads(response_body.decode('utf-8'))
-                    model_info = model_payload.get('model_info') or {}
-                    live2d_path = model_info.get('path', '')
+                try:
+                    model_response = await get_current_live2d_model(current_name)
+                    response_body = getattr(model_response, 'body', b'')
+                    if response_body:
+                        model_payload = json.loads(response_body.decode('utf-8'))
+                        model_info = model_payload.get('model_info') or {}
+                        live2d_path = model_info.get('path', '')
+                except Exception as exc:
+                    logger.warning("🎮 Live2D 模型路径解析失败: %s", type(exc).__name__)
 
             mmd_info = avatar.get('mmd', {})
             if isinstance(mmd_info, dict):
