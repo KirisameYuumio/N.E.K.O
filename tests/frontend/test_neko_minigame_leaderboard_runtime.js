@@ -1,0 +1,201 @@
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function logger() {
+  return {
+    log() {}, info() {}, warn() {}, error() {},
+    async enable() { return { ok: true }; },
+    async enableAfterRouteStart() { return { ok: true }; },
+    async flush() { return { ok: true }; },
+    reset() {},
+  };
+}
+
+function abortError() {
+  const error = new Error('aborted');
+  error.name = 'AbortError';
+  return error;
+}
+
+function createTransport({ server = false } = {}) {
+  const values = new Map();
+  const pending = new Set();
+  const serverCalls = [];
+  let storagePending = false;
+  let runtimeState = { sessionId: 'leaderboard-session', characterName: 'Yui' };
+
+  function pendingRequest(options = {}) {
+    return new Promise((resolve, reject) => {
+      const entry = { resolve, reject };
+      pending.add(entry);
+      const abort = () => {
+        pending.delete(entry);
+        reject(abortError());
+      };
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener('abort', abort, { once: true });
+    });
+  }
+
+  const transport = {
+    logger: logger(),
+    configureLogger() {},
+    connectGame(request) {
+      return {
+        accepted: true,
+        protocolVersion: '1',
+        hostVersion: 'leaderboard-test-host',
+        registration: {
+          mode: 'registered',
+          gameId: request.manifest.id,
+          publisherId: 'test',
+          version: request.manifest.version,
+        },
+        grantedCapabilities: [
+          ...request.manifest.requiredCapabilities,
+          ...request.manifest.optionalCapabilities,
+        ],
+      };
+    },
+    requestGameStorage(operation, payload, options = {}) {
+      if (storagePending) return pendingRequest(options);
+      if (operation === 'get') {
+        return Promise.resolve(values.has(payload.key)
+          ? { ok: true, found: true, value: values.get(payload.key) }
+          : { ok: true, found: false });
+      }
+      if (operation === 'set') values.set(payload.key, payload.value);
+      if (operation === 'delete') values.delete(payload.key);
+      return Promise.resolve({ ok: true });
+    },
+    getRuntimeState() { return runtimeState; },
+    applyRuntimeState(state) { runtimeState = { ...runtimeState, ...state }; return runtimeState; },
+    resetRuntime() { return runtimeState; },
+    async start() { return { ok: true, state: { session_id: runtimeState.sessionId } }; },
+    async end() { return { ok: true, state: { session_id: runtimeState.sessionId } }; },
+    async heartbeat() { return { ok: true, active: true }; },
+    async drain() { return { ok: true, outputs: [] }; },
+    dispose() {},
+  };
+  if (server) {
+    transport.submitServerLeaderboard = async (payload) => {
+      serverCalls.push({ operation: 'submit', payload });
+      return { ok: true, rank: 1 };
+    };
+    transport.listServerLeaderboard = async (payload) => {
+      serverCalls.push({ operation: 'list', payload });
+      return { ok: true, entries: [] };
+    };
+    transport.getServerLeaderboardBest = async (payload) => {
+      serverCalls.push({ operation: 'best', payload });
+      return { ok: true, entry: null };
+    };
+  }
+  return {
+    transport,
+    values,
+    pending,
+    serverCalls,
+    setStoragePending(value) { storagePending = value; },
+  };
+}
+
+function manifest(capabilities) {
+  return {
+    id: 'leaderboard-test',
+    version: '1.0.0',
+    requiredCapabilities: ['logging', ...capabilities],
+    leaderboards: {
+      main: {
+        scoreField: 'score',
+        order: 'descending',
+        maxEntries: 3,
+        retention: 'recent',
+      },
+    },
+  };
+}
+
+async function main() {
+  global.window = { console: { error() {} } };
+  const sourcePath = path.resolve(__dirname, '../../static/game/sdk/neko-minigame-sdk.js');
+  vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
+
+  const localHost = createTransport();
+  const game = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+    transport: localHost.transport,
+  });
+  for (const score of [10, 30, 20, 40]) {
+    await game.leaderboard.local.submit('main', { score, mode: 'duel' });
+  }
+  const ranked = await game.leaderboard.local.list('main', { sort: 'rank', limit: 10 });
+  assert(ranked.data.entries.map((entry) => entry.score).join(',') === '40,30,20',
+    'local leaderboard did not rank and bound retained entries');
+  const recent = await game.leaderboard.local.list('main', { sort: 'recent', limit: 10 });
+  assert(recent.data.entries.map((entry) => entry.score).join(',') === '40,20,30',
+    'local leaderboard did not preserve recent ordering');
+  const best = await game.leaderboard.local.getBest('main');
+  assert(best.data.entry.score === 40, 'local leaderboard best entry was incorrect');
+
+  let clearError = null;
+  try { await game.leaderboard.local.clear('main'); }
+  catch (error) { clearError = error; }
+  assert(clearError?.code === 'invalid_request', 'local leaderboard clear did not require confirmation');
+
+  localHost.setStoragePending(true);
+  const pendingReads = Array.from({ length: 4 }, () => (
+    game.leaderboard.local.list('main').then(() => null, (error) => error)
+  ));
+  await new Promise((resolve) => setImmediate(resolve));
+  let busyError = null;
+  try { await game.leaderboard.local.list('main'); }
+  catch (error) { busyError = error; }
+  assert(busyError?.code === 'busy', 'local leaderboard pending requests were not bounded');
+  game.dispose();
+  const disposedErrors = await Promise.all(pendingReads);
+  assert(disposedErrors.every((error) => error?.code === 'disposed'),
+    'local leaderboard dispose did not release pending requests');
+  assert(localHost.pending.size === 0, 'local leaderboard host requests remained resident');
+
+  const unavailableHost = createTransport();
+  const unavailable = await window.NekoMiniGame.connect({
+    ...manifest(['runtime', 'leaderboard-local']),
+    optionalCapabilities: ['leaderboard-server'],
+  }, { transport: unavailableHost.transport });
+  assert(!unavailable.capabilities.has('leaderboard-server'),
+    'server leaderboard was granted without a server transport');
+  unavailable.dispose();
+
+  const serverHost = createTransport({ server: true });
+  const serverGame = await window.NekoMiniGame.connect(
+    manifest(['runtime', 'leaderboard-server']),
+    { transport: serverHost.transport },
+  );
+  let earlySubmitError = null;
+  try { await serverGame.leaderboard.server.submit('main', { score: 9 }); }
+  catch (error) { earlySubmitError = error; }
+  assert(earlySubmitError?.code === 'session_invalid',
+    'server leaderboard accepted a score before runtime end');
+  await serverGame.runtime.start({ mode: 'duel' });
+  await serverGame.runtime.end({ score: 9 });
+  await serverGame.leaderboard.server.submit('main', { score: 9, mode: 'duel' });
+  await serverGame.leaderboard.server.list('main', { limit: 10 });
+  await serverGame.leaderboard.server.getMyBest('main', { mode: 'duel' });
+  assert(serverHost.serverCalls.map((call) => call.operation).join(',') === 'submit,list,best',
+    'server leaderboard facade did not use its reserved transport methods');
+  assert(serverHost.serverCalls[0].payload.session_id === 'leaderboard-session',
+    'server leaderboard submit did not inject the trusted runtime session');
+  serverGame.dispose();
+
+  process.stdout.write('mini-game leaderboard runtime test passed\n');
+}
+
+main().catch((error) => {
+  process.stderr.write(`${error.stack || error}\n`);
+  process.exitCode = 1;
+});

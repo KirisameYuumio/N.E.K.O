@@ -235,11 +235,22 @@ class Live2DManager {
 
     // 初始化 PIXI 应用
     async initPIXI(canvasId, containerId, options = {}) {
+        const resizeMode = String(options.resizeMode || 'host-window');
+        if (!['fixed', 'host-window'].includes(resizeMode)) {
+            throw new Error(`不支持的 Live2D resizeMode: ${resizeMode}`);
+        }
+        if (resizeMode === 'fixed' && (!(Number(options.width) > 0) || !(Number(options.height) > 0))) {
+            throw new Error('Live2D fixed resizeMode 需要有效的 width 和 height');
+        }
         if (this._initPIXIPromise) {
             return await this._initPIXIPromise;
         }
 
         if (this.isInitialized && this.pixi_app && this.pixi_app.stage) {
+            const initializedResizeMode = this._lastPIXIContext?.resizeMode || 'host-window';
+            if (initializedResizeMode !== resizeMode) {
+                throw new Error(`Live2D 已按 ${initializedResizeMode} 初始化，不能复用为 ${resizeMode}`);
+            }
             console.warn('Live2D 管理器已经初始化');
             return this.pixi_app;
         }
@@ -284,6 +295,8 @@ class Live2DManager {
             resolution: this._getRenderResolutionForQuality(getEffectiveLive2DRenderQuality(window.renderQuality)),
             autoDensity: true
         };
+        const pixiOptions = { ...options };
+        delete pixiOptions.resizeMode;
 
         this._initPIXIPromise = (async () => {
             try {
@@ -298,7 +311,7 @@ class Live2DManager {
                     width: initW,
                     height: initH,
                     ...defaultOptions,
-                    ...options
+                    ...pixiOptions
                 });
 
                 if (!this.pixi_app) {
@@ -323,7 +336,7 @@ class Live2DManager {
                 }
 
                 this.isInitialized = true;
-                this._lastPIXIContext = { canvasId, containerId };
+                this._lastPIXIContext = { canvasId, containerId, resizeMode };
                 if (typeof window.targetFrameRate === 'number' && this.pixi_app.ticker) {
                     this.pixi_app.ticker.maxFPS = window.targetFrameRate;
                 }
@@ -344,6 +357,17 @@ class Live2DManager {
                 }
                 // 启动自适应帧率守护：静止时降到地板（LIVE2D_IDLE_FPS），活动时升回配置帧率。
                 this._startIdleFpsGovernor();
+
+                // 嵌入小游戏的固定画布由 SDK 的 viewport/fit 契约管理，不能跟随宿主
+                // window resize。否则 200x300 renderer 会被放大到整个游戏窗口，并把
+                // 模型 scale 再乘一次面积比，造成窗口尺寸变化后角色巨大化。
+                if (resizeMode === 'fixed') {
+                    console.log('[Live2D Core] PIXI.Application 以固定视口初始化:', {
+                        width: this.pixi_app.renderer?.screen?.width,
+                        height: this.pixi_app.renderer?.screen?.height,
+                    });
+                    return this.pixi_app;
+                }
 
                 // Resize 渲染器并等比调整模型坐标/尺寸
                 // 触发时机：
@@ -490,9 +514,11 @@ class Live2DManager {
 
     async ensurePIXIReady(canvasId, containerId, options = {}) {
         const lastContext = this._lastPIXIContext || {};
+        const resizeMode = String(options.resizeMode || 'host-window');
         const contextMatches = (
             lastContext.canvasId === canvasId &&
-            lastContext.containerId === containerId
+            lastContext.containerId === containerId &&
+            (lastContext.resizeMode || 'host-window') === resizeMode
         );
 
         if (this.isInitialized && this.pixi_app && this.pixi_app.stage && contextMatches) {
@@ -520,7 +546,7 @@ class Live2DManager {
         }
         const app = await this.initPIXI(canvasId, containerId, options);
         if (app && app.stage) {
-            this._lastPIXIContext = { canvasId, containerId };
+            this._lastPIXIContext = { canvasId, containerId, resizeMode };
         }
         return app;
     }
