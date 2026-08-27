@@ -199,6 +199,7 @@ class LLMSessionManager(
         self.pending_use_tts = None
         self.is_hot_swap_imminent = False
         self.tts_handler_task = None
+        self._tts_handler_response_queue = None
         # 热切换相关变量
         self.background_preparation_task = None
         self.final_swap_task = None

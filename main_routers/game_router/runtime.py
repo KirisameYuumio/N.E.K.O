@@ -2654,6 +2654,10 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
         state,
         game_type=game_type,
     )
+    source_state = state
+    source_route_instance_id = str(
+        (source_state or {}).get("_sdk_route_instance_id") or ""
+    )
     finalize_raw = data.get("finalize_turn")
     finalize_turn = _game_route_event_has_user_input(event) if finalize_raw is None else finalize_raw is not False
     result = await _mirror_game_assistant_text(
@@ -2668,10 +2672,15 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
         finalize_turn=finalize_turn,
     )
     if result.get("ok") and str(event.get("kind") or "") == "opening-line":
-        session_id = str(data.get("session_id") or "")
-        state = _get_active_game_route_state(lanlan_name, game_type)
-        if state and (not session_id or session_id == str(state.get("session_id") or "")):
-            _append_game_dialog(state, {
+        current_state = _get_active_game_route_state(lanlan_name, game_type)
+        current_route_instance_id = str(
+            (current_state or {}).get("_sdk_route_instance_id") or ""
+        )
+        if (
+            current_state is source_state
+            and current_route_instance_id == source_route_instance_id
+        ):
+            _append_game_dialog(current_state, {
                 "type": "assistant",
                 "source": "opening_line",
                 "kind": "opening-line",
@@ -2946,6 +2955,13 @@ async def game_project_speech_preload(game_type: str, request: Request):
     )
     if stale_response:
         return stale_response
+    route_instance_error = _sdk_route_instance_error(state, data)
+    if route_instance_error is not None:
+        return {
+            **route_instance_error,
+            "lanlan_name": lanlan_name,
+            "method": "project_tts_preload",
+        }
 
     _absorb_request_language(data, lanlan_name)
     mgr = get_session_manager().get(lanlan_name)

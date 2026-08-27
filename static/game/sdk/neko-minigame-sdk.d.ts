@@ -205,6 +205,7 @@ declare namespace NekoMiniGame {
     readonly type: string;
     readonly timestamp: number;
     readonly sessionId: string;
+    readonly routeInstanceId?: string;
     readonly payload: T;
   }
 

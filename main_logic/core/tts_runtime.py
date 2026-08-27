@@ -592,7 +592,7 @@ class TtsRuntimeMixin:
                         )
                 if not pending_lines:
                     return summarize(results_by_index)
-                worker, api_key, route_voice_id, provider_key, disabled, _tts_config = (
+                worker, api_key, route_voice_id, provider_key, disabled, tts_config = (
                     self._resolve_tts_worker_spec()
                 )
                 if disabled:
@@ -603,6 +603,18 @@ class TtsRuntimeMixin:
                             "reason": "tts_disabled",
                         }
                     return summarize(results_by_index, "tts_disabled")
+                if not self._tts_worker_supports_completion(
+                    worker,
+                    provider_key,
+                    tts_config,
+                ):
+                    for index, _clean, _key, _signature in pending_lines:
+                        results_by_index[index] = {
+                            "index": index,
+                            "status": "failed",
+                            "reason": "tts_unavailable",
+                        }
+                    return summarize(results_by_index, "tts_unavailable")
 
                 meta = TTS_PROVIDER_REGISTRY.get(provider_key) if provider_key else None
                 normalize_spaces = not meta or meta.category != "ws_bistream"
@@ -870,8 +882,10 @@ class TtsRuntimeMixin:
         must be cancelled before a replacement worker/handler pair is created.
         """
         handler_task = self.tts_handler_task
+        handler_queue = getattr(self, "_tts_handler_response_queue", None)
         if handler_task is not None and not handler_task.done():
-            GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
+            if handler_queue is self.tts_response_queue:
+                GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
             handler_task.cancel()
             try:
                 await asyncio.wait_for(handler_task, timeout=1.0)
@@ -879,6 +893,15 @@ class TtsRuntimeMixin:
                 pass
         if self.tts_handler_task is handler_task:
             self.tts_handler_task = None
+            if getattr(self, "_tts_handler_response_queue", None) is handler_queue:
+                self._tts_handler_response_queue = None
+
+    def _start_tts_response_handler(self):
+        """Start one handler and bind its ownership to the captured response queue."""
+        task = asyncio.create_task(self.tts_response_handler())
+        self.tts_handler_task = task
+        self._tts_handler_response_queue = self.tts_response_queue
+        return task
 
     async def ensure_tts_pipeline_alive(self) -> None:
         """Light TTS startup helper: spawn worker + handler task if not alive.
@@ -900,7 +923,7 @@ class TtsRuntimeMixin:
                 )
             )
         if self.tts_handler_task is None or self.tts_handler_task.done():
-            self.tts_handler_task = asyncio.create_task(self.tts_response_handler())
+            self._start_tts_response_handler()
 
     async def _apply_pending_tts_route_after_swap(self) -> None:
         """Apply pending TTS route and reconcile worker state after hot-swap."""
@@ -1142,6 +1165,8 @@ class TtsRuntimeMixin:
                 pass
             if self.tts_handler_task is handler_task_ref:
                 self.tts_handler_task = None
+                if getattr(self, "_tts_handler_response_queue", None) is resp_queue_ref:
+                    self._tts_handler_response_queue = None
 
         if thread_ref and thread_ref.is_alive():
             try:
@@ -1223,7 +1248,7 @@ class TtsRuntimeMixin:
         # 重新启动 tts_response_handler 以监听新队列
         if self.tts_handler_task and not self.tts_handler_task.done():
             self.tts_handler_task.cancel()
-        self.tts_handler_task = asyncio.create_task(self.tts_response_handler())
+        self._start_tts_response_handler()
 
         logger.info("🔄 TTS Worker 已重新拉起，等待运行时就绪信号...")
 
@@ -1829,7 +1854,8 @@ class TtsRuntimeMixin:
                 self._discard_pending_ai_voice_echo()
             except asyncio.CancelledError:
                 logger.info("🎧 tts_response_handler cancelled")
-                GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
+                if q is self.tts_response_queue:
+                    GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
                 # asyncio.to_thread 取消后，线程池里那个 thread 仍阻塞在 q.get()。
                 # push 哨兵唤醒它返回，避免线程泄漏（线程持有 queue ref，整个 queue
                 # 也会被一起留住）。put_nowait 失败不影响主流程。

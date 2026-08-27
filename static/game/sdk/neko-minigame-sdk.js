@@ -2671,6 +2671,16 @@
         if (!sessionId || (currentSessionId && sessionId !== currentSessionId)) {
           fail('session_invalid', 'The host control belongs to another game session');
         }
+        const routeInstanceId = String(
+          rawEnvelope.routeInstanceId || rawEnvelope.sdk_route_instance_id || '',
+        ).trim();
+        const currentRouteInstanceId = String(runtimeRouteInstanceId || '').trim();
+        if (
+          currentRouteInstanceId
+          && routeInstanceId !== currentRouteInstanceId
+        ) {
+          fail('session_invalid', 'The host control belongs to another route generation');
+        }
         const payload = normalizeContractPayload(
           rawEnvelope.payload,
           schema,
@@ -2683,6 +2693,7 @@
           type,
           timestamp: Number(rawEnvelope.timestamp || Date.now()),
           sessionId,
+          ...(routeInstanceId ? { routeInstanceId } : {}),
           payload,
         }));
         return true;

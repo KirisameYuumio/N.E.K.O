@@ -30,6 +30,7 @@ from fastapi import WebSocketDisconnect
 from main_logic.omni_realtime_client import OmniRealtimeClient
 from main_logic.omni_offline_client import OmniOfflineClient
 from utils.llm_client import AIMessage
+from utils.game_route_state import get_active_game_route_generation_identity
 from main_logic.session_state import SessionEvent
 from main_logic.agent_event_bus import dispatch_user_utterance
 from config import SESSION_ARCHIVE_TRIGGER_TOKENS, SESSION_TURN_THRESHOLD
@@ -1153,6 +1154,11 @@ class TurnMixin:
         transcript_text = transcript.strip()
         record_transcript_text = transcript_text
         voice_rms_recorded = False
+        source_game_route_identity = (
+            get_active_game_route_generation_identity(self.lanlan_name)
+            if is_voice_source
+            else None
+        )
 
         # 更新用户活动时间戳（用于主动搭话检测）。先捕获「转写到达时刻」局部变量，
         # 下面 last_user_message_time 复用同一时刻——若 takeover dispatcher 注册，
@@ -1287,6 +1293,12 @@ class TurnMixin:
                         "type": "user_transcript",
                         "text": transcript.strip()
                     }
+                    if source_game_route_identity is not None:
+                        game_type, session_id, route_instance_id = source_game_route_identity
+                        message["game_type"] = game_type
+                        message["session_id"] = session_id
+                        if route_instance_id:
+                            message["sdk_route_instance_id"] = route_instance_id
                     await self.websocket.send_json(message)
                 except Exception as e:
                     logger.error(f"⚠️ 发送用户转录到前端失败: {e}")

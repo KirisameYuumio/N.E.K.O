@@ -231,7 +231,9 @@ When a dialogue response includes a `control` object, every key must be declared
 under `manifest.contracts.controls` and every value is validated against that
 key's schema before the result reaches game code. Undeclared or invalid controls
 reject with `invalid_contract`; the host does not interpret them as built-in
-game rules.
+game rules. Each delivered control envelope carries the authoritative
+`sessionId` and, once a route is active, `routeInstanceId`; the SDK drops output
+from an older route generation before it reaches game handlers.
 
 `dialogue.request()` does not inject request-scoped host context. A game that
 needs host context must first use `context.read()` and deliberately place the

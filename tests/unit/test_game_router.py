@@ -6322,6 +6322,33 @@ async def test_project_speech_preload_is_silent_and_deduplicates_lines(monkeypat
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_project_speech_preload_rejects_a_stale_active_route_generation(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("example-game", "reused-session", "Lan")
+        state["_sdk_route_instance_id"] = "route-B"
+        result = await gr_runtime.game_project_speech_preload(
+            "example-game",
+            _FakeRequest({
+                "lines": ["route A preload"],
+                "session_id": "reused-session",
+                "sdk_route_instance_id": "route-A",
+                "render_language": "ja",
+            }),
+        )
+
+    assert result["ok"] is False
+    assert result["reason"] == "route_instance_id_mismatch"
+    assert result["method"] == "project_tts_preload"
+    assert mgr.preloaded == []
+    assert mgr.render_language_at_mirror == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_project_speech_preload_disconnect_cancels_backend_work(monkeypatch):
     class DisconnectingRequest(_FakeRequest):
         async def is_disconnected(self):
@@ -6743,6 +6770,48 @@ async def test_project_mirror_assistant_records_opening_line_in_game_log(monkeyp
         "request_id": "opening-1",
         "ts": state["game_dialog_log"][0]["ts"],
     }]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_mirror_assistant_does_not_record_opening_line_on_replacement_route(
+    monkeypatch,
+):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingMirrorManager(_FakeGameRouteManager):
+        async def mirror_assistant_output(self, text, **kwargs):
+            self.assistant_mirrored.append((text, kwargs))
+            entered.set()
+            await release.wait()
+            return {"ok": True, "mirrored": True, "method": "project_text_mirror"}
+
+    mgr = BlockingMirrorManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        route_a = gr_runtime._activate_game_route("example-game", "reused-session", "Lan")
+        route_a["_sdk_route_instance_id"] = "route-A"
+        task = asyncio.create_task(gr_runtime.game_project_mirror_assistant(
+            "example-game",
+            _FakeRequest({
+                "line": "route A opening",
+                "session_id": "reused-session",
+                "sdk_route_instance_id": "route-A",
+                "event": {"kind": "opening-line"},
+            }),
+        ))
+        await entered.wait()
+        route_b = gr_runtime._activate_game_route("example-game", "reused-session", "Lan")
+        route_b["_sdk_route_instance_id"] = "route-B"
+        release.set()
+        result = await task
+
+        assert result["ok"] is True
+        assert route_a["game_dialog_log"] == []
+        assert route_b["game_dialog_log"] == []
 
 
 @pytest.mark.unit

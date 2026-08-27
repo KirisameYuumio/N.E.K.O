@@ -875,9 +875,14 @@
     }
 
     async drain(payload, options = {}) {
+      const trustedPayload = this._trustedRuntimePayload(payload);
+      const sourceRoute = Object.freeze({
+        sessionId: String(trustedPayload.session_id || ''),
+        routeInstanceId: String(trustedPayload.sdk_route_instance_id || ''),
+      });
       const response = await this._post(
         this._gameEndpoint('route/drain'),
-        this._trustedRuntimePayload(payload),
+        trustedPayload,
         {
           timeoutMs: 8000,
           operation: 'route_drain',
@@ -886,7 +891,7 @@
       );
       try {
         const data = await response.clone().json();
-        this._dispatchGameControls(data?.outputs);
+        this._dispatchGameControls(data?.outputs, sourceRoute);
       } catch (_) { /* the SDK still owns response validation */ }
       return response;
     }
@@ -950,9 +955,11 @@
       this._controlBridge.onError = null;
     }
 
-    _dispatchGameControls(outputs) {
+    _dispatchGameControls(outputs, sourceRoute = null) {
       const bridge = this._controlBridge;
       if (!bridge.active || !bridge.onControl || !Array.isArray(outputs)) return;
+      const sessionId = String(sourceRoute?.sessionId || this.sessionId || '');
+      const routeInstanceId = String(sourceRoute?.routeInstanceId || '');
       for (const output of outputs) {
         const control = output?.control || output?.result?.control;
         if (!control || typeof control !== 'object' || Array.isArray(control)) continue;
@@ -968,7 +975,8 @@
                 if (!Number.isFinite(value) || value <= 0) return Date.now();
                 return value < 100000000000 ? value * 1000 : value;
               })(),
-              sessionId: this.sessionId,
+              sessionId,
+              ...(routeInstanceId ? { routeInstanceId } : {}),
               payload,
             });
           } catch (error) {

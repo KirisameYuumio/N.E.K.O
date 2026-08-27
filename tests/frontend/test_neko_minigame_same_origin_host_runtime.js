@@ -31,8 +31,12 @@ async function main() {
   const listeners = new Map();
   let releaseProtocolTwo;
   let markProtocolTwoStarted;
+  let releaseDelayedDrain;
+  let markDelayedDrainStarted;
   const protocolTwoGate = new Promise((resolve) => { releaseProtocolTwo = resolve; });
   const protocolTwoStarted = new Promise((resolve) => { markProtocolTwoStarted = resolve; });
+  const delayedDrainGate = new Promise((resolve) => { releaseDelayedDrain = resolve; });
+  const delayedDrainStarted = new Promise((resolve) => { markDelayedDrainStarted = resolve; });
   const fetchImpl = async (url, init = {}) => {
     const pathName = String(url);
     if (pathName.startsWith('/api/config/page_config')) {
@@ -55,13 +59,30 @@ async function main() {
       });
     }
     if (pathName.endsWith('/route/drain')) {
-      return jsonResponse({
+      const responseData = {
         ok: true,
         outputs: [{
           ts: 123,
           result: { control: { stance: 'ready' } },
         }],
-      });
+      };
+      if (body.delay_control_parse === true) {
+        return {
+          ok: true,
+          status: 200,
+          async json() { return responseData; },
+          clone() {
+            return {
+              async json() {
+                markDelayedDrainStarted();
+                await delayedDrainGate;
+                return responseData;
+              },
+            };
+          },
+        };
+      }
+      return jsonResponse(responseData);
     }
     return jsonResponse({ ok: true, accepted: true });
   };
@@ -339,14 +360,31 @@ async function main() {
 
   const controls = [];
   host.startGameControlBridge({ onControl: (control) => controls.push(control) });
-  await host.drain({ session_id: 'attacker-session' });
+  const delayedDrain = host.drain({
+    session_id: 'attacker-session',
+    sdk_route_instance_id: 'route-instance-A',
+    delay_control_parse: true,
+  });
+  await delayedDrainStarted;
+  host.applyRuntimeState({
+    session_id: 'replacement-session',
+    lanlan_name: 'Server Neko',
+  });
+  releaseDelayedDrain();
+  await delayedDrain;
   assert(controls.length === 1 && controls[0].type === 'stance'
     && controls[0].payload === 'ready',
   'route outputs were not converted into SDK control envelopes');
   assert(controls[0].sessionId === 'server-session',
-    'control envelope did not carry the authoritative route session');
+    'control envelope did not preserve the drain request session');
+  assert(controls[0].routeInstanceId === 'route-instance-A',
+    'control envelope did not preserve the drain request route generation');
   assert(controls[0].timestamp === 123000,
     'second-based backend control timestamps were not normalized to milliseconds');
+  host.applyRuntimeState({
+    session_id: 'server-session',
+    lanlan_name: 'Server Neko',
+  });
 
   const millisecondControls = [];
   host.stopGameControlBridge();

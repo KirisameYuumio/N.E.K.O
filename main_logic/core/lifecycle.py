@@ -1363,19 +1363,14 @@ class LifecycleMixin:
             tts_ready = self.tts_ready
             logger.info(f"🎤 TTS线程已在运行，复用现有线程 (ready={tts_ready})")
 
-        # 确保旧的 TTS handler task 已经停止
+        # 确保旧的 TTS handler task 已经停止，同时按其绑定 queue 校验缓存所有权。
         if self.tts_handler_task and not self.tts_handler_task.done():
             logger.info("🎧 Cancelling old tts_handler_task...")
-            self.tts_handler_task.cancel()
-            try:
-                await asyncio.wait_for(self.tts_handler_task, timeout=1.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                # Cancel echo or slow exit of the superseded handler — safe to proceed either way.
-                pass
+        await self._stop_tts_response_handler()
 
         # 启动新的 TTS handler task
         logger.info(f"🎧 Creating tts_handler_task (response_queue id={id(self.tts_response_queue):#x})")
-        self.tts_handler_task = asyncio.create_task(self.tts_response_handler())
+        self._start_tts_response_handler()
 
         # 仅在确认为就绪时才标记可发送，避免“假就绪”导致静默
         async with self.tts_cache_lock:

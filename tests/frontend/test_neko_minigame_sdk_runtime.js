@@ -268,8 +268,6 @@ async function main() {
     'declared host control was not validated and delivered exactly once');
   assert(controlErrors.length === 1 && controlErrors[0].code === 'invalid_contract',
     'invalid host control did not produce a bounded public error');
-  removeControl();
-  removeControlError();
   assert(game.capabilities.has('runtime'), 'required runtime capability was not granted');
   assert(game.capabilities.has('voice-input'), 'available optional voice capability was not granted');
   assert(game.capabilities.has('avatar-renderer'), 'available avatar capability was not granted');
@@ -298,6 +296,30 @@ async function main() {
   const started = await game.runtime.start({ mode: 'default' });
   assert(started.data.payload.mode === 'default', 'runtime start did not use the host transport');
   const routeInstanceId = started.data.payload.sdk_route_instance_id;
+  controlBridgeOptions.onControl({
+    protocolVersion: '1',
+    sequence: 3,
+    type: 'stance',
+    sessionId: 'sdk-test-session',
+    routeInstanceId: 'stale-route-instance',
+    payload: 'press',
+  });
+  assert(controls.length === 1,
+    'a stale route-generation control was delivered to the replacement route');
+  assert(controlErrors.length === 2 && controlErrors.at(-1).code === 'session_invalid',
+    'a stale route-generation control did not produce a bounded public error');
+  controlBridgeOptions.onControl({
+    protocolVersion: '1',
+    sequence: 4,
+    type: 'stance',
+    sessionId: 'sdk-test-session',
+    routeInstanceId,
+    payload: 'press',
+  });
+  assert(controls.length === 2 && controls.at(-1).routeInstanceId === routeInstanceId,
+    'the active route-generation control was not delivered with its identity');
+  removeControl();
+  removeControlError();
   voiceOptions.onTranscript({
     text: 'stale words',
     request_id: 'voice-stale',

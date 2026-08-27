@@ -874,6 +874,80 @@ async def test_game_speech_preload_cancellation_stops_and_releases_worker():
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_speech_preload_rejects_worker_without_completion_before_starting_thread():
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr.game_speech_audio_cache_identity = lambda _text: (
+        "unavailable-cache-key",
+        "unavailable-runtime-signature",
+    )
+    worker_started = False
+
+    def must_not_start(_request_queue, _response_queue, _api_key, _voice_id):
+        nonlocal worker_started
+        worker_started = True
+
+    mgr._resolve_tts_worker_spec = lambda: (
+        must_not_start,
+        "",
+        "voice",
+        "local_cosyvoice",
+        False,
+        {"base_url": "http://127.0.0.1:9880"},
+    )
+    try:
+        result = await core_module.LLMSessionManager.preload_game_speech_audio(
+            mgr,
+            ["unsupported preload"],
+        )
+
+        assert result == {
+            "ok": False,
+            "results": [{
+                "index": 0,
+                "status": "failed",
+                "reason": "tts_unavailable",
+            }],
+            "loaded": 0,
+            "hits": 0,
+            "failed": 1,
+            "reason": "tts_unavailable",
+        }
+        assert worker_started is False
+        assert mgr._game_speech_preload_active_workers == {}
+    finally:
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_stale_tts_handler_cancellation_preserves_new_runtime_cache_capture():
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    old_response_queue = queue.Queue()
+    mgr.tts_response_queue = old_response_queue
+    mgr._start_tts_response_handler()
+    old_handler = mgr.tts_handler_task
+    await asyncio.sleep(0)
+
+    mgr.tts_response_queue = queue.Queue()
+    assert GAME_SPEECH_AUDIO_CACHE.begin_capture(
+        mgr,
+        "new-runtime-speech",
+        "new-runtime-cache-key",
+        "new-runtime-signature",
+    ) is True
+    try:
+        await core_module.LLMSessionManager._stop_tts_response_handler(mgr)
+
+        assert old_handler.done()
+        assert GAME_SPEECH_AUDIO_CACHE.stats()["captures"] == 1
+    finally:
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
 def test_game_speech_audio_identity_is_opaque_and_invalidates_by_language():
     mgr = _make_manager()
     mgr._build_tts_runtime_key = lambda: ("provider", "secret-api-key", "voice-a")
@@ -993,6 +1067,41 @@ async def test_mirror_user_input_propagates_the_source_route_identity():
         "text": "source-bound transcript",
         "source": "external_voice_route",
         "request_id": "voice-route-a",
+        "game_type": "example-game",
+        "session_id": "reused-session",
+        "sdk_route_instance_id": "route-A",
+    }]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_omni_realtime_transcript_freezes_source_route_identity_before_await(
+    monkeypatch,
+):
+    mgr = _make_transcript_manager()
+    mgr.session = object.__new__(core_module.OmniRealtimeClient)
+    mgr.websocket = _FakeConnectedWebSocket()
+    mgr._broadcast_voice_transcript_observed = AsyncMock()
+    route_identity = ["example-game", "reused-session", "route-A"]
+    monkeypatch.setattr(
+        turn_module,
+        "get_active_game_route_generation_identity",
+        lambda _lanlan_name: tuple(route_identity),
+    )
+
+    async def replace_route_during_takeover_probe(*_args, **_kwargs):
+        route_identity[:] = ["example-game", "reused-session", "route-B"]
+        return False
+
+    mgr._takeover_input_dispatcher = replace_route_during_takeover_probe
+    await core_module.LLMSessionManager.handle_input_transcript(
+        mgr,
+        "route-bound words",
+    )
+
+    assert mgr.websocket.sent == [{
+        "type": "user_transcript",
+        "text": "route-bound words",
         "game_type": "example-game",
         "session_id": "reused-session",
         "sdk_route_instance_id": "route-A",
