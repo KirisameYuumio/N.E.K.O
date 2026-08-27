@@ -271,6 +271,26 @@ async function main() {
   assert(mappedState.eventKey === 'goal:happy', 'speech event key was not retained');
   assert(mappedState.ignored_large_field === undefined,
     'unknown host playback fields escaped the bounded public state');
+  bridgeOptions.onState({
+    type: 'speech_playback_state',
+    active: true,
+    speech_id: 'pending-audio-work',
+    remaining_seconds: 0,
+    pending_audio_work: true,
+    updated_at: Date.now(),
+  }, 'window_event');
+  assert(states.at(-1).active === true && states.at(-1).pendingAudioWork === true,
+    'authoritative pending audio work was collapsed into an inactive snapshot');
+  bridgeOptions.onState({
+    type: 'speech_playback_state',
+    active: true,
+    speech_id: 'pending-audio-work-drained',
+    remaining_seconds: 0,
+    pending_audio_work: false,
+    updated_at: Date.now(),
+  }, 'window_event');
+  assert(states.at(-1).active === false && states.at(-1).pendingAudioWork === false,
+    'zero-remaining playback stayed active after pending work drained');
 
   stateBeforeResponseMode = true;
   const beforeResponseStateStart = states.length;

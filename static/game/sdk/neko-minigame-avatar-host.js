@@ -244,8 +244,8 @@
         && state.viewport.width === viewport.width
         && state.viewport.height === viewport.height;
       if (sameSize && reason !== 'model-changed' && reason !== 'mounted') return;
-      state.viewport = viewport;
       await state.raw.resize(viewport, state.config.fit, Object.freeze({ reason }));
+      if (!state.disposed && !disposed) state.viewport = viewport;
     }
 
     function enqueueStateOperation(state, operation, callback) {
@@ -454,7 +454,7 @@
           pendingOperations: 0,
         };
         await racePendingMount(raw.setModel(config.model), pendingState, slot);
-        await resizeState(state, 'mounted');
+        await racePendingMount(resizeState(state, 'mounted'), pendingState, slot);
         if (disposed || abortController?.signal?.aborted) {
           fail('disposed', 'Avatar host was disposed while mounting', { slot });
         }

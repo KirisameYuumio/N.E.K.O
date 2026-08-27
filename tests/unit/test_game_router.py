@@ -315,6 +315,59 @@ async def test_route_end_before_start_consumes_exact_session_without_activation(
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_repeated_route_end_does_not_cancel_same_session_restart(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    postgame_calls = []
+
+    async def fake_submit(_archive):
+        return {"ok": True, "status": "cached", "count": 1}
+
+    async def fake_postgame(*args, **kwargs):
+        postgame_calls.append((args, kwargs))
+        return {"ok": True, "action": "sent"}
+
+    async def fake_pregame_context(**kwargs):
+        assert kwargs["game_type"] == "soccer"
+        return gr_pregame._default_soccer_pregame_context(), "lightweight", ""
+
+    _gr_patch_all(monkeypatch, "_submit_game_archive_to_memory", fake_submit)
+    _gr_patch_all(monkeypatch, "_deliver_game_postgame", fake_postgame)
+    _gr_patch_all(monkeypatch, "_build_soccer_pregame_context", fake_pregame_context)
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("soccer", "reused-session", "Lan")
+        _mark_game_started(state)
+        payload = {
+            "lanlan_name": "Lan",
+            "session_id": "reused-session",
+            "reason": "pagehide",
+        }
+
+        first_end = await gr_runtime._complete_game_end_from_payload("soccer", payload)
+        second_end = await gr_runtime._complete_game_end_from_payload("soccer", payload)
+
+        tombstone_key = ("Lan", "soccer", "reused-session")
+        assert first_end["route_closed"] is True
+        assert second_end["archive"] == first_end["archive"]
+        assert len(postgame_calls) == 1
+        assert tombstone_key not in gr_runtime._game_route_end_tombstones
+
+        restart = await gr_runtime.game_route_start(
+            "soccer",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "reused-session",
+            }),
+        )
+
+        assert restart["ok"] is True
+        assert restart.get("reason") != "ended_before_start"
+        assert restart["state"]["game_route_active"] is True
+        assert tombstone_key not in gr_runtime._game_route_end_tombstones
+
+
+@pytest.mark.unit
 def test_route_end_before_start_tombstones_expire_and_stay_bounded(monkeypatch):
     clock = {"now": 100.0}
     patch_module_clock(monkeypatch, gr_runtime, monotonic=lambda: clock["now"])

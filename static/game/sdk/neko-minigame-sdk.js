@@ -1524,6 +1524,7 @@
     const remainingSeconds = audioContextState === 'suspended'
       ? rawRemainingSeconds
       : Math.max(0, rawRemainingSeconds - ageMs / 1000);
+    const pendingAudioWork = raw.pendingAudioWork === true || raw.pending_audio_work === true;
     if (ageMs > SPEECH_PLAYBACK_ABSOLUTE_STALE_MS) return null;
     if (ageMs > SPEECH_PLAYBACK_STALE_MS && remainingSeconds <= 0.5) return null;
     const speechId = boundedSpeechString(raw.speechId || raw.speech_id, 'speech playback id', 128);
@@ -1532,7 +1533,7 @@
       ? Math.max(0, Math.min(9, Number(priorityValue)))
       : null;
     return Object.freeze({
-      active: raw.active === true && remainingSeconds > 0.05,
+      active: raw.active === true && (remainingSeconds > 0.05 || pendingAudioWork),
       speechId,
       turnId: boundedSpeechString(raw.turnId || raw.turn_id, 'speech turn id', 128),
       playbackTurnId: boundedSpeechString(
@@ -1541,7 +1542,7 @@
         128,
       ),
       remainingSeconds,
-      pendingAudioWork: raw.pendingAudioWork === true || raw.pending_audio_work === true,
+      pendingAudioWork,
       audioContextState,
       audioContextTime: safeSpeechPlaybackNumber(
         raw.audioContextTime || raw.audio_context_time,

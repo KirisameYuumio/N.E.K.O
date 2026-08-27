@@ -6,6 +6,16 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function settleWithin(promise, timeoutMs, message) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 async function main() {
   const listeners = new Map();
   const frames = new Map();
@@ -48,6 +58,8 @@ async function main() {
           viewport,
           models: [],
           resizes: [],
+          resizeAttempts: [],
+          failNextResize: false,
           disposed: 0,
         };
         controllerStates.push(state);
@@ -59,6 +71,11 @@ async function main() {
           resume() { state.paused = false; },
           getState() { return { ready: state.models.length > 0 }; },
           async resize(viewport, fit, metadata) {
+            state.resizeAttempts.push({ viewport, fit, metadata });
+            if (state.failNextResize) {
+              state.failNextResize = false;
+              throw new Error('transient resize failure');
+            }
             state.viewport = viewport;
             state.resizes.push({ viewport, fit, metadata });
           },
@@ -125,6 +142,20 @@ async function main() {
   await new Promise((resolve) => setImmediate(resolve));
   assert(controllerStates[1].resizes.at(-1).viewport.width === 500,
     'container resize was not delivered');
+  controllerStates[1].failNextResize = true;
+  containers.container.clientWidth = 550;
+  observers[0].trigger();
+  for (const [id, callback] of Array.from(frames)) { frames.delete(id); callback(); }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(container.getState().viewport.width === 500,
+    'failed resize committed an unrendered viewport');
+  const attemptsAfterFailure = controllerStates[1].resizeAttempts.length;
+  observers[0].trigger();
+  for (const [id, callback] of Array.from(frames)) { frames.delete(id); callback(); }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(controllerStates[1].resizeAttempts.length === attemptsAfterFailure + 1
+    && container.getState().viewport.width === 550,
+    'same-size retry was skipped after a transient resize failure');
 
   const hostOne = await host.mount({
     ...base,
@@ -258,7 +289,11 @@ async function main() {
   }).then(() => null, (error) => error);
   await new Promise((resolve) => setImmediate(resolve));
   stalledModelHost.dispose();
-  const stalledMountError = await stalledMount;
+  const stalledMountError = await settleWithin(
+    stalledMount,
+    1000,
+    'initial model cancellation left mount pending',
+  );
   assert(stalledMountError?.code === 'disposed',
     'host disposal did not settle an initial model load that ignored cancellation');
   assert(stalledModelHost.pendingCount === 0 && stalledRawDisposed === 1,
@@ -266,6 +301,52 @@ async function main() {
   releaseInitialModel();
   await new Promise((resolve) => setImmediate(resolve));
   assert(stalledRawDisposed === 1, 'late initial model completion disposed the raw controller twice');
+
+  let releaseInitialResize;
+  const initialResizeGate = new Promise((resolve) => { releaseInitialResize = resolve; });
+  let stalledResizeRawDisposed = 0;
+  const stalledResizeHost = windowMock.NekoMiniGameAvatarHost.create({
+    slots: {
+      stalledresize: {
+        container: { clientWidth: 200, clientHeight: 300 },
+        async createController() {
+          return {
+            async setModel() {},
+            focus() {},
+            setEmotion() {},
+            pause() {},
+            resume() {},
+            getState() { return {}; },
+            async resize() { await initialResizeGate; },
+            dispose() { stalledResizeRawDisposed += 1; },
+          };
+        },
+      },
+    },
+    windowImpl: windowMock,
+    documentImpl: {},
+    ResizeObserverImpl: ResizeObserverMock,
+  });
+  const stalledResizeMount = stalledResizeHost.mount({
+    ...base,
+    slot: 'stalledresize',
+    viewport: { mode: 'fixed', width: 200, height: 300 },
+    resize: { mode: 'fixed' },
+  }).then(() => null, (error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  stalledResizeHost.dispose();
+  const stalledResizeError = await settleWithin(
+    stalledResizeMount,
+    1000,
+    'initial resize cancellation left mount pending',
+  );
+  assert(stalledResizeError?.code === 'disposed',
+    'host disposal did not settle an initial resize that ignored cancellation');
+  assert(stalledResizeHost.pendingCount === 0 && stalledResizeRawDisposed === 1,
+    'cancelled initial resize did not release its pending slot and raw controller');
+  releaseInitialResize();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(stalledResizeRawDisposed === 1, 'late initial resize completion disposed the raw controller twice');
 
   let releaseBlockedModel;
   const blockedModelGate = new Promise((resolve) => { releaseBlockedModel = resolve; });
