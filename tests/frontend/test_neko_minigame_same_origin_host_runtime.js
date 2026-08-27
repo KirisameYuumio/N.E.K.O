@@ -134,6 +134,7 @@ async function main() {
       'example-game',
       'waiting-lock-game',
       'third-party-game',
+      'speech-only-game',
       'no-lock-game',
       'logger-one',
       'logger-two',
@@ -326,6 +327,9 @@ async function main() {
   const startResponse = await host.start({
     session_id: 'attacker-session',
     lanlan_name: 'Attacker Neko',
+    game_memory_archive_enabled: false,
+    soccerGameMemoryEnabled: false,
+    badminton_game_memory_event_reply_enabled: false,
   });
   const startData = await startResponse.clone().json();
   host.applyRouteState(startData.state);
@@ -334,6 +338,14 @@ async function main() {
     'route start trusted an application-supplied session id');
   assert(startCall.body.game_memory_enabled === true,
     'opening-screen memory consent was not attached to route start');
+  assert(startCall.body.game_memory_player_interaction_enabled === true
+    && startCall.body.game_memory_event_reply_enabled === true
+    && startCall.body.game_memory_archive_enabled === true
+    && startCall.body.game_memory_postgame_context_enabled === true,
+  'trusted host did not derive the complete memory policy from consent');
+  assert(!Object.hasOwn(startCall.body, 'soccerGameMemoryEnabled')
+    && !Object.hasOwn(startCall.body, 'badminton_game_memory_event_reply_enabled'),
+  'caller-controlled legacy memory aliases survived the trusted host boundary');
   assert(/^[a-f0-9]{48}$/.test(startCall.body.sdk_voice_control_credential || ''),
     'capability-granted route start did not carry its opaque voice credential');
   const ungrantedHost = createHost({
@@ -376,11 +388,62 @@ async function main() {
   assert(calls.length === callsBeforeDeniedCapabilities
     && windowMock.localStorage.getItem(`${ungrantedHost._gameStoragePrefix()}denied`) == null,
   'a denied direct host operation produced a fetch or storage side effect');
-  await ungrantedHost.start({ sdk_voice_control_credential: 'f'.repeat(48) });
+  await ungrantedHost.start({
+    sdk_voice_control_credential: 'f'.repeat(48),
+    gameMemoryEnabled: true,
+    game_archive_memory_enabled: true,
+    soccer_game_memory_enabled: true,
+    badmintonGameMemoryArchiveEnabled: true,
+  });
   const ungrantedStart = calls.filter((call) => call.url.endsWith('/route/start')).at(-1);
   assert(ungrantedStart.body.sdk_voice_control_credential === '',
     'an ungranted game smuggled its own voice credential into route start');
+  assert(ungrantedStart.body.game_memory_enabled === false
+    && ungrantedStart.body.game_memory_player_interaction_enabled === false
+    && ungrantedStart.body.game_memory_event_reply_enabled === false
+    && ungrantedStart.body.game_memory_archive_enabled === false
+    && ungrantedStart.body.game_memory_postgame_context_enabled === false,
+  'a game without memory grant overrode the host-owned memory policy');
+  assert(!Object.hasOwn(ungrantedStart.body, 'gameMemoryEnabled')
+    && !Object.hasOwn(ungrantedStart.body, 'game_archive_memory_enabled')
+    && !Object.hasOwn(ungrantedStart.body, 'soccer_game_memory_enabled')
+    && !Object.hasOwn(ungrantedStart.body, 'badmintonGameMemoryArchiveEnabled'),
+  'ungranted legacy memory aliases were forwarded to the backend');
+  await ungrantedHost.heartbeat({
+    game_memory_enabled: true,
+    soccer_game_memory_archive_enabled: true,
+  });
+  const ungrantedHeartbeat = calls.filter((call) => call.url.endsWith('/route/heartbeat')).at(-1);
+  assert(ungrantedHeartbeat.body.game_memory_enabled === false
+    && ungrantedHeartbeat.body.game_memory_archive_enabled === false
+    && !Object.hasOwn(ungrantedHeartbeat.body, 'soccer_game_memory_archive_enabled'),
+  'a heartbeat bypassed the host-owned memory opt-out policy');
   ungrantedHost.dispose();
+
+  const speechOnlyHost = createHost({
+    gameType: 'speech-only-game',
+    sessionId: 'speech-only-session',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  const speechOnlyHandshake = speechOnlyHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'speech-only-game',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging', 'speech-output'],
+      optionalCapabilities: [],
+    },
+  });
+  assert(speechOnlyHandshake.grantedCapabilities.includes('speech-output')
+    && !speechOnlyHandshake.grantedCapabilities.includes('dialogue'),
+  'speech-only fixture unexpectedly received dialogue');
+  await speechOnlyHost.mirrorSpeechOutput({ line: 'speech-only mirror' });
+  const speechOnlyMirror = calls.filter((call) => call.url.endsWith('/mirror-assistant')).at(-1);
+  assert(speechOnlyMirror.body.line === 'speech-only mirror',
+    'speech-output mirroring was incorrectly gated by dialogue');
+  speechOnlyHost.dispose();
 
   const disconnectedHost = createHost({
     gameType: 'third-party-game',

@@ -119,6 +119,9 @@ async def _push_game_window_state_change(
         )
 
 
+_GAME_ROUTE_SPEECH_CANCEL_PUSH_TIMEOUT_SECONDS = 2.0
+
+
 async def _push_game_speech_cancel(
     mgr,
     *,
@@ -148,7 +151,10 @@ async def _push_game_speech_cancel(
         client_state = getattr(ws, "client_state", None)
         if client_state is not None and client_state != client_state.CONNECTED:
             return
-        await ws.send_json(payload)
+        await asyncio.wait_for(
+            ws.send_json(payload),
+            timeout=_GAME_ROUTE_SPEECH_CANCEL_PUSH_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         logger.warning(
             "game_route_speech_cancel WS push failed (game=%s, session=%s, lanlan=%s): %s",

@@ -48,6 +48,27 @@
   const HOST_LAUNCH_REGISTRY_LIMIT = 64;
   const HOST_REGISTRATION_CAPABILITY_LIMIT = 32;
   const GLOBAL_CONSOLE_CAPTURE_REGISTRIES = new WeakMap();
+  const MEMORY_POLICY_PAYLOAD_KEYS = Object.freeze([
+    'game_memory_enabled', 'gameMemoryEnabled', 'memoryEnabled', 'enableGameMemory',
+    'game_player_interaction_memory_enabled', 'gamePlayerInteractionMemoryEnabled',
+    'game_memory_player_interaction_enabled', 'gameMemoryPlayerInteractionEnabled',
+    'game_event_reply_memory_enabled', 'gameEventReplyMemoryEnabled',
+    'game_memory_event_reply_enabled', 'gameMemoryEventReplyEnabled',
+    'game_archive_memory_enabled', 'gameArchiveMemoryEnabled',
+    'game_memory_archive_enabled', 'gameMemoryArchiveEnabled',
+    'game_postgame_context_memory_enabled', 'gamePostgameContextMemoryEnabled',
+    'game_memory_postgame_context_enabled', 'gameMemoryPostgameContextEnabled',
+    'soccer_game_memory_enabled', 'soccerGameMemoryEnabled',
+    'soccer_game_memory_player_interaction_enabled', 'soccerGameMemoryPlayerInteractionEnabled',
+    'soccer_game_memory_event_reply_enabled', 'soccerGameMemoryEventReplyEnabled',
+    'soccer_game_memory_archive_enabled', 'soccerGameMemoryArchiveEnabled',
+    'soccer_game_memory_postgame_context_enabled', 'soccerGameMemoryPostgameContextEnabled',
+    'badminton_game_memory_enabled', 'badmintonGameMemoryEnabled',
+    'badminton_game_memory_player_interaction_enabled', 'badmintonGameMemoryPlayerInteractionEnabled',
+    'badminton_game_memory_event_reply_enabled', 'badmintonGameMemoryEventReplyEnabled',
+    'badminton_game_memory_archive_enabled', 'badmintonGameMemoryArchiveEnabled',
+    'badminton_game_memory_postgame_context_enabled', 'badmintonGameMemoryPostgameContextEnabled',
+  ]);
 
   class NekoMiniGameHostError extends Error {
     constructor(code, message, details = {}) {
@@ -812,10 +833,21 @@
       const source = payload && typeof payload === 'object' && !Array.isArray(payload)
         ? payload
         : {};
+      const trusted = { ...source };
+      for (const key of MEMORY_POLICY_PAYLOAD_KEYS) delete trusted[key];
+      const memoryEnabled = (
+        this._grantedCapabilities.has('memory')
+        && this._memoryConsentEnabled === true
+      );
       return {
-        ...source,
+        ...trusted,
         session_id: this.sessionId,
         ...(this.routeLanlanName ? { lanlan_name: this.routeLanlanName } : {}),
+        game_memory_enabled: memoryEnabled,
+        game_memory_player_interaction_enabled: memoryEnabled,
+        game_memory_event_reply_enabled: memoryEnabled,
+        game_memory_archive_enabled: memoryEnabled,
+        game_memory_postgame_context_enabled: memoryEnabled,
       };
     }
 
@@ -908,7 +940,6 @@
       this._requireGrantedCapability('runtime', 'route_start');
       return this._post(this._gameEndpoint('route/start'), {
         ...this._trustedRuntimePayload(payload),
-        game_memory_enabled: this._memoryConsentEnabled,
         sdk_voice_control_credential: (
           this._grantedCapabilities.has('voice-input')
             ? this._voiceControlCredential
@@ -1129,7 +1160,11 @@
 
     mirrorSpeechOutput(payload, options = {}) {
       this._requireGrantedCapability('speech-output', 'speech_mirror');
-      return this.mirrorAssistant(payload, options);
+      return this._post(this._gameEndpoint('mirror-assistant'), this._trustedRuntimePayload(payload), {
+        timeoutMs: 15000,
+        operation: 'speech_mirror',
+        ...options,
+      });
     }
 
     preloadSpeechOutput(payload, options = {}) {

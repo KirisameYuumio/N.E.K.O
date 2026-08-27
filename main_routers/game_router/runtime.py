@@ -546,14 +546,20 @@ def _sdk_bounded_json_copy(value: Any, *, field: str, maximum_bytes: int) -> Any
 
 def _sdk_route_instance_error(state: dict | None, data: dict) -> dict | None:
     """Reject stale SDK capabilities once a route has a generation identity."""
+    actual = str(data.get("sdk_route_instance_id") or "").strip()
     if not isinstance(state, dict):
-        return None
+        if not actual:
+            return None
+        return {
+            "ok": False,
+            "reason": "route_instance_id_mismatch",
+            "state": _public_route_state(None),
+        }
     expected = str(state.get("_sdk_route_instance_id") or "").strip()
     if not expected:
         # Routes opened by legacy callers predate generation binding and retain
         # their historical session-only compatibility.
         return None
-    actual = str(data.get("sdk_route_instance_id") or "").strip()
     if actual == expected:
         return None
     return {
@@ -2864,7 +2870,7 @@ async def game_project_speak(game_type: str, request: Request):
                     speech_task = asyncio.current_task()
                     speech_correlation_id = str(
                         data.get("sdk_speech_correlation_id") or ""
-                    )[:128]
+                    ).strip()[:128]
                     state["_sdk_active_speech_task"] = speech_task
                     if speech_correlation_id:
                         state["_sdk_active_speech_correlation_id"] = (

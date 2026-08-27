@@ -44,6 +44,33 @@ def test_game_route_speech_cancel_is_scoped_to_the_sdk_correlation_id():
     assert "applyUserActivityCancel(" in block
 
 
+def test_reconnect_route_snapshot_cannot_overwrite_a_newer_websocket_route_event():
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    state_source = APP_STATE_PATH.read_text(encoding="utf-8")
+    reconnect_block = _block_after(
+        source,
+        "function syncGameWindowStateOnWsConnect() {",
+    )
+
+    assert "gameRouteStateRevision: 0" in state_source
+    assert "var reconciliationGeneration = _gameRouteReconciliationGeneration;" in reconnect_block
+    assert "var routeRevisionAtRequest = gameRouteStateRevision();" in reconnect_block
+    assert (
+        "reconciliationGeneration !== _gameRouteReconciliationGeneration"
+        in reconnect_block
+    )
+    assert (
+        "gameRouteStateRevision() !== routeRevisionAtRequest"
+        in reconnect_block
+    )
+    assert reconnect_block.index(
+        "gameRouteStateRevision() !== routeRevisionAtRequest"
+    ) < reconnect_block.index(
+        "window.dispatchEvent(new CustomEvent('neko-game-window-state-change'"
+    )
+    assert source.count("advanceGameRouteStateRevision();") >= 3
+
+
 def _block_after(js: str, opener: str) -> str:
     """Return the brace-balanced body that follows ``opener``.
 

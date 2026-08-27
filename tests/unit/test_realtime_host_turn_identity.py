@@ -52,6 +52,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -221,18 +222,26 @@ async def test_server_vad_binds_route_captured_at_speech_onset_before_audio_proc
     async def on_transcript_with_route(text, *, source_game_route_identity):
         delivered.append((text, source_game_route_identity))
 
-    async def blocked_audio_processing(_chunk):
+    async def blocked_audio_processing(chunk):
         processing_started.set()
         await processing_release.wait()
-        return b""
+        return chunk
+
+    async def discard_event(_event):
+        return None
 
     client = _free_client(
         None,
         on_input_transcript_with_route=on_transcript_with_route,
         get_input_route_identity=lambda: current_route[0],
     )
-    client._audio_processor = object()
+    client._audio_processor = SimpleNamespace(
+        noise_reduce_enabled=True,
+        _denoiser=object(),
+        speech_probability=1.0,
+    )
     client.process_audio_chunk_async = blocked_audio_processing
+    client.send_event = discard_event
 
     loud_frame = (1000).to_bytes(2, "little", signed=True) * 480
     ingress = asyncio.create_task(client.stream_audio(loud_frame))
@@ -258,22 +267,108 @@ async def test_server_vad_does_not_capture_route_from_idle_silence():
     async def on_transcript_with_route(text, *, source_game_route_identity):
         delivered.append((text, source_game_route_identity))
 
-    async def discard_audio(_chunk):
-        return b""
+    async def passthrough_audio(chunk):
+        return chunk
+
+    async def discard_event(_event):
+        return None
 
     client = _free_client(
         None,
         on_input_transcript_with_route=on_transcript_with_route,
         get_input_route_identity=lambda: current_route[0],
     )
-    client._audio_processor = object()
-    client.process_audio_chunk_async = discard_audio
+    client._audio_processor = SimpleNamespace(
+        noise_reduce_enabled=True,
+        _denoiser=object(),
+        speech_probability=0.0,
+    )
+    client.process_audio_chunk_async = passthrough_audio
+    client.send_event = discard_event
 
     await client.stream_audio(bytes(960))
     assert client._input_route_identity_captured is False
 
     current_route[0] = ("example-game", "session-b", "route-b")
+    client._audio_processor.speech_probability = 1.0
     loud_frame = (1000).to_bytes(2, "little", signed=True) * 480
+    await client.stream_audio(loud_frame)
+    client._bind_input_route_identity_to_item("provider-item-b")
+    await client._deliver_input_transcript("hello", item_id="provider-item-b")
+
+    assert delivered == [
+        ("hello", ("example-game", "session-b", "route-b")),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_server_vad_without_local_onset_never_reads_the_event_time_route():
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def discard_event(_event):
+        return None
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._has_server_vad = True
+    client.send_event = discard_event
+
+    quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
+    await client.stream_audio(quiet_frame)
+    assert client._input_route_identity_captured is False
+
+    current_route[0] = ("example-game", "session-b", "route-b")
+    client._bind_input_route_identity_to_item("provider-item-old-audio")
+    await client._deliver_input_transcript(
+        "old audio",
+        item_id="provider-item-old-audio",
+    )
+
+    assert delivered == [("old audio", None)]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_rnnoise_rejects_a_loud_noise_frame_before_route_ownership_freezes():
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def passthrough_audio(chunk):
+        return chunk
+
+    async def discard_event(_event):
+        return None
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._audio_processor = SimpleNamespace(
+        noise_reduce_enabled=True,
+        _denoiser=object(),
+        speech_probability=0.0,
+    )
+    client.process_audio_chunk_async = passthrough_audio
+    client.send_event = discard_event
+    loud_frame = (1000).to_bytes(2, "little", signed=True) * 480
+
+    await client.stream_audio(loud_frame)
+    assert client._input_route_identity_captured is False
+
+    current_route[0] = ("example-game", "session-b", "route-b")
+    client._audio_processor.speech_probability = 1.0
     await client.stream_audio(loud_frame)
     client._bind_input_route_identity_to_item("provider-item-b")
     await client._deliver_input_transcript("hello", item_id="provider-item-b")

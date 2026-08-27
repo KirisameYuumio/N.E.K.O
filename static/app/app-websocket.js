@@ -37,6 +37,7 @@
     const CAPTURE_BRIDGE_REGION_IMAGE_MAX_CHARS = 9 * 1024 * 1024;
     let _pendingUserActivityCancelTimer = 0;
     let _pendingUserActivityCancelTurnId = null;
+    let _gameRouteReconciliationGeneration = 0;
     let _lanlanNameWaitAttempts = 0;
     let _lanlanNameWaitLastLogAt = 0;
     let _coreApiCapabilityRefreshPromise = null;
@@ -48,6 +49,16 @@
     let _musicPlayUrlCoordBeforeUnloadBound = false;
     let _musicPlayUrlBroadcastUnavailableWarned = false;
     const MUSIC_PLAY_URL_SENDER_ID = (Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
+
+    function gameRouteStateRevision() {
+        var revision = Number(S.gameRouteStateRevision);
+        return Number.isFinite(revision) ? (revision >>> 0) : 0;
+    }
+
+    function advanceGameRouteStateRevision() {
+        S.gameRouteStateRevision = (gameRouteStateRevision() + 1) >>> 0;
+        return S.gameRouteStateRevision;
+    }
 
     // ---- DOM element shortcuts (resolved lazily / once) ----
     function $id(id) { return document.getElementById(id); }
@@ -2369,10 +2380,22 @@
                     }
                 } catch (_) {}
                 if (!lan) return; // greeting 流水线还没解析角色 → 跳过本次，下次 onopen 再来
+                _gameRouteReconciliationGeneration = (
+                    _gameRouteReconciliationGeneration + 1
+                ) >>> 0;
+                var reconciliationGeneration = _gameRouteReconciliationGeneration;
+                var routeRevisionAtRequest = gameRouteStateRevision();
                 fetch('/api/game/route/active?lanlan_name=' + encodeURIComponent(lan))
                     .then(function (resp) { return resp && resp.ok ? resp.json() : null; })
                     .then(function (data) {
                         if (!data) return;
+                        if (
+                            reconciliationGeneration !== _gameRouteReconciliationGeneration
+                            || gameRouteStateRevision() !== routeRevisionAtRequest
+                        ) {
+                            console.log('[GameWindow] 忽略晚到的重连路由快照');
+                            return;
+                        }
                         var action = data.active ? 'opened' : 'closed';
                         try {
                             window.dispatchEvent(new CustomEvent('neko-game-window-state-change', {
@@ -3195,6 +3218,7 @@
                             console.log(`[GameVoiceSTT] 忽略过期的 GAME_ROUTE_ENDED | ended_route=${endedRouteInstanceId} current_route=${currentRouteInstanceId}`);
                             return;
                         }
+                        advanceGameRouteStateRevision();
                         S.gameRouteActive = false;
                         S.gameRouteGameType = '';
                         S.gameRouteLanlanName = '';
@@ -4829,6 +4853,7 @@
                         if (isStaleGameWindowEvent) {
                             console.log(`[GameWindow] 忽略过期窗口事件 | action=${detail.action} incoming=${incomingGameSessionId} current=${currentGameSessionId}`);
                         } else if (detail.action === 'opened') {
+                            advanceGameRouteStateRevision();
                             S.gameRouteActive = true;
                             S.gameRouteGameType = detail.gameType || '';
                             S.gameRouteLanlanName = detail.lanlanName || '';
@@ -4840,6 +4865,7 @@
                                 window.stopProactiveChatSchedule();
                             }
                         } else if (detail.action === 'closed') {
+                            advanceGameRouteStateRevision();
                             var wasGameRouteActive = !!S.gameRouteActive;
                             S.gameRouteActive = false;
                             S.gameRouteGameType = '';

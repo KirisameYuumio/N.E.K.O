@@ -150,12 +150,18 @@ class _TransportMixin:
         return identity
 
     def _capture_input_route_identity(self) -> None:
-        """Snapshot the route owning the first locally detected speech frame."""
+        """Compatibility helper that snapshots the current route immediately."""
+        self._capture_input_route_identity_snapshot(
+            self._read_input_route_identity()
+        )
+
+    def _capture_input_route_identity_snapshot(self, identity) -> None:
+        """Commit the ingress snapshot owning the first confirmed speech frame."""
         if self._input_route_identity_captured or bool(
             getattr(self, "_audio_in_buffer", False)
         ):
             return
-        self._input_route_identity = self._read_input_route_identity()
+        self._input_route_identity = identity
         self._input_route_identity_captured = True
 
     def _remember_input_route_identity(self, item_id: object = None) -> None:
@@ -177,10 +183,14 @@ class _TransportMixin:
         item_key = str(item_id or "").strip()
         if not item_key:
             return
+        # The server event can arrive after the active route changes. Without a
+        # locally confirmed ingress snapshot, binding the event-time route would
+        # attribute old microphone audio to a newer game. Preserve explicit None
+        # so the routed transcript is safely rejected instead.
         identity = (
             self._input_route_identity
             if self._input_route_identity_captured
-            else self._read_input_route_identity()
+            else None
         )
         identities = self._input_route_identity_by_item
         identities.pop(item_key, None)
@@ -688,13 +698,13 @@ class _TransportMixin:
 
         current_time = time.time()
         # 本地音量判定：用原始输入做 RMS，避免 VAD 延迟时误清 buffer
+        ingress_route_identity = self._read_input_route_identity()
         raw_samples = np.frombuffer(audio_chunk, dtype=np.int16)
+        raw_loud = False
         if len(raw_samples) > 0:
             local_rms = np.sqrt(np.mean(raw_samples.astype(np.float32) ** 2))
             if local_rms > self._client_vad_threshold:
-                # Capture on the first actual speech onset, before RNNoise or
-                # any other await. Idle silence must not pin an obsolete route.
-                self._capture_input_route_identity()
+                raw_loud = True
                 self._last_local_loud_time = current_time
 
         # Detect input sample rate based on chunk size
@@ -730,6 +740,16 @@ class _TransportMixin:
             and audio_processor._denoiser is not None
         )
         self._rnnoise_vad_active = _rnnoise_vad_live
+        if _rnnoise_vad_live:
+            if audio_processor.speech_probability > 0.4:
+                self._capture_input_route_identity_snapshot(
+                    ingress_route_identity
+                )
+        elif raw_loud:
+            # RMS is the only local onset signal for 16 kHz/mobile input or
+            # when RNNoise is unavailable. Commit the pre-await ingress owner,
+            # never the route that happens to be active after processing.
+            self._capture_input_route_identity_snapshot(ingress_route_identity)
         if not self._has_server_vad:
             if _rnnoise_vad_live:
                 # Priority 2: RNNoise speech probability with sustained threshold

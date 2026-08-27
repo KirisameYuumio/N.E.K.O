@@ -525,6 +525,51 @@ async def test_game_speech_cancel_carries_exact_route_and_correlation_identity()
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_game_speech_cancel_push_has_a_hard_timeout(monkeypatch):
+    send_cancelled = False
+
+    class ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    async def stalled_send(_payload):
+        nonlocal send_cancelled
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            send_cancelled = True
+            raise
+
+    websocket = SimpleNamespace(
+        client_state=ConnectedState(),
+        send_json=stalled_send,
+    )
+    manager = SimpleNamespace(websocket=websocket)
+    monkeypatch.setattr(
+        gr_route_lifecycle,
+        "_GAME_ROUTE_SPEECH_CANCEL_PUSH_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    await asyncio.wait_for(
+        gr_route_lifecycle._push_game_speech_cancel(
+            manager,
+            lanlan_name="Lan",
+            game_type="neutral-sdk-game",
+            session_id="session-1",
+            route_instance_id="route-instance-b",
+            speech_correlation_id="speech-correlation-b",
+        ),
+        timeout=0.2,
+    )
+
+    assert send_cancelled is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_route_speech_cleanup_releases_browser_audio_after_backend_task_done(
     monkeypatch,
 ):
@@ -6256,7 +6301,7 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
                 "session_id": "match_1",
                 "request_id": "req-2",
                 "render_language": "ja",
-                "sdk_speech_correlation_id": "sdk-correlation-1",
+                "sdk_speech_correlation_id": "  sdk-correlation-1  ",
             }),
         )
 
@@ -6490,6 +6535,29 @@ async def test_project_speech_preload_allows_a_new_preroute_after_completed_gene
 
     assert result["ok"] is True
     assert mgr.preloaded == [["next round preload"]]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speech_preload_rejects_old_generation_without_active_route(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        result = await gr_runtime.game_project_speech_preload(
+            "example-game",
+            _FakeRequest({
+                "lines": ["late route A preload"],
+                "session_id": "reused-session",
+                "sdk_route_instance_id": "route-A",
+            }),
+        )
+
+    assert result["ok"] is False
+    assert result["reason"] == "route_instance_id_mismatch"
+    assert result["method"] == "project_tts_preload"
+    assert mgr.preloaded == []
 
 
 @pytest.mark.unit
