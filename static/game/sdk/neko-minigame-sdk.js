@@ -2016,6 +2016,14 @@
       });
     }
 
+    function runtimeCapabilityPayload(payload) {
+      const routeInstanceId = String(runtimeRouteInstanceId || '').trim();
+      return Object.freeze({
+        ...(payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}),
+        ...(routeInstanceId ? { sdk_route_instance_id: routeInstanceId } : {}),
+      });
+    }
+
     function stopHeartbeatLifecycle() {
       if (heartbeatLifecycle.timer != null) {
         windowImpl.clearInterval?.(heartbeatLifecycle.timer);
@@ -2148,7 +2156,7 @@
       heartbeatLifecycle.startedAt = Date.now();
       try {
         const response = await normalizeTransportResponse(await transport.heartbeat(
-          runtimePayload(),
+          runtimeCapabilityPayload(runtimePayload()),
           {
             signal: controller.signal,
             timeoutMs: runtimeConfig.heartbeat.timeoutMs,
@@ -2209,10 +2217,10 @@
       outputLifecycle.inFlight = true;
       try {
         const response = await normalizeTransportResponse(await transport.drain(
-          {
+          runtimeCapabilityPayload({
             ...runtimePayload(),
             limit: runtimeConfig.outputs.limit,
-          },
+          }),
           {
             signal: controller.signal,
             timeoutMs: runtimeConfig.outputs.timeoutMs,
@@ -2579,7 +2587,7 @@
         externalSignal.addEventListener('abort', entry.externalAbortHandler, { once: true });
       }
       gameProtocolSequence = (gameProtocolSequence % Number.MAX_SAFE_INTEGER) + 1;
-      const envelope = Object.freeze({
+      const envelope = runtimeCapabilityPayload({
         protocolVersion: SDK_PROTOCOL_VERSION,
         sequence: gameProtocolSequence,
         kind,
@@ -3112,7 +3120,7 @@
           limit: MAX_CONTEXT_PENDING_REQUESTS,
           timeoutMs: 15000,
           requestOptions,
-          invoke: (options) => transport.readGameContext(Object.freeze({
+          invoke: (options) => transport.readGameContext(runtimeCapabilityPayload({
             scopes,
             session_id: session.id,
           }), options),
@@ -3187,7 +3195,7 @@
           limit: MAX_MEMORY_PENDING_REQUESTS,
           timeoutMs: 15000,
           requestOptions,
-          invoke: (options) => transport.submitGameMemory(Object.freeze({
+          invoke: (options) => transport.submitGameMemory(runtimeCapabilityPayload({
             session_id: runtimeSession().id,
             submission,
           }), options),
@@ -3815,7 +3823,7 @@
         assertNoForbiddenDialogueFields(payload);
         const boundedPayload = normalizeBoundedJson(payload, 'quick lines payload');
         const session = runtimeSession();
-        const trustedPayload = Object.freeze({
+        const trustedPayload = runtimeCapabilityPayload({
           ...boundedPayload,
           session_id: session.id,
           ...(session.characterName ? { lanlan_name: session.characterName } : {}),
@@ -3848,7 +3856,7 @@
           ...(authorPrompt ? { prompt: authorPrompt } : {}),
         }, 'dialogue payload');
         const session = runtimeSession();
-        const trustedPayload = Object.freeze({
+        const trustedPayload = runtimeCapabilityPayload({
           ...boundedPayload,
           session_id: session.id,
           ...(session.characterName ? { lanlan_name: session.characterName } : {}),
@@ -4012,7 +4020,7 @@
           requestOptions,
           invoke: (options) => {
             correlationId = beginSpeechCorrelation(speechMetadata);
-            return transport.requestSpeechOutput(Object.freeze({
+            return transport.requestSpeechOutput(runtimeCapabilityPayload({
               ...payload,
               sdk_speech_correlation_id: correlationId,
             }), options);
@@ -4054,7 +4062,7 @@
       }
       const request = normalizeSpeechMirrorRequest(requestInput);
       const session = runtimeSession();
-      const payload = Object.freeze({
+      const payload = runtimeCapabilityPayload({
         line: request.text,
         source: request.source,
         session_id: session.id,

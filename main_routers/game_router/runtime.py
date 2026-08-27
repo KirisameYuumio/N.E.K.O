@@ -490,6 +490,25 @@ def _sdk_bounded_json_copy(value: Any, *, field: str, maximum_bytes: int) -> Any
     return json.loads(encoded.decode("utf-8"))
 
 
+def _sdk_route_instance_error(state: dict | None, data: dict) -> dict | None:
+    """Reject stale SDK capabilities once a route has a generation identity."""
+    if not isinstance(state, dict):
+        return None
+    expected = str(state.get("_sdk_route_instance_id") or "").strip()
+    if not expected:
+        # Routes opened by legacy callers predate generation binding and retain
+        # their historical session-only compatibility.
+        return None
+    actual = str(data.get("sdk_route_instance_id") or "").strip()
+    if actual == expected:
+        return None
+    return {
+        "ok": False,
+        "reason": "route_instance_id_mismatch",
+        "state": _public_route_state(state),
+    }
+
+
 def _sdk_active_route_from_payload(game_type: str, data: dict) -> tuple[str, str, dict | None, dict | None]:
     lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
     session_id = str(data.get("session_id") or data.get("sessionId") or "").strip()
@@ -508,6 +527,9 @@ def _sdk_active_route_from_payload(game_type: str, data: dict) -> tuple[str, str
             "reason": "session_id_mismatch",
             "state": _public_route_state(state),
         }
+    route_instance_error = _sdk_route_instance_error(state, data)
+    if route_instance_error is not None:
+        return lanlan_name, session_id, state, route_instance_error
     return lanlan_name, session_id, state, None
 
 
@@ -693,6 +715,7 @@ async def _run_game_chat(
     session_id: str,
     event: Any,
     *,
+    lanlan_name: str = "",
     allow_postgame: bool = False,
     postgame_snapshot: Optional[dict] = None,
     postgame_meta_out: Optional[Dict[str, Any]] = None,
@@ -732,9 +755,13 @@ async def _run_game_chat(
 
     if not event and normalized_author_prompt is None:
         return {"error": "缺少 event 字段", "line": "", "control": {}}
-    lanlan_name = ""
+    lanlan_name = str(lanlan_name or "").strip()
     if isinstance(event, dict):
-        lanlan_name = str(event.get("lanlan_name") or event.get("lanlanName") or "").strip()
+        event_lanlan_name = str(
+            event.get("lanlan_name") or event.get("lanlanName") or ""
+        ).strip()
+        if event_lanlan_name:
+            lanlan_name = event_lanlan_name
     _append_game_session_debug_log(
         game_type,
         session_id,
@@ -1336,6 +1363,17 @@ async def game_chat(game_type: str, request: Request):
             "lanlan_name": lanlan_name,
             "method": "game_chat",
         }
+    route_instance_error = _sdk_route_instance_error(state, data)
+    if route_instance_error is not None:
+        return {
+            **route_instance_error,
+            "skipped": "stale_route_instance",
+            "handled": False,
+            "line": "",
+            "control": {},
+            "lanlan_name": lanlan_name,
+            "method": "game_chat",
+        }
     if state and state.get("session_id") == session_id:
         _update_game_memory_enabled_from_payload(state, data, game_type=game_type)
         if isinstance(event, dict):
@@ -1376,7 +1414,10 @@ async def game_chat(game_type: str, request: Request):
     if isinstance(event, dict) and lanlan_name:
         event = dict(event)
         event.setdefault("lanlan_name", lanlan_name)
-    run_options: Dict[str, Any] = {"prompt_locale": prompt_locale}
+    run_options: Dict[str, Any] = {
+        "prompt_locale": prompt_locale,
+        "lanlan_name": lanlan_name,
+    }
     if author_prompt is not None:
         run_options["author_prompt"] = author_prompt
     result = await _run_game_chat(game_type, session_id, event, **run_options)
@@ -1600,6 +1641,20 @@ async def game_route_start(game_type: str, request: Request):
             if _is_badminton_game_type(game_type):
                 state["mode"] = _normalize_badminton_mode(data.get("mode"))
             _update_route_start_state_from_payload(state, data)
+
+    def route_start_is_current() -> bool:
+        current_state = _get_active_game_route_state(lanlan_name, game_type)
+        if (
+            current_state is not state
+            or state.get("game_route_active") is not True
+            or str(state.get("session_id") or "") != session_id
+        ):
+            return False
+        if route_instance_id and (
+            str(state.get("_sdk_route_instance_id") or "") != route_instance_id
+        ):
+            return False
+        return True
     # 推 WS 让多窗口前端联动收缩 chat.html（触发其内部 collapse 按钮态 + 移
     # 至工作区左下角）+ 隐藏 pet (live2d/vrm/mmd) 容器。这只是 UX 联动事件，
     # 不参与 game-route 状态判定；前端在 game_window_state_change=closed 时
@@ -1614,10 +1669,7 @@ async def game_route_start(game_type: str, request: Request):
     # session_id 双重匹配（防 state 字典里同 (lanlan,game_type) key 已被新一轮
     # supersede 替换为新 state）。
     mgr_for_ws = get_session_manager().get(lanlan_name)
-    if (
-        state.get("game_route_active")
-        and str(state.get("session_id") or "") == session_id
-    ):
+    if route_start_is_current():
         await _push_game_window_state_change(
             mgr_for_ws,
             action="opened",
@@ -1670,30 +1722,49 @@ async def game_route_start(game_type: str, request: Request):
             else:
                 context = _default_soccer_pregame_context()
             source, error = "fallback", "ai_failed"
-        now = time.time()
-        state["preGameContext"] = context
-        state["pre_game_context_source"] = source
-        state["pre_game_context_error"] = error
-        state["heartbeat_enabled"] = True
-        state["last_heartbeat_at"] = now
-        state["last_activity"] = now
-        _append_game_session_debug_log(
-            game_type,
-            session_id,
-            lanlan_name=lanlan_name,
-            category="route",
-            event="route_start_completed",
-            message="小游戏路由开始完成",
-            details={
-                "pre_game_context_source": source,
-                "pre_game_context_error": error,
-                "before_game_external_mode": state.get("before_game_external_mode"),
-                "before_game_external_active": state.get("before_game_external_active"),
-                "heartbeat_enabled": state.get("heartbeat_enabled"),
-            },
-        )
+        async with route_lock:
+            if not route_start_is_current():
+                return {
+                    "ok": True,
+                    "reason": "superseded",
+                    "state": {"game_route_active": False},
+                }
+            now = time.time()
+            state["preGameContext"] = context
+            state["pre_game_context_source"] = source
+            state["pre_game_context_error"] = error
+            state["heartbeat_enabled"] = True
+            state["last_heartbeat_at"] = now
+            state["last_activity"] = now
+            _append_game_session_debug_log(
+                game_type,
+                session_id,
+                lanlan_name=lanlan_name,
+                category="route",
+                event="route_start_completed",
+                message="小游戏路由开始完成",
+                details={
+                    "pre_game_context_source": source,
+                    "pre_game_context_error": error,
+                    "before_game_external_mode": state.get("before_game_external_mode"),
+                    "before_game_external_active": state.get("before_game_external_active"),
+                    "heartbeat_enabled": state.get("heartbeat_enabled"),
+                },
+            )
+    else:
+        async with route_lock:
+            if not route_start_is_current():
+                return {
+                    "ok": True,
+                    "reason": "superseded",
+                    "state": {"game_route_active": False},
+                }
     if state.get("before_game_external_mode") == "audio" and state.get("before_game_external_active"):
-        await route_external_stream_message(lanlan_name, {"input_type": "audio"})
+        await route_external_stream_message(
+            lanlan_name,
+            {"input_type": "audio"},
+            expected_state=state,
+        )
     if not (game_type == "soccer" or _is_badminton_game_type(game_type)):
         _append_game_session_debug_log(
             game_type,
@@ -1755,6 +1826,9 @@ async def game_route_drain(game_type: str, request: Request):
     session_id = str(data.get("session_id") or "")
     if session_id and session_id != str(state.get("session_id") or ""):
         return {"ok": True, "outputs": [], "state": _public_route_state(state)}
+    route_instance_error = _sdk_route_instance_error(state, data)
+    if route_instance_error is not None:
+        return {**route_instance_error, "outputs": []}
 
     _absorb_request_language(data, lanlan_name)
     _update_game_route_language_from_payload(state, data)
@@ -2149,6 +2223,9 @@ async def game_route_heartbeat(game_type: str, request: Request):
     session_id = str(data.get("session_id") or "")
     if session_id and session_id != str(state.get("session_id") or ""):
         return {"ok": True, "active": False, "reason": "session_id_mismatch", "state": _public_route_state(state)}
+    route_instance_error = _sdk_route_instance_error(state, data)
+    if route_instance_error is not None:
+        return {**route_instance_error, "active": False}
 
     _absorb_request_language(data, lanlan_name)
     _update_game_route_language_from_payload(state, data)
@@ -3159,10 +3236,15 @@ async def finalize_game_routes_for_character(old_lanlan_name: str) -> int:
     return finalized_count
 
 
-async def route_external_stream_message(lanlan_name: str, message: dict) -> bool:
+async def route_external_stream_message(
+    lanlan_name: str,
+    message: dict,
+    *,
+    expected_state: dict | None = None,
+) -> bool:
     """Return True when a main WebSocket stream_data message was consumed by game routing."""
     state = _get_active_game_route_state(lanlan_name)
-    if not state:
+    if not state or (expected_state is not None and state is not expected_state):
         return False
 
     mgr = get_session_manager().get(lanlan_name)

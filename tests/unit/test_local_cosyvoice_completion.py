@@ -25,6 +25,7 @@ class _ClosingSocket:
             self._has_text = True
         if data.get("event") == "end":
             self._end.set()
+            await asyncio.sleep(0)
 
     async def close(self):
         self._end.set()
@@ -59,7 +60,11 @@ def test_local_cosyvoice_emits_completion_only_after_armed_normal_close(monkeypa
         ),
     )
     monkeypatch.setattr(worker_module.websockets, "connect", connect)
-    monkeypatch.setattr(worker_module, "_resample_audio", lambda *_args: b"resampled")
+    monkeypatch.setattr(
+        worker_module,
+        "_resample_audio",
+        lambda *_args, **kwargs: b"tail" if kwargs.get("last") else b"resampled",
+    )
     monkeypatch.setattr(worker_module, "_record_tts_telemetry", lambda *_args: None)
 
     requests = queue.Queue()
@@ -78,9 +83,10 @@ def test_local_cosyvoice_emits_completion_only_after_armed_normal_close(monkeypa
             responses.get(timeout=0.05)
 
         requests.put((None, None))
-        observed = [responses.get(timeout=1), responses.get(timeout=1)]
+        observed = [responses.get(timeout=1), responses.get(timeout=1), responses.get(timeout=1)]
         assert observed == [
             ("__audio__", "speech-1", b"resampled"),
+            ("__audio__", "speech-1", b"tail"),
             ("__audio_done__", "speech-1"),
         ]
         assert sockets[-1].sent[-1] == {"event": "end"}

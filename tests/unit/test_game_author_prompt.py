@@ -245,6 +245,7 @@ async def test_game_chat_endpoint_accepts_author_prompt_without_game_event(monke
             return {
                 "session_id": "round-1",
                 "lanlan_name": "Test Neko",
+                "event": None,
                 "prompt": _prompt([{"role": "user", "content": "reply to this"}]),
             }
 
@@ -270,7 +271,8 @@ async def test_game_chat_endpoint_accepts_author_prompt_without_game_event(monke
     result = await runtime.game_chat("test-game", FakeRequest())
 
     assert result["line"] == "ok"
-    assert captured["event"] == {"lanlan_name": "Test Neko"}
+    assert captured["event"] is None
+    assert captured["kwargs"]["lanlan_name"] == "Test Neko"
     assert captured["kwargs"]["author_prompt"]["mode"] == "author-managed"
 
 

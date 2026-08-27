@@ -1808,13 +1808,13 @@ class TurnMixin:
                     log_context="mirror cached speech",
                 )
             return {
-                "ok": True,
+                "ok": audio_sent,
                 "method": "project_tts_cache",
                 "cache_status": "hit",
                 "speech_id": turn_id,
                 "audio_sent": audio_sent,
                 "audio_queued": False,
-                "audio_completed": True,
+                "audio_completed": audio_sent,
                 "audio_completion_supported": True,
                 "turn_end_emitted": bool(emit_turn_end_after),
                 "interrupt_audio": bool(interrupt_audio),
@@ -1829,7 +1829,9 @@ class TurnMixin:
         await self.ensure_tts_pipeline_alive()
         audio_queued = False
         capture_started = False
-        completion_supported = True
+        completion_supported = bool(
+            getattr(self, "_tts_completion_supported", True)
+        )
         effective_wait_for_audio_completion = (
             wait_for_audio_completion and completion_supported
         )

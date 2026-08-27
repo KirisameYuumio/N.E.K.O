@@ -285,10 +285,17 @@ async function main() {
     'dialogue request was allowed before an active runtime route existed');
   const started = await game.runtime.start({ mode: 'default' });
   assert(started.data.payload.mode === 'default', 'runtime start did not use the host transport');
+  const routeInstanceId = started.data.payload.sdk_route_instance_id;
   const dialogue = await game.dialogue.request({ event: 'goal' });
   assert(dialogue.data.payload.event === 'goal', 'dialogue request did not use the host transport');
   assert(dialogue.data.payload.session_id === 'sdk-test-session',
     'dialogue request did not bind the trusted runtime session');
+  assert(dialogue.data.payload.sdk_route_instance_id === routeInstanceId,
+    'dialogue request was not bound to the active route generation');
+  await game.events.emit('round-started', { round: 2 });
+  assert(protocolMessages.at(-1).envelope.sdk_route_instance_id === routeInstanceId,
+    'game protocol message was not bound to the active route generation');
+  protocolMessages.pop();
   const quickLines = await game.dialogue.quickLines({ mode: 'duel' });
   assert(quickLines.data.lines.goal[0] === 'nice shot',
     'quick lines did not use the host transport');

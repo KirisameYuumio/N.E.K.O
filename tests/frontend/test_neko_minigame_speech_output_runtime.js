@@ -24,6 +24,7 @@ async function main() {
   let bridgeStarts = 0;
   let bridgeStops = 0;
   let transportDisposals = 0;
+  let lastStartPayload = null;
   let nextSpeechId = 1;
   let pendingMode = false;
   let ignoreSpeechAbortMode = false;
@@ -77,10 +78,13 @@ async function main() {
       sessionId: 'speech-session-1',
       characterName: '测试猫娘',
     }),
-    start: async () => ({
-      ok: true,
-      state: { game_route_active: true, session_id: 'speech-session-1', lanlan_name: '测试猫娘' },
-    }),
+    start: async (payload) => {
+      lastStartPayload = payload;
+      return {
+        ok: true,
+        state: { game_route_active: true, session_id: 'speech-session-1', lanlan_name: '测试猫娘' },
+      };
+    },
     heartbeat: async () => ({ ok: true, active: true }),
     drain: async () => ({ ok: true, outputs: [] }),
     end: async () => ({ ok: true }),
@@ -177,6 +181,7 @@ async function main() {
   assert(preStartSpeechError?.code === 'invalid_state' && speechCalls.length === 0,
     'speech output ran before the runtime route was accepted');
   await game.runtime.start({});
+  const routeInstanceId = lastStartPayload.sdk_route_instance_id;
   const response = await game.speech.speak({
     text: '  SDK 语音输出测试  ',
     requestId: 'request-1',
@@ -201,6 +206,8 @@ async function main() {
     'runtime session was not injected into the trusted speech request');
   assert(firstCall.payload.lanlan_name === '测试猫娘',
     'runtime character was not injected into the trusted speech request');
+  assert(firstCall.payload.sdk_route_instance_id === routeInstanceId,
+    'speech request was not bound to the active route generation');
   assert(firstCall.payload.playback_gain === 1.5, 'relative speech gain was not forwarded');
   assert(firstCall.payload.interrupt_audio === true, 'speech interrupt policy was not forwarded');
   assert(firstCall.payload.reuse_synthesized_audio === true,
@@ -232,6 +239,8 @@ async function main() {
   assert(mirrorCalls[0].payload.session_id === 'speech-session-1'
     && mirrorCalls[0].payload.lanlan_name === '测试猫娘',
   'text-only speech mirror did not inject the runtime session and character');
+  assert(mirrorCalls[0].payload.sdk_route_instance_id === routeInstanceId,
+    'speech mirror was not bound to the active route generation');
   assert(mirrorCalls[0].payload.request_id === 'mirror-request-1'
     && mirrorCalls[0].payload.turn_id === 'mirror-turn-1'
     && mirrorCalls[0].payload.finalize_turn === true,

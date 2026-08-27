@@ -963,6 +963,7 @@ class TtsRuntimeMixin:
         )
         if disabled:
             logger.info("TTS 已被用户禁用, 使用 dummy worker")
+        self._tts_completion_supported = tts_worker is not dummy_tts_worker
 
         # 根据实际选中的 TTS provider 类别决定是否启用流式文本规范化。
         # ws_bistream 类（qwen / step / cosyvoice）直接把文本碎片发给服务端处理，

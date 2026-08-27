@@ -409,6 +409,29 @@ def test_sdk_route_instance_candidates_are_deduplicated_and_bounded():
 
 
 @pytest.mark.unit
+def test_sdk_route_instance_binding_rejects_missing_and_stale_generations():
+    legacy_state = {"game_route_active": True, "session_id": "legacy"}
+    assert gr_runtime._sdk_route_instance_error(legacy_state, {}) is None
+
+    identified_state = {
+        "game_route_active": True,
+        "session_id": "identified",
+        "_sdk_route_instance_id": "route-B",
+    }
+    assert gr_runtime._sdk_route_instance_error(
+        identified_state,
+        {"sdk_route_instance_id": "route-B"},
+    ) is None
+    assert gr_runtime._sdk_route_instance_error(identified_state, {})["reason"] == (
+        "route_instance_id_mismatch"
+    )
+    assert gr_runtime._sdk_route_instance_error(
+        identified_state,
+        {"sdk_route_instance_id": "route-A"},
+    )["reason"] == "route_instance_id_mismatch"
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_delayed_old_route_end_does_not_close_reused_session_generation(monkeypatch):
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
@@ -3991,7 +4014,15 @@ async def test_game_chat_refreshes_matching_route_locale_with_live_precedence(mo
     manager = _LocaleTrackingManager()
     prompt_locales = []
 
-    async def fake_run_game_chat(_game_type, _session_id, _event, *, prompt_locale=None):
+    async def fake_run_game_chat(
+        _game_type,
+        _session_id,
+        _event,
+        *,
+        prompt_locale=None,
+        lanlan_name="",
+    ):
+        assert lanlan_name == "Lan"
         prompt_locales.append(prompt_locale)
         return {"line": "ok", "control": {}}
 

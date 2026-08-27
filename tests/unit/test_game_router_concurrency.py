@@ -1120,6 +1120,74 @@ async def test_route_start_serializes_supersede_across_game_types_for_same_lanla
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_slow_pregame_start_cannot_publish_after_new_generation_takes_over(monkeypatch):
+    _stub_archive_calls(monkeypatch)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    external_states = []
+
+    async def _fake_pregame(*, session_id, **_kwargs):
+        if session_id == "match-A":
+            first_started.set()
+            await release_first.wait()
+        return (
+            gr_pregame._default_soccer_pregame_context(initial_difficulty="lv2"),
+            "fallback",
+            "",
+        )
+
+    async def _capture_external(_lanlan_name, _message, *, expected_state=None):
+        external_states.append(expected_state)
+        return True
+
+    class _ActiveAudioManager:
+        is_active = True
+        input_mode = "audio"
+        session = object()
+
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": _ActiveAudioManager()})
+    _gr_patch_all(monkeypatch, "_build_soccer_pregame_context", _fake_pregame)
+    _gr_patch_all(monkeypatch, "route_external_stream_message", _capture_external)
+
+    with reset_game_route_state():
+        first_task = asyncio.create_task(gr_runtime.game_route_start(
+            "soccer",
+            _FakeRouteStartRequest({
+                "lanlan_name": "Lan",
+                "session_id": "match-A",
+                "sdk_route_instance_id": "route-A",
+            }),
+        ))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        first_state = gr_runtime._get_active_game_route_state("Lan", "soccer")
+
+        second = await asyncio.wait_for(gr_runtime.game_route_start(
+            "soccer",
+            _FakeRouteStartRequest({
+                "lanlan_name": "Lan",
+                "session_id": "match-B",
+                "sdk_route_instance_id": "route-B",
+            }),
+        ), timeout=2)
+        second_state = gr_runtime._get_active_game_route_state("Lan", "soccer")
+        release_first.set()
+        first = await asyncio.wait_for(first_task, timeout=2)
+
+        assert second["ok"] is True
+        assert first == {
+            "ok": True,
+            "reason": "superseded",
+            "state": {"game_route_active": False},
+        }
+        assert first_state is not second_state
+        assert first_state["game_route_active"] is False
+        assert second_state["game_route_active"] is True
+        assert second_state["_sdk_route_instance_id"] == "route-B"
+        assert first_state not in external_states
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_session_create_lock_evicted_with_session():
     """codex P2 follow-up: ``_game_session_create_locks`` must drop its
     per-key entry when the session is closed via ``_close_and_remove_session``.

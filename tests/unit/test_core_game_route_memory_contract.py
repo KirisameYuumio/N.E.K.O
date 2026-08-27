@@ -359,6 +359,55 @@ async def test_mirror_assistant_speech_replays_opted_in_cached_audio_without_req
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_cached_speech_replay_reports_failed_audio_delivery():
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+    mgr.game_speech_audio_cache_identity = lambda _text: ("opaque-cache-key", "voice-signature")
+    completed_audio = []
+
+    async def send_audio_done(speech_id):
+        completed_audio.append(speech_id)
+        return True
+
+    mgr.send_audio_done = send_audio_done
+    try:
+        first = await core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "缓存发送失败",
+            metadata=_soccer_mirror_meta({"kind": "cache-failure"}),
+            mirror_text=False,
+            emit_turn_end_after=False,
+            reuse_synthesized_audio=True,
+        )
+        assert GAME_SPEECH_AUDIO_CACHE.append_capture(mgr, first["speech_id"], b"cached-pcm")
+        assert GAME_SPEECH_AUDIO_CACHE.complete_capture(mgr, first["speech_id"], "voice-signature")
+
+        async def fail_send_speech(_audio, speech_id=None):
+            return False
+
+        mgr.send_speech = fail_send_speech
+        replay = await core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "缓存发送失败",
+            metadata=_soccer_mirror_meta({"kind": "cache-failure"}),
+            mirror_text=False,
+            emit_turn_end_after=False,
+            reuse_synthesized_audio=True,
+        )
+
+        assert replay["method"] == "project_tts_cache"
+        assert replay["ok"] is False
+        assert replay["audio_sent"] is False
+        assert replay["audio_completed"] is False
+        assert completed_audio == [replay["speech_id"]]
+    finally:
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_speech_waits_for_matching_audio_done_before_returning():
     mgr = _make_manager()
     mgr.tts_thread = _FakeAliveThread()
@@ -479,6 +528,36 @@ async def test_local_cosyvoice_waits_for_connection_boundary_audio_completion():
     assert result["audio_queued"] is True
     assert result["audio_completed"] is True
     assert result["audio_completion_supported"] is True
+    assert getattr(mgr, "_game_speech_completion_waiter", None) is None
+    mgr._clear_tts_pipeline.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_disabled_tts_does_not_wait_for_an_unsupported_completion_boundary():
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+    mgr._tts_completion_supported = False
+    mgr._clear_tts_pipeline = AsyncMock()
+
+    result = await asyncio.wait_for(
+        core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "禁用语音时立即返回",
+            metadata=_soccer_mirror_meta({"kind": "disabled-tts"}),
+            mirror_text=False,
+            emit_turn_end_after=False,
+            wait_for_audio_completion=True,
+            audio_completion_timeout=45.0,
+        ),
+        timeout=0.5,
+    )
+
+    assert result["ok"] is True
+    assert result["audio_queued"] is True
+    assert result["audio_completed"] is None
+    assert result["audio_completion_supported"] is False
     assert getattr(mgr, "_game_speech_completion_waiter", None) is None
     mgr._clear_tts_pipeline.assert_not_awaited()
 

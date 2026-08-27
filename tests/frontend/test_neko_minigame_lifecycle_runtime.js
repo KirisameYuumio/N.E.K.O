@@ -139,6 +139,7 @@ async function main() {
     },
     async heartbeat(payload) {
       heartbeatCalls += 1;
+      this.lastHeartbeatPayload = payload;
       return { ok: true, active: true, payload };
     },
     async drain(payload) {
@@ -223,8 +224,12 @@ async function main() {
   await game.runtime.pulse(true);
   await game.runtime.pollOutputs();
   assert(heartbeatCalls >= 1, 'manual heartbeat did not use the host transport');
+  assert(transport.lastHeartbeatPayload?.sdk_route_instance_id === firstRouteInstanceId,
+    'runtime heartbeat was not bound to the active route generation');
   assert(transport.lastDrainPayload?.limit === 50,
     'runtime drain did not delegate its bounded output limit to the host');
+  assert(transport.lastDrainPayload?.sdk_route_instance_id === firstRouteInstanceId,
+    'runtime drain was not bound to the active route generation');
   assert(envelopes.length === 2, 'runtime outputs were not delivered as events');
   assert(envelopes[0].type === 'runtime-output', 'runtime output event type is invalid');
   assert(envelopes[0].sequence > 0, 'runtime event sequence was not assigned');

@@ -36,6 +36,7 @@ function createTransport(options = {}) {
   const storageValues = new Map();
   const storageCalls = [];
   let disposed = 0;
+  let lastStartPayload = null;
   let contextPendingMode = false;
   let consentPendingMode = false;
   let storagePendingMode = false;
@@ -85,6 +86,7 @@ function createTransport(options = {}) {
       return runtimeState;
     },
     async start(payload) {
+      lastStartPayload = payload;
       return { ok: true, state: { game_route_active: true }, payload };
     },
     async end(payload) { return { ok: true, payload }; },
@@ -136,6 +138,7 @@ function createTransport(options = {}) {
     setConsentPending(value) { consentPendingMode = value; },
     setStoragePending(value) { storagePendingMode = value; },
     get disposed() { return disposed; },
+    get lastStartPayload() { return lastStartPayload; },
   };
 }
 
@@ -193,7 +196,12 @@ async function main() {
   assert(host.consentCalls[0].payload.enabled === true,
     'memory consent did not use the trusted host');
   await game.runtime.start({ mode: 'test' });
+  const routeInstanceId = host.lastStartPayload.sdk_route_instance_id;
   assert(game.memory.consent.locked, 'memory consent did not lock at runtime start');
+
+  await game.context.read(['current-state']);
+  assert(host.contextCalls.at(-1).payload.sdk_route_instance_id === routeInstanceId,
+    'active context read was not bound to the route generation');
 
   let lockedConsentError = null;
   try { await game.memory.configureConsent(false); }
@@ -211,6 +219,8 @@ async function main() {
     'consented memory submission did not reach the trusted host');
   assert(host.memoryCalls[0].payload.session_id === 'context-memory-session',
     'memory submission did not bind the runtime session');
+  assert(host.memoryCalls[0].payload.sdk_route_instance_id === routeInstanceId,
+    'memory submission was not bound to the route generation');
   assert(Object.keys(host.memoryCalls[0].payload.submission).sort().join(',')
     === 'events,result,state,summary',
   'memory submission contained fields outside the visible event/state/result/summary contract');
