@@ -201,6 +201,9 @@ async function main() {
   assert(resetState.id === 'session-2', 'runtime reset did not rotate the host session');
   const started = await game.runtime.start({ mode: 'default' });
   assert(started.ok && started.data.ok, 'runtime start response was not normalized');
+  const firstRouteInstanceId = started.data.payload.sdk_route_instance_id;
+  assert(typeof firstRouteInstanceId === 'string' && firstRouteInstanceId.length > 0,
+    'runtime start did not receive an SDK-owned route generation');
   assert(game.runtime.state === 'running', 'successful runtime start did not enter running');
   assert(game.runtime.session.characterName === 'Yui', 'host route state was not applied');
   assert(environment.intervals.size === 2, 'heartbeat and output polling did not have two bounded timers');
@@ -255,6 +258,8 @@ async function main() {
   unsubscribeOutput();
   const ended = await game.runtime.end({ reason: 'completed' });
   assert(ended.ok && ended.data.ok, 'runtime end response was not normalized');
+  assert(ended.data.payload.sdk_route_instance_id === firstRouteInstanceId,
+    'runtime end did not retain the matching route generation');
   assert(game.runtime.state === 'ended', 'runtime end did not enter ended');
   assert(environment.intervals.size === 0, 'runtime end did not release lifecycle timers');
   assert(!environment.documentListeners.has('visibilitychange'),
@@ -263,6 +268,14 @@ async function main() {
     'runtime end did not release page-exit listeners');
   assert(stateEvents.some((event) => event.payload.current === 'running'),
     'runtime state transitions were not emitted');
+
+  const restarted = await game.runtime.start({ mode: 'restart-same-session' });
+  const secondRouteInstanceId = restarted.data.payload.sdk_route_instance_id;
+  assert(secondRouteInstanceId && secondRouteInstanceId !== firstRouteInstanceId,
+    'a new route start reused the previous route generation');
+  const reended = await game.runtime.end({ reason: 'restart-completed' });
+  assert(reended.data.payload.sdk_route_instance_id === secondRouteInstanceId,
+    'restarted route end did not retain its own generation');
 
   let reentrantDisposeError = null;
   game.events.on('runtime-state', (event) => {

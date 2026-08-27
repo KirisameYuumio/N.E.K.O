@@ -251,9 +251,16 @@ async function main() {
   }
   assert(pendingLimitError?.code === 'busy', 'pending renderer did not consume the host bound');
   limitedHost.dispose();
-  releasePendingFactory();
-  const pendingDisposeError = await pendingMount;
+  const pendingDisposeError = await settleWithin(
+    pendingMount,
+    1000,
+    'controller factory cancellation left mount pending',
+  );
   assert(pendingDisposeError?.code === 'disposed', 'pending mount did not observe host disposal');
+  assert(limitedHost.pendingCount === 0,
+    'cancelled controller factory retained its pending mount slot');
+  releasePendingFactory();
+  await new Promise((resolve) => setImmediate(resolve));
   assert(pendingRawDisposed === 1, 'controller resolved after disposal was not released exactly once');
 
   let releaseInitialModel;

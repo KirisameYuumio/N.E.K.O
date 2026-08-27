@@ -263,6 +263,19 @@ async function main() {
   assert(!pendingGame.memory.consent.enabled && !pendingGame.memory.consent.configured,
     'a cancelled previous-session consent request changed the new session');
 
+  const preInvokeStorageCalls = pendingHost.storageCalls.length;
+  const preInvokeAbort = new AbortController();
+  const preInvokeRequest = pendingGame.storage.set(
+    'cancel-before-host',
+    { forbidden: true },
+    { signal: preInvokeAbort.signal },
+  ).then(() => null, (error) => error);
+  preInvokeAbort.abort();
+  assert((await preInvokeRequest)?.code === 'cancelled',
+    'pre-invoke storage cancellation did not reject publicly');
+  assert(pendingHost.storageCalls.length === preInvokeStorageCalls,
+    'cancelled managed request invoked the host after public cancellation');
+
   const pendingStorageRequests = Array.from({ length: 4 }, (_, index) => (
     pendingGame.storage.get(`pending/${index}`).then(() => null, (error) => error)
   ));

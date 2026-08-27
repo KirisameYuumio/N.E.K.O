@@ -425,12 +425,25 @@
       let raw = null;
       let state = null;
       try {
-        raw = ensureController(await descriptor.createController({
+        const controllerCreation = Promise.resolve().then(() => descriptor.createController({
           config,
           viewport,
           signal: abortController?.signal,
           fitLive2DModel,
-        }), slot);
+        }));
+        try {
+          raw = await racePendingMount(controllerCreation, pendingState, slot);
+        } catch (error) {
+          // A renderer factory is third-party code and may ignore AbortSignal.
+          // If disposal wins the race, observe the late settlement and release
+          // any controller it eventually returns without keeping mount pending.
+          controllerCreation.then(
+            (lateRaw) => disposeRaw(lateRaw, `${slot}.late-create`),
+            () => undefined,
+          );
+          throw error;
+        }
+        raw = ensureController(raw, slot);
         if (disposed || abortController?.signal?.aborted) {
           fail('disposed', 'Avatar host was disposed while mounting', { slot });
         }

@@ -151,6 +151,28 @@ async function main() {
   host.stopSpeechOutputBridge();
 
   await host.configureGameMemoryConsent({ enabled: true, session_id: 'client-session' });
+  const cancelledDirectRequest = new AbortController();
+  cancelledDirectRequest.abort();
+  let cancelledStorageError = null;
+  try {
+    host.requestGameStorage(
+      'set',
+      { key: 'cancelled-direct', value: true },
+      { signal: cancelledDirectRequest.signal },
+    );
+  } catch (error) { cancelledStorageError = error; }
+  assert(cancelledStorageError?.code === 'cancelled'
+    && windowMock.localStorage.getItem('neko_game_storage:soccer:cancelled-direct') == null,
+  'already-cancelled direct storage request mutated localStorage');
+  let cancelledConsentError = null;
+  try {
+    host.configureGameMemoryConsent(
+      { enabled: false, session_id: 'client-session' },
+      { signal: cancelledDirectRequest.signal },
+    );
+  } catch (error) { cancelledConsentError = error; }
+  assert(cancelledConsentError?.code === 'cancelled' && host._memoryConsentEnabled === true,
+    'already-cancelled direct memory consent request changed host state');
   const startResponse = await host.start({
     session_id: 'attacker-session',
     lanlan_name: 'Attacker Neko',

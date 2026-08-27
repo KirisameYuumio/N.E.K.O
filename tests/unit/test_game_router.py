@@ -293,7 +293,7 @@ async def test_route_end_before_start_consumes_exact_session_without_activation(
                 "reason": "pagehide",
             },
         )
-        key = ("Lan", "soccer", "page-exit-before-start")
+        key = ("Lan", "soccer", "page-exit-before-start", "")
         assert end_result["ok"] is True
         assert key in gr_runtime._game_route_end_tombstones
 
@@ -347,7 +347,7 @@ async def test_repeated_route_end_does_not_cancel_same_session_restart(monkeypat
         first_end = await gr_runtime._complete_game_end_from_payload("soccer", payload)
         second_end = await gr_runtime._complete_game_end_from_payload("soccer", payload)
 
-        tombstone_key = ("Lan", "soccer", "reused-session")
+        tombstone_key = ("Lan", "soccer", "reused-session", "")
         assert first_end["route_closed"] is True
         assert second_end["archive"] == first_end["archive"]
         assert len(postgame_calls) == 1
@@ -389,7 +389,67 @@ def test_route_end_before_start_tombstones_expire_and_stay_bounded(monkeypatch):
         assert len(gr_runtime._game_route_end_tombstones) == (
             gr_runtime._GAME_ROUTE_END_TOMBSTONE_LIMIT
         )
-        assert ("Lan", "soccer", "bounded-0") not in gr_runtime._game_route_end_tombstones
+        assert ("Lan", "soccer", "bounded-0", "") not in gr_runtime._game_route_end_tombstones
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_delayed_old_route_end_does_not_close_reused_session_generation(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    async def fake_submit(_archive):
+        return {"ok": True, "status": "cached", "count": 1}
+
+    async def fake_postgame(*_args, **_kwargs):
+        return {"ok": True, "action": "sent"}
+
+    async def fake_pregame_context(**_kwargs):
+        return gr_pregame._default_soccer_pregame_context(), "lightweight", ""
+
+    _gr_patch_all(monkeypatch, "_submit_game_archive_to_memory", fake_submit)
+    _gr_patch_all(monkeypatch, "_deliver_game_postgame", fake_postgame)
+    _gr_patch_all(monkeypatch, "_build_soccer_pregame_context", fake_pregame_context)
+
+    def request(instance_id):
+        return _FakeRequest({
+            "lanlan_name": "Lan",
+            "session_id": "reused-generation-session",
+            "sdk_route_instance_id": instance_id,
+        })
+
+    with reset_game_route_state():
+        first_start = await gr_runtime.game_route_start("soccer", request("route-A"))
+        first_state = gr_runtime._get_active_game_route_state("Lan", "soccer")
+        assert first_state["_sdk_route_instance_id"] == "route-A"
+        assert "sdk_route_instance_id" not in first_start["state"]
+        _mark_game_started(first_state)
+        await gr_runtime._complete_game_end_from_payload(
+            "soccer",
+            {
+                "lanlan_name": "Lan",
+                "session_id": "reused-generation-session",
+                "sdk_route_instance_id": "route-A",
+            },
+        )
+
+        second_start = await gr_runtime.game_route_start("soccer", request("route-B"))
+        assert "sdk_route_instance_id" not in second_start["state"]
+
+        delayed = await gr_runtime._complete_game_end_from_payload(
+            "soccer",
+            {
+                "lanlan_name": "Lan",
+                "session_id": "reused-generation-session",
+                "sdk_route_instance_id": "route-A",
+            },
+        )
+        active = gr_runtime._get_active_game_route_state("Lan", "soccer")
+        assert delayed["reason"] == "stale_route_instance"
+        assert active["game_route_active"] is True
+        assert active["_sdk_route_instance_id"] == "route-B"
+        assert (
+            "Lan", "soccer", "reused-generation-session", "route-A"
+        ) not in gr_runtime._game_route_end_tombstones
 
 
 @pytest.mark.unit

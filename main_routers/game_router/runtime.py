@@ -250,7 +250,7 @@ _GAME_ROUTE_END_TOMBSTONE_LIMIT = 256
 # route/start request enters the activation lock. Keep a short, bounded marker
 # so that exact start is consumed instead of resurrecting a route after the
 # page is gone. Entries are removed on match, expiry, and capacity eviction.
-_game_route_end_tombstones: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+_game_route_end_tombstones: OrderedDict[tuple[str, str, str, str], float] = OrderedDict()
 
 
 def _prune_game_route_end_tombstones(now: float | None = None) -> None:
@@ -269,10 +269,14 @@ def _remember_game_route_end_before_start(
     lanlan_name: str,
     game_type: str,
     session_id: str,
+    route_instance_id: str = "",
 ) -> None:
     now = time.monotonic()
     _prune_game_route_end_tombstones(now)
-    key = (str(lanlan_name or ""), str(game_type or ""), str(session_id or "default"))
+    key = (
+        str(lanlan_name or ""), str(game_type or ""),
+        str(session_id or "default"), str(route_instance_id or ""),
+    )
     _game_route_end_tombstones.pop(key, None)
     _game_route_end_tombstones[key] = now + _GAME_ROUTE_END_TOMBSTONE_TTL_SECONDS
     _prune_game_route_end_tombstones(now)
@@ -282,10 +286,14 @@ def _consume_game_route_end_before_start(
     lanlan_name: str,
     game_type: str,
     session_id: str,
+    route_instance_id: str = "",
 ) -> bool:
     now = time.monotonic()
     _prune_game_route_end_tombstones(now)
-    key = (str(lanlan_name or ""), str(game_type or ""), str(session_id or "default"))
+    key = (
+        str(lanlan_name or ""), str(game_type or ""),
+        str(session_id or "default"), str(route_instance_id or ""),
+    )
     expires_at = _game_route_end_tombstones.pop(key, None)
     return expires_at is not None and expires_at > now
 
@@ -1443,6 +1451,7 @@ async def game_route_start(game_type: str, request: Request):
     request_prompt_language_full = _resolve_game_prompt_locale(lanlan_name, data)
 
     session_id = str(data.get("session_id") or "default")
+    route_instance_id = str(data.get("sdk_route_instance_id") or "").strip()
     # 同一角色同一时刻只允许一个 active 游戏路由：启动新路由前先结束所有其它仍活跃的
     # 路由（同 game_type 旧 session、不同 game_type、未来跨游戏并存均覆盖）。否则
     # is_game_route_active(lanlan_name) / _get_active_game_route_state(lanlan_name)
@@ -1476,7 +1485,9 @@ async def game_route_start(game_type: str, request: Request):
     route_lock = _get_route_lock(lanlan_name, game_type)
     async with supersede_lock:
         async with route_lock:
-            if _consume_game_route_end_before_start(lanlan_name, game_type, session_id):
+            if _consume_game_route_end_before_start(
+                lanlan_name, game_type, session_id, route_instance_id,
+            ):
                 logger.info(
                     "🎮 route/start 被先到达的页面退出请求抵消: game=%s session=%s lanlan=%s",
                     game_type,
@@ -1534,6 +1545,8 @@ async def game_route_start(game_type: str, request: Request):
                 lanlan_name,
                 data.get("game_last_full_dialogue_count"),
             )
+            if route_instance_id:
+                state["_sdk_route_instance_id"] = route_instance_id
             _update_game_route_language_from_payload(state, data)
             # Take over the SessionManager: ordinary chat LLM output handlers must
             # stay silent during the game, and any voice transcript that reaches
@@ -3423,10 +3436,17 @@ async def _complete_game_end_from_payload(
             },
         )
     session_id = str(data.get('session_id', 'default'))
+    route_instance_id = str(data.get("sdk_route_instance_id") or "").strip()
     lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
     exit_reason = str(data.get("reason") or default_reason)
     postgame_options = _normalize_postgame_options(data.get("postgameProactive"), reason=exit_reason)
     state = _get_active_game_route_state(lanlan_name, game_type) if lanlan_name else None
+    if (
+        state
+        and route_instance_id
+        and str(state.get("_sdk_route_instance_id") or "") != route_instance_id
+    ):
+        state = None
     route_was_already_completed = False
     if lanlan_name and not (state and str(state.get("session_id") or "") == session_id):
         # Serialize the no-match decision against route/start. If this end won
@@ -3437,7 +3457,16 @@ async def _complete_game_end_from_payload(
         async with supersede_lock:
             async with end_route_lock:
                 candidate = _game_route_states.get(_route_state_key(lanlan_name, game_type))
-                if candidate and str(candidate.get("session_id") or "") == session_id:
+                candidate_session_matches = bool(
+                    candidate and str(candidate.get("session_id") or "") == session_id
+                )
+                candidate_instance_id = str(
+                    (candidate or {}).get("_sdk_route_instance_id") or ""
+                )
+                candidate_instance_matches = bool(
+                    not route_instance_id or candidate_instance_id == route_instance_id
+                )
+                if candidate_session_matches and candidate_instance_matches:
                     if candidate.get("game_route_active") is True:
                         state = candidate
                     elif candidate.get("_exit_task") or candidate.get("_exit_flow_started"):
@@ -3454,12 +3483,25 @@ async def _complete_game_end_from_payload(
                             lanlan_name,
                             game_type,
                             session_id,
+                            route_instance_id,
                         )
+                elif candidate_session_matches and route_instance_id:
+                    # A delayed retry from an older route generation must never
+                    # finalize the currently active generation or poison a later
+                    # start with a tombstone.
+                    return {
+                        "ok": True,
+                        "closed": False,
+                        "route_closed": False,
+                        "session_id": session_id,
+                        "reason": "stale_route_instance",
+                    }
                 else:
                     _remember_game_route_end_before_start(
                         lanlan_name,
                         game_type,
                         session_id,
+                        route_instance_id,
                     )
     _append_game_session_debug_log(
         game_type,

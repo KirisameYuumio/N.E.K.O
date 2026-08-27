@@ -1427,6 +1427,11 @@
     if (renderLanguage && !/^[A-Za-z0-9-]+$/.test(renderLanguage)) {
       fail('invalid_request', 'speech render language must be a BCP-47-style identifier');
     }
+    for (const field of ['mirrorText', 'emitTurnEnd']) {
+      if (value[field] !== undefined && typeof value[field] !== 'boolean') {
+        fail('invalid_request', `speech ${field} must be a boolean when provided`);
+      }
+    }
     const event = normalizeSpeechEvent(value.event);
     return Object.freeze({
       text,
@@ -1437,8 +1442,8 @@
       relativeGain,
       interruptExisting: value.interruptExisting === true,
       reuseSynthesizedAudio: value.reuseSynthesizedAudio === true,
-      mirrorText: value.mirrorText === true,
-      emitTurnEnd: value.emitTurnEnd === true,
+      mirrorText: value.mirrorText,
+      emitTurnEnd: value.emitTurnEnd,
       reason: boundedSpeechString(value.reason, 'speech reason', 128),
       language,
       renderLanguage,
@@ -1452,12 +1457,15 @@
     }
     const text = boundedSpeechString(value.text, 'speech mirror text', MAX_SPEECH_TEXT_CHARS);
     if (!text) fail('invalid_request', 'speech mirror text is required');
+    if (value.finalizeTurn !== undefined && typeof value.finalizeTurn !== 'boolean') {
+      fail('invalid_request', 'speech mirror finalizeTurn must be a boolean when provided');
+    }
     return Object.freeze({
       text,
       requestId: boundedSpeechString(value.requestId, 'speech mirror requestId', 128),
       turnId: boundedSpeechString(value.turnId, 'speech mirror turnId', 128),
       source: boundedSpeechString(value.source, 'speech mirror source', 64, 'game'),
-      finalizeTurn: value.finalizeTurn === true,
+      finalizeTurn: value.finalizeTurn,
       event: normalizeSpeechEvent(value.event),
     });
   }
@@ -1718,6 +1726,8 @@
     const localLeaderboardClientId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     let runtimePhase = 'idle';
     let runtimeRouteEstablished = false;
+    let runtimeRouteInstanceId = '';
+    let runtimeRouteInstanceSequence = 0;
     let runtimeStartSettlement = null;
     let runtimeEndWaitingForStart = false;
     let runtimeEventSequence = 0;
@@ -1953,6 +1963,19 @@
       if (!runtimeConfig || typeof runtimeConfig.payload !== 'function') return {};
       const payload = runtimeConfig.payload();
       return payload == null ? {} : payload;
+    }
+
+    function nextRuntimeRouteInstanceId() {
+      runtimeRouteInstanceSequence = (runtimeRouteInstanceSequence % Number.MAX_SAFE_INTEGER) + 1;
+      const randomId = windowImpl.crypto?.randomUUID?.();
+      return String(randomId || `${Date.now().toString(36)}-${runtimeRouteInstanceSequence.toString(36)}`);
+    }
+
+    function runtimeRoutePayload(payload, routeInstanceId = runtimeRouteInstanceId) {
+      return Object.freeze({
+        ...(payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}),
+        ...(routeInstanceId ? { sdk_route_instance_id: routeInstanceId } : {}),
+      });
     }
 
     function stopHeartbeatLifecycle() {
@@ -2223,7 +2246,7 @@
         // the backend orders an early end against the matching start.
         try {
           const endRequest = transport.end(
-            payload == null ? {} : payload,
+            runtimeRoutePayload(payload),
             { useBeacon: true },
           );
           Promise.resolve(endRequest).catch(() => null);
@@ -2398,10 +2421,19 @@
       });
       try {
         const result = await Promise.race([
-          Promise.resolve().then(() => invoke({
-            signal: controller.signal,
-            timeoutMs: normalizedTimeoutMs,
-          })),
+          Promise.resolve().then(() => {
+            if (controller.signal.aborted) {
+              fail(entry.reason === 'disposed' ? 'disposed' : (entry.reason || 'cancelled'),
+                entry.reason === 'disposed'
+                  ? 'The mini-game SDK client has been disposed'
+                  : 'The host request was cancelled',
+                { operation });
+            }
+            return invoke({
+              signal: controller.signal,
+              timeoutMs: normalizedTimeoutMs,
+            });
+          }),
           timeoutPromise,
           cancellationPromise,
         ]);
@@ -2846,6 +2878,8 @@
         }
         memoryConsentLocked = true;
         runtimeRouteEstablished = false;
+        const routeInstanceId = nextRuntimeRouteInstanceId();
+        runtimeRouteInstanceId = routeInstanceId;
         stopRuntimeMonitoring();
         startPageExitLifecycle();
         const operation = beginRuntimeOperation('start', requestOptions);
@@ -2858,7 +2892,7 @@
         setRuntimePhase('starting', 'start-request');
         try {
           const response = await normalizeTransportResponse(await transport.start(
-            payload,
+            runtimeRoutePayload(payload, routeInstanceId),
             operation.requestOptions,
           ));
           if (!isRuntimeOperationCurrent(operation)) return response;
@@ -2933,7 +2967,7 @@
         };
         try {
           const response = await normalizeTransportResponse(await transport.end(
-            payload,
+            runtimeRoutePayload(payload),
             operation.requestOptions,
           ));
           if (isRuntimeOperationCurrent(operation)) {
@@ -3917,8 +3951,8 @@
         session_id: session.id,
         ...(session.characterName ? { lanlan_name: session.characterName } : {}),
         ...(request.requestId ? { request_id: request.requestId } : {}),
-        mirror_text: request.mirrorText,
-        emit_turn_end: request.emitTurnEnd,
+        ...(request.mirrorText !== undefined ? { mirror_text: request.mirrorText } : {}),
+        ...(request.emitTurnEnd !== undefined ? { emit_turn_end: request.emitTurnEnd } : {}),
         interrupt_audio: request.interruptExisting,
         reuse_synthesized_audio: request.reuseSynthesizedAudio,
         playback_gain: request.relativeGain,
@@ -3986,7 +4020,7 @@
         ...(session.characterName ? { lanlan_name: session.characterName } : {}),
         ...(request.requestId ? { request_id: request.requestId } : {}),
         ...(request.turnId ? { turn_id: request.turnId } : {}),
-        finalize_turn: request.finalizeTurn,
+        ...(request.finalizeTurn !== undefined ? { finalize_turn: request.finalizeTurn } : {}),
         event: request.event,
       });
       return normalizeTransportResponse(await performManagedHostRequest({

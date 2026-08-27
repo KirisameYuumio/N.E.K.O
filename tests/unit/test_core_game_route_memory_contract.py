@@ -389,7 +389,7 @@ async def test_game_speech_waits_for_matching_audio_done_before_returning():
 
     assert result["ok"] is True
     assert result["audio_completed"] is True
-    assert mgr._game_speech_completion_waiter is None
+    assert getattr(mgr, "_game_speech_completion_waiter", None) is None
 
 
 @pytest.mark.unit
@@ -415,6 +415,36 @@ async def test_game_speech_timeout_clears_pipeline_before_returning():
     assert result["audio_completed"] is False
     mgr._clear_tts_pipeline.assert_awaited_once()
     assert mgr._game_speech_completion_waiter is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_local_cosyvoice_does_not_wait_for_unavailable_audio_completion():
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+    mgr._tts_active_provider_key = "local_cosyvoice"
+    mgr._clear_tts_pipeline = AsyncMock()
+
+    result = await asyncio.wait_for(
+        core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "本地协议没有完成帧",
+            metadata=_soccer_mirror_meta({"kind": "local-completion-capability"}),
+            mirror_text=False,
+            emit_turn_end_after=False,
+            wait_for_audio_completion=True,
+            audio_completion_timeout=45.0,
+        ),
+        timeout=1,
+    )
+
+    assert result["ok"] is True
+    assert result["audio_queued"] is True
+    assert result["audio_completed"] is None
+    assert result["audio_completion_supported"] is False
+    assert getattr(mgr, "_game_speech_completion_waiter", None) is None
+    mgr._clear_tts_pipeline.assert_not_awaited()
 
 
 @pytest.mark.unit

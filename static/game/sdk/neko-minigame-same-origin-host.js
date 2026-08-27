@@ -383,7 +383,12 @@
       }
     }
 
-    requestGameStorage(operationInput, payload = {}) {
+    requestGameStorage(operationInput, payload = {}, options = {}) {
+      if (options.signal?.aborted) {
+        throw this._hostError('cancelled', 'Game storage request was cancelled', {
+          operation: 'game_storage',
+        });
+      }
       if (this._disposed) {
         throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`, {
           operation: 'game_storage',
@@ -874,7 +879,12 @@
       );
     }
 
-    configureGameMemoryConsent(payload = {}) {
+    configureGameMemoryConsent(payload = {}, options = {}) {
+      if (options.signal?.aborted) {
+        throw this._hostError('cancelled', 'Memory consent request was cancelled', {
+          operation: 'memory_consent',
+        });
+      }
       const requestedSession = String(payload.session_id || payload.sessionId || '');
       if (requestedSession && requestedSession !== this.sessionId) {
         throw this._hostError('session_invalid', 'Memory consent belongs to another session', {

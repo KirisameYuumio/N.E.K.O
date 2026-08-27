@@ -1827,9 +1827,15 @@ class TurnMixin:
         await self.ensure_tts_pipeline_alive()
         audio_queued = False
         capture_started = False
+        completion_supported = (
+            getattr(self, "_tts_active_provider_key", None) != "local_cosyvoice"
+        )
+        effective_wait_for_audio_completion = (
+            wait_for_audio_completion and completion_supported
+        )
         completion_future = (
             self._begin_game_speech_completion_wait(turn_id)
-            if wait_for_audio_completion
+            if effective_wait_for_audio_completion
             else None
         )
         try:
@@ -1885,9 +1891,11 @@ class TurnMixin:
             self._clear_game_speech_correlation(turn_id)
 
         return {
-            "ok": not (wait_for_audio_completion and audio_queued and not audio_completed),
+            "ok": not (
+                effective_wait_for_audio_completion and audio_queued and not audio_completed
+            ),
             **({"reason": "audio_completion_timeout"}
-               if wait_for_audio_completion and audio_queued and not audio_completed else {}),
+               if effective_wait_for_audio_completion and audio_queued and not audio_completed else {}),
             "method": "project_tts",
             "cache_status": (
                 "miss" if capture_started
@@ -1897,7 +1905,8 @@ class TurnMixin:
             "speech_id": turn_id,
             "audio_sent": audio_queued,
             "audio_queued": audio_queued,
-            "audio_completed": audio_completed if wait_for_audio_completion else None,
+            "audio_completed": audio_completed if effective_wait_for_audio_completion else None,
+            "audio_completion_supported": completion_supported,
             "turn_end_emitted": bool(emit_turn_end_after),
             "interrupt_audio": bool(interrupt_audio),
             "playback_gain": normalized_playback_gain,

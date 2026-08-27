@@ -211,6 +211,11 @@ async function main() {
   assert(firstCall.options.signal instanceof AbortSignal,
     'speech request did not receive an SDK-owned AbortSignal');
 
+  await game.speech.speak({ text: 'use backend conversation defaults' });
+  assert(speechCalls[1].payload.mirror_text === undefined
+    && speechCalls[1].payload.emit_turn_end === undefined,
+  'omitted speech conversation controls overrode backend defaults');
+
   const mirrorResponse = await game.speech.mirror({
     text: '  只镜像到主聊天  ',
     requestId: 'mirror-request-1',
@@ -235,6 +240,10 @@ async function main() {
     'text-only speech mirror did not forward bounded event metadata');
   assert(mirrorCalls[0].options.signal instanceof AbortSignal,
     'text-only speech mirror did not receive an SDK-owned AbortSignal');
+
+  await game.speech.mirror({ text: 'use backend finalize default' });
+  assert(mirrorCalls[1].payload.finalize_turn === undefined,
+    'omitted mirror finalize control overrode the backend event-derived default');
 
   const preloadResponse = await game.speech.preload(
     ['  预载台词一  ', '预载台词一', '预载台词二'],
