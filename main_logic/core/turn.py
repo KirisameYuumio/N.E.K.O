@@ -56,9 +56,6 @@ from .game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE
 from main_logic import core as _core_facade
 
 
-_SOURCE_GAME_ROUTE_IDENTITY_UNSET = object()
-
-
 class TurnMixin:
     """Conversation turn pipeline methods (see module docstring)."""
 
@@ -1141,7 +1138,7 @@ class TurnMixin:
         is_voice_source: bool = True,
         source: str | None = None,
         metadata: dict | None = None,
-        source_game_route_identity: Any = _SOURCE_GAME_ROUTE_IDENTITY_UNSET,
+        source_game_route_identity: Any = Ellipsis,
     ):
         """Sync transcript text into queues/cache and push it to the frontend.
 
@@ -1159,11 +1156,11 @@ class TurnMixin:
         record_transcript_text = transcript_text
         voice_rms_recorded = False
         source_identity_was_explicit = (
-            source_game_route_identity is not _SOURCE_GAME_ROUTE_IDENTITY_UNSET
+            source_game_route_identity is not Ellipsis
         )
         if not is_voice_source:
             source_game_route_identity = None
-        elif source_game_route_identity is _SOURCE_GAME_ROUTE_IDENTITY_UNSET:
+        elif source_game_route_identity is Ellipsis:
             # Compatibility for direct callers that do not have an ingress
             # token. Realtime and independent-ASR production paths pass the
             # identity captured when the utterance began.
