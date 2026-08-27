@@ -32,6 +32,8 @@
   // its explicit failure state wins instead of racing the transport timeout.
   const DEFAULT_VOICE_CONTROL_TIMEOUT_MS = 15000;
   const DEFAULT_VOICE_CONTROL_PENDING_LIMIT = 4;
+  const DEFAULT_STORAGE_LOCK_TIMEOUT_MS = 8000;
+  const VOICE_CONTROL_WINDOW_EVENT = 'neko-game-voice-control-message';
   const GAME_STORAGE_KEY_LIMIT = 256;
   const GAME_STORAGE_VALUE_BYTES = 64 * 1024;
   const GAME_STORAGE_TOTAL_BYTES = 1024 * 1024;
@@ -153,6 +155,7 @@
       this._voiceControlBridge = {
         channel: null,
         storageHandler: null,
+        windowEventHandler: null,
         storageKey: '',
         senderId: `game-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`,
         nextRequestId: 0,
@@ -253,7 +256,8 @@
         'speech-output',
         'context-read',
         'memory',
-        ...(this._canUseGameStorage() ? ['storage', 'leaderboard-local'] : []),
+        ...(this._canUseGameStorage() ? ['storage'] : []),
+        ...(this._canUseGameStorage() && this._canUseGameStorageLock() ? ['leaderboard-local'] : []),
         ...(this._avatarHost ? ['avatar-renderer'] : []),
         ...(this._audioHost ? ['audio'] : []),
       ]);
@@ -285,6 +289,76 @@
 
     _gameStoragePrefix() {
       return `neko:minigame-storage:v1:${encodeURIComponent(this.gameType)}:${encodeURIComponent(this.gameVersion)}:`;
+    }
+
+    _canUseGameStorageLock() {
+      return typeof this._navigator?.locks?.request === 'function';
+    }
+
+    async runGameStorageExclusive(lockNameInput, callback, options = {}) {
+      if (this._disposed) {
+        throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`, {
+          operation: 'game_storage_lock',
+        });
+      }
+      if (!this._canUseGameStorageLock()) {
+        throw this._hostError('capability_unavailable', 'Cross-window game storage locking is unavailable', {
+          operation: 'game_storage_lock',
+        });
+      }
+      if (typeof callback !== 'function') {
+        throw this._hostError('invalid_request', 'Game storage lock callback is required', {
+          operation: 'game_storage_lock',
+        });
+      }
+      const lockName = String(lockNameInput || '').trim();
+      if (!lockName || lockName.length > 128) {
+        throw this._hostError('invalid_request', 'Game storage lock name is invalid', {
+          operation: 'game_storage_lock',
+        });
+      }
+      const AbortControllerImpl = this._window.AbortController || globalThis.AbortController;
+      const controller = new AbortControllerImpl();
+      const externalSignal = options.signal;
+      const abortFromExternal = () => controller.abort(externalSignal?.reason);
+      if (externalSignal?.aborted) abortFromExternal();
+      else externalSignal?.addEventListener?.('abort', abortFromExternal, { once: true });
+      const timeoutMs = boundedPositiveInteger(
+        options.timeoutMs,
+        DEFAULT_STORAGE_LOCK_TIMEOUT_MS,
+        60000,
+      );
+      let acquired = false;
+      let timeoutId = this._window.setTimeout(() => controller.abort(), timeoutMs);
+      const qualifiedName = `${this._gameStoragePrefix()}lock:${lockName}`;
+      try {
+        return await this._navigator.locks.request(
+          qualifiedName,
+          { mode: 'exclusive', signal: controller.signal },
+          async () => {
+            acquired = true;
+            this._window.clearTimeout(timeoutId);
+            timeoutId = null;
+            if (this._disposed) {
+              throw this._hostError('disposed', `${this.displayName} host adapter has been disposed`, {
+                operation: 'game_storage_lock',
+              });
+            }
+            return callback();
+          },
+        );
+      } catch (error) {
+        if (!acquired && controller.signal.aborted) {
+          throw this._hostError(externalSignal?.aborted ? 'cancelled' : 'timeout', 'Game storage lock was not acquired', {
+            operation: 'game_storage_lock',
+            cause: error,
+          });
+        }
+        throw error;
+      } finally {
+        if (timeoutId != null) this._window.clearTimeout(timeoutId);
+        externalSignal?.removeEventListener?.('abort', abortFromExternal);
+      }
     }
 
     requestGameStorage(operationInput, payload = {}) {
@@ -754,7 +828,11 @@
               protocolVersion: SDK_PROTOCOL_VERSION,
               sequence: bridge.sequence,
               type,
-              timestamp: Number(output?.ts || Date.now()),
+              timestamp: (() => {
+                const value = Number(output?.ts);
+                if (!Number.isFinite(value) || value <= 0) return Date.now();
+                return value < 100000000000 ? value * 1000 : value;
+              })(),
               sessionId: this.sessionId,
               payload,
             });
@@ -1050,6 +1128,8 @@
         } catch (_) { /* ignore malformed coordination messages */ }
       };
       this._window.addEventListener('storage', bridge.storageHandler);
+      bridge.windowEventHandler = (event) => acceptMessage(event?.detail, 'same_document');
+      this._window.addEventListener(VOICE_CONTROL_WINDOW_EVENT, bridge.windowEventHandler);
       return !!bridge.channel || typeof this._window.localStorage !== 'undefined';
     }
 
@@ -1065,6 +1145,12 @@
           storage_nonce: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
         });
         this._window.localStorage.setItem(bridge.storageKey, serialized);
+        const CustomEventImpl = this._window.CustomEvent || globalThis.CustomEvent;
+        if (typeof this._window.dispatchEvent === 'function' && typeof CustomEventImpl === 'function') {
+          this._window.dispatchEvent(new CustomEventImpl(VOICE_CONTROL_WINDOW_EVENT, {
+            detail: JSON.parse(serialized),
+          }));
+        }
         this._window.setTimeout(() => {
           try {
             if (this._window.localStorage.getItem(bridge.storageKey) === serialized) {
@@ -1152,6 +1238,10 @@
       if (bridge.storageHandler) {
         this._window.removeEventListener('storage', bridge.storageHandler);
         bridge.storageHandler = null;
+      }
+      if (bridge.windowEventHandler) {
+        this._window.removeEventListener(VOICE_CONTROL_WINDOW_EVENT, bridge.windowEventHandler);
+        bridge.windowEventHandler = null;
       }
       if (bridge.channel) {
         bridge.channel.onmessage = null;

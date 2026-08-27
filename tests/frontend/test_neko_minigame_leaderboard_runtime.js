@@ -22,8 +22,9 @@ function abortError() {
   return error;
 }
 
-function createTransport({ server = false } = {}) {
-  const values = new Map();
+function createTransport({ server = false, shared = null } = {}) {
+  const values = shared?.values || new Map();
+  const lockTails = shared?.lockTails || new Map();
   const pending = new Set();
   const serverCalls = [];
   let storagePending = false;
@@ -72,6 +73,19 @@ function createTransport({ server = false } = {}) {
       if (operation === 'set') values.set(payload.key, payload.value);
       if (operation === 'delete') values.delete(payload.key);
       return Promise.resolve({ ok: true });
+    },
+    async runGameStorageExclusive(lockName, callback) {
+      const previous = lockTails.get(lockName) || Promise.resolve();
+      let release;
+      const gate = new Promise((resolve) => { release = resolve; });
+      const tail = previous.catch(() => {}).then(() => gate);
+      lockTails.set(lockName, tail);
+      await previous.catch(() => {});
+      try { return await callback(); }
+      finally {
+        release();
+        if (lockTails.get(lockName) === tail) lockTails.delete(lockName);
+      }
     },
     getRuntimeState() { return runtimeState; },
     applyRuntimeState(state) { runtimeState = { ...runtimeState, ...state }; return runtimeState; },
@@ -141,6 +155,26 @@ async function main() {
     'local leaderboard did not preserve recent ordering');
   const best = await game.leaderboard.local.getBest('main');
   assert(best.data.entry.score === 40, 'local leaderboard best entry was incorrect');
+
+  const shared = { values: new Map(), lockTails: new Map() };
+  const firstClientHost = createTransport({ shared });
+  const secondClientHost = createTransport({ shared });
+  const firstClient = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+    transport: firstClientHost.transport,
+  });
+  const secondClient = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+    transport: secondClientHost.transport,
+  });
+  await Promise.all([
+    firstClient.leaderboard.local.submit('main', { score: 11, source: 'first' }),
+    secondClient.leaderboard.local.submit('main', { score: 22, source: 'second' }),
+  ]);
+  const crossClient = await firstClient.leaderboard.local.list('main', { sort: 'rank', limit: 10 });
+  assert(crossClient.data.entries.map((entry) => entry.score).join(',') === '22,11',
+    'cross-client local leaderboard submissions overwrote the same storage snapshot');
+  assert(shared.lockTails.size === 0, 'cross-client leaderboard lock remained resident after mutation');
+  firstClient.dispose();
+  secondClient.dispose();
 
   let clearError = null;
   try { await game.leaderboard.local.clear('main'); }

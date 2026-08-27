@@ -69,16 +69,29 @@ async function main() {
     AbortController,
     console: { warn() {}, error() {}, log() {} },
     fetch: fetchImpl,
-    navigator: { sendBeacon: () => false },
+    navigator: {
+      sendBeacon: () => false,
+      locks: { request: async (_name, _options, callback) => callback() },
+    },
     location: { origin: 'http://127.0.0.1:48911' },
     localStorage: storage(),
     setTimeout,
     clearTimeout,
     setInterval,
     clearInterval,
-    addEventListener(type, handler) { listeners.set(type, handler); },
+    addEventListener(type, handler) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(handler);
+    },
     removeEventListener(type, handler) {
-      if (listeners.get(type) === handler) listeners.delete(type);
+      listeners.get(type)?.delete(handler);
+      if (!listeners.get(type)?.size) listeners.delete(type);
+    },
+    dispatchEvent(event) {
+      for (const handler of Array.from(listeners.get(event.type) || [])) handler(event);
+    },
+    CustomEvent: class CustomEventMock {
+      constructor(type, options = {}) { this.type = type; this.detail = options.detail; }
     },
   };
   global.window = windowMock;
@@ -102,7 +115,9 @@ async function main() {
       id: 'soccer',
       version: '1.0.0',
       requiredCapabilities: ['runtime', 'logging'],
-      optionalCapabilities: ['dialogue', 'quick-lines', 'context-read', 'memory'],
+      optionalCapabilities: [
+        'dialogue', 'quick-lines', 'context-read', 'memory', 'storage', 'leaderboard-local',
+      ],
     },
   });
   assert(handshake.grantedCapabilities.includes('context-read'),
@@ -111,6 +126,14 @@ async function main() {
     'same-origin host did not grant its memory adapter');
   assert(handshake.grantedCapabilities.includes('quick-lines'),
     'registered soccer quick-lines were not granted');
+  assert(handshake.grantedCapabilities.includes('storage')
+    && handshake.grantedCapabilities.includes('leaderboard-local'),
+  'cross-window-safe local leaderboard capability was not granted');
+  let storageLockEntered = false;
+  await host.runGameStorageExclusive('leaderboards/main', async () => {
+    storageLockEntered = true;
+  });
+  assert(storageLockEntered, 'trusted host did not enter its origin-wide storage lock');
 
   let initialSpeechError = null;
   windowMock.localStorage.setItem('neko_speech_playback_state', JSON.stringify({
@@ -197,6 +220,53 @@ async function main() {
   'route outputs were not converted into SDK control envelopes');
   assert(controls[0].sessionId === 'server-session',
     'control envelope did not carry the authoritative route session');
+  assert(controls[0].timestamp === 123000,
+    'second-based backend control timestamps were not normalized to milliseconds');
+
+  const millisecondControls = [];
+  host.stopGameControlBridge();
+  host.startGameControlBridge({ onControl: (control) => millisecondControls.push(control) });
+  host._dispatchGameControls([{ ts: 1700000000123, control: { mood: 'happy' } }]);
+  assert(millisecondControls[0].timestamp === 1700000000123,
+    'millisecond control timestamps were changed during normalization');
+
+  let sameDocumentState = null;
+  host.startVoiceControlBridge({
+    BroadcastChannelImpl: null,
+    onState: (state, source) => { sameDocumentState = { state, source }; },
+  });
+  windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
+    detail: {
+      type: 'game_voice_control_state',
+      game_type: 'soccer',
+      session_id: 'server-session',
+      reason: 'state-sync',
+    },
+  }));
+  assert(sameDocumentState?.source === 'same_document'
+    && sameDocumentState.state.reason === 'state-sync',
+  'same-document voice fallback state was not received');
+  const sameDocumentController = (event) => {
+    if (event?.detail?.type !== 'game_voice_control_request') return;
+    windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
+      detail: {
+        type: 'game_voice_control_state',
+        game_type: 'soccer',
+        session_id: 'server-session',
+        request_id: event.detail.request_id,
+        reason: 'queried',
+        ok: true,
+      },
+    }));
+  };
+  windowMock.addEventListener('neko-game-voice-control-message', sameDocumentController);
+  const sameDocumentResponse = await host.requestVoiceControl('query', { timeoutMs: 500 });
+  assert(sameDocumentResponse.reason === 'queried',
+    'same-document voice fallback request did not complete without BroadcastChannel');
+  windowMock.removeEventListener('neko-game-voice-control-message', sameDocumentController);
+  host.stopVoiceControlBridge();
+  assert(!listeners.has('neko-game-voice-control-message'),
+    'same-document voice fallback listener was not released');
 
   let releaseLimitedProtocol;
   let markLimitedProtocolStarted;
@@ -262,6 +332,26 @@ async function main() {
     && !genericHandshake.grantedCapabilities.includes('quick-lines'),
   'generic games received a quick-lines route without a registered dictionary');
 
+  const noLockHost = window.createNekoMiniGameSameOriginHost({
+    gameType: 'no-lock-game',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: { sendBeacon: () => false },
+  });
+  const noLockHandshake = noLockHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'no-lock-game',
+      version: '1.0.0',
+      requiredCapabilities: ['logging'],
+      optionalCapabilities: ['storage', 'leaderboard-local'],
+    },
+  });
+  assert(noLockHandshake.grantedCapabilities.includes('storage')
+    && !noLockHandshake.grantedCapabilities.includes('leaderboard-local'),
+  'host granted cross-window leaderboard mutations without an origin-wide lock');
+
+  noLockHost.dispose();
   genericHost.dispose();
   host.dispose();
   process.stdout.write('mini-game same-origin host runtime test passed\n');

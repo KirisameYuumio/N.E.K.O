@@ -18,6 +18,7 @@ async function main() {
   const posted = [];
   let nextIntervalId = 1;
   let channelClosed = false;
+  const localValues = new Map();
 
   const addEventListener = (type, handler) => {
     if (!listeners.has(type)) listeners.set(type, new Set());
@@ -53,7 +54,10 @@ async function main() {
       this.onmessage = null;
       global.__gameVoiceChannel = this;
     }
-    postMessage(message) { posted.push(message); }
+    postMessage(message) {
+      if (this.failPosts) throw new Error('channel unavailable');
+      posted.push(message);
+    }
     close() { channelClosed = true; }
   }
 
@@ -65,11 +69,22 @@ async function main() {
     stopMicCapture: async () => { appState.isRecording = false; },
     addEventListener,
     removeEventListener,
+    dispatchEvent(event) {
+      for (const handler of Array.from(listeners.get(event.type) || [])) handler(event);
+    },
+    CustomEvent: class CustomEventMock {
+      constructor(type, options = {}) { this.type = type; this.detail = options.detail; }
+    },
   };
 
   global.window = windowMock;
   global.document = documentMock;
   global.BroadcastChannel = BroadcastChannelMock;
+  global.localStorage = {
+    getItem(key) { return localValues.has(key) ? localValues.get(key) : null; },
+    setItem(key, value) { localValues.set(key, String(value)); },
+    removeItem(key) { localValues.delete(key); },
+  };
   global.setInterval = (callback, delay) => {
     const id = nextIntervalId++;
     intervals.set(id, { callback, delay });
@@ -86,6 +101,8 @@ async function main() {
   assert(channel?.name === 'neko_game_voice_control_channel', 'host channel was not created');
   assert(intervals.size === 1, 'bounded state synchronization timer was not installed');
   assert(listeners.get('storage')?.size === 1, 'localStorage fallback listener was not installed');
+  assert(listeners.get('neko-game-voice-control-message')?.size === 1,
+    'same-document fallback listener was not installed');
   assert(listeners.get('neko-game-window-state-change')?.size === 1, 'route reconciliation listener was not installed');
   assert(listeners.get('neko-game-voice-transcription-state-change')?.size === 1,
     'transcription state listener was not installed');
@@ -175,6 +192,27 @@ async function main() {
   assert(posted.some((message) => message.request_id === 'wrong-route' && message.reason === 'route_mismatch'),
     'route mismatch was not rejected');
 
+  const sameDocumentResponses = [];
+  const sameDocumentObserver = (event) => {
+    if (event?.detail?.type === 'game_voice_control_state') sameDocumentResponses.push(event.detail);
+  };
+  addEventListener('neko-game-voice-control-message', sameDocumentObserver);
+  channel.failPosts = true;
+  windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
+    detail: {
+      type: 'game_voice_control_request',
+      sender_id: 'soccer-window',
+      request_id: 'same-document-query',
+      action: 'query',
+      game_type: 'soccer',
+      session_id: 'soccer-runtime',
+    },
+  }));
+  await flush();
+  assert(sameDocumentResponses.some((message) => message.request_id === 'same-document-query'),
+    'same-document fallback request was not answered after BroadcastChannel failure');
+  removeEventListener('neko-game-voice-control-message', sameDocumentObserver);
+
   const dispose = listeners.get('pagehide')?.values().next().value;
   assert(typeof dispose === 'function', 'pagehide cleanup was not installed');
   dispose();
@@ -183,6 +221,8 @@ async function main() {
   assert(!listeners.get('pagehide')?.size, 'pagehide cleanup listener was not released');
   assert(!listeners.get('beforeunload')?.size, 'beforeunload cleanup listener was not released');
   assert(!listeners.get('storage')?.size, 'localStorage fallback listener was not released');
+  assert(!listeners.get('neko-game-voice-control-message')?.size,
+    'same-document fallback listener was not released');
   assert(!listeners.get('neko-game-window-state-change')?.size, 'route reconciliation listener was not released');
   assert(!listeners.get('neko-game-voice-transcription-state-change')?.size,
     'transcription state listener was not released');

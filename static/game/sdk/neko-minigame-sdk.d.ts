@@ -153,7 +153,7 @@ declare namespace NekoMiniGame {
     require(capability: Capability): true;
   }
 
-  type RuntimeState = 'idle' | 'starting' | 'running' | 'degraded' | 'ending' | 'ended' | 'disposed';
+  type RuntimeState = 'idle' | 'starting' | 'running' | 'degraded' | 'inactive' | 'ending' | 'ended' | 'disposed';
 
   interface RuntimeSession {
     readonly id: string;

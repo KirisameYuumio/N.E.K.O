@@ -245,6 +245,7 @@ async function main() {
 
   await game.runtime.start();
   assert(consent.input.disabled, 'memory consent remained editable after runtime start');
+  await game.runtime.end({ reason: 'presentation-test-complete' });
   game.runtime.reset({ newSession: true });
   assert(!consent.input.checked && !consent.enabled && !consent.input.disabled,
     'new runtime session did not reset the consent presentation to default-off');

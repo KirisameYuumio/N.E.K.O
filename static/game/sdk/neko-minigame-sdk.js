@@ -1068,7 +1068,8 @@
       case 'storage':
         return typeof transport.requestGameStorage === 'function';
       case 'leaderboard-local':
-        return typeof transport.requestGameStorage === 'function';
+        return typeof transport.requestGameStorage === 'function'
+          && typeof transport.runGameStorageExclusive === 'function';
       case 'leaderboard-server':
         return typeof transport.submitServerLeaderboard === 'function'
           && typeof transport.listServerLeaderboard === 'function'
@@ -1689,6 +1690,7 @@
     let memoryConsentLocked = false;
     let memoryConsentConfigured = false;
     let localLeaderboardSequence = 0;
+    const localLeaderboardClientId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     let runtimePhase = 'idle';
     let runtimeEventSequence = 0;
     let runtimeConfig = null;
@@ -2692,6 +2694,12 @@
       },
       reset(resetOptions = {}) {
         requireCapability('runtime', 'runtime.reset');
+        if (!['idle', 'ended', 'inactive'].includes(runtimePhase)) {
+          fail('invalid_state', 'Active runtimes must be ended before reset', {
+            operation: 'runtime.reset',
+            state: runtimePhase,
+          });
+        }
         stopRuntimeMonitoring();
         stopRuntimeOperation();
         abortPendingProtocolRequests('cancelled');
@@ -3080,7 +3088,7 @@
       });
     }
 
-    async function mutateLocalLeaderboard(boardId, operation, callback) {
+    async function mutateLocalLeaderboard(boardId, operation, callback, requestOptions = {}) {
       if (localLeaderboardMutations.has(boardId)) {
         fail('busy', 'A local leaderboard mutation is already in progress', {
           operation,
@@ -3088,7 +3096,13 @@
         });
       }
       localLeaderboardMutations.add(boardId);
-      try { return await callback(); }
+      try {
+        return await transport.runGameStorageExclusive(
+          `leaderboards/${boardId}`,
+          callback,
+          { timeoutMs: 8000, signal: requestOptions.signal },
+        );
+      }
       finally { localLeaderboardMutations.delete(boardId); }
     }
 
@@ -3106,7 +3120,7 @@
           const current = await readLocalLeaderboard(boardId, definition, requestOptions);
           localLeaderboardSequence = (localLeaderboardSequence + 1) % Number.MAX_SAFE_INTEGER;
           const entry = Object.freeze({
-            id: `local-${Date.now().toString(36)}-${localLeaderboardSequence.toString(36)}`,
+            id: `local-${localLeaderboardClientId}-${localLeaderboardSequence.toString(36)}`,
             submittedAt: Date.now(),
             score: normalized.score,
             data: normalized.data,
@@ -3134,7 +3148,7 @@
             totalEntries: stored.entries.length,
             isPersonalBest: rankIndex === 0,
           });
-        });
+        }, requestOptions);
       },
       async list(boardIdInput, options = {}, requestOptions = {}) {
         requireCapability('leaderboard-local', 'leaderboard.local.list');
@@ -3181,7 +3195,7 @@
         return mutateLocalLeaderboard(boardId, 'leaderboard.local.clear', async () => {
           await requestLocalLeaderboardStorage('delete', boardId, {}, requestOptions);
           return localLeaderboardResult({ boardId, cleared: true });
-        });
+        }, requestOptions);
       },
     });
 

@@ -213,6 +213,7 @@ async function main() {
     === 'events,result,state,summary',
   'memory submission contained fields outside the visible event/state/result/summary contract');
 
+  await game.runtime.end({ reason: 'memory-test-complete' });
   game.runtime.reset({ newSession: true });
   assert(!game.memory.consent.enabled && !game.memory.consent.configured && !game.memory.consent.locked,
     'new runtime session did not reset memory consent to disabled');

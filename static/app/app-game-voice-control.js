@@ -11,6 +11,7 @@
 
     var CHANNEL_NAME = 'neko_game_voice_control_channel';
     var STORAGE_KEY = 'neko_game_voice_control_message';
+    var WINDOW_EVENT = 'neko-game-voice-control-message';
     var STATE_POLL_INTERVAL_MS = 250;
     var COMMAND_TIMEOUT_MS = 12000;
     var senderId = 'host-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
@@ -20,6 +21,7 @@
     var stateTimer = null;
     var lastStateFingerprint = '';
     var storageHandler = null;
+    var windowEventHandler = null;
     var gameWindowStateHandler = null;
     var transcriptionStateHandler = null;
     var voiceTranscriptHandler = null;
@@ -96,6 +98,11 @@
                 storage_nonce: Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
             }, payload || {}));
             localStorage.setItem(STORAGE_KEY, serialized);
+            if (typeof window.dispatchEvent === 'function' && typeof window.CustomEvent === 'function') {
+                window.dispatchEvent(new window.CustomEvent(WINDOW_EVENT, {
+                    detail: JSON.parse(serialized)
+                }));
+            }
             if (ephemeral) {
                 localStorage.removeItem(STORAGE_KEY);
                 return true;
@@ -259,6 +266,10 @@
         catch (_) {}
     };
     window.addEventListener('storage', storageHandler);
+    windowEventHandler = function (event) {
+        acceptMessage(event && event.detail);
+    };
+    window.addEventListener(WINDOW_EVENT, windowEventHandler);
 
     // app-websocket's reconnect reconciliation dispatches this event from an
     // authoritative /api/game/route/active read. Mirror it into appState so a
@@ -325,6 +336,10 @@
         if (storageHandler) {
             window.removeEventListener('storage', storageHandler);
             storageHandler = null;
+        }
+        if (windowEventHandler) {
+            window.removeEventListener(WINDOW_EVENT, windowEventHandler);
+            windowEventHandler = null;
         }
         if (gameWindowStateHandler) {
             window.removeEventListener('neko-game-window-state-change', gameWindowStateHandler);

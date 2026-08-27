@@ -171,16 +171,18 @@ unsubscribe();
 `runtime.start()` applies the host-returned session state and owns heartbeat,
 output polling, request cancellation, page visibility, and page-exit listeners. A
 rejected or failed start enters `degraded` state and keeps output polling
-available without sending heartbeats. `runtime.reset()`, `runtime.end()`, and
-`game.dispose()` stop timers, remove the listener, and abort in-flight lifecycle
-requests. Games can inspect `game.runtime.state` and the immutable
-`game.runtime.session` snapshot.
+available without sending heartbeats. `runtime.end()` and `game.dispose()` stop
+timers, remove the listener, and abort in-flight lifecycle requests. Games can
+inspect `game.runtime.state` and the immutable `game.runtime.session` snapshot.
 
 `runtime.reset()` also cancels in-flight protocol, context, dialogue, memory and
 speech operations that were bound to the previous session, clears local speech
 correlation state, and resets memory consent to default-off. Official game
 storage is game-version namespaced rather than session-scoped, so storage
 operations are not cancelled merely because a round creates a new session.
+Reset is accepted only while the runtime is `idle`, `ended`, or `inactive`;
+games must await `runtime.end()` before resetting an active, starting, degraded,
+or ending route so the host session cannot be abandoned by local-only cleanup.
 
 When `pageExit` is enabled, the SDK emits `page-exit` once so the game can
 synchronously release game-owned resources, submits the configured end payload
@@ -320,8 +322,12 @@ This is local, personal game data. It does not claim to aggregate other N.E.K.O
 installations, platform accounts or marketplace players. Each client bounds the
 number of boards, retained entries, entry/state byte size and pending requests;
 the trusted host additionally enforces per-game key, value and total quotas.
-Local mutations for the same board are serialized by rejecting overlap with
-`busy`, and client disposal cancels pending storage work.
+Local mutations for the same board are serialized across trusted game windows by
+the host's origin-wide storage lock; overlapping mutation calls from one client
+are still rejected with `busy`, and client disposal cancels pending storage work.
+The trusted same-origin host grants `leaderboard-local` only when both local
+storage and the browser Web Locks API are available, because raw read/write
+storage cannot provide a safe cross-window read-modify-write contract.
 
 The matching future service facade is already reserved as
 `game.leaderboard.server.submit/list/getMyBest`. It requires the separate

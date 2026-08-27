@@ -220,6 +220,12 @@ async function main() {
   assert(nestedMutationBlocked && envelopes[1].payload.result.metadata.source === 'host',
     'one runtime event listener mutated nested payload observed by another listener');
 
+  let activeResetError = null;
+  try { game.runtime.reset({ newSession: true }); }
+  catch (error) { activeResetError = error; }
+  assert(activeResetError?.code === 'invalid_state' && game.runtime.state === 'running',
+    'runtime reset abandoned an active host route instead of requiring runtime.end()');
+
   const heartbeatBeforeVisibility = heartbeatCalls;
   environment.documentImpl.visibilityState = 'hidden';
   environment.documentImpl.hidden = true;
