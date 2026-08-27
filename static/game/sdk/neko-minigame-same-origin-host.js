@@ -835,6 +835,10 @@
         : {};
       const trusted = { ...source };
       for (const key of MEMORY_POLICY_PAYLOAD_KEYS) delete trusted[key];
+      if (trusted.event && typeof trusted.event === 'object' && !Array.isArray(trusted.event)) {
+        trusted.event = { ...trusted.event };
+        for (const key of MEMORY_POLICY_PAYLOAD_KEYS) delete trusted.event[key];
+      }
       const memoryEnabled = (
         this._grantedCapabilities.has('memory')
         && this._memoryConsentEnabled === true

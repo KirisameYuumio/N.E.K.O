@@ -3268,6 +3268,7 @@
                         }
                         var transcriptionProvider = (statusDetails && statusDetails.provider) || '';
                         var transcriptionReady = !!(statusDetails && statusDetails.ready === true);
+                        advanceGameRouteStateRevision();
                         S.gameRouteActive = true;
                         S.gameRouteGameType = (statusDetails && statusDetails.game_type) || '';
                         S.gameRouteLanlanName = (statusDetails && statusDetails.lanlan_name) || '';

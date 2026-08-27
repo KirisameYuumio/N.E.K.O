@@ -402,6 +402,32 @@ def test_server_vad_does_not_recapture_tail_frames_as_the_next_utterance():
     )
 
 
+@pytest.mark.unit
+def test_evicted_server_vad_item_does_not_consume_the_next_utterance_owner():
+    current_route = [("example-game", "session-0", "route-0")]
+    client = _free_client(
+        None,
+        get_input_route_identity=lambda: current_route[0],
+    )
+
+    for index in range(_transport._INPUT_ROUTE_IDENTITY_ITEM_LIMIT + 1):
+        current_route[0] = (
+            "example-game",
+            f"session-{index}",
+            f"route-{index}",
+        )
+        client._capture_input_route_identity()
+        client._bind_input_route_identity_to_item(f"provider-item-{index}")
+
+    current_route[0] = ("example-game", "session-next", "route-next")
+    client._capture_input_route_identity()
+
+    assert client._take_input_route_identity("provider-item-0") is None
+    assert client._take_input_route_identity() == (
+        "example-game", "session-next", "route-next",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Contract 3 first: the shape of an ordinary turn is the baseline everything
 # else is measured against.

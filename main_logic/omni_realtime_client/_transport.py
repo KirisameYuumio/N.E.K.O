@@ -202,8 +202,11 @@ class _TransportMixin:
 
     def _take_input_route_identity(self, item_id: object = None):
         item_key = str(item_id or "").strip()
-        if item_key and item_key in self._input_route_identity_by_item:
-            return self._input_route_identity_by_item.pop(item_key)
+        if item_key:
+            # A server-VAD item has an exact owner or no provable owner. If its
+            # bounded mapping was evicted, falling through would consume the
+            # next utterance's global snapshot and misattribute the old final.
+            return self._input_route_identity_by_item.pop(item_key, None)
         identity = (
             self._input_route_identity
             if self._input_route_identity_captured

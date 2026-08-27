@@ -394,6 +394,12 @@ async function main() {
     game_archive_memory_enabled: true,
     soccer_game_memory_enabled: true,
     badmintonGameMemoryArchiveEnabled: true,
+    event: {
+      kind: 'nested-memory-bypass',
+      game_memory_enabled: true,
+      soccerGameMemoryArchiveEnabled: true,
+      badminton_game_memory_event_reply_enabled: true,
+    },
   });
   const ungrantedStart = calls.filter((call) => call.url.endsWith('/route/start')).at(-1);
   assert(ungrantedStart.body.sdk_voice_control_credential === '',
@@ -409,6 +415,11 @@ async function main() {
     && !Object.hasOwn(ungrantedStart.body, 'soccer_game_memory_enabled')
     && !Object.hasOwn(ungrantedStart.body, 'badmintonGameMemoryArchiveEnabled'),
   'ungranted legacy memory aliases were forwarded to the backend');
+  assert(ungrantedStart.body.event.kind === 'nested-memory-bypass'
+    && !Object.hasOwn(ungrantedStart.body.event, 'game_memory_enabled')
+    && !Object.hasOwn(ungrantedStart.body.event, 'soccerGameMemoryArchiveEnabled')
+    && !Object.hasOwn(ungrantedStart.body.event, 'badminton_game_memory_event_reply_enabled'),
+  'nested legacy memory aliases bypassed the host-owned memory policy');
   await ungrantedHost.heartbeat({
     game_memory_enabled: true,
     soccer_game_memory_archive_enabled: true,

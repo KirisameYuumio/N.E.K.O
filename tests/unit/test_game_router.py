@@ -4185,6 +4185,7 @@ async def test_game_chat_refreshes_matching_route_locale_with_live_precedence(mo
         *,
         prompt_locale=None,
         lanlan_name="",
+        **_route_kwargs,
     ):
         assert lanlan_name == "Lan"
         prompt_locales.append(prompt_locale)
@@ -4230,6 +4231,125 @@ async def test_game_chat_refreshes_matching_route_locale_with_live_precedence(mo
         assert stale["skipped"] == "route_inactive"
         assert len(prompt_locales) == before_stale_calls
         assert (state["user_language"], state["user_language_source"]) == ("ko", "request")
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_standard_game_chat_binds_llm_to_validated_route_generation(monkeypatch):
+    captured = {}
+
+    async def fake_run_game_chat(
+        game_type,
+        session_id,
+        event,
+        *,
+        expected_route_state=None,
+        expected_route_instance_id="",
+        **_kwargs,
+    ):
+        captured.update({
+            "game_type": game_type,
+            "session_id": session_id,
+            "event": event,
+            "expected_route_state": expected_route_state,
+            "expected_route_instance_id": expected_route_instance_id,
+        })
+        return {"line": "ok", "control": {}}
+
+    _gr_patch_all(monkeypatch, "_run_game_chat", fake_run_game_chat)
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route(
+            "example-game", "reused-session", "Lan"
+        )
+        state["_sdk_route_instance_id"] = "route-A"
+
+        result = await gr_runtime.game_chat(
+            "example-game",
+            _FakeRequest({
+                "session_id": "reused-session",
+                "lanlan_name": "Lan",
+                "sdk_route_instance_id": "route-A",
+                "event": {"kind": "neutral-turn"},
+            }),
+        )
+
+        assert result["line"] == "ok"
+        assert captured["game_type"] == "example-game"
+        assert captured["session_id"] == "reused-session"
+        assert captured["event"]["kind"] == "neutral-turn"
+        assert captured["expected_route_state"] is state
+        assert captured["expected_route_instance_id"] == "route-A"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_standard_game_chat_drops_reply_from_replaced_route_generation(monkeypatch):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    reply_chunks = []
+
+    class BlockingSession:
+        async def stream_text(self, _text):
+            entered.set()
+            await release.wait()
+            reply_chunks.append('late reply')
+
+        async def update_session(self, _config):
+            return None
+
+    _gr_patch_all(monkeypatch, "_refresh_game_session_instructions", AsyncMock())
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    with reset_game_route_state():
+        route_a = gr_runtime._activate_game_route(
+            "example-game", "reused-session", "Lan"
+        )
+        route_a["_sdk_route_instance_id"] = "route-A"
+        session = BlockingSession()
+        key = gr_runtime._game_session_key(
+            "Lan", "example-game", "reused-session"
+        )
+        gr_runtime._game_sessions[key] = {
+            "session": session,
+            "reply_chunks": reply_chunks,
+            "lanlan_name": "Lan",
+            "lanlan_prompt": "",
+            "user_language": "en",
+            "game_type": "example-game",
+            "session_id": "reused-session",
+            "last_activity": 0,
+            "lock": asyncio.Lock(),
+            "instructions": "stub",
+            "source": {"provider": "fake"},
+        }
+
+        task = asyncio.create_task(
+            gr_runtime.game_chat(
+                "example-game",
+                _FakeRequest({
+                    "session_id": "reused-session",
+                    "lanlan_name": "Lan",
+                    "sdk_route_instance_id": "route-A",
+                    "event": {"kind": "neutral-turn"},
+                }),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+
+        route_b = gr_runtime._activate_game_route(
+            "example-game", "reused-session", "Lan"
+        )
+        route_b["_sdk_route_instance_id"] = "route-B"
+        release.set()
+        result = await asyncio.wait_for(task, timeout=1)
+
+        assert result["skipped"] == "route_superseded"
+        assert result["line"] == ""
+        assert reply_chunks == []
+        assert route_a["game_dialog_log"] == []
+        assert route_b["game_dialog_log"] == []
 
 
 @pytest.mark.unit

@@ -1253,6 +1253,38 @@ async def _run_game_chat(
                 return err_result
 
             llm_elapsed_ms = int((time.perf_counter() - llm_started_at) * 1000)
+            if not allow_postgame:
+                post_state = _find_game_route_state_for_session(
+                    game_type,
+                    session_id,
+                    lanlan_name,
+                )
+                if expected_route_state is not None and (
+                    post_state is not expected_route_state
+                    or (
+                        expected_route_instance_id
+                        and str(
+                            (post_state or {}).get("_sdk_route_instance_id") or ""
+                        )
+                        != expected_route_instance_id
+                    )
+                ):
+                    reply_chunks.clear()
+                    return {
+                        "line": "",
+                        "control": {},
+                        "skipped": "route_superseded",
+                    }
+                if isinstance(post_state, dict) and (
+                    post_state.get("_exit_flow_started")
+                    or post_state.get("game_route_active") is False
+                ):
+                    reply_chunks.clear()
+                    return {
+                        "line": "",
+                        "control": {},
+                        "skipped": "route_inactive",
+                    }
             full_reply = ''.join(reply_chunks)
 
     if short_circuit_route_inactive:
@@ -1668,6 +1700,10 @@ async def game_chat(game_type: str, request: Request):
         event,
         prompt_locale=prompt_locale,
         lanlan_name=lanlan_name,
+        expected_route_state=state,
+        expected_route_instance_id=str(
+            (state or {}).get("_sdk_route_instance_id") or ""
+        ),
     )
     return _record_game_chat_result(state, session_id, event, result)
 

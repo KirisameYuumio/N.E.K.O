@@ -68,7 +68,16 @@ def test_reconnect_route_snapshot_cannot_overwrite_a_newer_websocket_route_event
     ) < reconnect_block.index(
         "window.dispatchEvent(new CustomEvent('neko-game-window-state-change'"
     )
-    assert source.count("advanceGameRouteStateRevision();") >= 3
+    stt_gate_block = _block_after(
+        source,
+        "if (statusCode === 'GAME_VOICE_STT_GATE_ACTIVE') {",
+    )
+    assert stt_gate_block.index(
+        "advanceGameRouteStateRevision();"
+    ) < stt_gate_block.index(
+        "S.gameRouteActive = true;"
+    )
+    assert source.count("advanceGameRouteStateRevision();") >= 4
 
 
 def _block_after(js: str, opener: str) -> str:
