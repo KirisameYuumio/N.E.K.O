@@ -164,6 +164,15 @@ async function main() {
     'opening-screen memory consent was not attached to route start');
   assert(host.sessionId === 'server-session' && host.routeLanlanName === 'Server Neko',
     'authoritative route identity did not replace the provisional host identity');
+  await host.evaluatePassiveGuard({
+    session_id: 'attacker-session',
+    lanlan_name: 'Attacker Neko',
+    event: { kind: 'idle' },
+  });
+  const passiveGuardCall = calls.find((call) => call.url.endsWith('/passive-guard'));
+  assert(passiveGuardCall.body.session_id === 'server-session'
+    && passiveGuardCall.body.lanlan_name === 'Server Neko',
+  'passive guard trusted application-supplied route identity');
 
   await host.publishGameProtocol('event', {
     protocolVersion: '1',
@@ -308,9 +317,29 @@ async function main() {
   assert(sameDocumentResponse.reason === 'queried',
     'same-document voice fallback request did not complete without BroadcastChannel');
   windowMock.removeEventListener('neko-game-voice-control-message', sameDocumentController);
+  const voiceAbortController = new AbortController();
+  const cancelledVoiceRequest = host.requestVoiceControl('query', {
+    timeoutMs: 500,
+    signal: voiceAbortController.signal,
+  }).catch((error) => error);
+  voiceAbortController.abort();
+  const cancelledVoiceError = await cancelledVoiceRequest;
+  assert(cancelledVoiceError?.code === 'cancelled' && host._voiceControlBridge.pending.size === 0,
+    'aborted voice control request remained pending in the trusted host');
   host.stopVoiceControlBridge();
   assert(!listeners.has('neko-game-voice-control-message'),
     'same-document voice fallback listener was not released');
+
+  let recognitionAbortCalls = 0;
+  class RecognitionMock {
+    start() {}
+    stop() {}
+    abort() { recognitionAbortCalls += 1; }
+  }
+  host.startSpeechRecognition('release-test', { RecognitionImpl: RecognitionMock });
+  host.releaseSpeechRecognition('release-test');
+  assert(recognitionAbortCalls === 1 && host._speechRecognitionSlots.size === 0,
+    'speech recognition release did not abort and remove its browser recognizer');
 
   let releaseLimitedProtocol;
   let markLimitedProtocolStarted;
@@ -356,6 +385,35 @@ async function main() {
   try { await limitedQueued; } catch (error) { disposedQueueError = error; }
   assert(disposedQueueError?.code === 'disposed',
     'queued protocol work survived host disposal');
+
+  const waitingLockNavigator = {
+    sendBeacon: () => false,
+    locks: {
+      request(_name, options) {
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          }, { once: true });
+        });
+      },
+    },
+  };
+  const waitingLockHost = window.createNekoMiniGameSameOriginHost({
+    gameType: 'waiting-lock-game',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: waitingLockNavigator,
+  });
+  const waitingLock = waitingLockHost.runGameStorageExclusive('leaderboards/main', async () => true)
+    .catch((error) => error);
+  await Promise.resolve();
+  assert(waitingLockHost._pendingStorageLockControllers.size === 1,
+    'trusted host did not track the pending Web Lock request');
+  waitingLockHost.dispose();
+  const waitingLockError = await waitingLock;
+  assert(waitingLockError?.code === 'disposed'
+    && waitingLockHost._pendingStorageLockControllers.size === 0,
+  'trusted host disposal did not abort and release its pending Web Lock request');
 
   const genericHost = window.createNekoMiniGameSameOriginHost({
     gameType: 'third-party-game',

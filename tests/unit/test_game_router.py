@@ -3649,6 +3649,52 @@ async def test_badminton_game_chat_rejects_missing_route_before_llm(monkeypatch)
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_generic_game_chat_rejects_missing_route_before_session_creation(monkeypatch):
+    async def fail_create_session(*_args, **_kwargs):
+        raise AssertionError("missing generic route should not create an LLM session")
+
+    monkeypatch.setattr(gr_runtime, "_get_or_create_session", fail_create_session)
+    with reset_game_route_state():
+        result = await gr_runtime.game_chat("soccer", _FakeRequest({
+            "session_id": "missing-session",
+            "lanlan_name": "Lan",
+            "event": {"kind": "goal"},
+        }))
+
+    assert result["skipped"] == "route_inactive"
+    assert result["line"] == ""
+    assert result["control"] == {}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_route_drain_preserves_outputs_beyond_requested_limit(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("soccer", "drain-session", "Lan")
+        state["pending_outputs"] = [
+            {"type": "first"},
+            {"type": "second"},
+            {"type": "third"},
+        ]
+        first = await gr_runtime.game_route_drain("soccer", _FakeRequest({
+            "session_id": "drain-session",
+            "lanlan_name": "Lan",
+            "limit": 2,
+        }))
+        second = await gr_runtime.game_route_drain("soccer", _FakeRequest({
+            "session_id": "drain-session",
+            "lanlan_name": "Lan",
+            "limit": 2,
+        }))
+
+    assert [item["type"] for item in first["outputs"]] == ["first", "second"]
+    assert [item["type"] for item in second["outputs"]] == ["third"]
+    assert state["pending_outputs"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_badminton_game_chat_rate_limit_does_not_refresh_route_locale(monkeypatch):
     manager = _LocaleTrackingManager()
 
@@ -3709,11 +3755,6 @@ async def test_game_chat_refreshes_matching_route_locale_with_live_precedence(mo
                 {"i18n_language": "ko", "render_language": "pt"},
                 "ko", ("ko", "request"),
             ),
-            (
-                "en", False,
-                {"session_id": "stale-session", "render_language": "es"},
-                "es", ("ko", "request"),
-            ),
         ]
         for manager_language, explicit, payload, prompt, route_locale in cases:
             manager.user_language = manager_language
@@ -3726,6 +3767,19 @@ async def test_game_chat_refreshes_matching_route_locale_with_live_precedence(mo
             }))
             assert prompt_locales[-1] == prompt
             assert (state["user_language"], state["user_language_source"]) == route_locale
+
+        before_stale_calls = len(prompt_locales)
+        manager.user_language = "en"
+        manager._user_language_explicit = False
+        stale = await gr_runtime.game_chat("soccer", _FakeRequest({
+            "session_id": "stale-session",
+            "lanlan_name": "Lan",
+            "render_language": "es",
+            "event": {"kind": "round_end"},
+        }))
+        assert stale["skipped"] == "route_inactive"
+        assert len(prompt_locales) == before_stale_calls
+        assert (state["user_language"], state["user_language_source"]) == ("ko", "request")
 
 
 @pytest.mark.unit

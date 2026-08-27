@@ -264,6 +264,13 @@ async function main() {
 
   const voiceState = await game.voice.toggle();
   assert(voiceState.action === 'toggle', 'voice toggle did not use the host transport');
+  let inactiveDialogueError = null;
+  try { await game.dialogue.request({ event: 'before-start' }); }
+  catch (error) { inactiveDialogueError = error; }
+  assert(inactiveDialogueError?.code === 'invalid_state',
+    'dialogue request was allowed before an active runtime route existed');
+  const started = await game.runtime.start({ mode: 'default' });
+  assert(started.data.payload.mode === 'default', 'runtime start did not use the host transport');
   const dialogue = await game.dialogue.request({ event: 'goal' });
   assert(dialogue.data.payload.event === 'goal', 'dialogue request did not use the host transport');
   assert(dialogue.data.payload.session_id === 'sdk-test-session',
@@ -318,19 +325,6 @@ async function main() {
   assert(invalidAuthorPromptError?.code === 'invalid_request',
     'author-managed dialogue accepted an unsupported role');
 
-  let implicitContextOrderError = null;
-  try {
-    await game.dialogue.request({
-      event: 'goal',
-      prompt: {
-        mode: 'author-managed',
-        messages: [{ role: 'user', content: 'current event' }],
-      },
-    }, { contextScopes: ['character-public'] });
-  } catch (error) { implicitContextOrderError = error; }
-  assert(implicitContextOrderError?.code === 'invalid_request',
-    'author-managed dialogue accepted implicit host context with undefined ordering');
-
   dialoguePendingMode = true;
   const boundedDialogueRequests = Array.from({ length: 4 }, (_, index) => (
     game.dialogue.request({ event: `pending-${index}` }).then(() => null, (error) => error)
@@ -361,8 +355,6 @@ async function main() {
     'public transport error lost its stable code or operation');
   assert(dialogueError.details.internal === undefined,
     'public transport error leaked transport-specific details');
-  const started = await game.runtime.start({ mode: 'default' });
-  assert(started.data.payload.mode === 'default', 'runtime start did not use the host transport');
   game.logger.info('runtime', 'ready', 'ready');
   assert(calls.some((entry) => entry[0] === 'info'), 'SDK logger did not use the required host logger');
 

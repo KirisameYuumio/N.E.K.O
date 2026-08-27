@@ -1240,6 +1240,21 @@ async def game_chat(game_type: str, request: Request):
         ) from exc
     lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
     state = _get_active_game_route_state(lanlan_name, game_type) if lanlan_name else None
+    if not _is_badminton_game_type(game_type) and (
+        not isinstance(state, dict)
+        or state.get("game_route_active") is not True
+        or str(state.get("session_id") or "") != session_id
+    ):
+        return {
+            "ok": True,
+            "skipped": "route_inactive",
+            "reason": "route_not_active",
+            "handled": False,
+            "line": "",
+            "control": {},
+            "lanlan_name": lanlan_name,
+            "method": "game_chat",
+        }
     if state and state.get("session_id") == session_id:
         _update_game_memory_enabled_from_payload(state, data, game_type=game_type)
         if isinstance(event, dict):
@@ -1634,8 +1649,16 @@ async def game_route_drain(game_type: str, request: Request):
     _absorb_request_language(data, lanlan_name)
     _update_game_route_language_from_payload(state, data)
     _update_game_memory_enabled_from_payload(state, data, game_type=game_type)
-    outputs = list(state.get("pending_outputs") or [])
-    state["pending_outputs"] = []
+    pending_outputs = state.get("pending_outputs")
+    if not isinstance(pending_outputs, list):
+        pending_outputs = []
+    try:
+        requested_limit = int(data.get("limit") or 50)
+    except (TypeError, ValueError):
+        requested_limit = 50
+    limit = max(1, min(requested_limit, 50))
+    outputs = list(pending_outputs[:limit])
+    state["pending_outputs"] = pending_outputs[limit:]
     return {"ok": True, "outputs": outputs, "state": _public_route_state(state)}
 
 

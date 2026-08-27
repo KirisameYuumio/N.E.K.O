@@ -247,7 +247,7 @@ declare namespace NekoMiniGame {
           }>[];
         }>;
       },
-      options?: RequestOptions & { contextScopes?: readonly string[] },
+      options?: RequestOptions,
     ): Promise<Response>;
   }
 

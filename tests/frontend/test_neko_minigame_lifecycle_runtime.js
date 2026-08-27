@@ -143,6 +143,7 @@ async function main() {
     },
     async drain(payload) {
       drainCalls += 1;
+      this.lastDrainPayload = payload;
       return { ok: true, outputs: drainCalls === 1 ? outputs : [], payload };
     },
     async end(payload) { return { ok: true, payload }; },
@@ -219,6 +220,8 @@ async function main() {
   await game.runtime.pulse(true);
   await game.runtime.pollOutputs();
   assert(heartbeatCalls >= 1, 'manual heartbeat did not use the host transport');
+  assert(transport.lastDrainPayload?.limit === 50,
+    'runtime drain did not delegate its bounded output limit to the host');
   assert(envelopes.length === 2, 'runtime outputs were not delivered as events');
   assert(envelopes[0].type === 'runtime-output', 'runtime output event type is invalid');
   assert(envelopes[0].sequence > 0, 'runtime event sequence was not assigned');
@@ -271,6 +274,86 @@ async function main() {
   assert(disposed === 1, 'runtime client did not release the transport');
   assert(reentrantDisposeError?.code === 'disposed',
     'a synchronous dispose listener could reopen a host request during cleanup');
+
+  const inactiveEnvironment = createEnvironment();
+  const inactiveTransport = {
+    ...transport,
+    logger: logger(),
+    resetRuntime() { return { sessionId: 'inactive-session', characterName: '' }; },
+    getRuntimeState() { return { sessionId: 'inactive-session', characterName: '' }; },
+    applyRuntimeState() { return { sessionId: 'inactive-session', characterName: '' }; },
+    async heartbeat() { return { ok: true, active: false, reason: 'route-gone' }; },
+    async drain() { return { ok: true, outputs: [] }; },
+    dispose() {},
+  };
+  const inactiveGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-inactive',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: inactiveTransport,
+    windowImpl: inactiveEnvironment.windowImpl,
+    documentImpl: inactiveEnvironment.documentImpl,
+  });
+  inactiveGame.runtime.configure({
+    heartbeat: { intervalMs: 2500, timeoutMs: 4500 },
+    outputs: { intervalMs: 700, timeoutMs: 8000 },
+    pageExit: true,
+  });
+  await inactiveGame.runtime.start({});
+  assert(inactiveEnvironment.intervals.size === 2,
+    'inactive lifecycle fixture did not start both monitoring timers');
+  await inactiveGame.runtime.pulse(true);
+  assert(inactiveGame.runtime.state === 'inactive' && inactiveEnvironment.intervals.size === 0,
+    'inactive heartbeat did not stop heartbeat and output monitoring together');
+  assert(inactiveEnvironment.windowListeners.size === 0
+    && inactiveEnvironment.documentListeners.size === 0,
+  'inactive heartbeat left lifecycle listeners resident');
+  inactiveGame.dispose();
+
+  const failedEndEnvironment = createEnvironment();
+  let rejectEnd = true;
+  const failedEndTransport = {
+    ...transport,
+    logger: logger(),
+    resetRuntime() { return { sessionId: 'failed-end-session', characterName: '' }; },
+    getRuntimeState() { return { sessionId: 'failed-end-session', characterName: '' }; },
+    applyRuntimeState() { return { sessionId: 'failed-end-session', characterName: '' }; },
+    async heartbeat() { return { ok: true, active: true }; },
+    async drain() { return { ok: true, outputs: [] }; },
+    async end() {
+      if (rejectEnd) throw Object.assign(new Error('network failed'), { code: 'request_failed' });
+      return { ok: true };
+    },
+    dispose() {},
+  };
+  const failedEndGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-failed-end',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: failedEndTransport,
+    windowImpl: failedEndEnvironment.windowImpl,
+    documentImpl: failedEndEnvironment.documentImpl,
+  });
+  failedEndGame.runtime.configure({
+    heartbeat: { intervalMs: 2500, timeoutMs: 4500 },
+    outputs: { intervalMs: 700, timeoutMs: 8000 },
+    pageExit: false,
+  });
+  await failedEndGame.runtime.start({});
+  let failedEndError = null;
+  try { await failedEndGame.runtime.end({}); }
+  catch (error) { failedEndError = error; }
+  assert(failedEndError?.code === 'request_failed'
+    && failedEndGame.runtime.state === 'degraded'
+    && failedEndEnvironment.intervals.size === 2,
+  'failed runtime end was treated as ended instead of retryable and monitored');
+  rejectEnd = false;
+  await failedEndGame.runtime.end({});
+  assert(failedEndGame.runtime.state === 'ended' && failedEndEnvironment.intervals.size === 0,
+    'retrying a failed runtime end did not close the route lifecycle');
+  failedEndGame.dispose();
 
   const cancellationEnvironment = createEnvironment();
   const blockedHeartbeat = deferred();

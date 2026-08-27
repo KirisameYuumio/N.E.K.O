@@ -222,11 +222,10 @@ message and does not persist this one-shot message list as host dialogue history
 Provider, model, API key, launch ticket and top-level raw history remain
 host-controlled.
 
-Author-managed calls cannot also request implicit `contextScopes`, because that
-would leave the injection position ambiguous. A game that needs host context
-must first use `context.read()` and deliberately place the sanitized result in
-its own ordered messages. Provider-specific message ordering compatibility is
-the game author's responsibility.
+`dialogue.request()` does not inject request-scoped host context. A game that
+needs host context must first use `context.read()` and deliberately place the
+sanitized result in its own ordered messages. Provider-specific message ordering
+compatibility is the game author's responsibility.
 
 ## Host context and game memory
 

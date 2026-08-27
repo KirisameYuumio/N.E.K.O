@@ -33,6 +33,7 @@
   const DEFAULT_VOICE_CONTROL_TIMEOUT_MS = 15000;
   const DEFAULT_VOICE_CONTROL_PENDING_LIMIT = 4;
   const DEFAULT_STORAGE_LOCK_TIMEOUT_MS = 8000;
+  const DEFAULT_STORAGE_LOCK_PENDING_LIMIT = 16;
   const VOICE_CONTROL_WINDOW_EVENT = 'neko-game-voice-control-message';
   const GAME_STORAGE_KEY_LIMIT = 256;
   const GAME_STORAGE_VALUE_BYTES = 64 * 1024;
@@ -110,6 +111,12 @@
         1024,
       );
       this._pendingRequests = new Map();
+      this._pendingStorageLockLimit = boundedPositiveInteger(
+        options.storageLockPendingLimit,
+        DEFAULT_STORAGE_LOCK_PENDING_LIMIT,
+        64,
+      );
+      this._pendingStorageLockControllers = new Set();
       this._protocolQueueLimit = boundedPositiveInteger(
         options.protocolQueueLimit,
         DEFAULT_PROTOCOL_QUEUE_LIMIT,
@@ -319,8 +326,14 @@
           operation: 'game_storage_lock',
         });
       }
+      if (this._pendingStorageLockControllers.size >= this._pendingStorageLockLimit) {
+        throw this._hostError('busy', 'Game storage lock request limit reached', {
+          operation: 'game_storage_lock',
+        });
+      }
       const AbortControllerImpl = this._window.AbortController || globalThis.AbortController;
       const controller = new AbortControllerImpl();
+      this._pendingStorageLockControllers.add(controller);
       const externalSignal = options.signal;
       const abortFromExternal = () => controller.abort(externalSignal?.reason);
       if (externalSignal?.aborted) abortFromExternal();
@@ -339,6 +352,7 @@
           { mode: 'exclusive', signal: controller.signal },
           async () => {
             acquired = true;
+            this._pendingStorageLockControllers.delete(controller);
             this._window.clearTimeout(timeoutId);
             timeoutId = null;
             if (this._disposed) {
@@ -351,13 +365,15 @@
         );
       } catch (error) {
         if (!acquired && controller.signal.aborted) {
-          throw this._hostError(externalSignal?.aborted ? 'cancelled' : 'timeout', 'Game storage lock was not acquired', {
+          const reason = this._disposed ? 'disposed' : (externalSignal?.aborted ? 'cancelled' : 'timeout');
+          throw this._hostError(reason, 'Game storage lock was not acquired', {
             operation: 'game_storage_lock',
             cause: error,
           });
         }
         throw error;
       } finally {
+        this._pendingStorageLockControllers.delete(controller);
         if (timeoutId != null) this._window.clearTimeout(timeoutId);
         externalSignal?.removeEventListener?.('abort', abortFromExternal);
       }
@@ -715,7 +731,7 @@
     }
 
     evaluatePassiveGuard(payload, options = {}) {
-      return this._post(this._gameEndpoint('passive-guard'), payload, {
+      return this._post(this._gameEndpoint('passive-guard'), this._trustedRuntimePayload(payload), {
         timeoutMs: 15000,
         operation: 'passive_guard',
         ...options,
@@ -1106,6 +1122,7 @@
         if (pending && data.reason !== 'working') {
           this._window.clearTimeout(pending.timeoutId);
           bridge.pending.delete(requestId);
+          pending.signal?.removeEventListener?.('abort', pending.abortHandler);
           pending.resolve(data);
         }
         try {
@@ -1193,19 +1210,38 @@
           operation: 'voice_control',
         }));
       }
+      const signal = options.signal || null;
+      if (signal?.aborted) {
+        return Promise.reject(this._hostError('cancelled', 'Voice control request was cancelled', {
+          operation: 'voice_control',
+        }));
+      }
 
       bridge.nextRequestId = (bridge.nextRequestId + 1) % Number.MAX_SAFE_INTEGER;
       const requestId = `voice-${Date.now().toString(36)}-${bridge.nextRequestId.toString(36)}`;
       const timeoutMs = Math.max(500, Number(options.timeoutMs || DEFAULT_VOICE_CONTROL_TIMEOUT_MS));
       return new Promise((resolve, reject) => {
+        const abortHandler = () => {
+          const pending = bridge.pending.get(requestId);
+          if (!pending) return;
+          bridge.pending.delete(requestId);
+          this._window.clearTimeout(pending.timeoutId);
+          signal?.removeEventListener?.('abort', abortHandler);
+          reject(this._hostError('cancelled', 'Voice control request was cancelled', {
+            operation: 'voice_control',
+            requestId,
+          }));
+        };
         const timeoutId = this._window.setTimeout(() => {
           bridge.pending.delete(requestId);
+          signal?.removeEventListener?.('abort', abortHandler);
           reject(this._hostError('timeout', 'Voice control request timed out', {
             operation: 'voice_control',
             requestId,
           }));
         }, timeoutMs);
-        bridge.pending.set(requestId, { resolve, reject, timeoutId });
+        bridge.pending.set(requestId, { resolve, reject, timeoutId, signal, abortHandler });
+        signal?.addEventListener?.('abort', abortHandler, { once: true });
         const posted = this._postVoiceControlMessage({
           type: 'game_voice_control_request',
           sender_id: bridge.senderId,
@@ -1218,6 +1254,7 @@
         if (!posted) {
           this._window.clearTimeout(timeoutId);
           bridge.pending.delete(requestId);
+          signal?.removeEventListener?.('abort', abortHandler);
           reject(this._hostError('unsupported', 'Voice control transport is unavailable', {
             operation: 'voice_control',
             requestId,
@@ -1230,6 +1267,7 @@
       const bridge = this._voiceControlBridge;
       for (const [requestId, pending] of bridge.pending.entries()) {
         this._window.clearTimeout(pending.timeoutId);
+        pending.signal?.removeEventListener?.('abort', pending.abortHandler);
         pending.reject(this._hostError(reason === 'disposed' ? 'disposed' : 'cancelled', 'Voice control request was cancelled', {
           operation: 'voice_control',
           requestId,
@@ -1413,9 +1451,19 @@
       const slotName = String(name || '').trim();
       const slot = this._speechRecognitionSlots.get(slotName);
       if (!slot) return;
-      if (slot.restartTimer != null) this._window.clearTimeout(slot.restartTimer);
+      const shouldAbort = slot.active || slot.listening || !slot.stopping;
+      slot.active = false;
+      slot.stopping = true;
+      slot.listening = false;
+      if (slot.restartTimer != null) {
+        this._window.clearTimeout(slot.restartTimer);
+        slot.restartTimer = null;
+      }
       const recognition = slot.recognition;
       if (recognition) {
+        if (shouldAbort) {
+          try { recognition.abort(); } catch (_) { /* already stopped */ }
+        }
         for (const eventName of [
           'start', 'audiostart', 'soundstart', 'speechstart', 'speechend',
           'soundend', 'audioend', 'nomatch', 'result', 'error', 'end',
@@ -2223,6 +2271,10 @@
     dispose(options = {}) {
       if (this._disposed) return;
       this._disposed = true;
+      for (const controller of this._pendingStorageLockControllers) {
+        try { controller.abort(); } catch (_) { /* already aborted */ }
+      }
+      this._pendingStorageLockControllers.clear();
       const preserveOperations = new Set(options.preservePendingOperations || []);
       this.cancelPendingRequests('disposed', { preserveOperations });
       this.stopAllSpeechRecognition();

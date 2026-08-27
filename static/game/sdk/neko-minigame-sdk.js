@@ -2041,7 +2041,7 @@
         }
         if (response.ok && data.ok !== false && data.active === false) {
           heartbeatLifecycle.failures = 0;
-          stopHeartbeatLifecycle();
+          stopRuntimeMonitoring();
           setRuntimePhase('inactive', String(data.reason || 'host-inactive'));
           await publishRuntimeEvent('runtime-inactive', data, { waitForHandlers: true });
           return response;
@@ -2087,7 +2087,10 @@
       outputLifecycle.inFlight = true;
       try {
         const response = await normalizeTransportResponse(await transport.drain(
-          runtimePayload(),
+          {
+            ...runtimePayload(),
+            limit: runtimeConfig.outputs.limit,
+          },
           {
             signal: controller.signal,
             timeoutMs: runtimeConfig.outputs.timeoutMs,
@@ -2095,20 +2098,11 @@
         ));
         if (disposed || outputLifecycle.controller !== controller) return response;
         const outputs = Array.isArray(response.data?.outputs) ? response.data.outputs : [];
-        const accepted = outputs.slice(0, runtimeConfig.outputs.limit);
-        for (const output of accepted) {
+        for (const output of outputs) {
           if (disposed || outputLifecycle.controller !== controller) break;
           await publishRuntimeEvent('runtime-output', output, { waitForHandlers: true });
         }
         if (disposed || outputLifecycle.controller !== controller) return response;
-        if (outputs.length > accepted.length) {
-          await publishRuntimeEvent('runtime-error', {
-            operation: 'drain',
-            reason: 'output_limit',
-            received: outputs.length,
-            accepted: accepted.length,
-          }, { waitForHandlers: true });
-        }
         if (!response.ok || response.data?.ok === false) {
           await publishRuntimeEvent('runtime-error', {
             operation: 'drain',
@@ -2803,21 +2797,25 @@
         stopRuntimeOperation();
         const operation = beginRuntimeOperation('end', requestOptions);
         setRuntimePhase('ending', 'end-request');
+        const recoverEndFailure = (reason) => {
+          if (!isRuntimeOperationCurrent(operation)) return;
+          setRuntimePhase('degraded', reason);
+          if (runtimePhase === 'degraded') startRuntimeMonitoring();
+        };
         try {
           const response = await normalizeTransportResponse(await transport.end(
             payload,
             operation.requestOptions,
           ));
           if (isRuntimeOperationCurrent(operation)) {
-            setRuntimePhase('ended', response.ok && response.data?.ok !== false
-              ? 'end-accepted'
-              : 'end-rejected');
+            if (response.ok && response.data?.ok !== false) setRuntimePhase('ended', 'end-accepted');
+            else recoverEndFailure('end-rejected');
           }
           return response;
         } catch (error) {
           const normalizedError = normalizeTransportError(error, 'runtime.end');
           if (isRuntimeOperationCurrent(operation)) {
-            setRuntimePhase('ended', 'end-failed');
+            recoverEndFailure('end-failed');
             await publishRuntimeEvent('runtime-error', {
               operation: 'end',
               reason: normalizedError.code,
@@ -3631,6 +3629,9 @@
       },
       async request(payload = {}, requestOptions = {}) {
         requireCapability('dialogue', 'dialogue.request');
+        if (!['running', 'degraded'].includes(runtimePhase)) {
+          fail('invalid_state', 'dialogue.request requires an active runtime route');
+        }
         if (!plainObject(payload)) fail('invalid_request', 'dialogue payload must be an object');
         const { prompt: rawPrompt, ...payloadWithoutPrompt } = payload;
         assertNoForbiddenDialogueFields(payloadWithoutPrompt);
@@ -3641,21 +3642,11 @@
           ...payloadWithoutPrompt,
           ...(authorPrompt ? { prompt: authorPrompt } : {}),
         }, 'dialogue payload');
-        const contextScopes = requestOptions.contextScopes === undefined
-          ? null
-          : normalizeContextScopes(requestOptions.contextScopes);
-        if (authorPrompt && contextScopes) {
-          fail(
-            'invalid_request',
-            'author-managed dialogue must read host context explicitly and place it in its own message sequence',
-          );
-        }
         const session = runtimeSession();
         const trustedPayload = Object.freeze({
           ...boundedPayload,
           session_id: session.id,
           ...(session.characterName ? { lanlan_name: session.characterName } : {}),
-          ...(contextScopes ? { context_scopes: contextScopes } : {}),
         });
         const rawResponse = await performManagedHostRequest({
           operation: 'dialogue.request',
