@@ -1849,7 +1849,8 @@ class TurnMixin:
                 if not await self.send_speech(audio_chunk, speech_id=turn_id):
                     audio_sent = False
                     break
-            await self.send_audio_done(turn_id)
+            done_sent = await self.send_audio_done(turn_id)
+            audio_sent = audio_sent and bool(done_sent)
             if emit_turn_end_after:
                 await self.emit_mirror_turn_end(
                     metadata=metadata,

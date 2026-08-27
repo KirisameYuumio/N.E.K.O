@@ -3178,6 +3178,7 @@
                         S.gameRouteLanlanName = '';
                         S.gameRouteSessionId = '';
                         S.gameRouteInstanceId = '';
+                        S.gameVoiceControlCredential = '';
                         setGameVoiceTranscriptionState({
                             transcription_mode: 'unavailable',
                             provider: '',
@@ -4812,6 +4813,7 @@
                             S.gameRouteLanlanName = detail.lanlanName || '';
                             S.gameRouteSessionId = incomingGameSessionId || '';
                             S.gameRouteInstanceId = incomingGameRouteInstanceId || '';
+                            S.gameVoiceControlCredential = String(response.sdk_voice_control_credential || '');
                             if (typeof window.stopProactiveChatSchedule === 'function') {
                                 S.proactiveChatWasStoppedByGameRoute = !!S.proactiveChatEnabled;
                                 window.stopProactiveChatSchedule();
@@ -4823,6 +4825,7 @@
                             S.gameRouteLanlanName = '';
                             S.gameRouteSessionId = '';
                             S.gameRouteInstanceId = '';
+                            S.gameVoiceControlCredential = '';
                             if ((wasGameRouteActive || S.proactiveChatWasStoppedByGameRoute)
                                     && S.proactiveChatEnabled
                                     && typeof window.scheduleProactiveChat === 'function') {

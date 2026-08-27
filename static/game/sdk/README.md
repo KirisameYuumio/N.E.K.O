@@ -54,17 +54,27 @@ const game = await NekoMiniGame.connect({
 game identity/version, selects protocol v1, reports its host version and either
 a `registered` or explicit `development` identity, and grants only reviewed
 capabilities. Unknown or disabled formal games are rejected; a game cannot mark
-itself as a development build. Before any game bundle, the trusted page host
-loads `neko-minigame-same-origin-bootstrap.js` and calls its one-shot
-`bootstrapNekoMiniGameSameOriginHost({ registrations })` with reviewed server
-registry entries or explicit local-development entries. The bootstrap installs
-a bounded immutable handoff, loads `neko-minigame-same-origin-host.js`, and then
-removes itself. The adapter consumes and deletes the handoff once, retains
+itself as a development build. Before any game bundle, the trusted page
+template emits a non-executable JSON script named
+`neko-minigame-host-launch`, followed immediately by
+`neko-minigame-same-origin-bootstrap.js`. The bootstrap synchronously consumes
+and removes that host-owned node; game code receives a readiness promise and
+the resulting factory, but no callable registration producer. It then attaches
+a bounded immutable handoff only to the adapter script element and loads
+`neko-minigame-same-origin-host.js`. The adapter consumes and deletes that
+script-scoped handoff once, seals the resulting factory against replacement, and retains
 immutable records only in its closure, and intersects each record's allowlist
 with locally available providers. The game factory cannot inject or replace a
 registration or capability provider. A future marketplace/isolated host can
 produce the same launch registrations after registry, integrity and
 launch-ticket checks without changing game code.
+
+```html
+<script id="neko-minigame-host-launch" type="application/json">
+{"registrations":{"example-game":{"mode":"registered","gameId":"example-game","publisherId":"reviewed-publisher","version":"1.0.0","allowedCapabilities":["runtime","logging"]}}}
+</script>
+<script src="/static/game/sdk/neko-minigame-same-origin-bootstrap.js"></script>
+```
 
 Unknown optional capabilities are not granted and appear in
 `game.capabilities.unavailable`. Missing required capabilities reject the

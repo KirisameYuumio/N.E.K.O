@@ -1,10 +1,10 @@
 /**
  * Trusted page-host bootstrap for the first-phase same-origin mini-game host.
  *
- * Load this before any game bundle. The N.E.K.O page host supplies reviewed
- * registrations (from its server registry or an explicit local-development
- * configuration); this helper installs the bounded one-shot handoff and then
- * loads the internal adapter. Game code receives only the resulting factory.
+ * The trusted page template must emit a JSON script with id
+ * `neko-minigame-host-launch` immediately before loading this file. This file
+ * consumes and removes that host-owned node synchronously, installs the
+ * bounded one-shot handoff, and loads the internal adapter before game code.
  */
 (() => {
   'use strict';
@@ -12,9 +12,8 @@
   const REGISTRATION_LIMIT = 64;
   const CAPABILITY_LIMIT = 32;
   const DEFAULT_ADAPTER_URL = '/static/game/sdk/neko-minigame-same-origin-host.js';
-  let bootstrapPromise = null;
 
-  function normalizeRegistrations(value) {
+  function normalizeRegistrations(value, providerRegistry = {}) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return Object.freeze({});
     const result = {};
     for (const [rawKey, rawRegistration] of Object.entries(value)) {
@@ -40,7 +39,7 @@
             .filter((name) => Boolean(name) && name.length <= 64),
         ),
       ].slice(0, CAPABILITY_LIMIT));
-      const rawProviders = rawRegistration.capabilityProviders;
+      const rawProviders = providerRegistry?.[gameId];
       const capabilityProviders = Object.freeze({
         quickLines: typeof rawProviders?.quickLines === 'function'
           ? rawProviders.quickLines
@@ -58,7 +57,7 @@
     return Object.freeze(result);
   }
 
-  function loadAdapterScript(adapterUrl, documentImpl) {
+  function loadAdapterScript(adapterUrl, documentImpl, registrations) {
     return new Promise((resolve, reject) => {
       if (!documentImpl?.createElement || !documentImpl?.head?.appendChild) {
         reject(new Error('MINIGAME_HOST_DOCUMENT_UNAVAILABLE'));
@@ -67,35 +66,46 @@
       const script = documentImpl.createElement('script');
       script.src = adapterUrl;
       script.async = false;
-      script.onload = () => resolve();
-      script.onerror = () => reject(new Error('MINIGAME_HOST_ADAPTER_LOAD_FAILED'));
+      Object.defineProperty(script, 'nekoHostLaunchRegistry', {
+        value: registrations,
+        configurable: true,
+      });
+      const releaseLaunchBinding = () => {
+        try { delete script.nekoHostLaunchRegistry; }
+        catch (_) { /* the adapter already consumed the immutable binding */ }
+      };
+      script.onload = () => {
+        releaseLaunchBinding();
+        resolve();
+      };
+      script.onerror = () => {
+        releaseLaunchBinding();
+        reject(new Error('MINIGAME_HOST_ADAPTER_LOAD_FAILED'));
+      };
       documentImpl.head.appendChild(script);
     });
   }
 
-  window.bootstrapNekoMiniGameSameOriginHost = function bootstrapNekoMiniGameSameOriginHost(
-    options = {},
-  ) {
-    if (bootstrapPromise) return bootstrapPromise;
-    const registrations = normalizeRegistrations(options.registrations);
-    const adapterUrl = String(options.adapterUrl || DEFAULT_ADAPTER_URL);
-    const loadAdapter = typeof options.loadAdapter === 'function'
-      ? options.loadAdapter
-      : () => loadAdapterScript(adapterUrl, options.documentImpl || window.document);
-    bootstrapPromise = (async () => {
-      window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ = registrations;
-      try {
-        await loadAdapter(adapterUrl);
-        if (typeof window.createNekoMiniGameSameOriginHost !== 'function') {
-          throw new Error('MINIGAME_HOST_ADAPTER_FACTORY_MISSING');
-        }
-        return window.createNekoMiniGameSameOriginHost;
-      } finally {
-        try { delete window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__; }
-        catch (_) { window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ = undefined; }
-        window.bootstrapNekoMiniGameSameOriginHost = undefined;
+  const documentImpl = window.document;
+  const launchNode = documentImpl?.getElementById?.('neko-minigame-host-launch');
+  let launchConfig = {};
+  try {
+    launchConfig = JSON.parse(String(launchNode?.textContent || '{}'));
+  } catch (_) {
+    launchConfig = {};
+  }
+  try { launchNode?.remove?.(); } catch (_) { /* already detached */ }
+  const registrations = normalizeRegistrations(
+    launchConfig.registrations,
+    launchNode?.nekoCapabilityProviders,
+  );
+  const adapterUrl = String(launchConfig.adapterUrl || DEFAULT_ADAPTER_URL);
+
+  window.nekoMiniGameSameOriginHostReady = (async () => {
+      await loadAdapterScript(adapterUrl, documentImpl, registrations);
+      if (typeof window.createNekoMiniGameSameOriginHost !== 'function') {
+        throw new Error('MINIGAME_HOST_ADAPTER_FACTORY_MISSING');
       }
+      return window.createNekoMiniGameSameOriginHost;
     })();
-    return bootstrapPromise;
-  };
 })();

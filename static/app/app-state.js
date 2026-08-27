@@ -137,6 +137,7 @@
         gameRouteLanlanName: '',
         gameRouteSessionId: '',
         gameRouteInstanceId: '',
+        gameVoiceControlCredential: '',
         gameVoiceSttGateActive: false,
         gameVoiceSttGameType: '',
         gameVoiceSttSessionId: '',

@@ -32,6 +32,7 @@ async function main() {
     gameRouteGameType: 'soccer',
     gameRouteSessionId: 'soccer-runtime',
     gameRouteInstanceId: 'route-instance-b',
+    gameVoiceControlCredential: 'voice-credential',
     isRecording: false,
     voiceStartPending: false,
     isMicMuted: false,
@@ -139,6 +140,7 @@ async function main() {
     sessionId: 'soccer-runtime',
     routeInstanceId: 'route-instance-a',
   } });
+  appState.gameVoiceControlCredential = 'voice-credential';
   assert(posted.some((message) => message.reason === 'route_closed'
     && message.route_active === false
     && message.game_type === 'soccer'
@@ -154,12 +156,28 @@ async function main() {
 
   channel.onmessage({ data: {
     type: 'game_voice_control_request',
+    sender_id: 'ungranted-window',
+    request_id: 'forged-credential',
+    action: 'start',
+    game_type: 'soccer',
+    session_id: 'soccer-runtime',
+    sdk_route_instance_id: 'route-instance-b',
+    launch_credential: 'wrong-credential',
+  } });
+  await flush();
+  assert(micButton.clickCount === 0 && posted.some((message) => (
+    message.request_id === 'forged-credential' && message.reason === 'route_mismatch'
+  )), 'a route identity without the launch credential controlled the microphone');
+
+  channel.onmessage({ data: {
+    type: 'game_voice_control_request',
     sender_id: 'stale-soccer-window',
     request_id: 'stale-start',
     action: 'start',
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-a',
+    launch_credential: 'voice-credential',
   } });
   await flush();
   assert(micButton.clickCount === 0 && posted.some((message) => message.request_id === 'stale-start'
@@ -176,6 +194,7 @@ async function main() {
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-b',
+    launch_credential: 'voice-credential',
   };
   channel.onmessage({ data: duplicatedStartRequest });
   windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
@@ -249,6 +268,7 @@ async function main() {
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-b',
+    launch_credential: 'voice-credential',
   } });
   await flush();
   assert(!appState.isRecording, 'stop request did not use the official microphone teardown');
@@ -264,6 +284,7 @@ async function main() {
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-b',
+    launch_credential: 'voice-credential',
   } });
   await flush();
   routeWindowListener({ detail: {
@@ -272,6 +293,7 @@ async function main() {
     sessionId: 'soccer-runtime',
     routeInstanceId: 'route-instance-c',
   } });
+  appState.gameVoiceControlCredential = 'voice-credential';
   appState.voiceStartPending = false;
   appState.isRecording = true;
   await new Promise((resolve) => setTimeout(resolve, 180));
@@ -291,6 +313,7 @@ async function main() {
     game_type: 'badminton',
     session_id: 'badminton-runtime',
     sdk_route_instance_id: 'badminton-route',
+    launch_credential: 'voice-credential',
   } });
   await flush();
   assert(posted.some((message) => message.request_id === 'wrong-route'
@@ -317,6 +340,7 @@ async function main() {
       game_type: 'soccer',
       session_id: 'soccer-runtime',
       sdk_route_instance_id: 'route-instance-c',
+      launch_credential: 'voice-credential',
     },
   }));
   await flush();

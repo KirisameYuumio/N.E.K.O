@@ -227,6 +227,8 @@ class _AudioMixin:
 
     async def clear_audio_buffer(self):
         """Send an input_audio_buffer.clear event to clear the server-side buffer."""
+        self._input_route_identity = None
+        self._input_route_identity_captured = False
         if self._is_gemini:
             logger.debug("Gemini mode: no WebSocket input_audio_buffer.clear event")
             return

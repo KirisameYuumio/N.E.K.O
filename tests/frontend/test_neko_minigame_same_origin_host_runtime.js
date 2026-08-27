@@ -27,6 +27,10 @@ function storage() {
 }
 
 async function main() {
+  const sourcePath = path.resolve(
+    __dirname,
+    '../../static/game/sdk/neko-minigame-same-origin-host.js',
+  );
   const calls = [];
   const listeners = new Map();
   let releaseProtocolTwo;
@@ -114,6 +118,12 @@ async function main() {
     CustomEvent: class CustomEventMock {
       constructor(type, options = {}) { this.type = type; this.detail = options.detail; }
     },
+    crypto: {
+      getRandomValues(values) {
+        values.fill(7);
+        return values;
+      },
+    },
   };
   const defaultCapabilities = [
     'runtime', 'dialogue', 'logging', 'voice-input', 'speech-output',
@@ -139,27 +149,63 @@ async function main() {
       } : {},
     }]),
   );
+  const launchNode = {
+    textContent: JSON.stringify({ registrations: hostLaunchRegistrations }),
+    nekoCapabilityProviders: {
+      'example-game': {
+        quickLines: async () => jsonResponse({ ok: true, lines: ['ready'] }),
+      },
+    },
+    remove() { this.removed = true; },
+  };
+  windowMock.document = {
+    currentScript: null,
+    getElementById(id) { return id === 'neko-minigame-host-launch' ? launchNode : null; },
+    createElement() { return {}; },
+    head: {
+      appendChild(script) {
+        windowMock.document.currentScript = script;
+        try {
+          vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
+        } finally {
+          windowMock.document.currentScript = null;
+        }
+        script.onload?.();
+      },
+    },
+  };
   global.window = windowMock;
 
   const bootstrapPath = path.resolve(
     __dirname,
     '../../static/game/sdk/neko-minigame-same-origin-bootstrap.js',
   );
-  const sourcePath = path.resolve(
-    __dirname,
-    '../../static/game/sdk/neko-minigame-same-origin-host.js',
-  );
   vm.runInThisContext(fs.readFileSync(bootstrapPath, 'utf8'), { filename: bootstrapPath });
-  await windowMock.bootstrapNekoMiniGameSameOriginHost({
-    registrations: hostLaunchRegistrations,
-    loadAdapter: async () => {
-      vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
-    },
-  });
-  assert(windowMock.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ === undefined,
-    'host launch registrations remained mutable after adapter bootstrap');
+  await windowMock.nekoMiniGameSameOriginHostReady;
+  assert(launchNode.removed === true, 'trusted launch node was not consumed before game code');
   assert(windowMock.bootstrapNekoMiniGameSameOriginHost === undefined,
-    'the one-shot host registry producer remained callable by game code');
+    'game code received a public registration producer');
+  const trustedFactory = windowMock.createNekoMiniGameSameOriginHost;
+  const factoryDescriptor = Object.getOwnPropertyDescriptor(
+    windowMock,
+    'createNekoMiniGameSameOriginHost',
+  );
+  assert(factoryDescriptor?.configurable === false && factoryDescriptor?.writable === false,
+    'trusted host factory remained replaceable after adapter bootstrap');
+  windowMock.document.currentScript = {
+    nekoHostLaunchRegistry: {
+      'forged-game': {
+        mode: 'registered',
+        gameId: 'forged-game',
+        version: '1.0.0',
+        allowedCapabilities: defaultCapabilities,
+      },
+    },
+  };
+  vm.runInThisContext(fs.readFileSync(sourcePath, 'utf8'), { filename: sourcePath });
+  windowMock.document.currentScript = null;
+  assert(windowMock.createNekoMiniGameSameOriginHost === trustedFactory,
+    'a later game-loaded adapter replaced the trusted host factory');
 
   const createHost = (options = {}) => window.createNekoMiniGameSameOriginHost(options);
   let missingRegistrationError = null;
@@ -203,6 +249,7 @@ async function main() {
       requiredCapabilities: ['runtime', 'logging'],
       optionalCapabilities: [
         'dialogue', 'quick-lines', 'context-read', 'memory', 'storage', 'leaderboard-local',
+        'voice-input',
       ],
     },
   });
@@ -271,6 +318,31 @@ async function main() {
     'route start trusted an application-supplied session id');
   assert(startCall.body.game_memory_enabled === true,
     'opening-screen memory consent was not attached to route start');
+  assert(/^[a-f0-9]{48}$/.test(startCall.body.sdk_voice_control_credential || ''),
+    'capability-granted route start did not carry its opaque voice credential');
+  const ungrantedHost = createHost({
+    gameType: 'third-party-game',
+    sessionId: 'ungranted-session',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  const ungrantedHandshake = ungrantedHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'third-party-game',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime'],
+      optionalCapabilities: [],
+    },
+  });
+  assert(!ungrantedHandshake.grantedCapabilities.includes('voice-input'),
+    'an unrequested voice capability was granted');
+  await ungrantedHost.start({ sdk_voice_control_credential: 'f'.repeat(48) });
+  const ungrantedStart = calls.filter((call) => call.url.endsWith('/route/start')).at(-1);
+  assert(ungrantedStart.body.sdk_voice_control_credential === '',
+    'an ungranted game smuggled its own voice credential into route start');
+  ungrantedHost.dispose();
   assert(host.sessionId === 'server-session' && host.routeLanlanName === 'Server Neko',
     'authoritative route identity did not replace the provisional host identity');
   assert(typeof host.evaluatePassiveGuard === 'undefined',

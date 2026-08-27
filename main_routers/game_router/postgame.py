@@ -88,6 +88,34 @@ _POSTGAME_REALTIME_UNORGANIZED_LIMIT = 12
 _POSTGAME_REALTIME_UNORGANIZED_MAX_TOKENS = 1500
 
 
+_GAME_SPEECH_CANCEL_SETTLE_SECONDS = 2.0
+
+
+async def _cancel_route_game_speech(state: dict, mgr: Any) -> None:
+    """Cancel and boundedly settle the one speech task owned by this route."""
+    task = state.pop("_sdk_active_speech_task", None)
+    if not isinstance(task, asyncio.Task) or task.done() or task is asyncio.current_task():
+        return
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=_GAME_SPEECH_CANCEL_SETTLE_SECONDS)
+    if task in done:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+        return
+    clear_pipeline = getattr(mgr, "_clear_tts_pipeline", None)
+    if callable(clear_pipeline):
+        try:
+            await asyncio.wait_for(
+                clear_pipeline(),
+                timeout=_GAME_SPEECH_CANCEL_SETTLE_SECONDS,
+            )
+        except (TimeoutError, asyncio.CancelledError, Exception) as exc:
+            logger.warning("⚠️ 游戏路由退出时清理超时语音失败: %s", exc)
+    logger.warning("⚠️ 游戏路由退出时语音任务未在上限内结束")
+
+
 def _normalize_postgame_options(raw: Any, *, reason: str) -> dict:
     """Normalize one-shot postgame delivery options from the game-end request."""
     reason_text = str(reason or "").strip().lower()
@@ -980,6 +1008,7 @@ async def _finalize_game_route_state_inner(
     state["_exit_flow_started"] = True
     state["exit_reason"] = reason
     state["exit_started_at"] = time.time()
+    state.pop("_sdk_voice_control_credential", None)
     # Capture postgame's prompt context BEFORE flipping the route inactive
     # / before the archive resolution / before any peer ``/route/start``
     # can replace this state in ``_game_route_states``.
@@ -990,6 +1019,7 @@ async def _finalize_game_route_state_inner(
     state["heartbeat_enabled"] = False
     lanlan_name = str(state.get("lanlan_name") or "")
     mgr = get_session_manager().get(lanlan_name) if lanlan_name else None
+    await _cancel_route_game_speech(state, mgr)
     # 推 closed 事件让前端还原 chat.html 折叠态 + 显回 pet 容器。所有 finalize
     # 路径（/route/end / heartbeat sweep / supersede）都走本 inner，与 active
     # flag 翻 false 同源，不会出现"已结束但 UI 仍锁着收缩态"的孤岛。
@@ -1000,6 +1030,7 @@ async def _finalize_game_route_state_inner(
         game_type=str(state.get("game_type") or ""),
         session_id=str(state.get("session_id") or ""),
         route_instance_id=str(state.get("_sdk_route_instance_id") or ""),
+        voice_control_credential="",
     )
     # Release the SessionManager-level takeover so ordinary chat handlers come
     # back online; chat LLM may produce auto-replies again, but the player has

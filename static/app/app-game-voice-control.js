@@ -172,7 +172,10 @@
         var requestedSessionId = String(request.session_id || '');
         if (requestedSessionId && route.sessionId && requestedSessionId !== route.sessionId) return false;
         var requestedRouteInstanceId = String(request.sdk_route_instance_id || '');
-        return !route.routeInstanceId || requestedRouteInstanceId === route.routeInstanceId;
+        if (route.routeInstanceId && requestedRouteInstanceId !== route.routeInstanceId) return false;
+        var expectedCredential = String(S.gameVoiceControlCredential || '');
+        return !!expectedCredential
+            && String(request.launch_credential || '') === expectedCredential;
     }
 
     function routeSnapshotIsCurrent(snapshot) {
@@ -396,6 +399,7 @@
             S.gameRouteLanlanName = '';
             S.gameRouteSessionId = '';
             S.gameRouteInstanceId = '';
+            S.gameVoiceControlCredential = '';
         } else {
             return;
         }

@@ -474,6 +474,7 @@ async def test_game_window_state_change_carries_the_route_generation():
         game_type="neutral-sdk-game",
         session_id="session-1",
         route_instance_id="route-instance-b",
+        voice_control_credential="ab" * 24,
     )
 
     websocket.send_json.assert_awaited_once_with({
@@ -483,6 +484,7 @@ async def test_game_window_state_change_carries_the_route_generation():
         "game_type": "neutral-sdk-game",
         "session_id": "session-1",
         "sdk_route_instance_id": "route-instance-b",
+        "sdk_voice_control_credential": "ab" * 24,
     })
 @pytest.mark.unit
 @pytest.mark.asyncio
@@ -4872,6 +4874,60 @@ async def test_project_speak_serializes_bounded_session_workers(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_route_replacement_cancels_the_previous_routes_active_speech(monkeypatch):
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class BlockingSpeechManager(_FakeGameRouteManager):
+        async def mirror_assistant_speech(self, line, **kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    mgr = BlockingSpeechManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(
+        monkeypatch,
+        "_submit_game_archive_to_memory",
+        AsyncMock(return_value={"ok": True, "status": "skipped"}),
+    )
+    with reset_game_route_state():
+        state_a = gr_runtime._activate_game_route(
+            "example-speech", "session-a", "Lan"
+        )
+        state_a["_sdk_route_instance_id"] = "route-a"
+        speech_task = asyncio.create_task(gr_runtime.game_project_speak(
+            "example-speech",
+            _FakeRequest({
+                "line": "route A speech",
+                "lanlan_name": "Lan",
+                "session_id": "session-a",
+                "sdk_route_instance_id": "route-a",
+            }),
+        ))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+
+        replacement = await gr_runtime.game_route_start(
+            "example-speech",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "session-b",
+                "sdk_route_instance_id": "route-b",
+            }),
+        )
+
+        assert replacement["ok"] is True
+        assert replacement["state"]["session_id"] == "session-b"
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await speech_task
+        assert "_sdk_active_speech_task" not in state_a
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_route_start_activates_stt_gate_when_audio_already_active(monkeypatch, _fake_realtime):
     mgr = _FakeGameRouteManager()
     mgr.is_active = True
@@ -6845,6 +6901,54 @@ async def test_project_mirror_assistant_serializes_publish_before_replacement_ro
         assert result["ok"] is True
         assert route_a["game_dialog_log"][0]["line"] == "route A opening"
         assert route_b["game_dialog_log"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_mirror_timeout_releases_route_lock_for_replacement(monkeypatch):
+    entered = asyncio.Event()
+
+    class StalledMirrorManager(_FakeGameRouteManager):
+        async def mirror_assistant_output(self, text, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+    mgr = StalledMirrorManager()
+    monkeypatch.setattr(gr_runtime, "_SDK_GAME_MIRROR_PUBLISH_TIMEOUT_SECONDS", 0.01)
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"MirrorTimeoutLan": mgr})
+    _gr_patch_all(
+        monkeypatch,
+        "_get_current_character_info",
+        lambda: {"lanlan_name": "MirrorTimeoutLan"},
+    )
+
+    with reset_game_route_state():
+        route_a = gr_runtime._activate_game_route(
+            "example-mirror-timeout", "session-a", "MirrorTimeoutLan"
+        )
+        route_a["_sdk_route_instance_id"] = "route-a"
+        mirror_task = asyncio.create_task(gr_runtime.game_project_mirror_assistant(
+            "example-mirror-timeout",
+            _FakeRequest({
+                "line": "stalled output",
+                "session_id": "session-a",
+                "sdk_route_instance_id": "route-a",
+            }),
+        ))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        result = await asyncio.wait_for(mirror_task, timeout=1)
+        assert result["ok"] is False
+        assert result["reason"] == "mirror_timeout"
+
+        route_lock = gr_runtime._get_route_lock(
+            "MirrorTimeoutLan", "example-mirror-timeout"
+        )
+        async with asyncio.timeout(1):
+            async with route_lock:
+                route_b = gr_runtime._activate_game_route(
+                    "example-mirror-timeout", "session-b", "MirrorTimeoutLan"
+                )
+        assert route_b["session_id"] == "session-b"
 
 
 @pytest.mark.unit

@@ -3824,6 +3824,7 @@ async def test_accepted_final_is_recorded_and_injected_once() -> None:
         is_voice_source=True,
         source="independent_asr",
         metadata={"provider": "glm"},
+        source_game_route_identity=None,
     )
     runtime.session.create_response.assert_awaited_once_with("hello")
 
@@ -5111,6 +5112,7 @@ async def test_websocket_core_submits_one_external_turn_after_local_history() ->
         is_voice_source=True,
         source="independent_asr",
         metadata={"provider": "qwen"},
+        source_game_route_identity=None,
     )
     runtime.session.submit_external_voice_turn.assert_awaited_once()
     call = runtime.session.submit_external_voice_turn.await_args
@@ -7992,6 +7994,7 @@ async def test_failed_lease_release_does_not_skip_accepted_final_delivery() -> N
         is_voice_source=True,
         source="independent_asr",
         metadata={"provider": "glm"},
+        source_game_route_identity=None,
     )
     assert component._asr_warm_expiry_task is not None
     component._asr_warm_expiry_task.cancel()
@@ -8441,6 +8444,7 @@ async def test_provider_final_lock_then_overflow_preserves_accepted_final() -> N
         is_voice_source=True,
         source="independent_asr",
         metadata={"provider": "openai"},
+        source_game_route_identity=None,
     )
     assert runtime._asr_lifecycle.has_pending_turn is False
     assert runtime._asr_sealed_turn_token is None
@@ -8493,6 +8497,7 @@ async def test_provider_overflow_lock_then_final_preserves_accepted_final() -> N
         is_voice_source=True,
         source="independent_asr",
         metadata={"provider": "openai"},
+        source_game_route_identity=None,
     )
     assert runtime._asr_lifecycle.snapshot.state is VoiceLifecycleState.WARM_IDLE
     assert runtime._asr_accepted_final_keys

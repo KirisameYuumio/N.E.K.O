@@ -9,6 +9,10 @@
 (() => {
   'use strict';
 
+  const FACTORY_PROPERTY = 'createNekoMiniGameSameOriginHost';
+  const existingFactory = Object.getOwnPropertyDescriptor(window, FACTORY_PROPERTY);
+  if (existingFactory && existingFactory.configurable === false) return;
+
   const DEFAULT_GAME_VERSION = '1.0.0';
   const SDK_PROTOCOL_VERSION = '1';
   const TRUSTED_HOST_VERSION = 'neko-trusted-same-origin-v1';
@@ -110,9 +114,10 @@
   }
 
   function consumeHostLaunchRegistry() {
-    const rawRegistry = window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__;
-    try { delete window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__; }
-    catch (_) { window.__NEKO_MINIGAME_HOST_LAUNCH_REGISTRY__ = undefined; }
+    const adapterScript = window.document?.currentScript;
+    const rawRegistry = adapterScript?.nekoHostLaunchRegistry;
+    try { delete adapterScript?.nekoHostLaunchRegistry; }
+    catch (_) { /* the bootstrap also clears the script-scoped binding on load */ }
     const registrations = new Map();
     const capabilityProviders = new Map();
     if (!rawRegistry || typeof rawRegistry !== 'object' || Array.isArray(rawRegistry)) {
@@ -137,6 +142,14 @@
   // can select host-owned records/providers but cannot add, replace, or mutate
   // them.
   const HOST_BOOTSTRAP = consumeHostLaunchRegistry();
+
+  function createVoiceControlCredential(windowImpl) {
+    const cryptoImpl = windowImpl?.crypto || globalThis.crypto;
+    if (!cryptoImpl || typeof cryptoImpl.getRandomValues !== 'function') return '';
+    const bytes = new Uint8Array(24);
+    cryptoImpl.getRandomValues(bytes);
+    return [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+  }
 
   class NekoMiniGameSameOriginHost {
     constructor(options = {}) {
@@ -181,6 +194,8 @@
       this._navigator = options.navigatorImpl || window.navigator;
       this._window = options.windowImpl || window;
       this._console = this._window.console || console;
+      this._voiceControlCredential = createVoiceControlCredential(this._window);
+      this._grantedCapabilities = new Set();
       this._avatarHost = options.avatarHost || null;
       this._audioHost = options.audioHost || null;
       const capabilityProviders = options.capabilityProviders && typeof options.capabilityProviders === 'object'
@@ -363,6 +378,12 @@
         ...(this._audioHost ? ['audio'] : []),
       ]);
       const allowedCapabilities = new Set(registration.allowedCapabilities);
+      const grantedCapabilities = [...new Set(requested)].filter((name) => (
+        locallyAvailable.has(name)
+        && allowedCapabilities.has(name)
+        && (name !== 'voice-input' || Boolean(this._voiceControlCredential))
+      ));
+      this._grantedCapabilities = new Set(grantedCapabilities);
       return {
         accepted: true,
         protocolVersion: SDK_PROTOCOL_VERSION,
@@ -373,9 +394,7 @@
           publisherId: registration.publisherId,
           version: registration.version,
         },
-        grantedCapabilities: [...new Set(requested)].filter((name) => (
-          locallyAvailable.has(name) && allowedCapabilities.has(name)
-        )),
+        grantedCapabilities,
       };
     }
 
@@ -859,6 +878,11 @@
       return this._post(this._gameEndpoint('route/start'), {
         ...this._trustedRuntimePayload(payload),
         game_memory_enabled: this._memoryConsentEnabled,
+        sdk_voice_control_credential: (
+          this._grantedCapabilities.has('voice-input')
+            ? this._voiceControlCredential
+            : ''
+        ),
       }, {
         timeoutMs: 60000,
         operation: 'route_start',
@@ -1361,6 +1385,11 @@
           operation: 'voice_control',
         }));
       }
+      if (!this._grantedCapabilities.has('voice-input') || !this._voiceControlCredential) {
+        return Promise.reject(this._hostError('capability_denied', 'Voice input was not granted to this launch', {
+          operation: 'voice_control',
+        }));
+      }
       if (bridge.pending.size >= bridge.pendingLimit) {
         return Promise.reject(this._hostError('busy', 'Voice control request limit reached', {
           operation: 'voice_control',
@@ -1420,6 +1449,7 @@
           action: normalizedAction,
           game_type: this.gameType,
           session_id: this.sessionId,
+          launch_credential: this._voiceControlCredential,
           ...(routeInstanceId ? { sdk_route_instance_id: routeInstanceId } : {}),
         });
         if (!posted) {
@@ -2491,6 +2521,8 @@
       this.stopAllSpeechRecognition();
       this.stopSpeechPlaybackBridge();
       this.stopVoiceControlBridge('disposed');
+      this._voiceControlCredential = '';
+      this._grantedCapabilities.clear();
       this.stopGameControlBridge();
       try { this._avatarHost?.dispose?.(); }
       catch (error) { this._console.warn(`[${this.displayName}Host] avatar host dispose failed:`, error); }
@@ -2501,7 +2533,7 @@
     }
   }
 
-  window.createNekoMiniGameSameOriginHost = function createNekoMiniGameSameOriginHost(options = {}) {
+  const createNekoMiniGameSameOriginHost = function createNekoMiniGameSameOriginHost(options = {}) {
     const gameType = String(options.gameType || '').trim();
     return new NekoMiniGameSameOriginHost({
       ...options,
@@ -2509,5 +2541,16 @@
       capabilityProviders: HOST_BOOTSTRAP.capabilityProviders.get(gameType) || null,
     });
   };
-  window.NekoMiniGameHostError = NekoMiniGameHostError;
+  Object.defineProperty(window, FACTORY_PROPERTY, {
+    value: createNekoMiniGameSameOriginHost,
+    configurable: false,
+    enumerable: true,
+    writable: false,
+  });
+  Object.defineProperty(window, 'NekoMiniGameHostError', {
+    value: NekoMiniGameHostError,
+    configurable: false,
+    enumerable: true,
+    writable: false,
+  });
 })();

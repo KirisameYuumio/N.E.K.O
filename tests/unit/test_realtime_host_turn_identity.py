@@ -210,6 +210,68 @@ async def test_input_transcript_keeps_route_captured_at_voice_ingress():
     assert client._input_route_identity is None
 
 
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_server_vad_binds_route_captured_before_audio_processing_await():
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+    processing_started = asyncio.Event()
+    processing_release = asyncio.Event()
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def blocked_audio_processing(_chunk):
+        processing_started.set()
+        await processing_release.wait()
+        return b""
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._audio_processor = object()
+    client.process_audio_chunk_async = blocked_audio_processing
+
+    ingress = asyncio.create_task(client.stream_audio(bytes(960)))
+    await asyncio.wait_for(processing_started.wait(), timeout=1)
+    current_route[0] = ("example-game", "session-b", "route-b")
+    processing_release.set()
+    await asyncio.wait_for(ingress, timeout=1)
+
+    client._bind_input_route_identity_to_item("provider-item-a")
+    await client._deliver_input_transcript("hello", item_id="provider-item-a")
+
+    assert delivered == [
+        ("hello", ("example-game", "session-a", "route-a")),
+    ]
+
+
+@pytest.mark.unit
+def test_server_vad_does_not_recapture_tail_frames_as_the_next_utterance():
+    current_route = [("example-game", "session-a", "route-a")]
+    client = _free_client(
+        None,
+        get_input_route_identity=lambda: current_route[0],
+    )
+
+    client._capture_input_route_identity()
+    client._bind_input_route_identity_to_item("provider-item-a")
+    client._audio_in_buffer = True
+    current_route[0] = ("example-game", "session-b", "route-b")
+    client._capture_input_route_identity()
+
+    assert client._input_route_identity_captured is False
+    assert client._input_route_identity is None
+
+    client._audio_in_buffer = False
+    client._capture_input_route_identity()
+    assert client._input_route_identity == (
+        "example-game", "session-b", "route-b",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Contract 3 first: the shape of an ordinary turn is the baseline everything
 # else is measured against.

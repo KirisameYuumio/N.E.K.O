@@ -2600,10 +2600,9 @@ class AsrRuntimeMixin:
                 "source": "independent_asr",
                 "metadata": {"provider": event.provider},
             }
-            if source_game_route_identity is not None:
-                transcript_kwargs["source_game_route_identity"] = (
-                    source_game_route_identity
-                )
+            transcript_kwargs["source_game_route_identity"] = (
+                source_game_route_identity
+            )
             accepted = await self.handle_input_transcript(
                 event.text,
                 **transcript_kwargs,

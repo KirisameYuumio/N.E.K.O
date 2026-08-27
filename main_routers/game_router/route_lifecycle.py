@@ -73,6 +73,7 @@ async def _push_game_window_state_change(
     game_type: str,
     session_id: str = "",
     route_instance_id: str = "",
+    voice_control_credential: str = "",
 ) -> None:
     """Broadcast the 'game window opened/closed' WS event so the chat.html / pet
     multi-windows can collapse / restore in sync (user-level UX linkage; not
@@ -101,6 +102,8 @@ async def _push_game_window_state_change(
         payload["session_id"] = session_id
     if route_instance_id:
         payload["sdk_route_instance_id"] = route_instance_id
+    if voice_control_credential:
+        payload["sdk_voice_control_credential"] = voice_control_credential
     try:
         ws = getattr(mgr, "websocket", None)
         if ws is None or not hasattr(ws, "send_json"):

@@ -410,6 +410,48 @@ async def test_cached_speech_replay_reports_failed_audio_delivery():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_cached_speech_replay_reports_failed_audio_done_delivery():
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+    mgr.game_speech_audio_cache_identity = lambda _text: ("opaque-cache-key", "voice-signature")
+    try:
+        first = await core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "缓存结束帧失败",
+            metadata=_soccer_mirror_meta({"kind": "cache-done-failure"}),
+            mirror_text=False,
+            emit_turn_end_after=False,
+            reuse_synthesized_audio=True,
+        )
+        assert GAME_SPEECH_AUDIO_CACHE.append_capture(mgr, first["speech_id"], b"cached-pcm")
+        assert GAME_SPEECH_AUDIO_CACHE.complete_capture(
+            mgr, first["speech_id"], "voice-signature"
+        )
+
+        mgr.send_speech = AsyncMock(return_value=True)
+        mgr.send_audio_done = AsyncMock(return_value=False)
+        replay = await core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "缓存结束帧失败",
+            metadata=_soccer_mirror_meta({"kind": "cache-done-failure"}),
+            mirror_text=False,
+            emit_turn_end_after=False,
+            reuse_synthesized_audio=True,
+        )
+
+        assert replay["method"] == "project_tts_cache"
+        assert replay["ok"] is False
+        assert replay["audio_sent"] is False
+        assert replay["audio_completed"] is False
+        mgr.send_audio_done.assert_awaited_once_with(replay["speech_id"])
+    finally:
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_speech_waits_for_matching_audio_done_before_returning():
     mgr = _make_manager()
     mgr.tts_thread = _FakeAliveThread()

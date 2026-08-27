@@ -243,10 +243,12 @@ _SDK_AUTHOR_CONTROL_MAX_BYTES = 64 * 1024
 _SDK_GAME_MEMORY_SUBMISSION_LIMIT = 16
 _SDK_GAME_SPEECH_PENDING_LIMIT = 4
 _SDK_GAME_SPEECH_PRELOAD_TIMEOUT_SECONDS = 300.0
+_SDK_GAME_MIRROR_PUBLISH_TIMEOUT_SECONDS = 15.0
 _GAME_ROUTE_END_TOMBSTONE_TTL_SECONDS = 120.0
 _GAME_ROUTE_END_TOMBSTONE_LIMIT = 256
 _SDK_ROUTE_INSTANCE_ID_LIMIT = 4
 _SDK_ROUTE_INSTANCE_ID_MAX_CHARS = 128
+_SDK_VOICE_CONTROL_CREDENTIAL_PATTERN = re.compile(r"^[A-Fa-f0-9]{48}$")
 
 
 # A page-exit beacon can reach the backend before its already-dispatched
@@ -1821,6 +1823,11 @@ async def game_route_start(game_type: str, request: Request):
             )
             if route_instance_id:
                 state["_sdk_route_instance_id"] = route_instance_id
+            voice_control_credential = str(
+                data.get("sdk_voice_control_credential") or ""
+            ).strip()
+            if _SDK_VOICE_CONTROL_CREDENTIAL_PATTERN.fullmatch(voice_control_credential):
+                state["_sdk_voice_control_credential"] = voice_control_credential
             _update_game_route_language_from_payload(state, data)
             # Take over the SessionManager: ordinary chat LLM output handlers must
             # stay silent during the game, and any voice transcript that reaches
@@ -1883,6 +1890,9 @@ async def game_route_start(game_type: str, request: Request):
             game_type=game_type,
             session_id=session_id,
             route_instance_id=route_instance_id,
+            voice_control_credential=str(
+                state.get("_sdk_voice_control_credential") or ""
+            ),
         )
     else:
         logger.info(
@@ -2683,17 +2693,29 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
                 "lanlan_name": lanlan_name,
                 "method": "project_text_mirror",
             }
-        result = await _mirror_game_assistant_text(
-            mgr,
-            line,
-            request_id=str(data.get("request_id") or "") or None,
-            game_type=game_type,
-            session_id=session_id,
-            source=str(data.get("source") or "game_llm"),
-            turn_id=str(data.get("turn_id") or "") or None,
-            event=event,
-            finalize_turn=finalize_turn,
-        )
+        try:
+            result = await asyncio.wait_for(
+                _mirror_game_assistant_text(
+                    mgr,
+                    line,
+                    request_id=str(data.get("request_id") or "") or None,
+                    game_type=game_type,
+                    session_id=session_id,
+                    source=str(data.get("source") or "game_llm"),
+                    turn_id=str(data.get("turn_id") or "") or None,
+                    event=event,
+                    finalize_turn=finalize_turn,
+                ),
+                timeout=_SDK_GAME_MIRROR_PUBLISH_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            return {
+                "ok": False,
+                "reason": "mirror_timeout",
+                "mirrored": False,
+                "lanlan_name": lanlan_name,
+                "method": "project_text_mirror",
+            }
         if result.get("ok") and str(event.get("kind") or "") == "opening-line":
             _append_game_dialog(current_state, {
                 "type": "assistant",
@@ -2835,26 +2857,32 @@ async def game_project_speak(game_type: str, request: Request):
                 if stale_response:
                     result = stale_response
                 else:
-                    result = await _speak_game_line_via_project_tts(
-                        mgr,
-                        line,
-                        request_id=str(data.get("request_id") or "") or None,
-                        game_type=game_type,
-                        session_id=session_id,
-                        mirror_text=data.get("mirror_text", True) is not False,
-                        emit_turn_end=data.get("emit_turn_end", True) is not False,
-                        interrupt_audio=interrupt_audio,
-                        playback_gain=playback_gain,
-                        reuse_synthesized_audio=reuse_synthesized_audio,
-                        speech_correlation_id=str(
-                            data.get("sdk_speech_correlation_id") or ""
-                        )[:128],
-                        event=_attach_game_memory_flag_to_event(
-                            data.get("event") if isinstance(data.get("event"), dict) else {},
-                            state,
+                    speech_task = asyncio.current_task()
+                    state["_sdk_active_speech_task"] = speech_task
+                    try:
+                        result = await _speak_game_line_via_project_tts(
+                            mgr,
+                            line,
+                            request_id=str(data.get("request_id") or "") or None,
                             game_type=game_type,
-                        ),
-                    )
+                            session_id=session_id,
+                            mirror_text=data.get("mirror_text", True) is not False,
+                            emit_turn_end=data.get("emit_turn_end", True) is not False,
+                            interrupt_audio=interrupt_audio,
+                            playback_gain=playback_gain,
+                            reuse_synthesized_audio=reuse_synthesized_audio,
+                            speech_correlation_id=str(
+                                data.get("sdk_speech_correlation_id") or ""
+                            )[:128],
+                            event=_attach_game_memory_flag_to_event(
+                                data.get("event") if isinstance(data.get("event"), dict) else {},
+                                state,
+                                game_type=game_type,
+                            ),
+                        )
+                    finally:
+                        if state.get("_sdk_active_speech_task") is speech_task:
+                            state.pop("_sdk_active_speech_task", None)
     finally:
         remaining = max(0, int(getattr(mgr, "_sdk_game_speech_pending_count", 1) or 1) - 1)
         if remaining:

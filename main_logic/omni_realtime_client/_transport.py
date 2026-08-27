@@ -134,8 +134,7 @@ class _TransportMixin:
         self._input_route_identity = None
         self._input_route_identity_by_item.clear()
 
-    def _remember_input_route_identity(self, item_id: object = None) -> None:
-        """Snapshot the active game generation at actual voice ingress."""
+    def _read_input_route_identity(self):
         identity = None
         reader = getattr(self, "get_input_route_identity", None)
         if callable(reader):
@@ -148,6 +147,20 @@ class _TransportMixin:
                     identity = tuple(str(part or "") for part in candidate)
             except Exception:
                 identity = None
+        return identity
+
+    def _capture_input_route_identity(self) -> None:
+        """Snapshot the route owning the first frame in the current buffer."""
+        if self._input_route_identity_captured or bool(
+            getattr(self, "_audio_in_buffer", False)
+        ):
+            return
+        self._input_route_identity = self._read_input_route_identity()
+        self._input_route_identity_captured = True
+
+    def _remember_input_route_identity(self, item_id: object = None) -> None:
+        """Compatibility helper for tests and non-stream ingress paths."""
+        identity = self._read_input_route_identity()
         item_key = str(item_id or "").strip()
         if item_key:
             identities = self._input_route_identity_by_item
@@ -158,6 +171,24 @@ class _TransportMixin:
             return
         self._input_route_identity = identity
         self._input_route_identity_captured = True
+
+    def _bind_input_route_identity_to_item(self, item_id: object = None) -> None:
+        """Bind a server-VAD item to the already captured audio-buffer owner."""
+        item_key = str(item_id or "").strip()
+        if not item_key:
+            return
+        identity = (
+            self._input_route_identity
+            if self._input_route_identity_captured
+            else None
+        )
+        identities = self._input_route_identity_by_item
+        identities.pop(item_key, None)
+        identities[item_key] = identity
+        while len(identities) > _INPUT_ROUTE_IDENTITY_ITEM_LIMIT:
+            identities.pop(next(iter(identities)))
+        self._input_route_identity = None
+        self._input_route_identity_captured = False
 
     def _take_input_route_identity(self, item_id: object = None):
         item_key = str(item_id or "").strip()
@@ -655,6 +686,10 @@ class _TransportMixin:
         if self._fatal_error_occurred:
             return
 
+        # Capture before RNNoise or any other await. Server-VAD reports the
+        # utterance later, after the active game route may already have changed.
+        self._capture_input_route_identity()
+
         current_time = time.time()
         # 本地音量判定：用原始输入做 RMS，避免 VAD 延迟时误清 buffer
         raw_samples = np.frombuffer(audio_chunk, dtype=np.int16)
@@ -706,7 +741,6 @@ class _TransportMixin:
                     self._user_recent_activity_time = current_time
                     if self._speech_detect_start == 0.0:
                         self._speech_detect_start = current_time
-                        self._remember_input_route_identity()
                     elif current_time - self._speech_detect_start >= self._speech_sustain_threshold:
                         self._client_vad_last_speech_time = current_time
                         self._client_vad_active = True
@@ -718,8 +752,6 @@ class _TransportMixin:
                 if len(samples) > 0:
                     rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
                     if rms > self._client_vad_threshold:
-                        if not self._client_vad_active:
-                            self._remember_input_route_identity()
                         self._client_vad_last_speech_time = current_time
                         self._client_vad_active = True
                         # RMS 噪音率高，但若 RNNoise 不可用（16kHz/移动端），
@@ -2078,7 +2110,7 @@ class _TransportMixin:
                     self._speech_started_total += 1
                     logger.info("Speech detected")
                     self._response_arbiter.notify_server_vad_started()
-                    self._remember_input_route_identity(event.get("item_id"))
+                    self._bind_input_route_identity_to_item(event.get("item_id"))
                     self._audio_in_buffer = True
                     # 重置静默计时器
                     self._last_speech_time = time.time()
