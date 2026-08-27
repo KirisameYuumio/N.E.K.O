@@ -10,6 +10,7 @@ import main_logic.core as core_module
 import main_logic.core.streaming as streaming_module
 import main_logic.core.tts_runtime as tts_runtime_module
 import main_logic.core.turn as turn_module
+from main_logic.core.game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE
 from tests.fake_clock import patch_module_clock
 
 # 假时钟一律打到「真正读 time.time() 的那个模块」上，而不是 core_module
@@ -278,6 +279,210 @@ async def test_mirror_assistant_speech_text_mirror_carries_metadata():
         "request_id": "req-1",
         "meta": metadata,
     }]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mirror_assistant_speech_binds_relative_gain_to_its_speech_id():
+    mgr = _make_manager()
+
+    result = await core_module.LLMSessionManager.mirror_assistant_speech(
+        mgr,
+        "大声一点",
+        metadata=_soccer_mirror_meta({"kind": "mailbox"}),
+        mirror_text=False,
+        emit_turn_end_after=False,
+        playback_gain=2.0,
+    )
+
+    assert result["playback_gain"] == 2.0
+    assert mgr.speech_playback_gain(result["speech_id"]) == 2.0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_mirror_assistant_speech_replays_opted_in_cached_audio_without_requeueing_tts():
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+    mgr.game_speech_audio_cache_identity = lambda _text: ("opaque-cache-key", "voice-signature")
+    sent_audio = []
+    completed_audio = []
+
+    async def send_speech(audio, speech_id=None):
+        sent_audio.append((bytes(audio), speech_id))
+        return True
+
+    async def send_audio_done(speech_id):
+        completed_audio.append(speech_id)
+        return True
+
+    mgr.send_speech = send_speech
+    mgr.send_audio_done = send_audio_done
+    try:
+        first = await core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "再来一球",
+            metadata=_soccer_mirror_meta({"kind": "goal"}),
+            mirror_text=False,
+            emit_turn_end_after=False,
+            reuse_synthesized_audio=True,
+        )
+        assert first["cache_status"] == "miss"
+        queued_before_hit = list(mgr.tts_request_queue.messages)
+        assert GAME_SPEECH_AUDIO_CACHE.append_capture(mgr, first["speech_id"], b"cached-pcm")
+        assert GAME_SPEECH_AUDIO_CACHE.complete_capture(
+            mgr, first["speech_id"], "voice-signature"
+        )
+
+        second = await core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "再来一球",
+            metadata=_soccer_mirror_meta({"kind": "goal"}),
+            mirror_text=False,
+            emit_turn_end_after=False,
+            reuse_synthesized_audio=True,
+        )
+
+        assert second["method"] == "project_tts_cache"
+        assert second["cache_status"] == "hit"
+        assert second["audio_sent"] is True
+        assert mgr.tts_request_queue.messages == queued_before_hit
+        assert sent_audio == [(b"cached-pcm", second["speech_id"])]
+        assert completed_audio == [second["speech_id"]]
+    finally:
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_speech_preload_captures_audio_without_sending_playback():
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr.send_speech = AsyncMock(return_value=True)
+    mgr.game_speech_audio_cache_identity = lambda _text: (
+        "preload-cache-key",
+        "preload-runtime-signature",
+    )
+    mgr.current_game_speech_audio_runtime_signature = (
+        lambda: "preload-runtime-signature"
+    )
+
+    def fake_worker(request_queue, response_queue, _api_key, _voice_id):
+        response_queue.put(("__ready__", True))
+        active_speech_id = None
+        while True:
+            speech_id, text = request_queue.get()
+            if speech_id == "__shutdown__":
+                return
+            if speech_id is None:
+                if active_speech_id:
+                    response_queue.put(("__audio_done__", active_speech_id))
+                    active_speech_id = None
+                continue
+            active_speech_id = speech_id
+            response_queue.put(("__audio__", speech_id, b"silent-preload-pcm"))
+
+    mgr._resolve_tts_worker_spec = lambda: (
+        fake_worker,
+        "",
+        "voice",
+        None,
+        False,
+    )
+    try:
+        result = await core_module.LLMSessionManager.preload_game_speech_audio(
+            mgr,
+            ["  预载这句  ", "预载这句"],
+        )
+
+        assert result["ok"] is True
+        assert result["results"] == [{"index": 0, "status": "loaded"}]
+        assert GAME_SPEECH_AUDIO_CACHE.get("preload-cache-key") == (
+            b"silent-preload-pcm",
+        )
+        mgr.send_speech.assert_not_awaited()
+        assert mgr.sent_responses == []
+        assert mgr.sync_message_queue.messages == []
+        assert mgr._game_speech_preload_active_workers == {}
+
+        def must_not_resolve_worker():
+            raise AssertionError("a fully cached preload must not start a TTS worker")
+
+        mgr._resolve_tts_worker_spec = must_not_resolve_worker
+        cached = await core_module.LLMSessionManager.preload_game_speech_audio(
+            mgr,
+            ["预载这句"],
+        )
+        assert cached["ok"] is True
+        assert cached["results"] == [{"index": 0, "status": "hit"}]
+    finally:
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_speech_preload_cancellation_stops_and_releases_worker():
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr.game_speech_audio_cache_identity = lambda _text: (
+        "cancel-cache-key",
+        "cancel-runtime-signature",
+    )
+    mgr.current_game_speech_audio_runtime_signature = (
+        lambda: "cancel-runtime-signature"
+    )
+
+    def blocking_worker(request_queue, response_queue, _api_key, _voice_id):
+        response_queue.put(("__ready__", True))
+        while True:
+            speech_id, _text = request_queue.get()
+            if speech_id == "__shutdown__":
+                return
+
+    mgr._resolve_tts_worker_spec = lambda: (
+        blocking_worker,
+        "",
+        "voice",
+        None,
+        False,
+    )
+    task = asyncio.create_task(
+        core_module.LLMSessionManager.preload_game_speech_audio(
+            mgr,
+            ["取消预载"],
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    result = await task
+
+    assert result == {"ok": False, "reason": "cancelled", "results": []}
+    assert mgr._game_speech_preload_pending_batches == 0
+    assert mgr._game_speech_preload_active_workers == {}
+    assert GAME_SPEECH_AUDIO_CACHE.stats()["captures"] == 0
+
+
+@pytest.mark.unit
+def test_game_speech_audio_identity_is_opaque_and_invalidates_by_language():
+    mgr = _make_manager()
+    mgr._build_tts_runtime_key = lambda: ("provider", "secret-api-key", "voice-a")
+    mgr._conversation_render_language = "zh-CN"
+
+    key_zh, signature_zh = core_module.LLMSessionManager.game_speech_audio_cache_identity(
+        mgr, "秘密台词"
+    )
+    mgr._conversation_render_language = "ja-JP"
+    key_ja, signature_ja = core_module.LLMSessionManager.game_speech_audio_cache_identity(
+        mgr, "秘密台词"
+    )
+
+    assert len(key_zh) == len(signature_zh) == 64
+    assert "秘密台词" not in key_zh
+    assert "secret-api-key" not in signature_zh
+    assert key_zh != key_ja
+    assert signature_zh != signature_ja
 
 
 @pytest.mark.unit

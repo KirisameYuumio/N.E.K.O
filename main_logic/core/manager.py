@@ -116,6 +116,17 @@ class LLMSessionManager(
         # request 读。
         self._pending_screenshot_avatar_position: dict | None = None
         self.current_speech_id = None
+        # Per-speech playback overrides are bounded and released on audio_done,
+        # interruption, or session teardown. Ordinary speech is absent and
+        # therefore keeps the global speaker gain unchanged.
+        self._speech_playback_gains: OrderedDict[str, float] = OrderedDict()
+        # Mini-game speech preload uses an isolated, short-lived worker so its
+        # synthesized chunks never enter the audible response handler. Batches
+        # are serialized per character and explicitly cancelled on teardown.
+        self._game_speech_preload_lock = asyncio.Lock()
+        self._game_speech_preload_pending_batches = 0
+        self._game_speech_preload_cancel_epoch = 0
+        self._game_speech_preload_active_workers: dict[Thread, Queue] = {}
         self._speech_output_total = 0  # diagnostic: chunks actually sent to frontend playback
         self._last_speech_output_time = 0.0
         self._last_speech_output_bytes = 0

@@ -20,7 +20,9 @@ Method-only mixin: every instance attribute is assigned in
 """
 
 import asyncio
+import hashlib
 import json
+import math
 import re
 import time
 from typing import Optional
@@ -31,10 +33,14 @@ from utils.frontend_utils import (
     replace_corner_mark,
     remove_bracket,
     is_only_punctuation,
+    TtsMarkdownStripper,
+    TtsBracketStripper,
 )
 from main_logic.omni_offline_client import _is_safety_violation_signal
 from main_logic.tts_client import (
     dummy_tts_worker,
+    TTS_SHUTDOWN_SENTINEL,
+    TTS_AUDIO_DONE_SENTINEL,
     TTS_PROVIDER_REGISTRY,
     VLLM_OMNI_DEFAULT_BASE_URL,
     VLLM_OMNI_DEFAULT_MODEL,
@@ -47,6 +53,7 @@ from threading import Thread
 from queue import Queue
 from ._shared import logger, NO_RETRY_TTS_CODES, IMMEDIATE_REPORT_TTS_CODES
 from .notices import enqueue_voice_migration_notice
+from .game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE
 
 # Late-binding read point for symbols that tests rebind on the facade via
 # ``monkeypatch.setattr("main_logic.core.<attr>", ...)``. Do NOT from-import
@@ -55,8 +62,67 @@ from .notices import enqueue_voice_migration_notice
 from main_logic import core as _core_facade
 
 
+_SPEECH_PLAYBACK_GAIN_MAX_ITEMS = 32
+_GAME_SPEECH_PRELOAD_MAX_LINES = 32
+_GAME_SPEECH_PRELOAD_MAX_PENDING_BATCHES = 4
+_GAME_SPEECH_PRELOAD_READY_TIMEOUT_SECONDS = 30.0
+_GAME_SPEECH_PRELOAD_ITEM_TIMEOUT_SECONDS = 90.0
+_GAME_SPEECH_PRELOAD_POLL_SECONDS = 0.01
+
+
 class TtsRuntimeMixin:
     """TTS runtime methods (see module docstring)."""
+
+    @staticmethod
+    def _normalize_speech_playback_gain(value) -> float:
+        if isinstance(value, bool):
+            return 1.0
+        try:
+            gain = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        if not math.isfinite(gain):
+            return 1.0
+        return max(0.0, min(2.0, gain))
+
+    def remember_speech_playback_gain(self, speech_id, gain) -> float:
+        """Remember a bounded per-speech mix override until its stream closes."""
+        normalized = self._normalize_speech_playback_gain(gain)
+        key = str(speech_id or "")
+        if not key:
+            return normalized
+        gains = getattr(self, "_speech_playback_gains", None)
+        if gains is None:
+            # Compatibility for tests and integrations constructing via __new__.
+            from collections import OrderedDict
+            gains = self._speech_playback_gains = OrderedDict()
+        gains.pop(key, None)
+        # Gain 1.0 is the implicit default and needs no resident entry.
+        if normalized != 1.0:
+            gains[key] = normalized
+            while len(gains) > _SPEECH_PLAYBACK_GAIN_MAX_ITEMS:
+                gains.popitem(last=False)
+        return normalized
+
+    def speech_playback_gain(self, speech_id) -> float:
+        key = str(speech_id or "")
+        gains = getattr(self, "_speech_playback_gains", None)
+        if not key or gains is None:
+            return 1.0
+        gain = gains.get(key, 1.0)
+        if key in gains:
+            gains.move_to_end(key)
+        return self._normalize_speech_playback_gain(gain)
+
+    def release_speech_playback_gain(self, speech_id) -> None:
+        gains = getattr(self, "_speech_playback_gains", None)
+        if gains is not None:
+            gains.pop(str(speech_id or ""), None)
+
+    def clear_speech_playback_gains(self) -> None:
+        gains = getattr(self, "_speech_playback_gains", None)
+        if gains is not None:
+            gains.clear()
 
     def _get_text_guard_max_length(self) -> int:
         """Read the user-configured reply token cap.
@@ -317,6 +383,339 @@ class TtsRuntimeMixin:
                 bool(getattr(self, "_is_free_preset_voice", False)),
             )
 
+    def game_speech_audio_cache_identity(self, clean_text: str) -> tuple[str, str]:
+        """Return opaque runtime and utterance hashes for mini-game audio reuse."""
+        language = str(
+            getattr(self, "_conversation_render_language", "")
+            or getattr(self, "_conversation_turn_language", "")
+            or getattr(self, "user_language", "")
+            or ""
+        ).strip()
+        runtime_material = (
+            "neko-game-speech-audio-v1",
+            self._build_tts_runtime_key(),
+            language,
+        )
+        runtime_signature = hashlib.sha256(
+            repr(runtime_material).encode("utf-8", errors="strict")
+        ).hexdigest()
+        cache_key = hashlib.sha256(
+            repr((runtime_signature, str(clean_text))).encode("utf-8", errors="strict")
+        ).hexdigest()
+        return cache_key, runtime_signature
+
+    def current_game_speech_audio_runtime_signature(self) -> str:
+        return self.game_speech_audio_cache_identity("")[1]
+
+    def _resolve_tts_worker_spec(self):
+        """Resolve the current project TTS worker without mutating runtime state."""
+        core_config = self._config_manager.get_core_config()
+        route_voice_id = self.voice_id or ""
+        if core_config.get("DISABLE_TTS", False):
+            return dummy_tts_worker, "", route_voice_id, None, True
+        route_voice_id, has_custom = self._effective_tts_route()
+        worker, api_key_override, provider_key = _core_facade.get_tts_worker(
+            core_api_type=self.core_api_type,
+            has_custom_voice=has_custom,
+            voice_id=route_voice_id,
+            excluded_provider_keys=getattr(
+                self, "_tts_excluded_provider_keys", frozenset()
+            ),
+        )
+        tts_config = self._config_manager.get_model_api_config(
+            "tts_custom" if has_custom else "tts_default"
+        )
+        api_key = self.resolve_tts_api_key(
+            provider_key, api_key_override, tts_config
+        )
+        return worker, api_key, route_voice_id, provider_key, False
+
+    @staticmethod
+    def _normalize_game_speech_preload_text(clean_text: str, *, normalize_spaces: bool) -> str:
+        text = replace_blank(clean_text) if normalize_spaces else clean_text
+        markdown = TtsMarkdownStripper()
+        bracket = TtsBracketStripper()
+        markdown_output = markdown.feed(text) + markdown.flush()
+        spoken = bracket.feed(markdown_output)
+        bracket.flush()
+        return str(spoken or "").strip()
+
+    def cancel_game_speech_preloads(self) -> None:
+        """Cancel active/queued preload batches and wake their isolated workers."""
+        self._game_speech_preload_cancel_epoch = (
+            int(getattr(self, "_game_speech_preload_cancel_epoch", 0)) + 1
+        )
+        workers = getattr(self, "_game_speech_preload_active_workers", {})
+        for request_queue in list(workers.values()):
+            try:
+                request_queue.put((TTS_SHUTDOWN_SENTINEL, None))
+            except Exception:
+                pass
+
+    async def preload_game_speech_audio(self, lines: list[str]) -> dict:
+        """Silently synthesize bounded mini-game text into the reusable cache."""
+        unique_lines: list[str] = []
+        seen: set[str] = set()
+        for value in list(lines or []):
+            clean = str(value or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            unique_lines.append(clean)
+        if not unique_lines:
+            return {"ok": False, "reason": "missing_lines", "results": []}
+        if len(unique_lines) > _GAME_SPEECH_PRELOAD_MAX_LINES:
+            return {
+                "ok": False,
+                "reason": "too_many_lines",
+                "limit": _GAME_SPEECH_PRELOAD_MAX_LINES,
+                "results": [],
+            }
+
+        if not hasattr(self, "_game_speech_preload_lock"):
+            self._game_speech_preload_lock = asyncio.Lock()
+            self._game_speech_preload_pending_batches = 0
+            self._game_speech_preload_cancel_epoch = 0
+            self._game_speech_preload_active_workers = {}
+        pending = int(getattr(self, "_game_speech_preload_pending_batches", 0))
+        if pending >= _GAME_SPEECH_PRELOAD_MAX_PENDING_BATCHES:
+            return {"ok": False, "reason": "busy", "results": []}
+        self._game_speech_preload_pending_batches = pending + 1
+        epoch = int(self._game_speech_preload_cancel_epoch)
+
+        def summarize(result_map: dict[int, dict], reason: str = "") -> dict:
+            ordered = [result_map[index] for index in sorted(result_map)]
+            loaded_count = sum(item["status"] == "loaded" for item in ordered)
+            hit_count = sum(item["status"] == "hit" for item in ordered)
+            response = {
+                "ok": all(
+                    item["status"] in {"loaded", "hit"} for item in ordered
+                ),
+                "results": ordered,
+                "loaded": loaded_count,
+                "hits": hit_count,
+                "failed": len(ordered) - loaded_count - hit_count,
+            }
+            if reason:
+                response["reason"] = reason
+            return response
+
+        try:
+            async with self._game_speech_preload_lock:
+                if epoch != self._game_speech_preload_cancel_epoch:
+                    raise asyncio.CancelledError
+                active_workers = self._game_speech_preload_active_workers
+                for active_thread in list(active_workers):
+                    if not active_thread.is_alive():
+                        active_workers.pop(active_thread, None)
+                if active_workers:
+                    return {
+                        "ok": False,
+                        "reason": "worker_cleanup_pending",
+                        "results": [],
+                    }
+                results_by_index: dict[int, dict] = {}
+                pending_lines: list[tuple[int, str, str, str]] = []
+                for index, clean in enumerate(unique_lines):
+                    cache_key, runtime_signature = (
+                        self.game_speech_audio_cache_identity(clean)
+                    )
+                    if GAME_SPEECH_AUDIO_CACHE.get(cache_key) is not None:
+                        results_by_index[index] = {"index": index, "status": "hit"}
+                    else:
+                        pending_lines.append(
+                            (index, clean, cache_key, runtime_signature)
+                        )
+                if not pending_lines:
+                    return summarize(results_by_index)
+                worker, api_key, route_voice_id, provider_key, disabled = (
+                    self._resolve_tts_worker_spec()
+                )
+                if disabled:
+                    for index, _clean, _key, _signature in pending_lines:
+                        results_by_index[index] = {
+                            "index": index,
+                            "status": "failed",
+                            "reason": "tts_disabled",
+                        }
+                    return summarize(results_by_index, "tts_disabled")
+
+                meta = TTS_PROVIDER_REGISTRY.get(provider_key) if provider_key else None
+                normalize_spaces = not meta or meta.category != "ws_bistream"
+                request_queue = Queue()
+                response_queue = Queue()
+                thread = Thread(
+                    target=worker,
+                    args=(request_queue, response_queue, api_key, route_voice_id),
+                    daemon=True,
+                )
+                self._game_speech_preload_active_workers[thread] = request_queue
+                thread.start()
+
+                async def next_response(timeout_seconds: float):
+                    deadline = time.monotonic() + timeout_seconds
+                    while True:
+                        if epoch != self._game_speech_preload_cancel_epoch:
+                            raise asyncio.CancelledError
+                        try:
+                            return response_queue.get_nowait()
+                        except Exception:
+                            if not thread.is_alive() and response_queue.empty():
+                                raise RuntimeError("tts_worker_stopped")
+                            if time.monotonic() >= deadline:
+                                raise asyncio.TimeoutError
+                            await asyncio.sleep(_GAME_SPEECH_PRELOAD_POLL_SECONDS)
+
+                try:
+                    ready = False
+                    ready_deadline = (
+                        time.monotonic()
+                        + _GAME_SPEECH_PRELOAD_READY_TIMEOUT_SECONDS
+                    )
+                    try:
+                        while not ready:
+                            message = await next_response(
+                                max(0.001, ready_deadline - time.monotonic())
+                            )
+                            if (
+                                isinstance(message, tuple)
+                                and len(message) == 2
+                                and message[0] == "__ready__"
+                            ):
+                                if message[1] is not True:
+                                    for index, _clean, _key, _signature in pending_lines:
+                                        results_by_index[index] = {
+                                            "index": index,
+                                            "status": "failed",
+                                            "reason": "tts_unavailable",
+                                        }
+                                    return summarize(results_by_index, "tts_unavailable")
+                                ready = True
+                    except asyncio.TimeoutError:
+                        for index, _clean, _key, _signature in pending_lines:
+                            results_by_index[index] = {
+                                "index": index,
+                                "status": "failed",
+                                "reason": "tts_ready_timeout",
+                            }
+                        return summarize(results_by_index, "tts_ready_timeout")
+                    except RuntimeError:
+                        for index, _clean, _key, _signature in pending_lines:
+                            results_by_index[index] = {
+                                "index": index,
+                                "status": "failed",
+                                "reason": "tts_unavailable",
+                            }
+                        return summarize(results_by_index, "tts_unavailable")
+
+                    for index, clean, cache_key, runtime_signature in pending_lines:
+                        if GAME_SPEECH_AUDIO_CACHE.get(cache_key) is not None:
+                            results_by_index[index] = {"index": index, "status": "hit"}
+                            continue
+                        spoken = self._normalize_game_speech_preload_text(
+                            clean, normalize_spaces=normalize_spaces
+                        )
+                        if not spoken:
+                            results_by_index[index] = {
+                                "index": index,
+                                "status": "failed",
+                                "reason": "empty_after_normalization",
+                            }
+                            continue
+                        speech_id = f"game-preload-{hashlib.sha256(cache_key.encode()).hexdigest()[:16]}-{index}"
+                        if not GAME_SPEECH_AUDIO_CACHE.begin_capture(
+                            self, speech_id, cache_key, runtime_signature
+                        ):
+                            results_by_index[index] = {
+                                "index": index,
+                                "status": "bypass_capacity",
+                            }
+                            continue
+                        request_queue.put((speech_id, spoken))
+                        request_queue.put((None, None))
+                        loaded = False
+                        failure_reason = "tts_incomplete"
+                        item_deadline = (
+                            time.monotonic()
+                            + _GAME_SPEECH_PRELOAD_ITEM_TIMEOUT_SECONDS
+                        )
+                        try:
+                            while True:
+                                message = await next_response(
+                                    max(0.001, item_deadline - time.monotonic())
+                                )
+                                if (
+                                    isinstance(message, tuple)
+                                    and len(message) == 3
+                                    and message[0] == "__audio__"
+                                ):
+                                    _, response_speech_id, audio = message
+                                    if str(response_speech_id or "") == speech_id:
+                                        GAME_SPEECH_AUDIO_CACHE.append_capture(
+                                            self, speech_id, audio
+                                        )
+                                    continue
+                                if isinstance(message, (bytes, bytearray, memoryview)):
+                                    GAME_SPEECH_AUDIO_CACHE.append_capture(
+                                        self, speech_id, message
+                                    )
+                                    continue
+                                if (
+                                    isinstance(message, tuple)
+                                    and len(message) == 2
+                                    and message[0] == TTS_AUDIO_DONE_SENTINEL
+                                    and str(message[1] or "") == speech_id
+                                ):
+                                    loaded = GAME_SPEECH_AUDIO_CACHE.complete_capture(
+                                        self,
+                                        speech_id,
+                                        self.current_game_speech_audio_runtime_signature(),
+                                    )
+                                    failure_reason = (
+                                        "tts_incomplete" if not loaded else ""
+                                    )
+                                    break
+                                if (
+                                    isinstance(message, tuple)
+                                    and len(message) == 2
+                                    and message[0] in {"__error__", "__ready__"}
+                                ):
+                                    failure_reason = "tts_unavailable"
+                                    break
+                        except asyncio.TimeoutError:
+                            failure_reason = "timeout"
+                        except RuntimeError:
+                            failure_reason = "tts_unavailable"
+                        finally:
+                            if not loaded:
+                                GAME_SPEECH_AUDIO_CACHE.fail_capture(self, speech_id)
+                        results_by_index[index] = (
+                            {"index": index, "status": "loaded"}
+                            if loaded
+                            else {
+                                "index": index,
+                                "status": "failed",
+                                "reason": failure_reason,
+                            }
+                        )
+                finally:
+                    try:
+                        request_queue.put((TTS_SHUTDOWN_SENTINEL, None))
+                    except Exception:
+                        pass
+                    await asyncio.to_thread(thread.join, 2.0)
+                    if not thread.is_alive():
+                        self._game_speech_preload_active_workers.pop(thread, None)
+
+                return summarize(results_by_index)
+        except asyncio.CancelledError:
+            return {"ok": False, "reason": "cancelled", "results": []}
+        finally:
+            self._game_speech_preload_pending_batches = max(
+                0,
+                int(getattr(self, "_game_speech_preload_pending_batches", 1)) - 1,
+            )
+
     async def _clear_tts_pipeline(self):
         """Clear the TTS request/response queues and pending caches, stopping the current synthesis.
 
@@ -348,6 +747,7 @@ class TtsRuntimeMixin:
         # 调用方在本函数返回后的重复清零保留不动：那是给 sleep 窗口内被并发
         # 置回 True 的情况兜底，与这里要修的取消残留是两件事。
         self._tts_done_queued_for_turn = False
+        GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
         if self.tts_thread and self.tts_thread.is_alive():
             while not self.tts_response_queue.empty():
                 try:
@@ -392,6 +792,24 @@ class TtsRuntimeMixin:
             and self.tts_ready
         )
 
+    async def _stop_tts_response_handler(self) -> None:
+        """Stop the handler bound to the current response queue.
+
+        ``tts_response_handler`` captures ``tts_response_queue`` when its task
+        starts. Replacing a worker also replaces that queue, so the old handler
+        must be cancelled before a replacement worker/handler pair is created.
+        """
+        handler_task = self.tts_handler_task
+        if handler_task is not None and not handler_task.done():
+            GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
+            handler_task.cancel()
+            try:
+                await asyncio.wait_for(handler_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        if self.tts_handler_task is handler_task:
+            self.tts_handler_task = None
+
     async def ensure_tts_pipeline_alive(self) -> None:
         """Light TTS startup helper: spawn worker + handler task if not alive.
 
@@ -402,6 +820,10 @@ class TtsRuntimeMixin:
         ``tts_ready`` flips).
         """
         if not (self.tts_thread and self.tts_thread.is_alive()):
+            # A live handler can still be blocked on the response queue owned
+            # by a worker that was shut down for native Realtime voice. It must
+            # not survive across the fresh queues created by _start_tts_thread.
+            await self._stop_tts_response_handler()
             self._start_tts_thread(
                 preserve_provider_exclusions=bool(
                     getattr(self, "_tts_excluded_provider_keys", frozenset())
@@ -466,26 +888,11 @@ class TtsRuntimeMixin:
             self._tts_fallback_uses_default_voice = False
 
         # 检查是否禁用了 TTS
-        core_config = self._config_manager.get_core_config()
-        route_voice_id = self.voice_id or ''
-        if core_config.get('DISABLE_TTS', False):
+        tts_worker, api_key, route_voice_id, provider_key, disabled = (
+            self._resolve_tts_worker_spec()
+        )
+        if disabled:
             logger.info("TTS 已被用户禁用, 使用 dummy worker")
-            tts_worker = dummy_tts_worker
-            api_key_override = None
-            provider_key = None
-            api_key = ''
-        else:
-            route_voice_id, has_custom = self._effective_tts_route()
-            tts_worker, api_key_override, provider_key = _core_facade.get_tts_worker(
-                core_api_type=self.core_api_type,
-                has_custom_voice=has_custom,
-                voice_id=route_voice_id,
-                excluded_provider_keys=self._tts_excluded_provider_keys,
-            )
-            tts_config = self._config_manager.get_model_api_config(
-                'tts_custom' if has_custom else 'tts_default'
-            )
-            api_key = self.resolve_tts_api_key(provider_key, api_key_override, tts_config)
 
         # 根据实际选中的 TTS provider 类别决定是否启用流式文本规范化。
         # ws_bistream 类（qwen / step / cosyvoice）直接把文本碎片发给服务端处理，
@@ -680,6 +1087,8 @@ class TtsRuntimeMixin:
         # 只在被拆除的 runtime 仍是当前 runtime 时才清全局 TTS 状态，
         # 避免新 session 已创建新队列/worker 后被旧 teardown 误重置
         if resp_queue_ref is self.tts_response_queue:
+            self.cancel_game_speech_preloads()
+            GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
             async with self.tts_cache_lock:
                 self.tts_ready = False
                 self.tts_pending_chunks.clear()
@@ -972,10 +1381,14 @@ class TtsRuntimeMixin:
         try:
             if self.websocket and hasattr(self.websocket, 'client_state') and self.websocket.client_state == self.websocket.client_state.CONNECTED:
                 effective_speech_id = speech_id if speech_id is not None else self.current_speech_id
-                await self.websocket.send_json({
+                header = {
                     "type": "audio_chunk",
                     "speech_id": effective_speech_id
-                })
+                }
+                playback_gain = self.speech_playback_gain(effective_speech_id)
+                if playback_gain != 1.0:
+                    header["playback_gain"] = playback_gain
+                await self.websocket.send_json(header)
                 await self.websocket.send_bytes(tts_audio)
                 logger.debug(f"🔊 send_speech OK: {len(tts_audio)} bytes, speech_id={effective_speech_id}")
                 self._speech_output_total += 1
@@ -1030,6 +1443,9 @@ class TtsRuntimeMixin:
         except Exception as e:
             logger.warning(f"⚠️ send_audio_done 发送失败: speech_id={speech_id}, err={e}")
             return False
+        finally:
+            # The stream lifecycle is over even when the client disconnected.
+            self.release_speech_playback_gain(speech_id)
 
     async def tts_response_handler(self):
         q = self.tts_response_queue
@@ -1067,6 +1483,7 @@ class TtsRuntimeMixin:
                         # matching ``__error__`` item.  Keep the speech identity so
                         # parallel failures from one reply can share one user notice.
                         pending_failed_speech_id = str(speech_id or "")
+                        GAME_SPEECH_AUDIO_CACHE.fail_capture(self, speech_id)
                     if speech_id == getattr(self, "_tts_replay_speech_id", None):
                         # marker 排在该句所有音频之后；只有音频实际送达前端才推进边界。
                         # 失败句若已播放过前缀也整体跳过，避免 fallback 从句首重念；
@@ -1082,6 +1499,11 @@ class TtsRuntimeMixin:
                         # await 才能保证这条收尾信号排在该 sid 的所有
                         # __audio__/裸 bytes 之后。fire-and-forget 会插到尾音
                         # 前面，前端提前收尾——正是本信号要解决的问题。
+                        GAME_SPEECH_AUDIO_CACHE.complete_capture(
+                            self,
+                            data[1],
+                            self.current_game_speech_audio_runtime_signature(),
+                        )
                         await self.send_audio_done(data[1])
                         completed_speech_id = str(data[1] or "")
                         if completed_speech_id:
@@ -1157,6 +1579,7 @@ class TtsRuntimeMixin:
                             getattr(self, "current_speech_id", "") or ""
                         )
                         pending_failed_speech_id = ""
+                        GAME_SPEECH_AUDIO_CACHE.fail_capture(self, error_speech_id)
                         logger.error(f"TTS Worker Error: {error_msg}")
 
                         # A configured endpoint failure is observable in the
@@ -1273,6 +1696,7 @@ class TtsRuntimeMixin:
                 elif isinstance(data, tuple) and len(data) == 3 and data[0] == "__audio__":
                     _, speech_id, audio_payload = data
                     if await self.send_speech(audio_payload, speech_id=speech_id):
+                        GAME_SPEECH_AUDIO_CACHE.append_capture(self, speech_id, audio_payload)
                         self._tts_replay_audio_emitted = True
                         self._tts_replay_sentence_audio_emitted = True
                         self._confirm_pending_ai_voice_echo(speech_id)
@@ -1287,17 +1711,25 @@ class TtsRuntimeMixin:
                             # note_core_loop_completed 自身幂等。
                             pass
                     else:
+                        GAME_SPEECH_AUDIO_CACHE.fail_capture(self, speech_id)
                         self._discard_pending_ai_voice_echo()
                     continue
 
                 size = len(data) if isinstance(data, (bytes, bytearray)) else f"type={type(data).__name__}"
                 logger.debug(f"🎧 handler dequeued audio: {size}, qsize≈{q.qsize()}")
+                implicit_speech_id = str(getattr(self, "current_speech_id", "") or "")
                 if await self.send_speech(data):
+                    GAME_SPEECH_AUDIO_CACHE.append_unscoped_capture(
+                        self, implicit_speech_id, data
+                    )
                     self._tts_replay_audio_emitted = True
                     self._tts_replay_sentence_audio_emitted = True
+                else:
+                    GAME_SPEECH_AUDIO_CACHE.fail_capture(self, implicit_speech_id)
                 self._discard_pending_ai_voice_echo()
             except asyncio.CancelledError:
                 logger.info("🎧 tts_response_handler cancelled")
+                GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
                 # asyncio.to_thread 取消后，线程池里那个 thread 仍阻塞在 q.get()。
                 # push 哨兵唤醒它返回，避免线程泄漏（线程持有 queue ref，整个 queue
                 # 也会被一起留住）。put_nowait 失败不影响主流程。

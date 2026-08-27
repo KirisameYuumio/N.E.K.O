@@ -1264,16 +1264,20 @@ class LifecycleMixin:
             await asyncio.sleep(0.5)
             logger.info("旧session清理完成")
 
-        # 如果当前不需要TTS但TTS线程仍在运行，发送停止信号
-        if not self.use_tts and self.tts_thread and self.tts_thread.is_alive():
-            logger.info("当前模式不需要TTS，关闭TTS线程")
-            try:
-                self.tts_request_queue.put(("__shutdown__", None))  # 通知线程退出
-                await asyncio.to_thread(self.tts_thread.join, 1.0)  # 等待线程结束
-            except Exception as e:
-                logger.error(f"关闭TTS线程时出错: {e}")
-            finally:
-                self.tts_thread = None
+        # 如果当前不需要TTS，worker 与其绑定的响应 handler 必须成对释放。
+        # handler 在启动时会捕获当时的 response queue；只关 worker 会让它
+        # 永久阻塞在旧队列，之后小游戏懒启动 TTS 时也无法消费新队列。
+        if not self.use_tts:
+            if self.tts_thread and self.tts_thread.is_alive():
+                logger.info("当前模式不需要TTS，关闭TTS线程")
+                try:
+                    self.tts_request_queue.put(("__shutdown__", None))  # 通知线程退出
+                    await asyncio.to_thread(self.tts_thread.join, 1.0)  # 等待线程结束
+                except Exception as e:
+                    logger.error(f"关闭TTS线程时出错: {e}")
+                finally:
+                    self.tts_thread = None
+            await self._stop_tts_response_handler()
 
     async def _start_session_start_tts_if_needed(self):
         """Asynchronously start the TTS process and wait for readiness"""
@@ -2897,6 +2901,7 @@ class LifecycleMixin:
         # duplicate end_session callback can't reset the CURRENT live session's
         # gate or drop its queued cues (Codex P1).
         self._reset_proactive_gate()
+        self.clear_speech_playback_gains()
 
         # Stale expected_session callbacks have already returned above. Invalidate
         # ASR callbacks before any remaining teardown awaits can yield.

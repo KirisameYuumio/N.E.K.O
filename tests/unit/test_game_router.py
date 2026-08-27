@@ -2177,6 +2177,40 @@ async def test_game_character_returns_live2d_path(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_game_character_uses_canonical_live2d_fallback_when_saved_path_is_empty(
+    monkeypatch,
+    game_character_locale_loader,
+):
+    import main_routers.characters_router as characters_router
+
+    _gr_patch_all(monkeypatch, "get_config_manager", lambda: _FakeConfigManager(
+        _characters_with_avatar("FallbackLan", {
+            "model_type": "live2d",
+            "live2d": {"model_path": ""},
+        })
+    ))
+
+    resolver_names = []
+
+    async def fake_current_live2d_model(name):
+        resolver_names.append(name)
+        return JSONResponse({
+            "model_info": {
+                "path": "/static/yui-lolita/yui-lolita.model3.json",
+                "is_fallback": True,
+            },
+        })
+
+    monkeypatch.setattr(characters_router, "get_current_live2d_model", fake_current_live2d_model)
+
+    result = await gr_runtime.game_character("soccer")
+
+    assert resolver_names == ["FallbackLan"]
+    assert result["live2d_path"] == "/static/yui-lolita/yui-lolita.model3.json"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_character_returns_vrm_path_for_live3d_vrm(
     monkeypatch,
     tmp_path,
@@ -4071,6 +4105,7 @@ class _FakeGameRouteManager:
         self.mirrored = []
         self.assistant_mirrored = []
         self.spoken = []
+        self.preloaded = []
         self.statuses = []
         self.user_activity_count = 0
         self._takeover_active = False
@@ -4101,6 +4136,22 @@ class _FakeGameRouteManager:
             "speech_id": "game-speech",
             "audio_sent": True,
             "voice_source": {"provider": "project_tts"},
+        }
+
+    async def preload_game_speech_audio(self, lines):
+        self.render_language_at_mirror.append(
+            getattr(self, "_conversation_render_language", None)
+        )
+        self.preloaded.append(list(lines))
+        return {
+            "ok": True,
+            "results": [
+                {"index": index, "status": "loaded"}
+                for index in range(len(lines))
+            ],
+            "loaded": len(lines),
+            "hits": 0,
+            "failed": 0,
         }
 
     def set_render_language(self, language):
@@ -4554,6 +4605,22 @@ async def test_route_external_audio_activates_game_stt_gate(monkeypatch):
     assert state["game_input_mode"] == "voice"
     assert state["activation_source"] == "external_voice_hijacked_by_game"
     assert "GAME_VOICE_STT_GATE_ACTIVE" in mgr.statuses[0]
+    status_payload = json.loads(mgr.statuses[0])
+    assert status_payload["details"] == {
+        "game_type": "soccer",
+        "session_id": "match_1",
+        "lanlan_name": "Lan",
+        "capture_owner": "host",
+        "transcription_mode": "backend_pending",
+        "provider": "",
+        "ready": False,
+        "stt_provider": "realtime",
+        "message": (
+            "游戏期间主语音入口已被游戏路由接管。宿主正在按 Core 能力和用户设置选择"
+            "原生或独立 STT；最终转写交给游戏路由，普通 chat LLM 输出在 SessionManager"
+            " 层被静音（session takeover）。"
+        ),
+    }
     assert len(mgr.statuses) == 1
     assert len(state["game_input_activation_log"]) == 1
     assert state["game_input_activation_log"][0]["source"] == "external_voice_hijacked_by_game"
@@ -5249,6 +5316,8 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
         "mirror_text": True,
         "emit_turn_end_after": True,
         "interrupt_audio": False,
+        "playback_gain": 1.0,
+        "reuse_synthesized_audio": False,
     })]
 
 
@@ -5282,6 +5351,8 @@ async def test_project_speak_can_skip_text_mirror_for_frontend_arbiter(monkeypat
         "mirror_text": False,
         "emit_turn_end_after": False,
         "interrupt_audio": False,
+        "playback_gain": 1.0,
+        "reuse_synthesized_audio": False,
     })]
 
 
@@ -5316,7 +5387,116 @@ async def test_project_speak_forwards_interrupt_audio(monkeypatch):
         "mirror_text": False,
         "emit_turn_end_after": False,
         "interrupt_audio": True,
+        "playback_gain": 1.0,
+        "reuse_synthesized_audio": False,
     })]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speak_forwards_synthesized_audio_reuse_opt_in(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    result = await gr_runtime.game_project_speak(
+        "soccer",
+        _FakeRequest({
+            "line": "重复使用这句",
+            "session_id": "match_1",
+            "reuse_synthesized_audio": True,
+        }),
+    )
+
+    assert result["ok"] is True
+    assert mgr.spoken[0][1]["reuse_synthesized_audio"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speech_preload_is_silent_and_deduplicates_lines(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    result = await gr_runtime.game_project_speech_preload(
+        "soccer",
+        _FakeRequest({
+            "lines": ["  开球了  ", "开球了", "看我的"],
+            "session_id": "match_1",
+            "render_language": "ja",
+        }),
+    )
+
+    assert result["ok"] is True
+    assert result["method"] == "project_tts_preload"
+    assert mgr.preloaded == [["开球了", "看我的"]]
+    assert mgr.render_language_at_mirror == ["ja"]
+    assert mgr.spoken == []
+    assert mgr.assistant_mirrored == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speech_preload_disconnect_cancels_backend_work(monkeypatch):
+    class DisconnectingRequest(_FakeRequest):
+        async def is_disconnected(self):
+            return True
+
+    class BlockingPreloadManager(_FakeGameRouteManager):
+        def __init__(self):
+            super().__init__()
+            self.cancelled = False
+
+        async def preload_game_speech_audio(self, lines):
+            self.preloaded.append(list(lines))
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    mgr = BlockingPreloadManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    result = await gr_runtime.game_project_speech_preload(
+        "soccer",
+        DisconnectingRequest({
+            "lines": ["断开后停止预载"],
+            "session_id": "match_1",
+        }),
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "cancelled"
+    assert mgr.cancelled is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_gain", "expected_gain"),
+    [(-1, 0.0), (0, 0.0), (1.5, 1.5), (3, 2.0), ("invalid", 1.0), (True, 1.0)],
+)
+async def test_project_speak_clamps_per_game_voice_playback_gain(
+    monkeypatch, requested_gain, expected_gain
+):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    result = await gr_runtime.game_project_speak(
+        "soccer",
+        _FakeRequest({
+            "line": "音量测试",
+            "session_id": "match_1",
+            "playback_gain": requested_gain,
+        }),
+    )
+
+    assert result["playback_gain"] == expected_gain
+    assert mgr.spoken[0][1]["playback_gain"] == expected_gain
 
 
 @pytest.mark.unit

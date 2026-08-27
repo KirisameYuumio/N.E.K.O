@@ -46,6 +46,7 @@ from ._shared import (
     _proactive_published_text_chunks,
     _get_chat_locale_text,
 )
+from .game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE
 
 # Late-binding read point for symbols that tests rebind on the facade via
 # ``monkeypatch.setattr("main_logic.core.<attr>", ...)``. Do NOT from-import
@@ -1720,6 +1721,8 @@ class TurnMixin:
         mirror_text: bool = True,
         emit_turn_end_after: bool = True,
         interrupt_audio: bool = False,
+        playback_gain: float = 1.0,
+        reuse_synthesized_audio: bool = False,
     ) -> dict:
         """Mirror an assistant line + play it through the project TTS pipeline.
 
@@ -1733,6 +1736,13 @@ class TurnMixin:
         if not clean:
             return {"ok": False, "reason": "missing_line", "audio_sent": False}
 
+        cache_key = ""
+        runtime_signature = ""
+        cached_chunks = None
+        if reuse_synthesized_audio:
+            cache_key, runtime_signature = self.game_speech_audio_cache_identity(clean)
+            cached_chunks = GAME_SPEECH_AUDIO_CACHE.get(cache_key)
+
         interrupted_speech_id = None
         if interrupt_audio:
             async with self.lock:
@@ -1743,6 +1753,7 @@ class TurnMixin:
             # liveness gate inside ``_clear_tts_pipeline`` makes this safe
             # when no worker is actually running.
             await self._clear_tts_pipeline()
+            self.release_speech_playback_gain(interrupted_speech_id)
             # Realtime native voice: also tell the provider to stop generating
             # so further audio.delta / output_audio.delta won't keep streaming
             # past the interruption point.  Local takeover guards drop these
@@ -1764,6 +1775,7 @@ class TurnMixin:
             self._tts_done_pending_until_ready = False
             turn_id = self.current_speech_id
             self.state.mark_user_input_preempt()
+        normalized_playback_gain = self.remember_speech_playback_gain(turn_id, playback_gain)
         await self.state.fire(SessionEvent.USER_INPUT, sid=turn_id)
 
         if mirror_text:
@@ -1777,8 +1789,46 @@ class TurnMixin:
                 cache_for_new_session=False,
             )
 
+        if cached_chunks is not None:
+            audio_sent = bool(cached_chunks)
+            for audio_chunk in cached_chunks:
+                if not await self.send_speech(audio_chunk, speech_id=turn_id):
+                    audio_sent = False
+                    break
+            await self.send_audio_done(turn_id)
+            if emit_turn_end_after:
+                await self.emit_mirror_turn_end(
+                    metadata=metadata,
+                    request_id=request_id,
+                    log_context="mirror cached speech",
+                )
+            return {
+                "ok": True,
+                "method": "project_tts_cache",
+                "cache_status": "hit",
+                "speech_id": turn_id,
+                "audio_sent": audio_sent,
+                "audio_queued": False,
+                "turn_end_emitted": bool(emit_turn_end_after),
+                "interrupt_audio": bool(interrupt_audio),
+                "playback_gain": normalized_playback_gain,
+                "voice_source": {
+                    "provider": "project_tts_cache",
+                    "method": "project_tts_cache",
+                    "use_existing_send_speech": True,
+                },
+            }
+
         await self.ensure_tts_pipeline_alive()
         audio_queued = False
+        capture_started = False
+        if reuse_synthesized_audio:
+            capture_started = GAME_SPEECH_AUDIO_CACHE.begin_capture(
+                self,
+                turn_id,
+                cache_key,
+                runtime_signature,
+            )
         if self.tts_thread and self.tts_thread.is_alive():
             async with self.tts_cache_lock:
                 if self.tts_ready:
@@ -1787,6 +1837,8 @@ class TurnMixin:
                     self.tts_pending_chunks.append((turn_id, clean))
                 status = self._request_tts_done_locked()
                 audio_queued = status in {"queued", "deferred", "already"}
+        if capture_started and not audio_queued:
+            GAME_SPEECH_AUDIO_CACHE.fail_capture(self, turn_id)
         if emit_turn_end_after:
             await self.emit_mirror_turn_end(
                 metadata=metadata,
@@ -1797,11 +1849,17 @@ class TurnMixin:
         return {
             "ok": True,
             "method": "project_tts",
+            "cache_status": (
+                "miss" if capture_started
+                else "bypass_capacity" if reuse_synthesized_audio
+                else "disabled"
+            ),
             "speech_id": turn_id,
             "audio_sent": audio_queued,
             "audio_queued": audio_queued,
             "turn_end_emitted": bool(emit_turn_end_after),
             "interrupt_audio": bool(interrupt_audio),
+            "playback_gain": normalized_playback_gain,
             "voice_source": {
                 "provider": "project_tts",
                 "method": "project_tts",

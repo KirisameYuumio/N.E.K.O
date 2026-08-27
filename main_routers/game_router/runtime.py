@@ -41,6 +41,10 @@ from .badminton_scores import (
     _normalize_badminton_mode,
     _remember_badminton_score_session,
 )
+from .author_prompt import (
+    _normalize_author_managed_prompt,
+    _run_author_managed_game_chat,
+)
 from .balance import (
     _apply_badminton_anger_pressure_cap,
     _apply_soccer_anger_pressure_cap,
@@ -175,6 +179,7 @@ from .session_pool import (  # noqa: F401
 
 import asyncio
 import json
+import math
 import re
 import time
 from collections import OrderedDict
@@ -561,6 +566,7 @@ async def _run_game_chat(
     postgame_snapshot: Optional[dict] = None,
     postgame_meta_out: Optional[Dict[str, Any]] = None,
     prompt_locale: str | None = None,
+    author_prompt: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Run A-layer game LLM for both HTTP game events and hijacked external text.
 
@@ -582,6 +588,16 @@ async def _run_game_chat(
     ``_route_session_id``.
     """
     request_started_at = time.perf_counter()
+
+    try:
+        normalized_author_prompt = _normalize_author_managed_prompt(author_prompt)
+    except ValueError as exc:
+        return {
+            "error": "invalid_author_prompt",
+            "message": str(exc),
+            "line": "",
+            "control": {},
+        }
 
     if not event:
         return {"error": "缺少 event 字段"}
@@ -636,6 +652,112 @@ async def _run_game_chat(
                 game_type, session_id, lanlan_name,
             )
             return {"line": "", "control": {}, "skipped": "route_inactive"}
+
+    if normalized_author_prompt is not None:
+        if allow_postgame:
+            return {
+                "error": "author_prompt_postgame_unsupported",
+                "line": "",
+                "control": {},
+            }
+        if not isinstance(pre_state, dict) or (
+            pre_state.get("game_route_active") is not True
+            or str(pre_state.get("session_id") or "") != str(session_id or "")
+        ):
+            return {"line": "", "control": {}, "skipped": "route_inactive"}
+
+        try:
+            author_result = await _run_author_managed_game_chat(
+                game_type,
+                lanlan_name,
+                normalized_author_prompt,
+                prompt_locale=prompt_locale,
+            )
+        except asyncio.TimeoutError:
+            _append_game_session_debug_log(
+                game_type,
+                session_id,
+                lanlan_name=lanlan_name,
+                level="warning",
+                category="llm",
+                event="game_chat_timeout",
+                message="作者编排的小游戏 LLM 响应超时，返回空台词",
+                details={"timeout_seconds": 15.0, "prompt_mode": "author-managed"},
+            )
+            return {"error": "LLM 响应超时", "line": "", "control": {}}
+        except Exception as exc:
+            logger.error(
+                "🎮 作者编排的游戏 LLM 调用失败: game=%s sid=%s error_type=%s",
+                game_type,
+                session_id,
+                type(exc).__name__,
+            )
+            _append_game_session_debug_log(
+                game_type,
+                session_id,
+                lanlan_name=lanlan_name,
+                level="error",
+                category="llm",
+                event="game_chat_exception",
+                message="作者编排的小游戏主 LLM 调用失败",
+                details={
+                    "error_type": type(exc).__name__,
+                    "prompt_mode": "author-managed",
+                },
+            )
+            return {"error": f"LLM 调用失败: {exc}", "line": "", "control": {}}
+
+        post_state = _find_game_route_state_for_session(game_type, session_id, lanlan_name)
+        if not isinstance(post_state, dict) or (
+            post_state.get("game_route_active") is not True
+            or str(post_state.get("session_id") or "") != str(session_id or "")
+        ):
+            return {"line": "", "control": {}, "skipped": "route_inactive"}
+
+        result = _parse_control_instructions(author_result["reply"], game_type=game_type)
+        if game_type == "soccer" and isinstance(event, dict):
+            result = _apply_soccer_anger_pressure_cap(result, event)
+        elif (
+            _is_badminton_game_type(game_type)
+            and isinstance(event, dict)
+            and _normalize_badminton_mode(event.get("mode")) == "duel"
+        ):
+            result = _apply_badminton_anger_pressure_cap(result, event)
+        if isinstance(event, dict) and event.get("balanceHint"):
+            result["balance_hint"] = event["balanceHint"]
+        total_elapsed_ms = int((time.perf_counter() - request_started_at) * 1000)
+        result["metrics"] = {
+            "llm_ms": author_result["llm_ms"],
+            "total_ms": total_elapsed_ms,
+        }
+        result["llm_source"] = author_result["source"]
+        logger.info(
+            "🎮 [%s:%s] 作者编排 LLM 完成: messages=%s roles=%s llm_ms=%s total_ms=%s",
+            game_type,
+            session_id,
+            author_result["message_count"],
+            ",".join(author_result["roles"]),
+            author_result["llm_ms"],
+            total_elapsed_ms,
+        )
+        _append_game_session_debug_log(
+            game_type,
+            session_id,
+            lanlan_name=lanlan_name,
+            category="llm",
+            event="game_chat_completed",
+            message="作者编排的小游戏主 LLM 返回完成",
+            details={
+                "prompt_mode": "author-managed",
+                "message_count": author_result["message_count"],
+                "roles": author_result["roles"],
+                "llm_ms": author_result["llm_ms"],
+                "total_ms": total_elapsed_ms,
+                "line_length": len(result.get("line") or ""),
+                "control_keys": sorted((result.get("control") or {}).keys()),
+            },
+        )
+        return result
 
     try:
         entry = await _get_or_create_session(
@@ -1055,6 +1177,17 @@ async def game_chat(game_type: str, request: Request):
 
     session_id = str(data.get('session_id', 'default'))
     event = data.get('event', {})
+    try:
+        author_prompt = _normalize_author_managed_prompt(data.get("prompt"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "ok": False,
+                "reason": "invalid_author_prompt",
+                "message": str(exc),
+            },
+        ) from exc
     lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
     state = _get_active_game_route_state(lanlan_name, game_type) if lanlan_name else None
     if state and state.get("session_id") == session_id:
@@ -1097,14 +1230,18 @@ async def game_chat(game_type: str, request: Request):
     if isinstance(event, dict) and lanlan_name:
         event = dict(event)
         event.setdefault("lanlan_name", lanlan_name)
-    result = await _run_game_chat(
-        game_type,
-        session_id,
-        event,
-        prompt_locale=prompt_locale,
-    )
+    run_options: Dict[str, Any] = {"prompt_locale": prompt_locale}
+    if author_prompt is not None:
+        run_options["author_prompt"] = author_prompt
+    result = await _run_game_chat(game_type, session_id, event, **run_options)
 
-    if state and state.get("session_id") == session_id and isinstance(event, dict):
+    if (
+        state
+        and state.get("session_id") == session_id
+        and isinstance(event, dict)
+        and not result.get("error")
+        and not result.get("skipped")
+    ):
         current_state = event.get("currentState")
         if isinstance(current_state, dict):
             state["last_state"] = current_state
@@ -1607,6 +1744,8 @@ async def _speak_game_line_via_project_tts(
     mirror_text: bool = True,
     emit_turn_end: bool = True,
     interrupt_audio: bool = False,
+    playback_gain: float = 1.0,
+    reuse_synthesized_audio: bool = False,
     event: dict | None = None,
 ) -> Dict[str, Any]:
     speak = getattr(mgr, "mirror_assistant_speech", None)
@@ -1627,6 +1766,8 @@ async def _speak_game_line_via_project_tts(
             mirror_text=mirror_text,
             emit_turn_end_after=emit_turn_end,
             interrupt_audio=interrupt_audio,
+            playback_gain=playback_gain,
+            reuse_synthesized_audio=reuse_synthesized_audio,
         )
     except Exception as exc:
         return {
@@ -1643,12 +1784,26 @@ async def _speak_game_line_via_project_tts(
             "voice_source": {"provider": "project_tts", "method": "project_tts"},
         }
     if isinstance(result, dict):
+        result.setdefault("playback_gain", playback_gain)
         result.setdefault("tts_pipeline", {})
         result["tts_pipeline"] = {
             "before": before_state,
             "after": _project_tts_pipeline_state(mgr),
         }
     return result
+
+
+def _normalize_game_voice_playback_gain(value: Any) -> float:
+    """Clamp a per-request game voice mix without changing global speaker volume."""
+    if isinstance(value, bool):
+        return 1.0
+    try:
+        gain = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(gain):
+        return 1.0
+    return max(0.0, min(2.0, gain))
 
 
 def _project_tts_pipeline_state(mgr: Any) -> dict[str, Any]:
@@ -1808,6 +1963,8 @@ async def game_project_speak(game_type: str, request: Request):
         return {"ok": False, "reason": "missing_lanlan_name"}
 
     interrupt_audio = _coerce_payload_bool(data.get("interrupt_audio")) is True
+    reuse_synthesized_audio = _coerce_payload_bool(data.get("reuse_synthesized_audio")) is True
+    playback_gain = _normalize_game_voice_playback_gain(data.get("playback_gain"))
     session_id = str(data.get("session_id") or "")
     state = _get_active_game_route_state(lanlan_name, game_type)
     if not state:
@@ -1853,6 +2010,8 @@ async def game_project_speak(game_type: str, request: Request):
             "request_id": str(data.get("request_id") or ""),
             "line_length": len(line),
             "interrupt_audio": interrupt_audio,
+            "playback_gain": playback_gain,
+            "reuse_synthesized_audio": reuse_synthesized_audio,
             "mirror_text": data.get("mirror_text", True) is not False,
             "emit_turn_end": data.get("emit_turn_end", True) is not False,
             "event_kind": data.get("event", {}).get("kind") if isinstance(data.get("event"), dict) else "",
@@ -1868,6 +2027,8 @@ async def game_project_speak(game_type: str, request: Request):
         mirror_text=data.get("mirror_text", True) is not False,
         emit_turn_end=data.get("emit_turn_end", True) is not False,
         interrupt_audio=interrupt_audio,
+        playback_gain=playback_gain,
+        reuse_synthesized_audio=reuse_synthesized_audio,
         event=_attach_game_memory_flag_to_event(
             data.get("event") if isinstance(data.get("event"), dict) else {},
             state,
@@ -1893,10 +2054,135 @@ async def game_project_speak(game_type: str, request: Request):
             "speech_id": result.get("speech_id"),
             "turn_end_emitted": result.get("turn_end_emitted"),
             "interrupt_audio": result.get("interrupt_audio"),
+            "playback_gain": result.get("playback_gain", playback_gain),
+            "cache_status": result.get("cache_status"),
             "error_type": result.get("error_type"),
             "error": result.get("error"),
             "tts_pipeline": result.get("tts_pipeline"),
             "voice_source": result.get("voice_source"),
+        },
+        preserve_details=True,
+    )
+    return result
+
+
+@router.post("/{game_type}/speech/preload")
+async def game_project_speech_preload(game_type: str, request: Request):
+    """Silently preload caller-selected text into the official project TTS cache."""
+    if str(game_type or "") == "new_user_icebreaker":
+        raise HTTPException(
+            status_code=400,
+            detail={"ok": False, "reason": "not_a_game_route"},
+        )
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "reason": "invalid_body"}
+
+    raw_lines = data.get("lines")
+    if not isinstance(raw_lines, list):
+        return {"ok": False, "reason": "invalid_lines"}
+    if len(raw_lines) > 32:
+        return {"ok": False, "reason": "too_many_lines", "limit": 32}
+    lines: list[str] = []
+    seen: set[str] = set()
+    total_characters = 0
+    for value in raw_lines:
+        if not isinstance(value, str):
+            return {"ok": False, "reason": "invalid_line"}
+        clean = value.strip()
+        if not clean or len(clean) > 2000:
+            return {"ok": False, "reason": "invalid_line"}
+        if clean in seen:
+            continue
+        seen.add(clean)
+        total_characters += len(clean)
+        if total_characters > 32000:
+            return {
+                "ok": False,
+                "reason": "lines_too_large",
+                "limit": 32000,
+            }
+        lines.append(clean)
+    if not lines:
+        return {"ok": False, "reason": "missing_lines"}
+
+    lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
+    if not lanlan_name:
+        return {"ok": False, "reason": "missing_lanlan_name"}
+    session_id = str(data.get("session_id") or "")
+    state = _get_active_game_route_state(lanlan_name, game_type)
+    if not state:
+        closed_response = _game_route_closed_session_response(
+            data,
+            session_id=session_id,
+            lanlan_name=lanlan_name,
+            method="project_tts_preload",
+        )
+        if closed_response:
+            return closed_response
+    stale_response = _game_route_stale_session_response(
+        state,
+        session_id,
+        lanlan_name=lanlan_name,
+        method="project_tts_preload",
+    )
+    if stale_response:
+        return stale_response
+
+    _absorb_request_language(data, lanlan_name)
+    mgr = get_session_manager().get(lanlan_name)
+    if not mgr:
+        return {"ok": False, "reason": "no_session_manager", "lanlan_name": lanlan_name}
+    _apply_request_render_language(data, mgr)
+    preload = getattr(mgr, "preload_game_speech_audio", None)
+    if not callable(preload):
+        return {"ok": False, "reason": "project_tts_preload_unavailable"}
+
+    _append_game_session_debug_log(
+        game_type,
+        session_id,
+        lanlan_name=lanlan_name,
+        category="speech",
+        event="project_speech_preload_requested",
+        message="小游戏项目语音静默预载开始",
+        details={"line_count": len(lines), "total_characters": total_characters},
+    )
+    preload_task = asyncio.create_task(preload(lines))
+    is_disconnected = getattr(request, "is_disconnected", None)
+    if callable(is_disconnected):
+        while not preload_task.done():
+            done, _ = await asyncio.wait({preload_task}, timeout=0.1)
+            if done:
+                break
+            if await is_disconnected():
+                preload_task.cancel()
+                break
+    try:
+        result = await preload_task
+    except asyncio.CancelledError:
+        result = {"ok": False, "reason": "cancelled", "results": []}
+    result.setdefault("lanlan_name", lanlan_name)
+    result.setdefault("method", "project_tts_preload")
+    _append_game_session_debug_log(
+        game_type,
+        session_id,
+        lanlan_name=lanlan_name,
+        level="info" if result.get("ok") else "warning",
+        category="speech",
+        event="project_speech_preload_result",
+        message="小游戏项目语音静默预载结束",
+        details={
+            "ok": result.get("ok"),
+            "reason": result.get("reason"),
+            "loaded": result.get("loaded", 0),
+            "hits": result.get("hits", 0),
+            "failed": result.get("failed", 0),
+            "statuses": [
+                str(item.get("status") or "")
+                for item in result.get("results", [])
+                if isinstance(item, dict)
+            ][:32],
         },
         preserve_details=True,
     )
@@ -2357,8 +2643,16 @@ async def route_external_stream_message(lanlan_name: str, message: dict) -> bool
                     "game_type": game_type,
                     "session_id": str(state.get("session_id") or ""),
                     "lanlan_name": lanlan_name,
+                    # Stable capability contract: this first edge only means
+                    # that the host owns capture and is resolving its backend
+                    # transcription route. The actual native/independent
+                    # provider arrives through the existing ASR status stream.
+                    "capture_owner": "host",
+                    "transcription_mode": "backend_pending",
+                    "provider": "",
+                    "ready": False,
                     "stt_provider": str(message.get("stt_provider") or "realtime"),
-                    "message": "游戏期间主语音入口已被游戏路由接管。复用原 Realtime 作为 STT provider；最终转写交给游戏路由，普通 chat LLM 输出在 SessionManager 层被静音（session takeover）。",
+                    "message": "游戏期间主语音入口已被游戏路由接管。宿主正在按 Core 能力和用户设置选择原生或独立 STT；最终转写交给游戏路由，普通 chat LLM 输出在 SessionManager 层被静音（session takeover）。",
                 },
             }
             _append_game_output(state, {
@@ -2959,9 +3253,9 @@ async def _load_game_character_prompt_locale(lanlan_name: str) -> tuple[str, boo
 async def game_character(game_type: str, request: Request = None):
     """Return current character information for model replacement.
 
-    The response includes the current model type and a frontend-addressable
-    model path. Each mini game chooses Live2D, VRM, MMD, or an explicit fallback
-    according to its own rendering support.
+    The response includes the current model type and frontend-addressable model
+    paths resolved by the host. Each mini game chooses the renderer it supports
+    without redefining the current character's model-selection policy.
     """
     def normalize_live3d_path(raw: str, static_dir: str) -> str:
         if not raw or not isinstance(raw, str):
@@ -3006,18 +3300,17 @@ async def game_character(game_type: str, request: Request = None):
         if isinstance(avatar, dict):
             live2d_info = avatar.get('live2d', {})
             if isinstance(live2d_info, dict):
-                raw = live2d_info.get('model_path', '')
-                if raw:
-                    # Live2D 可能来自 static、用户导入目录、CFA 回退目录或工坊。
-                    # 足球 demo 复用主角色接口的解析逻辑，避免把用户模型误拼成 /static/...。
-                    from ..characters_router import get_current_live2d_model
+                # Live2D 可能来自 static、用户导入目录、CFA 回退目录或工坊。
+                # 始终复用主角色接口的规范解析结果；即使保存路径为空，主页面也可能
+                # 已经选定回退模型，小游戏不能再自行选择另一只默认角色。
+                from ..characters_router import get_current_live2d_model
 
-                    model_response = await get_current_live2d_model(current_name)
-                    response_body = getattr(model_response, 'body', b'')
-                    if response_body:
-                        model_payload = json.loads(response_body.decode('utf-8'))
-                        model_info = model_payload.get('model_info') or {}
-                        live2d_path = model_info.get('path', '')
+                model_response = await get_current_live2d_model(current_name)
+                response_body = getattr(model_response, 'body', b'')
+                if response_body:
+                    model_payload = json.loads(response_body.decode('utf-8'))
+                    model_info = model_payload.get('model_info') or {}
+                    live2d_path = model_info.get('path', '')
 
             mmd_info = avatar.get('mmd', {})
             if isinstance(mmd_info, dict):
