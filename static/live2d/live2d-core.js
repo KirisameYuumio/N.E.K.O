@@ -268,9 +268,16 @@ class Live2DManager {
         }
 
         if (this.isInitialized && this.pixi_app && this.pixi_app.stage) {
-            const initializedResizeMode = this._lastPIXIContext?.resizeMode || 'host-window';
-            if (initializedResizeMode !== resizeMode) {
-                throw new Error(`Live2D 已按 ${initializedResizeMode} 初始化，不能复用为 ${resizeMode}`);
+            const initializedContext = this._lastPIXIContext || {};
+            const contextMatches = (
+                initializedContext.canvasId === requestedInitContext.canvasId
+                && initializedContext.containerId === requestedInitContext.containerId
+                && (initializedContext.resizeMode || 'host-window') === requestedInitContext.resizeMode
+                && (initializedContext.width ?? null) === requestedInitContext.width
+                && (initializedContext.height ?? null) === requestedInitContext.height
+            );
+            if (!contextMatches) {
+                throw new Error(`Live2D 已按 ${initializedContext.resizeMode || 'host-window'} 初始化，不能复用不同上下文`);
             }
             console.warn('Live2D 管理器已经初始化');
             return this.pixi_app;
@@ -358,7 +365,7 @@ class Live2DManager {
                 }
 
                 this.isInitialized = true;
-                this._lastPIXIContext = { canvasId, containerId, resizeMode };
+                this._lastPIXIContext = { ...requestedInitContext };
                 if (typeof window.targetFrameRate === 'number' && this.pixi_app.ticker) {
                     this.pixi_app.ticker.maxFPS = window.targetFrameRate;
                 }
@@ -538,10 +545,14 @@ class Live2DManager {
     async ensurePIXIReady(canvasId, containerId, options = {}) {
         const lastContext = this._lastPIXIContext || {};
         const resizeMode = String(options.resizeMode || 'host-window');
+        const requestedWidth = resizeMode === 'fixed' ? Number(options.width) : null;
+        const requestedHeight = resizeMode === 'fixed' ? Number(options.height) : null;
         const contextMatches = (
             lastContext.canvasId === canvasId &&
             lastContext.containerId === containerId &&
-            (lastContext.resizeMode || 'host-window') === resizeMode
+            (lastContext.resizeMode || 'host-window') === resizeMode &&
+            (lastContext.width ?? null) === requestedWidth &&
+            (lastContext.height ?? null) === requestedHeight
         );
 
         if (this.isInitialized && this.pixi_app && this.pixi_app.stage && contextMatches) {
@@ -569,7 +580,13 @@ class Live2DManager {
         }
         const app = await this.initPIXI(canvasId, containerId, options);
         if (app && app.stage) {
-            this._lastPIXIContext = { canvasId, containerId, resizeMode };
+            this._lastPIXIContext = {
+                canvasId,
+                containerId,
+                resizeMode,
+                width: requestedWidth,
+                height: requestedHeight,
+            };
         }
         return app;
     }

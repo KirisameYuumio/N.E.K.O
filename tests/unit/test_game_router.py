@@ -4232,6 +4232,14 @@ async def test_sdk_protocol_context_and_memory_endpoints_are_session_bound_and_b
                 "payload": {"round": 2},
             }, path="/api/game/soccer/protocol"),
         )
+        rejected_context = await gr_runtime.game_sdk_context_read(
+            "soccer",
+            _FakeRequest({
+                "session_id": "sdk-session",
+                "lanlan_name": "Lan",
+                "scopes": ["character-public"],
+            }, mutation_headers=False, path="/api/game/soccer/context/read"),
+        )
         context = await gr_runtime.game_sdk_context_read(
             "soccer",
             _FakeRequest({
@@ -4269,6 +4277,8 @@ async def test_sdk_protocol_context_and_memory_endpoints_are_session_bound_and_b
             "session_id": "sdk-session",
         }
         assert replayed["reason"] == "sequence_replayed"
+        assert isinstance(rejected_context, JSONResponse)
+        assert json.loads(rejected_context.body)["reason"] == "csrf_validation_failed"
         assert len(state["_sdk_protocol_events"]) == 1
         assert context["scopes"]["character-public"] == {
             "lanlan_name": "Lan",
@@ -4285,9 +4295,31 @@ async def test_sdk_protocol_context_and_memory_endpoints_are_session_bound_and_b
         archive = gr_archive._build_game_archive(state)
         assert archive["sdk_memory_submissions"][-1]["events"][0]["text"] == "玩家进球"
         assert archive["sdk_memory_submissions"][-1]["result"] == {"winner": "player"}
-        assert "SDK-submitted visible game material:" in (
+        source_labels = gr_archive.get_game_archive_highlight_source_labels(
+            gr_archive._archive_prompt_language(archive)
+        )
+        assert source_labels["sdk_memory_submissions"] in (
             gr_archive._build_game_archive_memory_highlight_source(archive)
         )
+        for language in ("zh", "zh-TW", "en", "ja", "ko", "ru", "es", "pt"):
+            assert gr_archive.get_game_archive_highlight_source_labels(language)[
+                "sdk_memory_submissions"
+            ]
+
+        fallback = gr_archive._fallback_game_archive_memory_highlights(archive)
+        assert fallback["memory_summary"] == "玩家赢下了本局"
+        assert any("玩家进球" in item for item in fallback["important_game_events"])
+        assert any('"winner":"player"' in item for item in fallback["important_game_events"])
+        assert '"player":2' in fallback["state_carryback"]
+
+        degraded_archive = dict(archive)
+        degraded_archive["game_context_degraded"] = True
+        degraded_archive.pop("memory_highlights", None)
+        degraded = await gr_archive._ensure_game_archive_memory_highlights(degraded_archive)
+        assert degraded["memory_summary"] == "玩家赢下了本局"
+        assert any("玩家进球" in item for item in degraded["important_game_events"])
+        memory_messages = gr_archive._build_game_archive_memory_messages(degraded_archive)
+        assert "玩家赢下了本局" in memory_messages[-1]["content"][0]["text"]
 
 
 @pytest.mark.unit

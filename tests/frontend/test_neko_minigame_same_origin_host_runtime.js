@@ -29,6 +29,10 @@ function storage() {
 async function main() {
   const calls = [];
   const listeners = new Map();
+  let releaseProtocolTwo;
+  let markProtocolTwoStarted;
+  const protocolTwoGate = new Promise((resolve) => { releaseProtocolTwo = resolve; });
+  const protocolTwoStarted = new Promise((resolve) => { markProtocolTwoStarted = resolve; });
   const fetchImpl = async (url, init = {}) => {
     const pathName = String(url);
     if (pathName.startsWith('/api/config/page_config')) {
@@ -36,6 +40,10 @@ async function main() {
     }
     const body = init.body ? JSON.parse(init.body) : {};
     calls.push({ url: pathName, init, body });
+    if (pathName.endsWith('/protocol') && body.sequence === 2) {
+      markProtocolTwoStarted();
+      await protocolTwoGate;
+    }
     if (pathName.endsWith('/route/start')) {
       return jsonResponse({
         ok: true,
@@ -148,6 +156,20 @@ async function main() {
     && protocolCall.init.headers['X-CSRF-Token'] === 'test-token',
   'protocol mutation did not carry the host CSRF contract');
 
+  const protocolTwo = host.publishGameProtocol('event', {
+    protocolVersion: '1', sequence: 2, type: 'second', payload: {},
+  });
+  const protocolThree = host.publishGameProtocol('state', {
+    protocolVersion: '1', sequence: 3, type: 'third', payload: {},
+  });
+  await protocolTwoStarted;
+  assert(!calls.some((call) => call.url.endsWith('/protocol') && call.body.sequence === 3),
+    'protocol transport allowed a later sequence to overtake an active request');
+  releaseProtocolTwo();
+  await Promise.all([protocolTwo, protocolThree]);
+  assert(calls.filter((call) => call.url.endsWith('/protocol')).map((call) => call.body.sequence).join(',') === '1,2,3',
+    'protocol transport did not preserve SDK call order');
+
   await host.readGameContext({
     session_id: 'attacker-session',
     scopes: ['character-public'],
@@ -160,6 +182,9 @@ async function main() {
   const memoryCall = calls.find((call) => call.url.endsWith('/memory/submit'));
   assert(contextCall.body.session_id === 'server-session',
     'context read did not bind the authoritative route session');
+  assert(contextCall.body._csrf_token === 'test-token'
+    && contextCall.init.headers['X-CSRF-Token'] === 'test-token',
+  'context read did not carry the host CSRF contract');
   assert(memoryCall.body.session_id === 'server-session'
     && memoryCall.body._csrf_token === 'test-token',
   'memory submission did not bind the authoritative session and CSRF token');
@@ -172,6 +197,51 @@ async function main() {
   'route outputs were not converted into SDK control envelopes');
   assert(controls[0].sessionId === 'server-session',
     'control envelope did not carry the authoritative route session');
+
+  let releaseLimitedProtocol;
+  let markLimitedProtocolStarted;
+  const limitedProtocolGate = new Promise((resolve) => { releaseLimitedProtocol = resolve; });
+  const limitedProtocolStarted = new Promise((resolve) => { markLimitedProtocolStarted = resolve; });
+  const limitedFetch = async (url, init = {}) => {
+    if (String(url).startsWith('/api/config/page_config')) {
+      return jsonResponse({ autostart_csrf_token: 'test-token' });
+    }
+    if (String(url).endsWith('/protocol')) {
+      markLimitedProtocolStarted();
+      await limitedProtocolGate;
+    }
+    return jsonResponse({ ok: true });
+  };
+  const limitedHost = window.createNekoMiniGameSameOriginHost({
+    gameType: 'soccer',
+    protocolQueueLimit: 2,
+    fetchImpl: limitedFetch,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  const limitedFirst = limitedHost.publishGameProtocol('event', {
+    protocolVersion: '1', sequence: 1, type: 'first', payload: {},
+  });
+  await limitedProtocolStarted;
+  const limitedQueued = limitedHost.publishGameProtocol('event', {
+    protocolVersion: '1', sequence: 2, type: 'second', payload: {},
+  });
+  let queueLimitError = null;
+  try {
+    await limitedHost.publishGameProtocol('event', {
+      protocolVersion: '1', sequence: 3, type: 'third', payload: {},
+    });
+  } catch (error) {
+    queueLimitError = error;
+  }
+  assert(queueLimitError?.code === 'busy', 'protocol queue did not enforce its hard capacity');
+  limitedHost.dispose({ preservePendingOperations: ['game_protocol'] });
+  releaseLimitedProtocol();
+  await limitedFirst;
+  let disposedQueueError = null;
+  try { await limitedQueued; } catch (error) { disposedQueueError = error; }
+  assert(disposedQueueError?.code === 'disposed',
+    'queued protocol work survived host disposal');
 
   const genericHost = window.createNekoMiniGameSameOriginHost({
     gameType: 'third-party-game',

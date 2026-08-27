@@ -25,6 +25,7 @@
   const DEFAULT_LOG_OVERFLOW_SIGNATURE_LIMIT = 64;
   const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
   const DEFAULT_PENDING_REQUEST_LIMIT = 64;
+  const DEFAULT_PROTOCOL_QUEUE_LIMIT = 64;
   const DEFAULT_SPEECH_RESTART_DELAY_MS = 350;
   const DEFAULT_SPEECH_SLOT_LIMIT = 4;
   // Leave headroom above the host's 12s microphone start/stop confirmation so
@@ -107,6 +108,13 @@
         1024,
       );
       this._pendingRequests = new Map();
+      this._protocolQueueLimit = boundedPositiveInteger(
+        options.protocolQueueLimit,
+        DEFAULT_PROTOCOL_QUEUE_LIMIT,
+        256,
+      );
+      this._protocolQueueDepth = 0;
+      this._protocolQueueTail = Promise.resolve();
       this._logTransport = {
         queue: [],
         queueLimit: boundedPositiveInteger(options.logQueueLimit, DEFAULT_LOG_QUEUE_LIMIT, 4096),
@@ -675,13 +683,43 @@
     }
 
     publishGameProtocol(kind, envelope = {}, options = {}) {
-      return this._postWithCsrf(this._gameEndpoint('protocol'), this._trustedRuntimePayload({
-        ...envelope,
-        kind: String(kind || envelope.kind || ''),
-      }), {
-        timeoutMs: 8000,
-        operation: 'game_protocol',
-        ...options,
+      if (this._disposed) {
+        return Promise.reject(this._hostError(
+          'disposed',
+          `${this.displayName} host adapter has been disposed`,
+          { operation: 'game_protocol' },
+        ));
+      }
+      if (this._protocolQueueDepth >= this._protocolQueueLimit) {
+        return Promise.reject(this._hostError(
+          'busy',
+          `${this.displayName} host protocol queue limit reached`,
+          { operation: 'game_protocol' },
+        ));
+      }
+
+      this._protocolQueueDepth += 1;
+      const run = () => {
+        if (this._disposed) {
+          throw this._hostError(
+            'disposed',
+            `${this.displayName} host adapter has been disposed`,
+            { operation: 'game_protocol' },
+          );
+        }
+        return this._postWithCsrf(this._gameEndpoint('protocol'), this._trustedRuntimePayload({
+          ...envelope,
+          kind: String(kind || envelope.kind || ''),
+        }), {
+          timeoutMs: 8000,
+          operation: 'game_protocol',
+          ...options,
+        });
+      };
+      const result = this._protocolQueueTail.then(run, run);
+      this._protocolQueueTail = result.then(() => undefined, () => undefined);
+      return result.finally(() => {
+        this._protocolQueueDepth = Math.max(0, this._protocolQueueDepth - 1);
       });
     }
 
@@ -729,7 +767,7 @@
     }
 
     readGameContext(payload, options = {}) {
-      return this._post(
+      return this._postWithCsrf(
         this._gameEndpoint('context/read'),
         this._trustedRuntimePayload(payload),
         { timeoutMs: 15000, operation: 'context_read', ...options },

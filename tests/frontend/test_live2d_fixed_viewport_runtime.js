@@ -83,6 +83,17 @@ async function main() {
     'fixed avatar renderer subscribed to host-window resize');
   assert(!addedEvents.some((event) => event.type === 'electron-display-changed'),
     'fixed avatar renderer subscribed to display resize');
+  const firstFixedApp = fixedManager.pixi_app;
+  await fixedManager.ensurePIXIReady('avatar-canvas', 'avatar-container', {
+    width: 400,
+    height: 600,
+    resizeMode: 'fixed',
+  });
+  assert(fixedManager.pixi_app !== firstFixedApp,
+    'fixed renderer was reused across different viewport dimensions');
+  assert(fixedManager.pixi_app.renderer.screen.width === 400
+    && fixedManager.pixi_app.renderer.screen.height === 600,
+  'fixed renderer was not rebuilt with the requested viewport dimensions');
 
   const hostManager = new context.window.Live2DManager();
   hostManager._startIdleFpsGovernor = () => {};

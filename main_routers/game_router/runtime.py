@@ -1749,6 +1749,17 @@ async def game_sdk_context_read(game_type: str, request: Request):
         return {"ok": False, "reason": "invalid_body"}
     if not isinstance(data, dict):
         return {"ok": False, "reason": "invalid_body"}
+
+    from ..system_router import _validate_local_mutation_request
+
+    validation_error = _validate_local_mutation_request(
+        request,
+        payload=data,
+        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
+    )
+    if validation_error is not None:
+        return validation_error
+
     lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
         game_type,
         data,
