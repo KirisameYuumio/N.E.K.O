@@ -38,7 +38,8 @@
         return {
             active: S.gameRouteActive === true,
             gameType: String(S.gameRouteGameType || ''),
-            sessionId: String(S.gameRouteSessionId || '')
+            sessionId: String(S.gameRouteSessionId || ''),
+            routeInstanceId: String(S.gameRouteInstanceId || '')
         };
     }
 
@@ -71,6 +72,7 @@
             route_active: route.active,
             game_type: route.gameType,
             session_id: route.sessionId,
+            sdk_route_instance_id: route.routeInstanceId,
             active: active,
             starting: starting,
             muted: S.isMicMuted === true,
@@ -136,6 +138,7 @@
             state.route_active,
             state.game_type,
             state.session_id,
+            state.sdk_route_instance_id,
             state.active,
             state.starting,
             state.muted,
@@ -160,7 +163,9 @@
         if (!route.active) return false;
         if (String(request.game_type || '') !== route.gameType) return false;
         var requestedSessionId = String(request.session_id || '');
-        return !requestedSessionId || !route.sessionId || requestedSessionId === route.sessionId;
+        if (requestedSessionId && route.sessionId && requestedSessionId !== route.sessionId) return false;
+        var requestedRouteInstanceId = String(request.sdk_route_instance_id || '');
+        return !route.routeInstanceId || requestedRouteInstanceId === route.routeInstanceId;
     }
 
     function voiceStartSettled() {
@@ -225,7 +230,8 @@
             }, true, {
                 active: false,
                 gameType: String(request.game_type || ''),
-                sessionId: String(request.session_id || '')
+                sessionId: String(request.session_id || ''),
+                routeInstanceId: String(request.sdk_route_instance_id || '')
             });
             return;
         }
@@ -306,15 +312,28 @@
         var detail = event && event.detail ? event.detail : {};
         var action = String(detail.action || '');
         var incomingSessionId = String(detail.sessionId || '');
+        var incomingRouteInstanceId = String(detail.routeInstanceId || '');
         if (action === 'opened') {
             S.gameRouteActive = true;
             S.gameRouteGameType = String(detail.gameType || '');
             S.gameRouteLanlanName = String(detail.lanlanName || '');
             S.gameRouteSessionId = incomingSessionId;
+            S.gameRouteInstanceId = incomingRouteInstanceId;
         } else if (action === 'closed') {
             var currentSessionId = String(S.gameRouteSessionId || '');
             if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) return;
-            var closingRoute = currentRoute();
+            var currentRouteInstanceId = String(S.gameRouteInstanceId || '');
+            if (
+                incomingRouteInstanceId
+                && currentRouteInstanceId
+                && incomingRouteInstanceId !== currentRouteInstanceId
+            ) return;
+            var closingRoute = {
+                active: false,
+                gameType: String(detail.gameType || S.gameRouteGameType || ''),
+                sessionId: incomingSessionId || currentSessionId,
+                routeInstanceId: incomingRouteInstanceId || currentRouteInstanceId
+            };
             S.gameRouteActive = false;
             broadcastState({
                 available: false,
@@ -324,11 +343,13 @@
             }, true, {
                 active: false,
                 gameType: closingRoute.gameType,
-                sessionId: closingRoute.sessionId
+                sessionId: closingRoute.sessionId,
+                routeInstanceId: closingRoute.routeInstanceId
             });
             S.gameRouteGameType = '';
             S.gameRouteLanlanName = '';
             S.gameRouteSessionId = '';
+            S.gameRouteInstanceId = '';
         } else {
             return;
         }
@@ -358,6 +379,7 @@
             timestamp: Date.now(),
             game_type: route.gameType,
             session_id: route.sessionId,
+            sdk_route_instance_id: route.routeInstanceId,
             request_id: String(detail.requestId || ''),
             source: String(detail.source || 'voice'),
             text: transcript

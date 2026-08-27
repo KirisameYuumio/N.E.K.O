@@ -342,6 +342,7 @@ async function main() {
         type: 'game_voice_control_state',
         game_type: 'soccer',
         session_id: 'server-session',
+        sdk_route_instance_id: event.detail.sdk_route_instance_id,
         request_id: event.detail.request_id,
         reason: 'queried',
         ok: true,
@@ -349,9 +350,14 @@ async function main() {
     }));
   };
   windowMock.addEventListener('neko-game-voice-control-message', sameDocumentController);
-  const sameDocumentResponse = await host.requestVoiceControl('query', { timeoutMs: 500 });
+  const sameDocumentResponse = await host.requestVoiceControl('query', {
+    timeoutMs: 500,
+    sdkRouteInstanceId: 'route-instance-a',
+  });
   assert(sameDocumentResponse.reason === 'queried',
     'same-document voice fallback request did not complete without BroadcastChannel');
+  assert(sameDocumentResponse.sdk_route_instance_id === 'route-instance-a',
+    'same-document voice request did not preserve the route generation');
   windowMock.removeEventListener('neko-game-voice-control-message', sameDocumentController);
   const voiceAbortController = new AbortController();
   const cancelledVoiceRequest = host.requestVoiceControl('query', {
@@ -383,6 +389,7 @@ async function main() {
       message_id: 'dual-response-1',
       game_type: 'soccer',
       session_id: 'server-session',
+      sdk_route_instance_id: event.detail.sdk_route_instance_id,
       request_id: event.detail.request_id,
       reason: 'dual-queried',
       ok: true,
@@ -397,11 +404,16 @@ async function main() {
     BroadcastChannelImpl: DualVoiceChannelMock,
     onState: () => { dualStateDeliveries += 1; },
   });
-  const dualResponse = await host.requestVoiceControl('query', { timeoutMs: 500 });
+  const dualResponse = await host.requestVoiceControl('query', {
+    timeoutMs: 500,
+    sdkRouteInstanceId: 'route-instance-b',
+  });
   assert(dualResponse.reason === 'dual-queried'
     && dualChannelMessages.some((message) => message.type === 'game_voice_control_request')
     && dualFallbackRequests === 1,
   'voice control did not publish the same request over channel and fallback paths');
+  assert(dualChannelMessages.some((message) => message.sdk_route_instance_id === 'route-instance-b'),
+    'voice control transport omitted the active route generation');
   assert(dualStateDeliveries === 1,
     'voice control delivered one response more than once across dual transports');
   host.stopVoiceControlBridge();

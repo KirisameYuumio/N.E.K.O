@@ -17,6 +17,7 @@ async function main() {
   let mountedAvatarConfig = null;
   const handshakeRequests = [];
   const protocolMessages = [];
+  const voiceRequests = [];
   let controlBridgeOptions = null;
   let controlBridgeStopped = 0;
   let protocolPendingMode = false;
@@ -125,7 +126,14 @@ async function main() {
       voiceOptions = options;
       return true;
     },
-    requestVoiceControl: async (action) => ({ ok: true, action }),
+    requestVoiceControl: async (action, options = {}) => {
+      voiceRequests.push({ action, options });
+      return {
+        ok: true,
+        action,
+        sdk_route_instance_id: options.sdkRouteInstanceId || '',
+      };
+    },
     stopVoiceControlBridge() { voiceStopped += 1; },
     async mountAvatar(config) {
       if (avatarMountFailure) {
@@ -269,15 +277,12 @@ async function main() {
     source: 'voice',
     timestamp: 123,
   });
-  assert(transcriptEvents.length === 1, 'final transcript was not emitted');
-  assert(transcriptEvents[0].text === 'final words', 'transcript was not normalized');
-  assert(transcriptEvents[0].requestId === 'voice-1', 'transcript request id was not normalized');
-  removeTranscript();
-  voiceOptions.onTranscript({ text: 'after unsubscribe' });
-  assert(transcriptEvents.length === 1, 'unsubscribe did not release transcript listener');
-
-  const voiceState = await game.voice.toggle();
-  assert(voiceState.action === 'toggle', 'voice toggle did not use the host transport');
+  assert(transcriptEvents.length === 0, 'voice transcript escaped before an active runtime route existed');
+  let inactiveVoiceError = null;
+  try { await game.voice.toggle(); }
+  catch (error) { inactiveVoiceError = error; }
+  assert(inactiveVoiceError?.code === 'invalid_state' && voiceRequests.length === 0,
+    'voice control reached the host before an active runtime route existed');
   let inactiveDialogueError = null;
   try { await game.dialogue.request({ event: 'before-start' }); }
   catch (error) { inactiveDialogueError = error; }
@@ -286,6 +291,30 @@ async function main() {
   const started = await game.runtime.start({ mode: 'default' });
   assert(started.data.payload.mode === 'default', 'runtime start did not use the host transport');
   const routeInstanceId = started.data.payload.sdk_route_instance_id;
+  voiceOptions.onTranscript({
+    text: 'stale words',
+    request_id: 'voice-stale',
+    source: 'voice',
+    timestamp: 122,
+    sdk_route_instance_id: 'stale-route-instance',
+  });
+  voiceOptions.onTranscript({
+    text: '  final words  ',
+    request_id: 'voice-1',
+    source: 'voice',
+    timestamp: 123,
+    sdk_route_instance_id: routeInstanceId,
+  });
+  assert(transcriptEvents.length === 1, 'active-route final transcript was not emitted exactly once');
+  assert(transcriptEvents[0].text === 'final words', 'transcript was not normalized');
+  assert(transcriptEvents[0].requestId === 'voice-1', 'transcript request id was not normalized');
+  removeTranscript();
+  voiceOptions.onTranscript({ text: 'after unsubscribe', sdk_route_instance_id: routeInstanceId });
+  assert(transcriptEvents.length === 1, 'unsubscribe did not release transcript listener');
+  const voiceState = await game.voice.toggle();
+  assert(voiceState.action === 'toggle', 'voice toggle did not use the host transport');
+  assert(voiceRequests.at(-1).options.sdkRouteInstanceId === routeInstanceId,
+    'voice control was not bound to the active route generation');
   const dialogue = await game.dialogue.request({ event: 'goal' });
   assert(dialogue.data.payload.event === 'goal', 'dialogue request did not use the host transport');
   assert(dialogue.data.payload.session_id === 'sdk-test-session',

@@ -942,6 +942,15 @@ class TtsRuntimeMixin:
             return "", False
         return self.voice_id or "", self._has_custom_tts()
 
+    def _tts_worker_supports_completion(self, tts_worker, provider_key: str | None) -> bool:
+        if tts_worker is dummy_tts_worker:
+            return False
+        if provider_key != "local_cosyvoice":
+            return True
+        local_config = self._config_manager.get_model_api_config("tts_custom")
+        local_base_url = str(local_config.get("base_url") or "").strip().lower()
+        return local_base_url.startswith(("ws://", "wss://"))
+
     def _start_tts_thread(self, *, preserve_provider_exclusions: bool = False):
         """Create and start the TTS worker thread.
 
@@ -963,7 +972,11 @@ class TtsRuntimeMixin:
         )
         if disabled:
             logger.info("TTS 已被用户禁用, 使用 dummy worker")
-        self._tts_completion_supported = tts_worker is not dummy_tts_worker
+        self._tts_completion_supported = self._tts_worker_supports_completion(
+            tts_worker,
+            provider_key,
+        )
+        self._tts_audio_output_supported = self._tts_completion_supported
 
         # 根据实际选中的 TTS provider 类别决定是否启用流式文本规范化。
         # ws_bistream 类（qwen / step / cosyvoice）直接把文本碎片发给服务端处理，

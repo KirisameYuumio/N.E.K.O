@@ -30,6 +30,7 @@ async function main() {
     gameRouteActive: true,
     gameRouteGameType: 'soccer',
     gameRouteSessionId: 'soccer-runtime',
+    gameRouteInstanceId: 'route-instance-b',
     isRecording: false,
     voiceStartPending: false,
     isMicMuted: false,
@@ -114,6 +115,7 @@ async function main() {
   appState.gameRouteActive = false;
   appState.gameRouteGameType = '';
   appState.gameRouteSessionId = '';
+  appState.gameRouteInstanceId = '';
   routeWindowListener({ detail: { action: 'opened', sessionId: 'missing-type' } });
   assert(appState.gameRouteGameType === '',
     'host voice bridge invented a soccer identity for a route without game_type');
@@ -121,21 +123,40 @@ async function main() {
   appState.gameRouteActive = true;
   appState.gameRouteGameType = 'soccer';
   appState.gameRouteSessionId = 'soccer-runtime';
+  appState.gameRouteInstanceId = 'route-instance-a';
   routeWindowListener({ detail: {
     action: 'closed',
     gameType: 'soccer',
     sessionId: 'soccer-runtime',
+    routeInstanceId: 'route-instance-a',
   } });
   assert(posted.some((message) => message.reason === 'route_closed'
     && message.route_active === false
     && message.game_type === 'soccer'
-    && message.session_id === 'soccer-runtime'),
+    && message.session_id === 'soccer-runtime'
+    && message.sdk_route_instance_id === 'route-instance-a'),
   'route close cleared the identity before publishing the final inactive state');
   routeWindowListener({ detail: {
     action: 'opened',
     gameType: 'soccer',
     sessionId: 'soccer-runtime',
+    routeInstanceId: 'route-instance-b',
   } });
+
+  channel.onmessage({ data: {
+    type: 'game_voice_control_request',
+    sender_id: 'stale-soccer-window',
+    request_id: 'stale-start',
+    action: 'start',
+    game_type: 'soccer',
+    session_id: 'soccer-runtime',
+    sdk_route_instance_id: 'route-instance-a',
+  } });
+  await flush();
+  assert(micButton.clickCount === 0 && posted.some((message) => message.request_id === 'stale-start'
+    && message.reason === 'route_mismatch'
+    && message.sdk_route_instance_id === 'route-instance-a'),
+  'stale same-session voice client controlled the replacement route');
 
   const duplicatedStartRequest = {
     type: 'game_voice_control_request',
@@ -145,6 +166,7 @@ async function main() {
     action: 'start',
     game_type: 'soccer',
     session_id: 'soccer-runtime',
+    sdk_route_instance_id: 'route-instance-b',
   };
   channel.onmessage({ data: duplicatedStartRequest });
   windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
@@ -183,6 +205,7 @@ async function main() {
     && message.game_type === 'soccer'
     && message.session_id === 'soccer-runtime'
     && message.request_id === 'voice-final-1'
+    && message.sdk_route_instance_id === 'route-instance-b'
     && message.text === 'hello game'),
   'final normalized transcript was not relayed to the active game route');
   const transcriptCount = posted.filter((message) => message.type === 'game_voice_transcript').length;
@@ -199,6 +222,7 @@ async function main() {
     action: 'stop',
     game_type: 'soccer',
     session_id: 'soccer-runtime',
+    sdk_route_instance_id: 'route-instance-b',
   } });
   await flush();
   assert(!appState.isRecording, 'stop request did not use the official microphone teardown');
@@ -212,12 +236,14 @@ async function main() {
     action: 'start',
     game_type: 'badminton',
     session_id: 'badminton-runtime',
+    sdk_route_instance_id: 'badminton-route',
   } });
   await flush();
   assert(posted.some((message) => message.request_id === 'wrong-route'
     && message.reason === 'route_mismatch'
     && message.game_type === 'badminton'
     && message.session_id === 'badminton-runtime'
+    && message.sdk_route_instance_id === 'badminton-route'
     && message.route_active === false),
     'route mismatch was not rejected');
 
@@ -235,6 +261,7 @@ async function main() {
       action: 'query',
       game_type: 'soccer',
       session_id: 'soccer-runtime',
+      sdk_route_instance_id: 'route-instance-b',
     },
   }));
   await flush();

@@ -1832,6 +1832,9 @@ class TurnMixin:
         completion_supported = bool(
             getattr(self, "_tts_completion_supported", True)
         )
+        audio_output_supported = bool(
+            getattr(self, "_tts_audio_output_supported", True)
+        )
         effective_wait_for_audio_completion = (
             wait_for_audio_completion and completion_supported
         )
@@ -1848,7 +1851,7 @@ class TurnMixin:
                     cache_key,
                     runtime_signature,
                 )
-            if self.tts_thread and self.tts_thread.is_alive():
+            if audio_output_supported and self.tts_thread and self.tts_thread.is_alive():
                 async with self.tts_cache_lock:
                     if self.tts_ready:
                         self._enqueue_tts_text_chunk(turn_id, clean)
@@ -1904,12 +1907,16 @@ class TurnMixin:
             self._cancel_game_speech_completion_wait()
             self._clear_game_speech_correlation(turn_id)
 
+        completion_timed_out = bool(
+            effective_wait_for_audio_completion and audio_queued and not audio_completed
+        )
         return {
-            "ok": not (
-                effective_wait_for_audio_completion and audio_queued and not audio_completed
+            "ok": bool(audio_queued and not completion_timed_out),
+            **(
+                {"reason": "tts_unavailable"} if not audio_queued
+                else {"reason": "audio_completion_timeout"} if completion_timed_out
+                else {}
             ),
-            **({"reason": "audio_completion_timeout"}
-               if effective_wait_for_audio_completion and audio_queued and not audio_completed else {}),
             "method": "project_tts",
             "cache_status": (
                 "miss" if capture_started

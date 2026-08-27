@@ -999,6 +999,7 @@ async def _finalize_game_route_state_inner(
         lanlan_name=lanlan_name,
         game_type=str(state.get("game_type") or ""),
         session_id=str(state.get("session_id") or ""),
+        route_instance_id=str(state.get("_sdk_route_instance_id") or ""),
     )
     # Release the SessionManager-level takeover so ordinary chat handlers come
     # back online; chat LLM may produce auto-replies again, but the player has
@@ -1034,6 +1035,9 @@ async def _finalize_game_route_state_inner(
                     "game_type": str(state.get("game_type") or ""),
                     "session_id": str(state.get("session_id") or ""),
                     "lanlan_name": lanlan_name,
+                    **({
+                        "sdk_route_instance_id": str(state.get("_sdk_route_instance_id")),
+                    } if state.get("_sdk_route_instance_id") else {}),
                     "reason": reason,
                     "before_game_external_mode": state.get("before_game_external_mode"),
                     "before_game_external_active": bool(state.get("before_game_external_active")),

@@ -23,6 +23,7 @@ from main_routers.game_router import game_context as gr_game_context
 from main_routers.game_router import logs as gr_logs
 from main_routers.game_router import pregame as gr_pregame
 from main_routers.game_router import runtime as gr_runtime
+from main_routers.game_router import route_lifecycle as gr_route_lifecycle
 from main_routers.game_router import visible_events as gr_visible_events
 from main_routers.system_router import AUTOSTART_CSRF_TOKEN
 from main_logic.core import LLMSessionManager
@@ -431,6 +432,58 @@ def test_sdk_route_instance_binding_rejects_missing_and_stale_generations():
     )["reason"] == "route_instance_id_mismatch"
 
 
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_active_reconciliation_exposes_the_authoritative_generation(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("neutral-sdk-game", "session-1", "Lan")
+        state["_sdk_route_instance_id"] = "route-instance-b"
+
+        result = await gr_runtime.game_route_any_active("Lan")
+
+    assert result == {
+        "ok": True,
+        "active": True,
+        "game_type": "neutral-sdk-game",
+        "session_id": "session-1",
+        "lanlan_name": "Lan",
+        "sdk_route_instance_id": "route-instance-b",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_window_state_change_carries_the_route_generation():
+    class ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    websocket = SimpleNamespace(
+        client_state=ConnectedState(),
+        send_json=AsyncMock(),
+    )
+    manager = SimpleNamespace(websocket=websocket)
+
+    await gr_route_lifecycle._push_game_window_state_change(
+        manager,
+        action="opened",
+        lanlan_name="Lan",
+        game_type="neutral-sdk-game",
+        session_id="session-1",
+        route_instance_id="route-instance-b",
+    )
+
+    websocket.send_json.assert_awaited_once_with({
+        "type": "game_window_state_change",
+        "action": "opened",
+        "lanlan_name": "Lan",
+        "game_type": "neutral-sdk-game",
+        "session_id": "session-1",
+        "sdk_route_instance_id": "route-instance-b",
+    })
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_delayed_old_route_end_does_not_close_reused_session_generation(monkeypatch):

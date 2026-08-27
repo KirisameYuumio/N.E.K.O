@@ -2380,7 +2380,8 @@
                                     action: action,
                                     lanlanName: data.lanlan_name || lan,
                                     gameType: data.game_type || '',
-                                    sessionId: data.session_id || ''
+                                    sessionId: data.session_id || '',
+                                    routeInstanceId: data.sdk_route_instance_id || ''
                                 }
                             }));
                         } catch (_) {}
@@ -3155,14 +3156,25 @@
                         // genuinely lack a session_id still process.
                         var endedSessionId = (statusDetails && statusDetails.session_id) || '';
                         var currentSessionId = S.gameRouteSessionId || '';
+                        var endedRouteInstanceId = (statusDetails && statusDetails.sdk_route_instance_id) || '';
+                        var currentRouteInstanceId = S.gameRouteInstanceId || '';
                         if (endedSessionId && currentSessionId && endedSessionId !== currentSessionId) {
                             console.log(`[GameVoiceSTT] 忽略过期的 GAME_ROUTE_ENDED | ended_session=${endedSessionId} current_session=${currentSessionId}`);
+                            return;
+                        }
+                        if (
+                            endedRouteInstanceId
+                            && currentRouteInstanceId
+                            && endedRouteInstanceId !== currentRouteInstanceId
+                        ) {
+                            console.log(`[GameVoiceSTT] 忽略过期的 GAME_ROUTE_ENDED | ended_route=${endedRouteInstanceId} current_route=${currentRouteInstanceId}`);
                             return;
                         }
                         S.gameRouteActive = false;
                         S.gameRouteGameType = '';
                         S.gameRouteLanlanName = '';
                         S.gameRouteSessionId = '';
+                        S.gameRouteInstanceId = '';
                         setGameVoiceTranscriptionState({
                             transcription_mode: 'unavailable',
                             provider: '',
@@ -3210,6 +3222,7 @@
                         S.gameRouteGameType = (statusDetails && statusDetails.game_type) || 'soccer';
                         S.gameRouteLanlanName = (statusDetails && statusDetails.lanlan_name) || '';
                         S.gameRouteSessionId = (statusDetails && statusDetails.session_id) || '';
+                        S.gameRouteInstanceId = (statusDetails && statusDetails.sdk_route_instance_id) || S.gameRouteInstanceId || '';
                         S.gameVoiceSttGameType = (statusDetails && statusDetails.game_type) || 'soccer';
                         S.gameVoiceSttSessionId = (statusDetails && statusDetails.session_id) || '';
                         // The route-resolution status may have arrived before
@@ -4772,14 +4785,22 @@
                             action: response.action || '',
                             lanlanName: response.lanlan_name || '',
                             gameType: response.game_type || '',
-                            sessionId: response.session_id || ''
+                            sessionId: response.session_id || '',
+                            routeInstanceId: response.sdk_route_instance_id || ''
                         };
                         var currentGameSessionId = S.gameRouteSessionId || '';
                         var incomingGameSessionId = detail.sessionId || '';
+                        var currentGameRouteInstanceId = S.gameRouteInstanceId || '';
+                        var incomingGameRouteInstanceId = detail.routeInstanceId || '';
                         var isStaleGameWindowEvent = detail.action === 'closed'
-                            && incomingGameSessionId
-                            && currentGameSessionId
-                            && incomingGameSessionId !== currentGameSessionId;
+                            && (
+                                (incomingGameSessionId
+                                    && currentGameSessionId
+                                    && incomingGameSessionId !== currentGameSessionId)
+                                || (incomingGameRouteInstanceId
+                                    && currentGameRouteInstanceId
+                                    && incomingGameRouteInstanceId !== currentGameRouteInstanceId)
+                            );
                         if (isStaleGameWindowEvent) {
                             console.log(`[GameWindow] 忽略过期窗口事件 | action=${detail.action} incoming=${incomingGameSessionId} current=${currentGameSessionId}`);
                         } else if (detail.action === 'opened') {
@@ -4787,6 +4808,7 @@
                             S.gameRouteGameType = detail.gameType || 'soccer';
                             S.gameRouteLanlanName = detail.lanlanName || '';
                             S.gameRouteSessionId = incomingGameSessionId || '';
+                            S.gameRouteInstanceId = incomingGameRouteInstanceId || '';
                             if (typeof window.stopProactiveChatSchedule === 'function') {
                                 S.proactiveChatWasStoppedByGameRoute = !!S.proactiveChatEnabled;
                                 window.stopProactiveChatSchedule();
@@ -4797,6 +4819,7 @@
                             S.gameRouteGameType = '';
                             S.gameRouteLanlanName = '';
                             S.gameRouteSessionId = '';
+                            S.gameRouteInstanceId = '';
                             if ((wasGameRouteActive || S.proactiveChatWasStoppedByGameRoute)
                                     && S.proactiveChatEnabled
                                     && typeof window.scheduleProactiveChat === 'function') {

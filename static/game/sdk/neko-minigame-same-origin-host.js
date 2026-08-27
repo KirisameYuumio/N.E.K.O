@@ -1142,6 +1142,10 @@
         bridge.lastState = data;
         const requestId = String(data.request_id || '');
         const pending = requestId ? bridge.pending.get(requestId) : null;
+        if (
+          pending?.routeInstanceId
+          && String(data.sdk_route_instance_id || '') !== pending.routeInstanceId
+        ) return;
         if (pending && data.reason !== 'working') {
           this._window.clearTimeout(pending.timeoutId);
           bridge.pending.delete(requestId);
@@ -1242,6 +1246,7 @@
         }));
       }
       const signal = options.signal || null;
+      const routeInstanceId = String(options.sdkRouteInstanceId || '').trim();
       if (signal?.aborted) {
         return Promise.reject(this._hostError('cancelled', 'Voice control request was cancelled', {
           operation: 'voice_control',
@@ -1271,7 +1276,14 @@
             requestId,
           }));
         }, timeoutMs);
-        bridge.pending.set(requestId, { resolve, reject, timeoutId, signal, abortHandler });
+        bridge.pending.set(requestId, {
+          resolve,
+          reject,
+          timeoutId,
+          signal,
+          abortHandler,
+          routeInstanceId,
+        });
         signal?.addEventListener?.('abort', abortHandler, { once: true });
         const posted = this._postVoiceControlMessage({
           type: 'game_voice_control_request',
@@ -1281,6 +1293,7 @@
           action: normalizedAction,
           game_type: this.gameType,
           session_id: this.sessionId,
+          ...(routeInstanceId ? { sdk_route_instance_id: routeInstanceId } : {}),
         });
         if (!posted) {
           this._window.clearTimeout(timeoutId);

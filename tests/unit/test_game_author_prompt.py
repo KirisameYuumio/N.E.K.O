@@ -267,13 +267,44 @@ async def test_game_chat_endpoint_accepts_author_prompt_without_game_event(monke
     monkeypatch.setattr(runtime, "_resolve_game_prompt_locale", lambda *_args, **_kwargs: "en")
     monkeypatch.setattr(runtime, "_append_game_dialog", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runtime, "_run_game_chat", fake_run)
+    monkeypatch.setattr(runtime, "_is_badminton_game_type", lambda _game_type: True)
 
-    result = await runtime.game_chat("test-game", FakeRequest())
+    def fail_legacy_event_adapter(_event):
+        raise AssertionError("author-managed SDK chat must bypass legacy game event adapters")
+
+    monkeypatch.setattr(runtime, "_sanitize_badminton_event", fail_legacy_event_adapter)
+
+    result = await runtime.game_chat("neutral-sdk-game", FakeRequest())
 
     assert result["line"] == "ok"
+    assert captured["game_type"] == "neutral-sdk-game"
     assert captured["event"] is None
     assert captured["kwargs"]["lanlan_name"] == "Test Neko"
     assert captured["kwargs"]["author_prompt"]["mode"] == "author-managed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_game_specific_chat_still_requires_a_registered_event(monkeypatch):
+    state = {"game_route_active": True, "session_id": "round-1"}
+
+    class FakeRequest:
+        async def json(self):
+            return {
+                "session_id": "round-1",
+                "lanlan_name": "Test Neko",
+                "event": None,
+            }
+
+    monkeypatch.setattr(runtime, "_resolve_lanlan_name", lambda value=None: str(value or "Test Neko"))
+    monkeypatch.setattr(runtime, "_get_active_game_route_state", lambda *_args: state)
+    monkeypatch.setattr(runtime, "_update_game_memory_enabled_from_payload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runtime, "_check_badminton_chat_rate", lambda *_args: True)
+    monkeypatch.setattr(runtime, "_is_badminton_game_type", lambda _game_type: True)
+    monkeypatch.setattr(runtime, "_sanitize_badminton_event", lambda _event: (None, "invalid_event"))
+
+    result = await runtime.game_chat("legacy-fixture", FakeRequest())
+
+    assert result["error"] == "invalid_event"
 
 
 @pytest.mark.asyncio

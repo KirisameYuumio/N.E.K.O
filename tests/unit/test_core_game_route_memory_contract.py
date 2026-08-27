@@ -1,6 +1,7 @@
 import asyncio
 from collections import deque
 import queue
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -266,7 +267,8 @@ async def test_mirror_assistant_speech_text_mirror_carries_metadata():
         request_id="req-1",
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["reason"] == "tts_unavailable"
     assert result["turn_end_emitted"] is True
     assert result["interrupt_audio"] is False
     assert mgr.user_activity == []
@@ -539,6 +541,7 @@ async def test_disabled_tts_does_not_wait_for_an_unsupported_completion_boundary
     mgr.tts_thread = _FakeAliveThread()
     mgr.tts_ready = True
     mgr._tts_completion_supported = False
+    mgr._tts_audio_output_supported = True
     mgr._clear_tts_pipeline = AsyncMock()
 
     result = await asyncio.wait_for(
@@ -560,6 +563,56 @@ async def test_disabled_tts_does_not_wait_for_an_unsupported_completion_boundary
     assert result["audio_completion_supported"] is False
     assert getattr(mgr, "_game_speech_completion_waiter", None) is None
     mgr._clear_tts_pipeline.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("configured_url", "expected"),
+    [
+        ("", False),
+        ("http://127.0.0.1:9880", False),
+        ("ws://127.0.0.1:9880", True),
+        ("WSS://example.test/cosy", True),
+    ],
+)
+def test_local_cosyvoice_completion_requires_a_websocket_url(configured_url, expected):
+    mgr = _make_manager()
+    mgr._config_manager = SimpleNamespace(
+        get_model_api_config=lambda slot: {"base_url": configured_url} if slot == "tts_custom" else {},
+    )
+
+    supported = core_module.LLMSessionManager._tts_worker_supports_completion(
+        mgr,
+        object(),
+        "local_cosyvoice",
+    )
+
+    assert supported is expected
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_unavailable_tts_worker_returns_an_explicit_failure():
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+    mgr._tts_completion_supported = False
+    mgr._tts_audio_output_supported = False
+
+    result = await core_module.LLMSessionManager.mirror_assistant_speech(
+        mgr,
+        "worker 不可用时不应报告成功",
+        metadata=_soccer_mirror_meta({"kind": "tts-unavailable"}),
+        mirror_text=False,
+        emit_turn_end_after=False,
+        wait_for_audio_completion=True,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "tts_unavailable"
+    assert result["audio_queued"] is False
+    assert result["audio_completion_supported"] is False
+    assert mgr.tts_request_queue.messages == []
 
 
 @pytest.mark.unit
@@ -790,7 +843,8 @@ async def test_mirror_assistant_speech_can_leave_turn_end_to_text_mirror():
         emit_turn_end_after=False,
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["reason"] == "tts_unavailable"
     assert result["turn_end_emitted"] is False
     assert result["interrupt_audio"] is False
     assert mgr.user_activity == []
@@ -814,7 +868,8 @@ async def test_mirror_assistant_speech_interrupt_audio_triggers_existing_interru
         interrupt_audio=True,
     )
 
-    assert result["ok"] is True
+    assert result["ok"] is False
+    assert result["reason"] == "tts_unavailable"
     assert result["interrupt_audio"] is True
     assert mgr.user_activity == ["old-speech"]
     assert mgr.audio_resampler.cleared is True

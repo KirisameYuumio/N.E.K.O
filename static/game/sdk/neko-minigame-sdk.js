@@ -1743,6 +1743,13 @@
         });
       }
     }
+
+    function voicePayloadMatchesActiveRoute(payload) {
+      if (!runtimeRouteEstablished || !['running', 'degraded'].includes(runtimePhase)) return false;
+      const expected = String(runtimeRouteInstanceId || '').trim();
+      const actual = String(payload?.sdk_route_instance_id || '').trim();
+      return !expected || actual === expected;
+    }
     const heartbeatLifecycle = {
       timer: null,
       controller: null,
@@ -2731,8 +2738,13 @@
     if (grantedSet.has('voice-input')) {
       try {
         voiceBridgeStarted = transport.startVoiceControlBridge({
-          onState: (state) => emit('voice-state', Object.freeze({ ...(state || {}) })),
+          onState: (state) => {
+            if (voicePayloadMatchesActiveRoute(state)) {
+              emit('voice-state', Object.freeze({ ...(state || {}) }));
+            }
+          },
           onTranscript: (payload) => {
+            if (!voicePayloadMatchesActiveRoute(payload)) return;
             const transcript = normalizeTranscript(payload);
             if (transcript) emit('voice-transcript', transcript);
           },
@@ -3918,11 +3930,15 @@
 
     async function requestVoice(action = 'query', requestOptions = {}) {
       requireCapability('voice-input', 'voice.request');
+      requireActiveRuntimeRoute(`voice.${action}`);
       if (!voiceBridgeStarted) {
         fail('transport_unavailable', 'The host voice bridge is unavailable');
       }
       try {
-        return await transport.requestVoiceControl(action, requestOptions);
+        return await transport.requestVoiceControl(action, {
+          ...requestOptions,
+          sdkRouteInstanceId: String(runtimeRouteInstanceId || '').trim(),
+        });
       } catch (error) {
         throw normalizeTransportError(error, `voice.${action}`);
       }

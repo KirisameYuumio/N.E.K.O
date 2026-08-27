@@ -1316,6 +1316,92 @@ async def _run_soccer_passive_guard_ai(data: Dict[str, Any], lanlan_name: str) -
 
 # ── 路由端点 ───────────────────────────────────────────────────────
 
+def _record_game_chat_result(
+    state: dict | None,
+    session_id: str,
+    event: Any,
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not (
+        state
+        and state.get("session_id") == session_id
+        and isinstance(event, dict)
+        and not result.get("error")
+        and not result.get("skipped")
+    ):
+        return result
+    current_state = event.get("currentState")
+    if isinstance(current_state, dict):
+        state["last_state"] = current_state
+    client_timeout_ms = event.get("client_timeout_ms")
+    try:
+        client_timeout_ms = int(float(client_timeout_ms))
+    except (TypeError, ValueError):
+        client_timeout_ms = 0
+    metrics = result.get("metrics") if isinstance(result, dict) else {}
+    try:
+        total_ms = int(float(metrics.get("total_ms"))) if isinstance(metrics, dict) else 0
+    except (TypeError, ValueError):
+        total_ms = 0
+    if client_timeout_ms > 0 and total_ms >= client_timeout_ms:
+        result["skipped_memory"] = "client_timeout"
+    else:
+        _append_game_dialog(state, {
+            "type": "game_event",
+            "kind": event.get("kind"),
+            "text": event.get("textRaw") or event.get("label") or "",
+            "result_line": result.get("line", ""),
+            "control": result.get("control", {}),
+        })
+    return result
+
+
+async def _run_author_managed_game_chat_request(
+    game_type: str,
+    data: dict,
+    *,
+    session_id: str,
+    event: Any,
+    author_prompt: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run the public SDK prompt path before any legacy game event adapters."""
+    route_data = dict(data)
+    route_data["session_id"] = session_id
+    lanlan_name, authoritative_session_id, state, route_error = (
+        _sdk_active_route_from_payload(game_type, route_data)
+    )
+    if route_error is not None:
+        return {
+            **route_error,
+            "skipped": "route_inactive",
+            "handled": False,
+            "line": "",
+            "control": {},
+            "lanlan_name": lanlan_name,
+            "method": "game_chat",
+        }
+    if state is not None:
+        _update_game_memory_enabled_from_payload(state, route_data, game_type=game_type)
+        if isinstance(event, dict):
+            _update_game_memory_enabled_from_payload(state, event, game_type=game_type)
+            event = _attach_game_memory_flag_to_event(event, state, game_type=game_type)
+    _absorb_request_language(route_data, lanlan_name)
+    if state is not None:
+        _update_game_route_language_from_payload(state, route_data)
+    prompt_locale = _resolve_game_prompt_locale(lanlan_name, data=route_data)
+    if isinstance(event, dict) and lanlan_name:
+        event = dict(event)
+        event.setdefault("lanlan_name", lanlan_name)
+    result = await _run_game_chat(
+        game_type,
+        authoritative_session_id,
+        event,
+        prompt_locale=prompt_locale,
+        lanlan_name=lanlan_name,
+        author_prompt=author_prompt,
+    )
+    return _record_game_chat_result(state, authoritative_session_id, event, result)
+
 @router.post("/{game_type}/chat")
 async def game_chat(game_type: str, request: Request):
     """Generic game LLM chat endpoint.
@@ -1346,6 +1432,14 @@ async def game_chat(game_type: str, request: Request):
                 "message": str(exc),
             },
         ) from exc
+    if author_prompt is not None:
+        return await _run_author_managed_game_chat_request(
+            game_type,
+            data,
+            session_id=session_id,
+            event=event,
+            author_prompt=author_prompt,
+        )
     lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
     state = _get_active_game_route_state(lanlan_name, game_type) if lanlan_name else None
     if not _is_badminton_game_type(game_type) and (
@@ -1414,45 +1508,14 @@ async def game_chat(game_type: str, request: Request):
     if isinstance(event, dict) and lanlan_name:
         event = dict(event)
         event.setdefault("lanlan_name", lanlan_name)
-    run_options: Dict[str, Any] = {
-        "prompt_locale": prompt_locale,
-        "lanlan_name": lanlan_name,
-    }
-    if author_prompt is not None:
-        run_options["author_prompt"] = author_prompt
-    result = await _run_game_chat(game_type, session_id, event, **run_options)
-
-    if (
-        state
-        and state.get("session_id") == session_id
-        and isinstance(event, dict)
-        and not result.get("error")
-        and not result.get("skipped")
-    ):
-        current_state = event.get("currentState")
-        if isinstance(current_state, dict):
-            state["last_state"] = current_state
-        client_timeout_ms = event.get("client_timeout_ms")
-        try:
-            client_timeout_ms = int(float(client_timeout_ms))
-        except (TypeError, ValueError):
-            client_timeout_ms = 0
-        metrics = result.get("metrics") if isinstance(result, dict) else {}
-        try:
-            total_ms = int(float(metrics.get("total_ms"))) if isinstance(metrics, dict) else 0
-        except (TypeError, ValueError):
-            total_ms = 0
-        if client_timeout_ms > 0 and total_ms >= client_timeout_ms:
-            result["skipped_memory"] = "client_timeout"
-        else:
-            _append_game_dialog(state, {
-                "type": "game_event",
-                "kind": event.get("kind"),
-                "text": event.get("textRaw") or event.get("label") or "",
-                "result_line": result.get("line", ""),
-                "control": result.get("control", {}),
-            })
-    return result
+    result = await _run_game_chat(
+        game_type,
+        session_id,
+        event,
+        prompt_locale=prompt_locale,
+        lanlan_name=lanlan_name,
+    )
+    return _record_game_chat_result(state, session_id, event, result)
 
 
 @router.post("/{game_type}/passive-guard")
@@ -1669,13 +1732,14 @@ async def game_route_start(game_type: str, request: Request):
     # session_id 双重匹配（防 state 字典里同 (lanlan,game_type) key 已被新一轮
     # supersede 替换为新 state）。
     mgr_for_ws = get_session_manager().get(lanlan_name)
-    if route_start_is_current():
+    if state.get("game_route_active") is True and route_start_is_current():
         await _push_game_window_state_change(
             mgr_for_ws,
             action="opened",
             lanlan_name=lanlan_name,
             game_type=game_type,
             session_id=session_id,
+            route_instance_id=route_instance_id,
         )
     else:
         logger.info(
@@ -1808,6 +1872,7 @@ async def game_route_any_active(lanlan_name: str = ""):
         "game_type": str(state.get("game_type") or ""),
         "session_id": str(state.get("session_id") or ""),
         "lanlan_name": str(state.get("lanlan_name") or ""),
+        "sdk_route_instance_id": str(state.get("_sdk_route_instance_id") or ""),
     }
 
 
@@ -3283,6 +3348,9 @@ async def route_external_stream_message(
                     "game_type": game_type,
                     "session_id": str(state.get("session_id") or ""),
                     "lanlan_name": lanlan_name,
+                    **({
+                        "sdk_route_instance_id": str(state.get("_sdk_route_instance_id")),
+                    } if state.get("_sdk_route_instance_id") else {}),
                     # Stable capability contract: this first edge only means
                     # that the host owns capture and is resolving its backend
                     # transcription route. The actual native/independent
