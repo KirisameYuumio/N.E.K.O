@@ -491,6 +491,51 @@ async def test_game_window_state_change_carries_the_route_generation():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_game_window_state_change_push_has_a_hard_timeout(monkeypatch):
+    send_cancelled = False
+
+    class ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    async def stalled_send(_payload):
+        nonlocal send_cancelled
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            send_cancelled = True
+            raise
+
+    websocket = SimpleNamespace(
+        client_state=ConnectedState(),
+        send_json=stalled_send,
+    )
+    manager = SimpleNamespace(websocket=websocket)
+    monkeypatch.setattr(
+        gr_route_lifecycle,
+        "_GAME_WINDOW_STATE_CHANGE_PUSH_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    await asyncio.wait_for(
+        gr_route_lifecycle._push_game_window_state_change(
+            manager,
+            action="closed",
+            lanlan_name="Lan",
+            game_type="neutral-sdk-game",
+            session_id="session-1",
+            route_instance_id="route-instance-b",
+        ),
+        timeout=0.2,
+    )
+
+    assert send_cancelled is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_speech_cancel_carries_exact_route_and_correlation_identity():
     class ConnectedState:
         CONNECTED = "connected"
@@ -678,6 +723,35 @@ async def test_idless_end_does_not_close_identified_route(monkeypatch):
         assert ("Lan", "soccer", "identified-session", "") not in (
             gr_runtime._game_route_end_tombstones
         )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_identified_end_does_not_close_generationless_active_route(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route(
+            "neutral-sdk-game",
+            "reused-session",
+            "Lan",
+        )
+
+        result = await gr_runtime._complete_game_end_from_payload(
+            "neutral-sdk-game",
+            {
+                "lanlan_name": "Lan",
+                "session_id": "reused-session",
+                "sdk_route_instance_id": "route-B",
+                "reason": "pagehide-before-route-B-start",
+            },
+        )
+
+        assert result["route_closed"] is False
+        assert state["game_route_active"] is True
+        assert (
+            "Lan", "neutral-sdk-game", "reused-session", "route-B"
+        ) in gr_runtime._game_route_end_tombstones
 
 
 @pytest.mark.unit
@@ -6095,6 +6169,46 @@ async def test_route_heartbeat_refreshes_last_state(monkeypatch):
     assert state["visibility_state"] == "visible"
     assert state["game_started"] is True
     assert state["game_started_elapsed_ms"] == 15_000
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_heartbeat_rechecks_authoritative_state_after_route_lock(
+    monkeypatch,
+):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route(
+            "neutral-sdk-game",
+            "session-1",
+            "Lan",
+        )
+        state["_sdk_route_instance_id"] = "route-A"
+        previous_heartbeat = state["last_heartbeat_at"]
+        route_lock = gr_runtime._get_route_lock("Lan", "neutral-sdk-game")
+        await route_lock.acquire()
+        try:
+            heartbeat_task = asyncio.create_task(
+                gr_runtime.game_route_heartbeat(
+                    "neutral-sdk-game",
+                    _FakeRequest({
+                        "lanlan_name": "Lan",
+                        "session_id": "session-1",
+                        "sdk_route_instance_id": "route-A",
+                    }),
+                )
+            )
+            await asyncio.sleep(0)
+            assert heartbeat_task.done() is False
+            state["game_route_active"] = False
+        finally:
+            route_lock.release()
+
+        result = await heartbeat_task
+
+        assert result["active"] is False
+        assert state["last_heartbeat_at"] == previous_heartbeat
 
 
 @pytest.mark.unit

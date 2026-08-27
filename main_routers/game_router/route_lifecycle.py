@@ -63,6 +63,7 @@ from utils.game_route_state import _game_route_states, _route_state_key
 
 
 _GAME_ROUTE_ACTIVATION_LOG_LIMIT = 32
+_GAME_WINDOW_STATE_CHANGE_PUSH_TIMEOUT_SECONDS = 2.0
 
 
 async def _push_game_window_state_change(
@@ -111,7 +112,10 @@ async def _push_game_window_state_change(
         client_state = getattr(ws, "client_state", None)
         if client_state is not None and client_state != client_state.CONNECTED:
             return
-        await ws.send_json(payload)
+        await asyncio.wait_for(
+            ws.send_json(payload),
+            timeout=_GAME_WINDOW_STATE_CHANGE_PUSH_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         logger.warning(
             "game_window_state_change WS push failed (action=%s, game=%s, lanlan=%s): %s",

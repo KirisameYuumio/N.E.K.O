@@ -994,7 +994,7 @@ async def test_game_speech_preload_retires_legacy_worker_after_item_timeout():
                 continue
             if first_item:
                 first_item = False
-                time.sleep(0.1)
+                time.sleep(0.5)
                 response_queue.put(b"late-untagged-first-item")
             else:
                 response_queue.put(b"second-item-audio")

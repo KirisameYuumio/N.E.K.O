@@ -2485,37 +2485,47 @@ async def game_route_heartbeat(game_type: str, request: Request):
     if not state:
         return {"ok": True, "active": False, "state": {"game_route_active": False}}
 
-    session_id = str(data.get("session_id") or "")
-    if session_id and session_id != str(state.get("session_id") or ""):
-        return {"ok": True, "active": False, "reason": "session_id_mismatch", "state": _public_route_state(state)}
-    route_instance_error = _sdk_route_instance_error(state, data)
-    if route_instance_error is not None:
-        return {**route_instance_error, "active": False}
+    route_lock = _get_route_lock(lanlan_name, game_type)
+    async with route_lock:
+        current_state = _get_active_game_route_state(lanlan_name, game_type)
+        if current_state is not state or current_state.get("game_route_active") is not True:
+            return {
+                "ok": True,
+                "active": False,
+                "state": _public_route_state(current_state),
+            }
 
-    _absorb_request_language(data, lanlan_name)
-    _update_game_route_language_from_payload(state, data)
+        session_id = str(data.get("session_id") or "")
+        if session_id and session_id != str(state.get("session_id") or ""):
+            return {"ok": True, "active": False, "reason": "session_id_mismatch", "state": _public_route_state(state)}
+        route_instance_error = _sdk_route_instance_error(state, data)
+        if route_instance_error is not None:
+            return {**route_instance_error, "active": False}
 
-    now = time.time()
-    state["last_heartbeat_at"] = now
-    state["last_activity"] = now
-    _touch_game_session_debug_log(game_type, str(state.get("session_id") or session_id or "default"), lanlan_name=lanlan_name)
-    _update_route_visibility_from_payload(state, data)
-    _update_route_start_state_from_payload(state, data)
-    _update_game_memory_enabled_from_payload(state, data, game_type=game_type)
-    current_state = data.get("currentState")
-    if isinstance(current_state, dict):
-        state["last_state"] = current_state
+        _absorb_request_language(data, lanlan_name)
+        _update_game_route_language_from_payload(state, data)
 
-    heartbeat_timeout = _route_heartbeat_timeout_seconds(state)
-    return {
-        "ok": True,
-        "active": True,
-        "heartbeat_interval_seconds": _GAME_ROUTE_HEARTBEAT_INTERVAL_SECONDS,
-        "heartbeat_timeout_seconds": heartbeat_timeout,
-        "foreground_heartbeat_timeout_seconds": _GAME_ROUTE_HEARTBEAT_TIMEOUT_SECONDS,
-        "hidden_heartbeat_timeout_seconds": _GAME_ROUTE_HIDDEN_HEARTBEAT_TIMEOUT_SECONDS,
-        "state": _public_route_state(state),
-    }
+        now = time.time()
+        state["last_heartbeat_at"] = now
+        state["last_activity"] = now
+        _touch_game_session_debug_log(game_type, str(state.get("session_id") or session_id or "default"), lanlan_name=lanlan_name)
+        _update_route_visibility_from_payload(state, data)
+        _update_route_start_state_from_payload(state, data)
+        _update_game_memory_enabled_from_payload(state, data, game_type=game_type)
+        reported_state = data.get("currentState")
+        if isinstance(reported_state, dict):
+            state["last_state"] = reported_state
+
+        heartbeat_timeout = _route_heartbeat_timeout_seconds(state)
+        return {
+            "ok": True,
+            "active": True,
+            "heartbeat_interval_seconds": _GAME_ROUTE_HEARTBEAT_INTERVAL_SECONDS,
+            "heartbeat_timeout_seconds": heartbeat_timeout,
+            "foreground_heartbeat_timeout_seconds": _GAME_ROUTE_HEARTBEAT_TIMEOUT_SECONDS,
+            "hidden_heartbeat_timeout_seconds": _GAME_ROUTE_HIDDEN_HEARTBEAT_TIMEOUT_SECONDS,
+            "state": _public_route_state(state),
+        }
 
 
 @router.post("/{game_type}/route/end")
@@ -3966,8 +3976,14 @@ async def _complete_game_end_from_payload(
                     (candidate or {}).get("_sdk_route_instance_id") or ""
                 )
                 candidate_instance_matches = bool(
-                    not candidate_instance_id
-                    or candidate_instance_id in route_instance_ids
+                    (
+                        not candidate_instance_id
+                        and not route_instance_ids
+                    )
+                    or (
+                        candidate_instance_id
+                        and candidate_instance_id in route_instance_ids
+                    )
                 )
                 if candidate_session_matches and candidate_instance_matches:
                     if candidate.get("game_route_active") is True:
