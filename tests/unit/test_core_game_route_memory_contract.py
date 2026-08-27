@@ -348,6 +348,8 @@ async def test_mirror_assistant_speech_replays_opted_in_cached_audio_without_req
         assert second["method"] == "project_tts_cache"
         assert second["cache_status"] == "hit"
         assert second["audio_sent"] is True
+        assert second["audio_completed"] is True
+        assert second["audio_completion_supported"] is True
         assert mgr.tts_request_queue.messages == queued_before_hit
         assert sent_audio == [(b"cached-pcm", second["speech_id"])]
         assert completed_audio == [second["speech_id"]]
@@ -419,30 +421,64 @@ async def test_game_speech_timeout_clears_pipeline_before_returning():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_local_cosyvoice_does_not_wait_for_unavailable_audio_completion():
+async def test_game_speech_cancellation_after_queueing_clears_pipeline():
+    mgr = _make_manager()
+    mgr.tts_thread = _FakeAliveThread()
+    mgr.tts_ready = True
+    mgr._clear_tts_pipeline = AsyncMock()
+    mgr.emit_mirror_turn_end = AsyncMock(side_effect=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await core_module.LLMSessionManager.mirror_assistant_speech(
+            mgr,
+            "取消后不能留下旧语音",
+            metadata=_soccer_mirror_meta({"kind": "cancel-after-queue"}),
+            mirror_text=False,
+            emit_turn_end_after=True,
+            wait_for_audio_completion=True,
+        )
+
+    mgr._clear_tts_pipeline.assert_awaited_once()
+    assert mgr._game_speech_completion_waiter is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_local_cosyvoice_waits_for_connection_boundary_audio_completion():
     mgr = _make_manager()
     mgr.tts_thread = _FakeAliveThread()
     mgr.tts_ready = True
     mgr._tts_active_provider_key = "local_cosyvoice"
     mgr._clear_tts_pipeline = AsyncMock()
 
-    result = await asyncio.wait_for(
+    task = asyncio.create_task(
         core_module.LLMSessionManager.mirror_assistant_speech(
             mgr,
-            "本地协议没有完成帧",
+            "本地协议以连接关闭作为完成边界",
             metadata=_soccer_mirror_meta({"kind": "local-completion-capability"}),
             mirror_text=False,
             emit_turn_end_after=False,
             wait_for_audio_completion=True,
-            audio_completion_timeout=45.0,
-        ),
-        timeout=1,
+            audio_completion_timeout=1.0,
+        )
     )
+    for _ in range(20):
+        if getattr(mgr, "_game_speech_completion_waiter", None):
+            break
+        await asyncio.sleep(0)
+
+    slot = mgr._game_speech_completion_waiter
+    assert slot is not None
+    assert task.done() is False
+    core_module.LLMSessionManager._resolve_game_speech_completion_wait(
+        mgr, slot[0], True
+    )
+    result = await asyncio.wait_for(task, timeout=1)
 
     assert result["ok"] is True
     assert result["audio_queued"] is True
-    assert result["audio_completed"] is None
-    assert result["audio_completion_supported"] is False
+    assert result["audio_completed"] is True
+    assert result["audio_completion_supported"] is True
     assert getattr(mgr, "_game_speech_completion_waiter", None) is None
     mgr._clear_tts_pipeline.assert_not_awaited()
 

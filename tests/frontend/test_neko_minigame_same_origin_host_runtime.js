@@ -161,8 +161,9 @@ async function main() {
       { signal: cancelledDirectRequest.signal },
     );
   } catch (error) { cancelledStorageError = error; }
+  const cancelledStorageKey = `${host._gameStoragePrefix()}cancelled-direct`;
   assert(cancelledStorageError?.code === 'cancelled'
-    && windowMock.localStorage.getItem('neko_game_storage:soccer:cancelled-direct') == null,
+    && windowMock.localStorage.getItem(cancelledStorageKey) == null,
   'already-cancelled direct storage request mutated localStorage');
   let cancelledConsentError = null;
   try {

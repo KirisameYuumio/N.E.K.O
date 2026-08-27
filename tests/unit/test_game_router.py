@@ -393,6 +393,22 @@ def test_route_end_before_start_tombstones_expire_and_stay_bounded(monkeypatch):
 
 
 @pytest.mark.unit
+def test_sdk_route_instance_candidates_are_deduplicated_and_bounded():
+    assert gr_runtime._sdk_route_instance_ids({
+        "sdk_route_instance_id": "primary",
+        "sdk_route_instance_ids": [
+            "primary",
+            "second",
+            "third",
+            "fourth",
+            "fifth",
+            123,
+            "x" * (gr_runtime._SDK_ROUTE_INSTANCE_ID_MAX_CHARS + 1),
+        ],
+    }) == ("primary", "second", "third", "fourth")
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_delayed_old_route_end_does_not_close_reused_session_generation(monkeypatch):
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
@@ -449,6 +465,72 @@ async def test_delayed_old_route_end_does_not_close_reused_session_generation(mo
         assert active["_sdk_route_instance_id"] == "route-B"
         assert (
             "Lan", "soccer", "reused-generation-session", "route-A"
+        ) not in gr_runtime._game_route_end_tombstones
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_idless_end_does_not_close_identified_route(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("soccer", "identified-session", "Lan")
+        state["_sdk_route_instance_id"] = "identified-route"
+
+        result = await gr_runtime._complete_game_end_from_payload(
+            "soccer",
+            {
+                "lanlan_name": "Lan",
+                "session_id": "identified-session",
+                "reason": "delayed-legacy-end",
+            },
+        )
+
+        assert result["reason"] == "stale_route_instance"
+        assert state["game_route_active"] is True
+        assert ("Lan", "soccer", "identified-session", "") not in (
+            gr_runtime._game_route_end_tombstones
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_end_candidate_generations_close_active_and_cancel_unresolved(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    _gr_patch_all(
+        monkeypatch,
+        "_submit_game_archive_to_memory",
+        AsyncMock(return_value={"ok": True, "status": "cached", "count": 1}),
+    )
+    _gr_patch_all(
+        monkeypatch,
+        "_deliver_game_postgame",
+        AsyncMock(return_value={"ok": True, "action": "sent"}),
+    )
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("soccer", "retry-session", "Lan")
+        state["_sdk_route_instance_id"] = "route-A"
+        _mark_game_started(state)
+
+        result = await gr_runtime._complete_game_end_from_payload(
+            "soccer",
+            {
+                "lanlan_name": "Lan",
+                "session_id": "retry-session",
+                "sdk_route_instance_id": "route-B",
+                "sdk_route_instance_ids": ["route-A", "route-B"],
+                "reason": "pagehide",
+            },
+        )
+
+        assert result["route_closed"] is True
+        assert state["game_route_active"] is False
+        assert (
+            "Lan", "soccer", "retry-session", "route-B"
+        ) in gr_runtime._game_route_end_tombstones
+        assert (
+            "Lan", "soccer", "retry-session", "route-A"
         ) not in gr_runtime._game_route_end_tombstones
 
 

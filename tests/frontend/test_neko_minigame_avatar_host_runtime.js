@@ -403,7 +403,11 @@ async function main() {
   assert(overflowError?.code === 'busy',
     'per-controller Avatar operation limit did not reject excess queued work');
   queuedController.dispose();
-  const [blockedDisposeError, queuedDisposeError] = await Promise.all([blockedModel, queuedModel]);
+  const [blockedDisposeError, queuedDisposeError] = await settleWithin(
+    Promise.all([blockedModel, queuedModel]),
+    1000,
+    'blocked Avatar operations did not settle after controller disposal',
+  );
   assert(blockedDisposeError?.code === 'disposed' && queuedDisposeError?.code === 'disposed',
     'Avatar disposal did not settle active and queued operations when the renderer stayed blocked');
   releaseBlockedModel();

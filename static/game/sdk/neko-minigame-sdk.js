@@ -61,6 +61,7 @@
   const SPEECH_PLAYBACK_ABSOLUTE_STALE_MS = 15000;
   const MAX_RUNTIME_EVENT_BYTES = 256 * 1024;
   const MAX_RUNTIME_OUTPUTS_PER_POLL = 50;
+  const MAX_RUNTIME_ROUTE_INSTANCE_IDS = 4;
   const MIN_RUNTIME_INTERVAL_MS = 250;
   const MAX_RUNTIME_INTERVAL_MS = 60000;
   const DEFAULT_HEARTBEAT_INTERVAL_MS = 2500;
@@ -1727,6 +1728,7 @@
     let runtimePhase = 'idle';
     let runtimeRouteEstablished = false;
     let runtimeRouteInstanceId = '';
+    const runtimeRouteInstanceIds = [];
     let runtimeRouteInstanceSequence = 0;
     let runtimeStartSettlement = null;
     let runtimeEndWaitingForStart = false;
@@ -1971,10 +1973,46 @@
       return String(randomId || `${Date.now().toString(36)}-${runtimeRouteInstanceSequence.toString(36)}`);
     }
 
+    function rememberRuntimeRouteInstanceId(routeInstanceId) {
+      const normalized = String(routeInstanceId || '').trim();
+      if (!normalized) return;
+      const existingIndex = runtimeRouteInstanceIds.indexOf(normalized);
+      if (existingIndex >= 0) runtimeRouteInstanceIds.splice(existingIndex, 1);
+      else if (runtimeRouteInstanceIds.length >= MAX_RUNTIME_ROUTE_INSTANCE_IDS) {
+        fail('busy', 'Too many unresolved runtime route generations', {
+          operation: 'runtime.start',
+          limit: MAX_RUNTIME_ROUTE_INSTANCE_IDS,
+        });
+      }
+      runtimeRouteInstanceIds.push(normalized);
+      runtimeRouteInstanceId = normalized;
+    }
+
+    function resolveRuntimeRouteInstanceId(routeInstanceId, { active = false } = {}) {
+      const normalized = String(routeInstanceId || '').trim();
+      if (active) {
+        runtimeRouteInstanceIds.splice(0, runtimeRouteInstanceIds.length, normalized);
+        runtimeRouteInstanceId = normalized;
+        return;
+      }
+      const existingIndex = runtimeRouteInstanceIds.indexOf(normalized);
+      if (existingIndex >= 0) runtimeRouteInstanceIds.splice(existingIndex, 1);
+      runtimeRouteInstanceId = runtimeRouteInstanceIds[runtimeRouteInstanceIds.length - 1] || '';
+    }
+
+    function clearRuntimeRouteInstanceIds() {
+      runtimeRouteInstanceIds.length = 0;
+      runtimeRouteInstanceId = '';
+    }
+
     function runtimeRoutePayload(payload, routeInstanceId = runtimeRouteInstanceId) {
+      const candidateIds = runtimeRouteInstanceIds.length
+        ? Array.from(runtimeRouteInstanceIds)
+        : (routeInstanceId ? [routeInstanceId] : []);
       return Object.freeze({
         ...(payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}),
         ...(routeInstanceId ? { sdk_route_instance_id: routeInstanceId } : {}),
+        ...(candidateIds.length ? { sdk_route_instance_ids: Object.freeze(candidateIds) } : {}),
       });
     }
 
@@ -2879,7 +2917,7 @@
         memoryConsentLocked = true;
         runtimeRouteEstablished = false;
         const routeInstanceId = nextRuntimeRouteInstanceId();
-        runtimeRouteInstanceId = routeInstanceId;
+        rememberRuntimeRouteInstanceId(routeInstanceId);
         stopRuntimeMonitoring();
         startPageExitLifecycle();
         const operation = beginRuntimeOperation('start', requestOptions);
@@ -2901,6 +2939,7 @@
           const routeActive = routeState?.game_route_active === true || data.active === true;
           if (response.ok && data.ok !== false && routeActive) {
             if (routeState) transport.applyRuntimeState(routeState);
+            resolveRuntimeRouteInstanceId(routeInstanceId, { active: true });
             runtimeRouteEstablished = true;
             setRuntimePhase('running', 'start-accepted');
             if (isRuntimeOperationCurrent(operation) && runtimePhase === 'running') {
@@ -2908,6 +2947,7 @@
             }
           } else if (response.ok && data.ok !== false) {
             if (routeState) transport.applyRuntimeState(routeState);
+            resolveRuntimeRouteInstanceId(routeInstanceId);
             runtimeRouteEstablished = false;
             stopRuntimeMonitoring();
             setRuntimePhase('inactive', 'start-inactive');
@@ -2973,6 +3013,7 @@
           if (isRuntimeOperationCurrent(operation)) {
             if (response.ok && response.data?.ok !== false) {
               runtimeRouteEstablished = false;
+              clearRuntimeRouteInstanceIds();
               setRuntimePhase('ended', 'end-accepted');
             } else recoverEndFailure('end-rejected');
           }
@@ -4364,6 +4405,7 @@
         if (disposed || disposing) return;
         disposing = true;
         runtimeRouteEstablished = false;
+        clearRuntimeRouteInstanceIds();
         stopRuntimeMonitoring();
         stopRuntimeOperation({ preserveEnd: disposeOptions.preserveRuntimeEnd === true });
         abortPendingSpeechRequests('disposed');

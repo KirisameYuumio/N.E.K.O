@@ -1814,6 +1814,8 @@ class TurnMixin:
                 "speech_id": turn_id,
                 "audio_sent": audio_sent,
                 "audio_queued": False,
+                "audio_completed": True,
+                "audio_completion_supported": True,
                 "turn_end_emitted": bool(emit_turn_end_after),
                 "interrupt_audio": bool(interrupt_audio),
                 "playback_gain": normalized_playback_gain,
@@ -1827,9 +1829,7 @@ class TurnMixin:
         await self.ensure_tts_pipeline_alive()
         audio_queued = False
         capture_started = False
-        completion_supported = (
-            getattr(self, "_tts_active_provider_key", None) != "local_cosyvoice"
-        )
+        completion_supported = True
         effective_wait_for_audio_completion = (
             wait_for_audio_completion and completion_supported
         )
@@ -1866,6 +1866,18 @@ class TurnMixin:
             if completion_future is not None:
                 self._cancel_game_speech_completion_wait()
             self._clear_game_speech_correlation(turn_id)
+            if audio_queued:
+                # A cancellation or mirror failure after queueing must not let
+                # the old worker outlive the request-level serialization lock.
+                # Preserve the original exception after the bounded teardown.
+                try:
+                    await self._clear_tts_pipeline()
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "[%s] queued game speech cleanup failed: %s",
+                        self.lanlan_name,
+                        cleanup_exc,
+                    )
             raise
 
         audio_completed = False

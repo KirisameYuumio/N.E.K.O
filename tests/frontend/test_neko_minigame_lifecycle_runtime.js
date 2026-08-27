@@ -260,6 +260,9 @@ async function main() {
   assert(ended.ok && ended.data.ok, 'runtime end response was not normalized');
   assert(ended.data.payload.sdk_route_instance_id === firstRouteInstanceId,
     'runtime end did not retain the matching route generation');
+  assert(ended.data.payload.sdk_route_instance_ids?.length === 1
+    && ended.data.payload.sdk_route_instance_ids[0] === firstRouteInstanceId,
+  'runtime end did not include its bounded route generation candidates');
   assert(game.runtime.state === 'ended', 'runtime end did not enter ended');
   assert(environment.intervals.size === 0, 'runtime end did not release lifecycle timers');
   assert(!environment.documentListeners.has('visibilitychange'),
@@ -276,6 +279,52 @@ async function main() {
   const reended = await game.runtime.end({ reason: 'restart-completed' });
   assert(reended.data.payload.sdk_route_instance_id === secondRouteInstanceId,
     'restarted route end did not retain its own generation');
+
+  const retryEnvironment = createEnvironment();
+  const retryStartPayloads = [];
+  let retryEndPayload = null;
+  const retryTransport = {
+    ...transport,
+    logger: logger(),
+    resetRuntime() { return { sessionId: 'retry-session', characterName: '' }; },
+    getRuntimeState() { return { sessionId: 'retry-session', characterName: '' }; },
+    applyRuntimeState() { return { sessionId: 'retry-session', characterName: '' }; },
+    async start(payload) {
+      retryStartPayloads.push(payload);
+      throw new Error(retryStartPayloads.length === 1 ? 'response lost' : 'request not delivered');
+    },
+    async heartbeat() { return { ok: true, active: true }; },
+    async drain() { return { ok: true, outputs: [] }; },
+    async end(payload) { retryEndPayload = payload; return { ok: true }; },
+    dispose() {},
+  };
+  const retryGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-route-retry',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: retryTransport,
+    windowImpl: retryEnvironment.windowImpl,
+    documentImpl: retryEnvironment.documentImpl,
+  });
+  retryGame.runtime.configure({ heartbeat: false, outputs: false, pageExit: true });
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    let retryError = null;
+    try { await retryGame.runtime.start({ attempt }); } catch (error) { retryError = error; }
+    assert(retryError?.code === 'request_failed', 'failed runtime start was not normalized');
+  }
+  const unresolvedIds = retryStartPayloads.map((item) => item.sdk_route_instance_id);
+  assert(new Set(unresolvedIds).size === 4, 'runtime retry did not retain four distinct route generations');
+  let retryCapacityError = null;
+  try { await retryGame.runtime.start({ attempt: 5 }); } catch (error) { retryCapacityError = error; }
+  assert(retryCapacityError?.code === 'busy' && retryStartPayloads.length === 4,
+    'runtime retry discarded an unresolved generation instead of enforcing its bound');
+  await retryGame.runtime.end({ reason: 'retry-cleanup' });
+  assert(retryEndPayload.sdk_route_instance_id === unresolvedIds[3]
+    && retryEndPayload.sdk_route_instance_ids?.length === 4
+    && unresolvedIds.every((id) => retryEndPayload.sdk_route_instance_ids.includes(id)),
+  'runtime end discarded a possibly committed route generation after retry failure');
+  retryGame.dispose();
 
   let reentrantDisposeError = null;
   game.events.on('runtime-state', (event) => {
@@ -530,6 +579,9 @@ async function main() {
     async end(payload, options = {}) {
       exitEndCalls += 1;
       assert(payload.reason === 'pagehide', 'page-exit payload factory was not used');
+      assert(payload.sdk_route_instance_id
+        && payload.sdk_route_instance_ids?.includes(payload.sdk_route_instance_id),
+      'page exit did not include the active route generation candidate');
       assert(options.useBeacon === true, 'page exit did not request beacon delivery');
       return { ok: true };
     },

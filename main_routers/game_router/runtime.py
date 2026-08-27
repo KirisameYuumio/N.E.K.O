@@ -244,6 +244,8 @@ _SDK_GAME_SPEECH_PENDING_LIMIT = 4
 _SDK_GAME_SPEECH_PRELOAD_TIMEOUT_SECONDS = 300.0
 _GAME_ROUTE_END_TOMBSTONE_TTL_SECONDS = 120.0
 _GAME_ROUTE_END_TOMBSTONE_LIMIT = 256
+_SDK_ROUTE_INSTANCE_ID_LIMIT = 4
+_SDK_ROUTE_INSTANCE_ID_MAX_CHARS = 128
 
 
 # A page-exit beacon can reach the backend before its already-dispatched
@@ -251,6 +253,31 @@ _GAME_ROUTE_END_TOMBSTONE_LIMIT = 256
 # so that exact start is consumed instead of resurrecting a route after the
 # page is gone. Entries are removed on match, expiry, and capacity eviction.
 _game_route_end_tombstones: OrderedDict[tuple[str, str, str, str], float] = OrderedDict()
+
+
+def _sdk_route_instance_ids(data: dict) -> tuple[str, ...]:
+    """Return the bounded, de-duplicated route generations owned by the SDK."""
+    result: list[str] = []
+
+    def append(value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        normalized = value.strip()
+        if (
+            not normalized
+            or len(normalized) > _SDK_ROUTE_INSTANCE_ID_MAX_CHARS
+            or normalized in result
+            or len(result) >= _SDK_ROUTE_INSTANCE_ID_LIMIT
+        ):
+            return
+        result.append(normalized)
+
+    append(data.get("sdk_route_instance_id"))
+    candidates = data.get("sdk_route_instance_ids")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            append(candidate)
+    return tuple(result)
 
 
 def _prune_game_route_end_tombstones(now: float | None = None) -> None:
@@ -1451,7 +1478,8 @@ async def game_route_start(game_type: str, request: Request):
     request_prompt_language_full = _resolve_game_prompt_locale(lanlan_name, data)
 
     session_id = str(data.get("session_id") or "default")
-    route_instance_id = str(data.get("sdk_route_instance_id") or "").strip()
+    route_instance_ids = _sdk_route_instance_ids(data)
+    route_instance_id = route_instance_ids[0] if route_instance_ids else ""
     # 同一角色同一时刻只允许一个 active 游戏路由：启动新路由前先结束所有其它仍活跃的
     # 路由（同 game_type 旧 session、不同 game_type、未来跨游戏并存均覆盖）。否则
     # is_game_route_active(lanlan_name) / _get_active_game_route_state(lanlan_name)
@@ -3436,19 +3464,14 @@ async def _complete_game_end_from_payload(
             },
         )
     session_id = str(data.get('session_id', 'default'))
-    route_instance_id = str(data.get("sdk_route_instance_id") or "").strip()
+    route_instance_ids = _sdk_route_instance_ids(data)
+    route_instance_id = route_instance_ids[0] if route_instance_ids else ""
     lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
     exit_reason = str(data.get("reason") or default_reason)
     postgame_options = _normalize_postgame_options(data.get("postgameProactive"), reason=exit_reason)
-    state = _get_active_game_route_state(lanlan_name, game_type) if lanlan_name else None
-    if (
-        state
-        and route_instance_id
-        and str(state.get("_sdk_route_instance_id") or "") != route_instance_id
-    ):
-        state = None
+    state = None
     route_was_already_completed = False
-    if lanlan_name and not (state and str(state.get("session_id") or "") == session_id):
+    if lanlan_name:
         # Serialize the no-match decision against route/start. If this end won
         # the lock before activation, leave a bounded exact-session tombstone;
         # if start won, adopt the now-active state and finalize it normally.
@@ -3464,7 +3487,8 @@ async def _complete_game_end_from_payload(
                     (candidate or {}).get("_sdk_route_instance_id") or ""
                 )
                 candidate_instance_matches = bool(
-                    not route_instance_id or candidate_instance_id == route_instance_id
+                    not candidate_instance_id
+                    or candidate_instance_id in route_instance_ids
                 )
                 if candidate_session_matches and candidate_instance_matches:
                     if candidate.get("game_route_active") is True:
@@ -3479,16 +3503,28 @@ async def _complete_game_end_from_payload(
                         state = candidate
                         route_was_already_completed = True
                     else:
+                        pending_ids = route_instance_ids or ("",)
+                        for pending_id in pending_ids:
+                            _remember_game_route_end_before_start(
+                                lanlan_name,
+                                game_type,
+                                session_id,
+                                pending_id,
+                            )
+                    for pending_id in route_instance_ids:
+                        if pending_id == candidate_instance_id:
+                            continue
                         _remember_game_route_end_before_start(
                             lanlan_name,
                             game_type,
                             session_id,
-                            route_instance_id,
+                            pending_id,
                         )
-                elif candidate_session_matches and route_instance_id:
+                elif candidate_session_matches and candidate_instance_id:
                     # A delayed retry from an older route generation must never
                     # finalize the currently active generation or poison a later
-                    # start with a tombstone.
+                    # start with a tombstone. An ID-less legacy end is stale too
+                    # once the server has an identified SDK route generation.
                     return {
                         "ok": True,
                         "closed": False,
@@ -3497,12 +3533,14 @@ async def _complete_game_end_from_payload(
                         "reason": "stale_route_instance",
                     }
                 else:
-                    _remember_game_route_end_before_start(
-                        lanlan_name,
-                        game_type,
-                        session_id,
-                        route_instance_id,
-                    )
+                    pending_ids = route_instance_ids or ("",)
+                    for pending_id in pending_ids:
+                        _remember_game_route_end_before_start(
+                            lanlan_name,
+                            game_type,
+                            session_id,
+                            pending_id,
+                        )
     _append_game_session_debug_log(
         game_type,
         session_id,
