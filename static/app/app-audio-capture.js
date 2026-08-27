@@ -499,6 +499,20 @@
         return window.SpeechRecognition || window.webkitSpeechRecognition || null;
     }
 
+    function publishGameVoiceBrowserTranscriptionState(ready, reason) {
+        if (
+            window.appWebSocket
+            && typeof window.appWebSocket.setGameVoiceTranscriptionState === 'function'
+        ) {
+            window.appWebSocket.setGameVoiceTranscriptionState({
+                transcription_mode: ready ? 'browser_fallback' : 'unavailable',
+                provider: 'browser',
+                ready: ready === true,
+                reason: String(reason || '')
+            });
+        }
+    }
+
     function gameVoiceRequestId() {
         return `game-voice-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     }
@@ -664,6 +678,7 @@
 
         const SpeechRecognition = getGameVoiceSpeechRecognition();
         if (!SpeechRecognition) {
+            publishGameVoiceBrowserTranscriptionState(false, 'browser_unsupported');
             if (!S.gameVoiceSttUnsupportedNotified) {
                 S.gameVoiceSttUnsupportedNotified = true;
                 console.warn('[GameVoiceSTT] 当前浏览器不支持 SpeechRecognition，无法启动游戏语音 STT gate');
@@ -704,6 +719,7 @@
             if (S.gameVoiceSttRecognition !== recognition) return;
             S.gameVoiceSttListening = true;
             S.gameVoiceSttStopping = false;
+            publishGameVoiceBrowserTranscriptionState(true, 'browser_ready');
             console.log('[GameVoiceSTT][Diag] recognition start');
         };
         recognition.onaudiostart = function () {
@@ -762,6 +778,7 @@
                 console.warn('[GameVoiceSTT][Diag] no-speech: 识别器启动了但没有形成可用语音。优先检查默认麦克风是否正确、是否有 audio/sound/speech start 日志。');
             }
             if (errorCode === 'not-allowed' || errorCode === 'service-not-allowed') {
+                publishGameVoiceBrowserTranscriptionState(false, errorCode);
                 if (typeof window.showStatusToast === 'function') {
                     window.showStatusToast(window.t ? window.t('app.gameVoiceSttMicPermissionDenied') : '游戏语音转写没有麦克风权限，请检查浏览器权限。', 4000);
                 }
@@ -798,6 +815,7 @@
             }
             console.warn('[GameVoiceSTT] recognition start failed:', error);
             S.gameVoiceSttListening = false;
+            publishGameVoiceBrowserTranscriptionState(false, 'browser_start_failed');
             restoreOrdinaryMicCaptureAfterGameVoiceSttFailure('recognition_start_failed', error);
             return false;
         }

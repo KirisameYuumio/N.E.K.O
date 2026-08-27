@@ -143,6 +143,13 @@
         gameVoiceSttStopping: false,
         gameVoiceSttRestartTimer: null,
         gameVoiceSttUnsupportedNotified: false,
+        // Stable host-facing contract for mini-games. The game never derives
+        // provider routing from free/paid labels; app-websocket publishes the
+        // actual route selected by Core/independent ASR/browser fallback.
+        gameVoiceTranscriptionMode: 'unavailable',
+        gameVoiceTranscriptionProvider: '',
+        gameVoiceTranscriptionReady: false,
+        gameVoiceTranscriptionReason: 'route_inactive',
         proactiveChatWasStoppedByGameRoute: false,
 
         // --- 会话 / WebSocket ---

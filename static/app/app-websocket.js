@@ -957,6 +957,70 @@
     }
     window.removeExternalAsrPreview = removeExternalAsrPreview;
 
+    var GAME_VOICE_TRANSCRIPTION_MODES = [
+        'backend_pending',
+        'native_core',
+        'independent_asr',
+        'browser_fallback',
+        'unavailable'
+    ];
+
+    /**
+     * Publish the actual host-owned transcription route to mini-game bridges.
+     *
+     * This is capability-based on purpose. Games must not infer their voice
+     * behavior from a free/paid label, and they never receive microphone PCM.
+     */
+    function setGameVoiceTranscriptionState(next) {
+        next = next && typeof next === 'object' ? next : {};
+        var mode = String(next.transcription_mode || next.mode || 'unavailable');
+        if (GAME_VOICE_TRANSCRIPTION_MODES.indexOf(mode) === -1) {
+            mode = 'unavailable';
+        }
+        var provider = String(next.provider || '');
+        var ready = next.ready === true;
+        var reason = String(next.reason || '');
+        var changed = S.gameVoiceTranscriptionMode !== mode
+            || S.gameVoiceTranscriptionProvider !== provider
+            || S.gameVoiceTranscriptionReady !== ready
+            || S.gameVoiceTranscriptionReason !== reason;
+        S.gameVoiceTranscriptionMode = mode;
+        S.gameVoiceTranscriptionProvider = provider;
+        S.gameVoiceTranscriptionReady = ready;
+        S.gameVoiceTranscriptionReason = reason;
+        if (changed) {
+            window.dispatchEvent(new CustomEvent(
+                'neko-game-voice-transcription-state-change',
+                {
+                    detail: {
+                        capture_owner: 'host',
+                        transcription_mode: mode,
+                        provider: provider,
+                        ready: ready,
+                        reason: reason
+                    }
+                }
+            ));
+        }
+        return {
+            capture_owner: 'host',
+            transcription_mode: mode,
+            provider: provider,
+            ready: ready,
+            reason: reason
+        };
+    }
+    mod.setGameVoiceTranscriptionState = setGameVoiceTranscriptionState;
+
+    function setBlockedGameVoiceTranscriptionState() {
+        setGameVoiceTranscriptionState({
+            transcription_mode: 'unavailable',
+            provider: S.independentAsrProvider || S.coreApiProvider || '',
+            ready: false,
+            reason: 'route_blocked'
+        });
+    }
+
     // Fail-closed voice-route teardown, shared by the two ways a route dies:
     // a runtime failure (ASR_LIFECYCLE_STATE blocked) and a STARTUP failure
     // (terminal ASR_INDEPENDENT_* codes). Startup failures can never emit
@@ -967,12 +1031,16 @@
 
     removeExternalAsrPreview();
     S.independentAsrActive = false;
+    // Set the sticky bit before publishing. The host bridge reacts
+    // synchronously to the event and otherwise normalizes an active-but-
+    // unavailable route back to backend_pending for one misleading frame.
+    S.voiceInputRouteBlocked = true;
+    setBlockedGameVoiceTranscriptionState();
     // Sticky: the teardown below is skipped while
     // the game STT gate owns the hardware, and
     // BLOCKED is never re-sent, so the game-exit
     // resume path would otherwise reopen the mic
     // onto a route that is still fail-closed.
-    S.voiceInputRouteBlocked = true;
     // The route is now fail-closed. _handle_core_asr_failure
     // (main_logic/core/asr_runtime.py) pins the microphone
     // route to "blocked" and nothing re-arms it inside this
@@ -2742,6 +2810,9 @@
                     }
                     var speechId = response.speech_id;
                     var shouldSkip = false;
+                    var playbackGain = Number(response.playback_gain);
+                    if (!Number.isFinite(playbackGain)) playbackGain = 1;
+                    playbackGain = Math.max(0, Math.min(2, playbackGain));
 
                     if (speechId && S.interruptedSpeechId && speechId === S.interruptedSpeechId) {
                         if (window.DEBUG_AUDIO) {
@@ -2768,6 +2839,7 @@
                         speechId: speechId || S.currentPlayingSpeechId || null,
                         turnId: resolveAssistantLifecycleTurnId(response.turn_id),
                         shouldSkip: shouldSkip,
+                        playbackGain: playbackGain,
                         epoch: S.incomingAudioEpoch,
                         receivedAt: Date.now()
                     });
@@ -2775,6 +2847,7 @@
                         speechId: speechId || S.currentPlayingSpeechId || null,
                         turnId: resolveAssistantLifecycleTurnId(response.turn_id),
                         shouldSkip: shouldSkip,
+                        playbackGain: playbackGain,
                         epoch: S.incomingAudioEpoch
                     });
                     if (window.appAudioPlayback &&
@@ -2995,6 +3068,14 @@
                         if (statusCode === 'ASR_INDEPENDENT_READY') {
                             S.independentAsrActive = true;
                             S.voiceInputRouteBlocked = false;
+                            if (S.gameRouteActive === true) {
+                                setGameVoiceTranscriptionState({
+                                    transcription_mode: 'independent_asr',
+                                    provider: asrProvider,
+                                    ready: true,
+                                    reason: 'asr_ready'
+                                });
+                            }
                             if (typeof window.showStatusToast === 'function') {
                                 window.showStatusToast(
                                     window.t ? window.t('microphone.independentAsrActive', { providerKey: asrProvider || 'unknown' }) : ('Independent ASR active: ' + asrProvider),
@@ -3008,6 +3089,14 @@
                             S.independentAsrActive = false;
                             // Healthy native route: nothing is fail-closed.
                             S.voiceInputRouteBlocked = false;
+                            if (S.gameRouteActive === true) {
+                                setGameVoiceTranscriptionState({
+                                    transcription_mode: 'native_core',
+                                    provider: asrProvider || S.coreApiProvider || '',
+                                    ready: true,
+                                    reason: 'native_ready'
+                                });
+                            }
                             return;
                         }
                         if (statusCode === 'ASR_INDEPENDENT_INJECTION_FAILED') {
@@ -3066,6 +3155,12 @@
                         S.gameRouteGameType = '';
                         S.gameRouteLanlanName = '';
                         S.gameRouteSessionId = '';
+                        setGameVoiceTranscriptionState({
+                            transcription_mode: 'unavailable',
+                            provider: '',
+                            ready: false,
+                            reason: 'route_inactive'
+                        });
                         console.log(`[GameVoiceSTT] 游戏语音路由已结束 | resume=${shouldResumeAudio} recording=${wasRecording} realtime_restore=${realtimeRestore && realtimeRestore.ok === false ? realtimeRestore.reason : 'ok'}`);
                         if (realtimeRestore && realtimeRestore.attempted && realtimeRestore.ok === false) {
                             console.warn('[GameVoiceSTT] 游戏退出后 Realtime 恢复未确认:', realtimeRestore.reason || 'unknown');
@@ -3095,13 +3190,41 @@
 
                     if (statusCode === 'GAME_VOICE_STT_GATE_ACTIVE') {
                         var sttProvider = (statusDetails && statusDetails.stt_provider) || 'browser';
+                        var transcriptionMode = (statusDetails && statusDetails.transcription_mode) || (
+                            sttProvider === 'realtime' ? 'backend_pending' : 'browser_fallback'
+                        );
+                        var transcriptionProvider = (statusDetails && statusDetails.provider) || '';
+                        var transcriptionReady = !!(statusDetails && statusDetails.ready === true);
                         S.gameRouteActive = true;
                         S.gameRouteGameType = (statusDetails && statusDetails.game_type) || 'soccer';
                         S.gameRouteLanlanName = (statusDetails && statusDetails.lanlan_name) || '';
                         S.gameRouteSessionId = (statusDetails && statusDetails.session_id) || '';
                         S.gameVoiceSttGameType = (statusDetails && statusDetails.game_type) || 'soccer';
                         S.gameVoiceSttSessionId = (statusDetails && statusDetails.session_id) || '';
-                        console.log(`[GameVoiceSTT] 游戏语音接管已激活 | game=${S.gameVoiceSttGameType} provider=${sttProvider} recording=${!!S.isRecording} muted=${!!S.isMicMuted}`);
+                        // The route-resolution status may have arrived before
+                        // this game-takeover edge. Preserve that authoritative
+                        // verdict rather than regressing to backend_pending.
+                        if (transcriptionMode === 'backend_pending') {
+                            if (S.independentAsrActive === true) {
+                                transcriptionMode = 'independent_asr';
+                                transcriptionProvider = S.independentAsrProvider || transcriptionProvider;
+                                transcriptionReady = true;
+                            } else if (
+                                S.independentAsrProvider
+                                && S.voiceInputRouteBlocked !== true
+                            ) {
+                                transcriptionMode = 'native_core';
+                                transcriptionProvider = S.independentAsrProvider || S.coreApiProvider || transcriptionProvider;
+                                transcriptionReady = true;
+                            }
+                        }
+                        setGameVoiceTranscriptionState({
+                            transcription_mode: transcriptionMode,
+                            provider: transcriptionProvider,
+                            ready: transcriptionReady,
+                            reason: transcriptionReady ? 'route_ready' : 'route_resolving'
+                        });
+                        console.log(`[GameVoiceSTT] 游戏语音接管已激活 | game=${S.gameVoiceSttGameType} mode=${transcriptionMode} provider=${transcriptionProvider || sttProvider} ready=${transcriptionReady} recording=${!!S.isRecording} muted=${!!S.isMicMuted}`);
                         if (S._voiceSessionInitialTimer) {
                             clearTimeout(S._voiceSessionInitialTimer);
                             S._voiceSessionInitialTimer = null;
@@ -3110,13 +3233,13 @@
                             S.proactiveChatWasStoppedByGameRoute = !!S.proactiveChatEnabled;
                             window.stopProactiveChatSchedule();
                         }
-                        if (sttProvider === 'realtime') {
+                        if (transcriptionMode !== 'browser_fallback') {
                             if (typeof window.stopGameVoiceSttGate === 'function') {
                                 window.stopGameVoiceSttGate();
                             } else {
                                 S.gameVoiceSttGateActive = false;
                             }
-                            console.log('[GameVoiceSTT] 复用原 Realtime STT，继续发送普通麦克风音频，普通回复由后端丢弃');
+                            console.log(`[GameVoiceSTT] 使用宿主后台转写 | mode=${transcriptionMode} provider=${transcriptionProvider || 'resolving'}；继续发送普通麦克风音频，普通回复由后端丢弃`);
                             return;
                         }
                         S.gameVoiceSttGateActive = true;
