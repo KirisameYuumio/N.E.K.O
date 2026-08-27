@@ -556,15 +556,23 @@
       });
     }
 
-    getCharacter(lanlanName = '') {
+    async getCharacter(lanlanName = '') {
       const url = new URL(this._gameEndpoint('character'), this._window.location.origin);
       if (lanlanName && lanlanName !== this.source) {
         url.searchParams.set('lanlan_name', lanlanName);
       }
-      return this._request(url.toString(), {}, {
+      const response = await this._request(url.toString(), {}, {
         operation: 'character',
         timeoutMs: 10000,
       });
+      if (response.ok) {
+        try {
+          const payload = await response.clone().json();
+          const resolvedName = String(payload?.lanlan_name || '').trim();
+          if (resolvedName) this._session.lanlanName = resolvedName;
+        } catch (_) { /* character metadata remains available to the caller */ }
+      }
+      return response;
     }
 
     getQuickLines(payload, options = {}) {
@@ -652,6 +660,10 @@
       return this.speak(payload, options);
     }
 
+    mirrorSpeechOutput(payload, options = {}) {
+      return this.mirrorAssistant(payload, options);
+    }
+
     preloadSpeechOutput(payload, options = {}) {
       return this._post(this._gameEndpoint('speech/preload'), payload, {
         timeoutMs: 180000,
@@ -673,23 +685,28 @@
 
     getMutationHeaders() {
       const headers = { 'Content-Type': 'application/json' };
+      const loadFromPageConfig = () => {
+        const lanlanName = this._window.lanlan_config?.lanlan_name || '';
+        return this.getPageConfig(lanlanName)
+          .then((response) => response.ok ? response.json() : null)
+          .then((config) => {
+            if (config && typeof config.autostart_csrf_token === 'string' && config.autostart_csrf_token) {
+              headers['X-CSRF-Token'] = config.autostart_csrf_token;
+            }
+            return headers;
+          })
+          .catch(() => headers);
+      };
       const security = this._window.nekoLocalMutationSecurity;
       if (security && typeof security.getMutationHeaders === 'function') {
         return Promise.resolve(security.getMutationHeaders())
-          .then((mutationHeaders) => Object.assign(headers, mutationHeaders || {}))
-          .catch(() => headers);
+          .then((mutationHeaders) => {
+            Object.assign(headers, mutationHeaders || {});
+            return csrfTokenFromHeaders(headers) ? headers : loadFromPageConfig();
+          })
+          .catch(loadFromPageConfig);
       }
-
-      const lanlanName = this._window.lanlan_config?.lanlan_name || '';
-      return this.getPageConfig(lanlanName)
-        .then((response) => response.ok ? response.json() : null)
-        .then((config) => {
-          if (config && typeof config.autostart_csrf_token === 'string' && config.autostart_csrf_token) {
-            headers['X-CSRF-Token'] = config.autostart_csrf_token;
-          }
-          return headers;
-        })
-        .catch(() => headers);
+      return loadFromPageConfig();
     }
 
     refreshMutationHeaders() {
@@ -1631,16 +1648,38 @@
         }
       } catch (_) { /* continue with asynchronous credential lookup */ }
       if (security && typeof security.getMutationHeaders === 'function') {
-        Promise.resolve(security.getMutationHeaders())
-          .then((headers) => this.postLog(payload, headers || {}))
-          .catch(() => this.postLog(payload));
+        this.getMutationHeaders()
+          .then((headers) => {
+            if (!csrfTokenFromHeaders(headers)) {
+              this._recordLogTransportOverflow(payload, 'missing_csrf_token');
+              return { ok: false, reason: 'missing_csrf_token' };
+            }
+            logger.mutationHeaders = { ...headers };
+            return this.postLog(payload, headers);
+          })
+          .catch((error) => {
+            this._recordLogTransportOverflow(payload, 'credential_lookup_failed');
+            return { ok: false, reason: 'credential_lookup_failed', error };
+          });
         return;
       }
       if (logger.mutationHeaders) {
         void this.postLog(payload, logger.mutationHeaders);
         return;
       }
-      void this.postLog(payload);
+      this.getMutationHeaders()
+        .then((headers) => {
+          if (!csrfTokenFromHeaders(headers)) {
+            this._recordLogTransportOverflow(payload, 'missing_csrf_token');
+            return { ok: false, reason: 'missing_csrf_token' };
+          }
+          logger.mutationHeaders = { ...headers };
+          return this.postLog(payload, headers);
+        })
+        .catch((error) => {
+          this._recordLogTransportOverflow(payload, 'credential_lookup_failed');
+          return { ok: false, reason: 'credential_lookup_failed', error };
+        });
     }
 
     _enableLogWithHeaders(reason, mutationHeaders = {}) {
@@ -1690,21 +1729,29 @@
     _hasLoggerSendCredentials() {
       const logger = this._logger;
       const security = this._window.nekoLocalMutationSecurity;
-      return !!(
-        logger.mutationHeaders ||
-        (security && (
-          typeof security.peekCachedToken === 'function' ||
-          typeof security.getMutationHeaders === 'function'
-        ))
-      );
+      if (csrfTokenFromHeaders(logger.mutationHeaders || {})) return true;
+      if (!security || typeof security.peekCachedToken !== 'function') return false;
+      try { return !!security.peekCachedToken(); }
+      catch (_) { return false; }
     }
 
     enableLoggerAfterRouteStart() {
       const logger = this._logger;
       const generation = logger.enableGeneration;
       if (this._hasLoggerSendCredentials()) {
-        logger.enabled = true;
-        return Promise.resolve({ ok: true, reason: 'route_start_credentials_ready' });
+        const security = this._window.nekoLocalMutationSecurity;
+        if (!logger.mutationHeaders && security && typeof security.peekCachedToken === 'function') {
+          try {
+            const token = security.peekCachedToken();
+            if (token) {
+              logger.mutationHeaders = { 'Content-Type': 'application/json', 'X-CSRF-Token': token };
+            }
+          } catch (_) { /* continue with asynchronous credential lookup */ }
+        }
+        if (csrfTokenFromHeaders(logger.mutationHeaders || {})) {
+          logger.enabled = true;
+          return Promise.resolve({ ok: true, reason: 'route_start_credentials_ready' });
+        }
       }
       if (logger.enableInFlight && logger.enablePromise) return logger.enablePromise;
       logger.enableInFlight = true;
@@ -1800,27 +1847,7 @@
       if (logger.enableInFlight && logger.enablePromise) return logger.enablePromise;
       logger.enableInFlight = true;
       const generation = logger.enableGeneration;
-      const security = this._window.nekoLocalMutationSecurity;
       const withEnableReason = (result) => ({ ...(result || {}), enableReason: reason });
-      try {
-        if (security && typeof security.peekCachedToken === 'function') {
-          const token = security.peekCachedToken();
-          if (token) {
-            return this._startLoggerEnablePromise(
-              this._enableLogWithHeaders(reason, { 'X-CSRF-Token': token }).then(withEnableReason),
-              generation,
-            );
-          }
-        }
-      } catch (_) { /* continue with asynchronous credential lookup */ }
-      if (security && typeof security.getMutationHeaders === 'function') {
-        return this._startLoggerEnablePromise(
-          Promise.resolve(security.getMutationHeaders())
-            .then((headers) => this._enableLogWithHeaders(reason, headers || {}))
-            .then(withEnableReason),
-          generation,
-        );
-      }
       return this._startLoggerEnablePromise(
         this.getMutationHeaders()
           .then((headers) => this._enableLogWithHeaders(reason, headers || {}))

@@ -30,6 +30,7 @@ async function main() {
   let ignorePreloadAbortMode = false;
   let malformedResponseId = false;
   const speechCalls = [];
+  const mirrorCalls = [];
   const preloadCalls = [];
   const pendingRequests = new Set();
   const windowMock = {
@@ -102,6 +103,10 @@ async function main() {
         else options.signal?.addEventListener('abort', rejectOnAbort, { once: true });
       });
     },
+    mirrorSpeechOutput(payload, options = {}) {
+      mirrorCalls.push({ payload, options });
+      return Promise.resolve({ ok: true, mirrored: true });
+    },
     preloadSpeechOutput(payload, options = {}) {
       preloadCalls.push({ payload, options });
       if (ignorePreloadAbortMode) return new Promise(() => {});
@@ -160,6 +165,31 @@ async function main() {
   assert(firstCall.payload.event.kind === 'goal', 'bounded speech event data was not forwarded');
   assert(firstCall.options.signal instanceof AbortSignal,
     'speech request did not receive an SDK-owned AbortSignal');
+
+  const mirrorResponse = await game.speech.mirror({
+    text: '  只镜像到主聊天  ',
+    requestId: 'mirror-request-1',
+    turnId: 'mirror-turn-1',
+    source: 'game-llm-result',
+    finalizeTurn: true,
+    event: { kind: 'user-voice', hasUserSpeech: true },
+  });
+  assert(mirrorResponse.ok && mirrorResponse.data.mirrored === true,
+    'text-only speech mirror response was not normalized');
+  assert(mirrorCalls.length === 1, 'text-only speech mirror did not use the trusted transport');
+  assert(mirrorCalls[0].payload.line === '只镜像到主聊天',
+    'text-only speech mirror text was not normalized');
+  assert(mirrorCalls[0].payload.session_id === 'speech-session-1'
+    && mirrorCalls[0].payload.lanlan_name === '测试猫娘',
+  'text-only speech mirror did not inject the runtime session and character');
+  assert(mirrorCalls[0].payload.request_id === 'mirror-request-1'
+    && mirrorCalls[0].payload.turn_id === 'mirror-turn-1'
+    && mirrorCalls[0].payload.finalize_turn === true,
+  'text-only speech mirror did not preserve bounded conversation metadata');
+  assert(mirrorCalls[0].payload.event.kind === 'user-voice',
+    'text-only speech mirror did not forward bounded event metadata');
+  assert(mirrorCalls[0].options.signal instanceof AbortSignal,
+    'text-only speech mirror did not receive an SDK-owned AbortSignal');
 
   const preloadResponse = await game.speech.preload(
     ['  预载台词一  ', '预载台词一', '预载台词二'],

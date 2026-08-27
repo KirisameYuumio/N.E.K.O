@@ -457,6 +457,12 @@ the project TTS route, provider and key selection, audio delivery, global voice
 volume, and playback-state bridge. Games never receive provider credentials,
 raw audio chunks, or host endpoints.
 
+When a game must mirror an assistant line into the host conversation without
+playing or synthesizing audio, it uses the same official capability through
+`game.speech.mirror({ text, event })`. This text-only path shares the bounded
+speech request pool and trusted session/character binding; games must not call
+the host mirror endpoint directly.
+
 `relativeGain` is a per-utterance multiplier from `0` to `2`; it does not replace
 the host's global voice-volume setting. `speech.speak()` and
 `speech.preload()` are protected by SDK-owned cancellation and timeout races, so

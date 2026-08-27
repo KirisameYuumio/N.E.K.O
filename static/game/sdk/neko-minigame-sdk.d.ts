@@ -470,6 +470,15 @@ declare namespace NekoMiniGame {
     renderLanguage?: string;
   }
 
+  interface SpeechMirrorRequest {
+    text: string;
+    requestId?: string;
+    turnId?: string;
+    source?: string;
+    finalizeTurn?: boolean;
+    event?: Readonly<Record<string, JsonValue>>;
+  }
+
   interface SpeechPlaybackState {
     readonly active: boolean;
     readonly speechId: string;
@@ -486,6 +495,7 @@ declare namespace NekoMiniGame {
     readonly pendingCount: number;
     readonly preloadPendingCount: number;
     speak(request: SpeechRequest, options?: RequestOptions): Promise<Response>;
+    mirror(request: SpeechMirrorRequest, options?: RequestOptions): Promise<Response>;
     preload(lines: string | readonly string[], options?: SpeechPreloadOptions): Promise<Response>;
     getState(): SpeechPlaybackState;
     onState(handler: (state: SpeechPlaybackState) => void): () => void;

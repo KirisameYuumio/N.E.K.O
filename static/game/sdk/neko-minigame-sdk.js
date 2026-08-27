@@ -1424,6 +1424,22 @@
     });
   }
 
+  function normalizeSpeechMirrorRequest(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      fail('invalid_request', 'speech mirror request must be an object');
+    }
+    const text = boundedSpeechString(value.text, 'speech mirror text', MAX_SPEECH_TEXT_CHARS);
+    if (!text) fail('invalid_request', 'speech mirror text is required');
+    return Object.freeze({
+      text,
+      requestId: boundedSpeechString(value.requestId, 'speech mirror requestId', 128),
+      turnId: boundedSpeechString(value.turnId, 'speech mirror turnId', 128),
+      source: boundedSpeechString(value.source, 'speech mirror source', 64, 'game'),
+      finalizeTurn: value.finalizeTurn === true,
+      event: normalizeSpeechEvent(value.event),
+    });
+  }
+
   function normalizeSpeechPreloadRequest(value, options = {}) {
     const input = Array.isArray(value) ? value : [value];
     if (!input.length || input.length > MAX_SPEECH_PRELOAD_LINES) {
@@ -3766,11 +3782,42 @@
       return response;
     }
 
+    async function mirrorSpeechOutput(requestInput, requestOptions = {}) {
+      requireCapability('speech-output', 'speech.mirror');
+      if (!speechBridgeStarted) {
+        fail('transport_unavailable', 'The host speech output bridge is unavailable');
+      }
+      if (typeof transport.mirrorSpeechOutput !== 'function') {
+        fail('transport_unavailable', 'The host does not support text-only speech mirroring');
+      }
+      const request = normalizeSpeechMirrorRequest(requestInput);
+      const session = runtimeSession();
+      const payload = Object.freeze({
+        line: request.text,
+        source: request.source,
+        session_id: session.id,
+        ...(session.characterName ? { lanlan_name: session.characterName } : {}),
+        ...(request.requestId ? { request_id: request.requestId } : {}),
+        ...(request.turnId ? { turn_id: request.turnId } : {}),
+        finalize_turn: request.finalizeTurn,
+        event: request.event,
+      });
+      return normalizeTransportResponse(await performManagedHostRequest({
+        operation: 'speech.mirror',
+        pendingSet: speechPendingRequests,
+        limit: MAX_SPEECH_PENDING_REQUESTS,
+        timeoutMs: DEFAULT_SPEECH_REQUEST_TIMEOUT_MS,
+        requestOptions,
+        invoke: (options) => transport.mirrorSpeechOutput(payload, options),
+      }));
+    }
+
     const speech = Object.freeze({
       get connected() { return !disposed && !disposing && speechBridgeStarted; },
       get pendingCount() { return speechPendingRequests.size; },
       get preloadPendingCount() { return speechPreloadPendingRequests.size; },
       speak: requestSpeechOutput,
+      mirror: mirrorSpeechOutput,
       preload: preloadSpeechOutput,
       getState() {
         requireCapability('speech-output', 'speech.getState');
