@@ -4422,6 +4422,42 @@ async def test_sdk_memory_submission_retention_is_bounded(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_passive_guard_requires_matching_active_route_before_llm(monkeypatch):
+    llm_calls = []
+
+    async def fake_passive_guard(data, lanlan_name):
+        llm_calls.append((data, lanlan_name))
+        return {"ok": True, "recommendedAction": "observe_more"}
+
+    _gr_patch_all(monkeypatch, "_run_soccer_passive_guard_ai", fake_passive_guard)
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    with reset_game_route_state():
+        inactive = await gr_runtime.game_passive_guard(
+            "soccer",
+            _FakeRequest({"session_id": "match_1", "lanlan_name": "Lan"}),
+        )
+        assert inactive["ok"] is False
+        assert inactive["reason"] == "game_route_inactive"
+
+        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        mismatched = await gr_runtime.game_passive_guard(
+            "soccer",
+            _FakeRequest({"session_id": "match_old", "lanlan_name": "Lan"}),
+        )
+        assert mismatched["ok"] is False
+        assert mismatched["reason"] == "session_id_mismatch"
+
+        accepted = await gr_runtime.game_passive_guard(
+            "soccer",
+            _FakeRequest({"session_id": "match_1", "lanlan_name": "Lan"}),
+        )
+
+    assert accepted["ok"] is True
+    assert len(llm_calls) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_project_speak_serializes_bounded_session_workers(monkeypatch):
     class BlockingSpeechManager(_FakeGameRouteManager):
         def __init__(self):
@@ -5623,26 +5659,30 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
 
-    result = await gr_runtime.game_project_speak(
-        "soccer",
-        _FakeRequest({
-            "line": "换我进攻了",
-            "session_id": "match_1",
-            "request_id": "req-2",
-            "render_language": "ja",
-        }),
-    )
+    with reset_game_route_state():
+        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({
+                "line": "换我进攻了",
+                "session_id": "match_1",
+                "request_id": "req-2",
+                "render_language": "ja",
+            }),
+        )
 
     assert result["ok"] is True
     assert result["method"] == "project_tts"
     assert result["voice_source"]["provider"] == "project_tts"
     assert mgr.render_language_at_mirror == ["ja"]
+    spoken_event = mgr.spoken[0][1]["metadata"]["mirror"]["event"]
+    assert spoken_event["soccer_game_memory_enabled"] is False
     assert mgr.spoken == [("换我进攻了", {
         "metadata": {
             "source": "game_route",
             "kind": "soccer",
             "session_id": "match_1",
-            "mirror": {"kind": "soccer", "session_id": "match_1", "event": {}},
+            "mirror": {"kind": "soccer", "session_id": "match_1", "event": spoken_event},
         },
         "request_id": "req-2",
         "mirror_text": True,
@@ -5660,24 +5700,28 @@ async def test_project_speak_can_skip_text_mirror_for_frontend_arbiter(monkeypat
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
 
-    result = await gr_runtime.game_project_speak(
-        "soccer",
-        _FakeRequest({
-            "line": "只播放语音",
-            "session_id": "match_1",
-            "request_id": "req-voice",
-            "mirror_text": False,
-            "emit_turn_end": False,
-        }),
-    )
+    with reset_game_route_state():
+        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({
+                "line": "只播放语音",
+                "session_id": "match_1",
+                "request_id": "req-voice",
+                "mirror_text": False,
+                "emit_turn_end": False,
+            }),
+        )
 
     assert result["ok"] is True
+    spoken_event = mgr.spoken[0][1]["metadata"]["mirror"]["event"]
+    assert spoken_event["soccer_game_memory_enabled"] is False
     assert mgr.spoken == [("只播放语音", {
         "metadata": {
             "source": "game_route",
             "kind": "soccer",
             "session_id": "match_1",
-            "mirror": {"kind": "soccer", "session_id": "match_1", "event": {}},
+            "mirror": {"kind": "soccer", "session_id": "match_1", "event": spoken_event},
         },
         "request_id": "req-voice",
         "mirror_text": False,
@@ -5695,25 +5739,29 @@ async def test_project_speak_forwards_interrupt_audio(monkeypatch):
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
 
-    result = await gr_runtime.game_project_speak(
-        "soccer",
-        _FakeRequest({
-            "line": "先听我说完",
-            "session_id": "match_1",
-            "request_id": "req-interrupt",
-            "mirror_text": False,
-            "emit_turn_end": False,
-            "interrupt_audio": True,
-        }),
-    )
+    with reset_game_route_state():
+        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({
+                "line": "先听我说完",
+                "session_id": "match_1",
+                "request_id": "req-interrupt",
+                "mirror_text": False,
+                "emit_turn_end": False,
+                "interrupt_audio": True,
+            }),
+        )
 
     assert result["ok"] is True
+    spoken_event = mgr.spoken[0][1]["metadata"]["mirror"]["event"]
+    assert spoken_event["soccer_game_memory_enabled"] is False
     assert mgr.spoken == [("先听我说完", {
         "metadata": {
             "source": "game_route",
             "kind": "soccer",
             "session_id": "match_1",
-            "mirror": {"kind": "soccer", "session_id": "match_1", "event": {}},
+            "mirror": {"kind": "soccer", "session_id": "match_1", "event": spoken_event},
         },
         "request_id": "req-interrupt",
         "mirror_text": False,
@@ -5731,14 +5779,16 @@ async def test_project_speak_forwards_synthesized_audio_reuse_opt_in(monkeypatch
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
 
-    result = await gr_runtime.game_project_speak(
-        "soccer",
-        _FakeRequest({
-            "line": "重复使用这句",
-            "session_id": "match_1",
-            "reuse_synthesized_audio": True,
-        }),
-    )
+    with reset_game_route_state():
+        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({
+                "line": "重复使用这句",
+                "session_id": "match_1",
+                "reuse_synthesized_audio": True,
+            }),
+        )
 
     assert result["ok"] is True
     assert mgr.spoken[0][1]["reuse_synthesized_audio"] is True
@@ -5887,17 +5937,43 @@ async def test_project_speak_clamps_per_game_voice_playback_gain(
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
 
-    result = await gr_runtime.game_project_speak(
-        "soccer",
-        _FakeRequest({
-            "line": "音量测试",
-            "session_id": "match_1",
-            "playback_gain": requested_gain,
-        }),
-    )
+    with reset_game_route_state():
+        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({
+                "line": "音量测试",
+                "session_id": "match_1",
+                "playback_gain": requested_gain,
+            }),
+        )
 
     assert result["playback_gain"] == expected_gain
     assert mgr.spoken[0][1]["playback_gain"] == expected_gain
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speak_rejects_inactive_route_before_tts(monkeypatch):
+    with reset_game_route_state():
+        mgr = _FakeGameRouteManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({
+                "line": "must not speak",
+                "session_id": "match_1",
+                "lanlan_name": "Lan",
+                "source": "game",
+            }),
+        )
+
+    assert result["ok"] is False
+    assert result["reason"] == "game_route_inactive"
+    assert result["audio_sent"] is False
+    assert mgr.spoken == []
+    assert mgr.assistant_mirrored == []
 
 
 @pytest.mark.unit

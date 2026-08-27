@@ -40,8 +40,8 @@
         };
     }
 
-    function currentVoiceState(extra) {
-        var route = currentRoute();
+    function currentVoiceState(extra, routeOverride) {
+        var route = routeOverride || currentRoute();
         var micButton = document.getElementById('micButton');
         var active = S.isRecording === true;
         var starting = !active && (S.voiceStartPending === true || window.isMicStarting === true);
@@ -121,8 +121,8 @@
         }
     }
 
-    function broadcastState(extra, force) {
-        var state = currentVoiceState(extra);
+    function broadcastState(extra, force, routeOverride) {
+        var state = currentVoiceState(extra, routeOverride);
         var fingerprint = JSON.stringify([
             state.available,
             state.route_active,
@@ -207,7 +207,18 @@
         if (!['query', 'start', 'stop', 'toggle'].includes(action)) return;
 
         if (!routeMatches(request)) {
-            broadcastState({ ok: false, reason: 'route_mismatch', request_id: requestId }, true);
+            broadcastState({
+                ok: false,
+                reason: 'route_mismatch',
+                request_id: requestId,
+                available: false,
+                active: false,
+                starting: false
+            }, true, {
+                active: false,
+                gameType: String(request.game_type || ''),
+                sessionId: String(request.session_id || '')
+            });
             return;
         }
         if (action === 'query') {
@@ -286,14 +297,25 @@
         } else if (action === 'closed') {
             var currentSessionId = String(S.gameRouteSessionId || '');
             if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) return;
+            var closingRoute = currentRoute();
             S.gameRouteActive = false;
+            broadcastState({
+                available: false,
+                active: false,
+                starting: false,
+                reason: 'route_closed'
+            }, true, {
+                active: false,
+                gameType: closingRoute.gameType,
+                sessionId: closingRoute.sessionId
+            });
             S.gameRouteGameType = '';
             S.gameRouteLanlanName = '';
             S.gameRouteSessionId = '';
         } else {
             return;
         }
-        broadcastState({}, true);
+        if (action === 'opened') broadcastState({}, true);
     };
     window.addEventListener('neko-game-window-state-change', gameWindowStateHandler);
 

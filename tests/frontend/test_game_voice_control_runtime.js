@@ -120,6 +120,21 @@ async function main() {
   appState.gameRouteActive = true;
   appState.gameRouteGameType = 'soccer';
   appState.gameRouteSessionId = 'soccer-runtime';
+  routeWindowListener({ detail: {
+    action: 'closed',
+    gameType: 'soccer',
+    sessionId: 'soccer-runtime',
+  } });
+  assert(posted.some((message) => message.reason === 'route_closed'
+    && message.route_active === false
+    && message.game_type === 'soccer'
+    && message.session_id === 'soccer-runtime'),
+  'route close cleared the identity before publishing the final inactive state');
+  routeWindowListener({ detail: {
+    action: 'opened',
+    gameType: 'soccer',
+    sessionId: 'soccer-runtime',
+  } });
 
   channel.onmessage({ data: {
     type: 'game_voice_control_request',
@@ -189,7 +204,11 @@ async function main() {
     session_id: 'badminton-runtime',
   } });
   await flush();
-  assert(posted.some((message) => message.request_id === 'wrong-route' && message.reason === 'route_mismatch'),
+  assert(posted.some((message) => message.request_id === 'wrong-route'
+    && message.reason === 'route_mismatch'
+    && message.game_type === 'badminton'
+    && message.session_id === 'badminton-runtime'
+    && message.route_active === false),
     'route mismatch was not rejected');
 
   const sameDocumentResponses = [];

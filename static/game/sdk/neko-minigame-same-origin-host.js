@@ -38,6 +38,7 @@
   const GAME_STORAGE_KEY_LIMIT = 256;
   const GAME_STORAGE_VALUE_BYTES = 64 * 1024;
   const GAME_STORAGE_TOTAL_BYTES = 1024 * 1024;
+  const GLOBAL_CONSOLE_CAPTURE_REGISTRIES = new WeakMap();
 
   class NekoMiniGameHostError extends Error {
     constructor(code, message, details = {}) {
@@ -200,6 +201,7 @@
         consoleErrorHandler: null,
         windowErrorHandler: null,
         rejectionHandler: null,
+        consoleCaptureRegistry: null,
       };
       this.logger = Object.freeze({
         log: this.log.bind(this),
@@ -2181,8 +2183,36 @@
     _installLoggerCapture() {
       const logger = this._logger;
       if (logger.windowErrorHandler || logger.rejectionHandler) return;
-      logger.originalWarn = this._console.warn;
-      logger.originalError = this._console.error;
+      let captureRegistry = GLOBAL_CONSOLE_CAPTURE_REGISTRIES.get(this._console);
+      if (!captureRegistry) {
+        const consoleObject = this._console;
+        captureRegistry = {
+          originalWarn: consoleObject.warn,
+          originalError: consoleObject.error,
+          hosts: new Set(),
+          warnWrapper: null,
+          errorWrapper: null,
+        };
+        captureRegistry.warnWrapper = (...args) => {
+          captureRegistry.originalWarn?.apply(consoleObject, args);
+          for (const host of Array.from(captureRegistry.hosts)) {
+            host.log('warning', 'frontend', 'console_warn', args.map((item) => String(item)).join(' '), { args }, true);
+          }
+        };
+        captureRegistry.errorWrapper = (...args) => {
+          captureRegistry.originalError?.apply(consoleObject, args);
+          for (const host of Array.from(captureRegistry.hosts)) {
+            host.log('error', 'frontend', 'console_error', args.map((item) => String(item)).join(' '), { args }, true);
+          }
+        };
+        GLOBAL_CONSOLE_CAPTURE_REGISTRIES.set(consoleObject, captureRegistry);
+        consoleObject.warn = captureRegistry.warnWrapper;
+        consoleObject.error = captureRegistry.errorWrapper;
+      }
+      captureRegistry.hosts.add(this);
+      logger.consoleCaptureRegistry = captureRegistry;
+      logger.originalWarn = captureRegistry.originalWarn;
+      logger.originalError = captureRegistry.originalError;
       logger.windowErrorHandler = (event) => {
         this.log('error', 'frontend', 'window_error', event.message || '前端脚本错误', {
           filename: event.filename || '',
@@ -2197,18 +2227,10 @@
           reason: reason && (reason.stack || reason.message || String(reason)),
         });
       };
-      logger.consoleWarnHandler = (...args) => {
-        logger.originalWarn.apply(this._console, args);
-        this.log('warning', 'frontend', 'console_warn', args.map((item) => String(item)).join(' '), { args }, true);
-      };
-      logger.consoleErrorHandler = (...args) => {
-        logger.originalError.apply(this._console, args);
-        this.log('error', 'frontend', 'console_error', args.map((item) => String(item)).join(' '), { args }, true);
-      };
+      logger.consoleWarnHandler = captureRegistry.warnWrapper;
+      logger.consoleErrorHandler = captureRegistry.errorWrapper;
       this._window.addEventListener('error', logger.windowErrorHandler);
       this._window.addEventListener('unhandledrejection', logger.rejectionHandler);
-      this._console.warn = logger.consoleWarnHandler;
-      this._console.error = logger.consoleErrorHandler;
     }
 
     _disposeLogger() {
@@ -2221,16 +2243,24 @@
         this._window.removeEventListener('unhandledrejection', logger.rejectionHandler);
         logger.rejectionHandler = null;
       }
-      if (logger.consoleWarnHandler && this._console.warn === logger.consoleWarnHandler && logger.originalWarn) {
-        this._console.warn = logger.originalWarn;
-      }
-      if (logger.consoleErrorHandler && this._console.error === logger.consoleErrorHandler && logger.originalError) {
-        this._console.error = logger.originalError;
+      const captureRegistry = logger.consoleCaptureRegistry;
+      if (captureRegistry) {
+        captureRegistry.hosts.delete(this);
+        if (!captureRegistry.hosts.size) {
+          if (this._console.warn === captureRegistry.warnWrapper && captureRegistry.originalWarn) {
+            this._console.warn = captureRegistry.originalWarn;
+          }
+          if (this._console.error === captureRegistry.errorWrapper && captureRegistry.originalError) {
+            this._console.error = captureRegistry.originalError;
+          }
+          GLOBAL_CONSOLE_CAPTURE_REGISTRIES.delete(this._console);
+        }
       }
       logger.consoleWarnHandler = null;
       logger.consoleErrorHandler = null;
       logger.originalWarn = null;
       logger.originalError = null;
+      logger.consoleCaptureRegistry = null;
       logger.contextProvider = null;
       this.resetLogger();
     }

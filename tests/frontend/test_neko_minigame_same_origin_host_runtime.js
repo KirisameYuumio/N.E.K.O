@@ -299,6 +299,19 @@ async function main() {
   assert(sameDocumentState?.source === 'same_document'
     && sameDocumentState.state.reason === 'state-sync',
   'same-document voice fallback state was not received');
+  windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
+    detail: {
+      type: 'game_voice_control_state',
+      game_type: 'soccer',
+      session_id: 'server-session',
+      route_active: false,
+      active: false,
+      reason: 'route_closed',
+    },
+  }));
+  assert(sameDocumentState?.state.route_active === false
+    && sameDocumentState.state.reason === 'route_closed',
+  'the trusted host dropped the closing route inactive voice state');
   const sameDocumentController = (event) => {
     if (event?.detail?.type !== 'game_voice_control_request') return;
     windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
@@ -452,6 +465,40 @@ async function main() {
   assert(noLockHandshake.grantedCapabilities.includes('storage')
     && !noLockHandshake.grantedCapabilities.includes('leaderboard-local'),
   'host granted cross-window leaderboard mutations without an origin-wide lock');
+
+  const originalConsoleWarn = windowMock.console.warn;
+  const originalConsoleError = windowMock.console.error;
+  const loggerHostOne = window.createNekoMiniGameSameOriginHost({
+    gameType: 'logger-one',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  const loggerHostTwo = window.createNekoMiniGameSameOriginHost({
+    gameType: 'logger-two',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  loggerHostOne.configureLogger();
+  loggerHostTwo.configureLogger();
+  const sharedCaptureRegistry = loggerHostOne._logger.consoleCaptureRegistry;
+  assert(sharedCaptureRegistry === loggerHostTwo._logger.consoleCaptureRegistry
+    && sharedCaptureRegistry.hosts.size === 2,
+  'same-document hosts did not share one bounded console capture registry');
+  loggerHostOne.dispose();
+  windowMock.console.warn('capture remains after first dispose');
+  windowMock.console.error('capture remains after first dispose');
+  assert(sharedCaptureRegistry.hosts.size === 1
+    && windowMock.console.warn === sharedCaptureRegistry.warnWrapper,
+  'disposing the first host corrupted the shared console wrapper');
+  loggerHostTwo.dispose();
+  windowMock.console.warn('original warn restored');
+  windowMock.console.error('original error restored');
+  assert(sharedCaptureRegistry.hosts.size === 0
+    && windowMock.console.warn === originalConsoleWarn
+    && windowMock.console.error === originalConsoleError,
+  'disposing the final host did not restore and release global console capture');
 
   noLockHost.dispose();
   genericHost.dispose();

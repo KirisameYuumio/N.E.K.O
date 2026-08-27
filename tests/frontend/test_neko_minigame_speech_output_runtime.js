@@ -68,6 +68,21 @@ async function main() {
       sessionId: 'speech-session-1',
       characterName: '测试猫娘',
     }),
+    resetRuntime: () => ({
+      sessionId: 'speech-session-1',
+      characterName: '测试猫娘',
+    }),
+    applyRuntimeState: () => ({
+      sessionId: 'speech-session-1',
+      characterName: '测试猫娘',
+    }),
+    start: async () => ({
+      ok: true,
+      state: { session_id: 'speech-session-1', lanlan_name: '测试猫娘' },
+    }),
+    heartbeat: async () => ({ ok: true, active: true }),
+    drain: async () => ({ ok: true, outputs: [] }),
+    end: async () => ({ ok: true }),
     startSpeechOutputBridge(options) {
       bridgeStarts += 1;
       bridgeOptions = options;
@@ -121,7 +136,7 @@ async function main() {
   const game = await window.NekoMiniGame.connect({
     id: 'speech-output-test',
     version: '1.0.0',
-    requiredCapabilities: ['logging', 'speech-output'],
+    requiredCapabilities: ['runtime', 'logging', 'speech-output'],
   }, { transport, windowImpl: windowMock, documentImpl: {} });
 
   assert(game.capabilities.has('speech-output'), 'speech-output capability was not granted');
@@ -134,6 +149,12 @@ async function main() {
   const errors = [];
   const unsubscribeState = game.speech.onState((state) => states.push(state));
   const unsubscribeError = game.speech.onError((error) => errors.push(error));
+  let preStartSpeechError = null;
+  try { await game.speech.speak({ text: 'must wait for route' }); }
+  catch (error) { preStartSpeechError = error; }
+  assert(preStartSpeechError?.code === 'invalid_state' && speechCalls.length === 0,
+    'speech output ran before the runtime route was accepted');
+  await game.runtime.start({});
   const response = await game.speech.speak({
     text: '  SDK 语音输出测试  ',
     requestId: 'request-1',

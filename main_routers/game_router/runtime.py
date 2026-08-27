@@ -1349,8 +1349,16 @@ async def game_passive_guard(game_type: str, request: Request):
     if not isinstance(data, dict):
         return {"ok": False, "reason": "invalid_request"}
 
-    lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
-    session_id = str(data.get("session_id") or "").strip()
+    lanlan_name, session_id, _state, route_error = _sdk_active_route_from_payload(
+        game_type,
+        data,
+    )
+    if route_error:
+        return {
+            **route_error,
+            "recommendedAction": "observe_more",
+            "exitPromptType": "none",
+        }
     try:
         return await _run_soccer_passive_guard_ai(data, lanlan_name)
     except asyncio.TimeoutError:
@@ -2300,16 +2308,14 @@ async def game_project_speak(game_type: str, request: Request):
     if not line:
         return {"ok": False, "reason": "missing_line"}
 
-    lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
-    if not lanlan_name:
-        return {"ok": False, "reason": "missing_lanlan_name"}
-
     interrupt_audio = _coerce_payload_bool(data.get("interrupt_audio")) is True
     reuse_synthesized_audio = _coerce_payload_bool(data.get("reuse_synthesized_audio")) is True
     playback_gain = _normalize_game_voice_playback_gain(data.get("playback_gain"))
-    session_id = str(data.get("session_id") or "")
-    state = _get_active_game_route_state(lanlan_name, game_type)
-    if not state:
+    lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
+        game_type,
+        data,
+    )
+    if route_error:
         closed_response = _game_route_closed_session_response(
             data,
             session_id=session_id,
@@ -2318,13 +2324,24 @@ async def game_project_speak(game_type: str, request: Request):
         )
         if closed_response:
             return closed_response
-    stale_response = _game_route_stale_session_response(
-        state,
-        session_id,
-        lanlan_name=lanlan_name,
-        method="project_tts",
-    )
-    if stale_response:
+        stale_response = _game_route_stale_session_response(
+            state,
+            session_id,
+            lanlan_name=lanlan_name,
+            method="project_tts",
+        )
+        result = stale_response or {
+            **route_error,
+            "audio_sent": False,
+            "audio_committed": False,
+            "lanlan_name": lanlan_name,
+            "method": "project_tts",
+            "voice_source": {
+                "provider": "project_tts",
+                "method": "project_tts",
+                "skipped": route_error.get("reason"),
+            },
+        }
         _append_game_session_debug_log(
             game_type,
             session_id,
@@ -2333,9 +2350,9 @@ async def game_project_speak(game_type: str, request: Request):
             category="speech",
             event="project_speech_skipped",
             message="小游戏项目语音请求被跳过",
-            details={"reason": stale_response.get("reason"), "method": "project_tts"},
+            details={"reason": result.get("reason"), "method": "project_tts"},
         )
-        return stale_response
+        return result
     _absorb_request_language(data, lanlan_name)
     mgr = get_session_manager().get(lanlan_name)
     if not mgr:
@@ -2382,9 +2399,7 @@ async def game_project_speak(game_type: str, request: Request):
             # launching a worker so stale queued speech can never leak into the
             # next session.
             current_state = _get_active_game_route_state(lanlan_name, game_type)
-            if state is not None and (
-                current_state is not state or not state.get("game_route_active")
-            ):
+            if current_state is not state or not state.get("game_route_active"):
                 result = {
                     "ok": False,
                     "reason": "game_route_inactive",

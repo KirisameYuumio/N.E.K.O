@@ -1695,6 +1695,7 @@
     let localLeaderboardSequence = 0;
     const localLeaderboardClientId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     let runtimePhase = 'idle';
+    let runtimeRouteEstablished = false;
     let runtimeEventSequence = 0;
     let runtimeConfig = null;
     const heartbeatLifecycle = {
@@ -2041,6 +2042,7 @@
         }
         if (response.ok && data.ok !== false && data.active === false) {
           heartbeatLifecycle.failures = 0;
+          runtimeRouteEstablished = false;
           stopRuntimeMonitoring();
           setRuntimePhase('inactive', String(data.reason || 'host-inactive'));
           await publishRuntimeEvent('runtime-inactive', data, { waitForHandlers: true });
@@ -2716,6 +2718,7 @@
         speechPlaybackRawState = null;
         speechPlaybackTransportSource = '';
         pageExitDispatched = false;
+        runtimeRouteEstablished = false;
         const state = transport.resetRuntime({ newSession: resetOptions.newSession === true });
         memoryConsentEnabled = false;
         memoryConsentLocked = false;
@@ -2746,6 +2749,7 @@
           });
         }
         memoryConsentLocked = true;
+        runtimeRouteEstablished = false;
         stopRuntimeMonitoring();
         startPageExitLifecycle();
         const operation = beginRuntimeOperation('start', requestOptions);
@@ -2759,6 +2763,7 @@
           const data = response.data || {};
           if (response.ok && data.ok !== false) {
             if (data.state && typeof data.state === 'object') transport.applyRuntimeState(data.state);
+            runtimeRouteEstablished = true;
             setRuntimePhase('running', 'start-accepted');
             if (isRuntimeOperationCurrent(operation) && runtimePhase === 'running') {
               startRuntimeMonitoring();
@@ -2808,8 +2813,10 @@
             operation.requestOptions,
           ));
           if (isRuntimeOperationCurrent(operation)) {
-            if (response.ok && response.data?.ok !== false) setRuntimePhase('ended', 'end-accepted');
-            else recoverEndFailure('end-rejected');
+            if (response.ok && response.data?.ok !== false) {
+              runtimeRouteEstablished = false;
+              setRuntimePhase('ended', 'end-accepted');
+            } else recoverEndFailure('end-rejected');
           }
           return response;
         } catch (error) {
@@ -3629,7 +3636,7 @@
       },
       async request(payload = {}, requestOptions = {}) {
         requireCapability('dialogue', 'dialogue.request');
-        if (!['running', 'degraded'].includes(runtimePhase)) {
+        if (!runtimeRouteEstablished || !['running', 'degraded'].includes(runtimePhase)) {
           fail('invalid_state', 'dialogue.request requires an active runtime route');
         }
         if (!plainObject(payload)) fail('invalid_request', 'dialogue payload must be an object');
@@ -3769,6 +3776,9 @@
 
     async function requestSpeechOutput(requestInput, requestOptions = {}) {
       requireCapability('speech-output', 'speech.speak');
+      if (!runtimeRouteEstablished || !['running', 'degraded'].includes(runtimePhase)) {
+        fail('invalid_state', 'speech.speak requires an active runtime route');
+      }
       if (!speechBridgeStarted) {
         fail('transport_unavailable', 'The host speech output bridge is unavailable');
       }
@@ -4160,6 +4170,7 @@
       dispose(disposeOptions = {}) {
         if (disposed || disposing) return;
         disposing = true;
+        runtimeRouteEstablished = false;
         stopRuntimeMonitoring();
         stopRuntimeOperation({ preserveEnd: disposeOptions.preserveRuntimeEnd === true });
         abortPendingSpeechRequests('disposed');
