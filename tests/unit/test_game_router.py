@@ -5692,6 +5692,28 @@ async def test_project_speak_forwards_synthesized_audio_reuse_opt_in(monkeypatch
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_project_speech_preload_requires_local_mutation_csrf(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    result = await gr_runtime.game_project_speech_preload(
+        "soccer",
+        _FakeRequest(
+            {"lines": ["不应进入合成"]},
+            mutation_headers=False,
+            path="/api/game/soccer/speech/preload",
+        ),
+    )
+
+    assert isinstance(result, JSONResponse)
+    assert result.status_code == 403
+    assert json.loads(result.body)["reason"] == "csrf_validation_failed"
+    assert mgr.preloaded == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_project_speech_preload_is_silent_and_deduplicates_lines(monkeypatch):
     mgr = _FakeGameRouteManager()
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})

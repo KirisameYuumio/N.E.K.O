@@ -2446,6 +2446,18 @@ async def game_project_speech_preload(game_type: str, request: Request):
         data = await request.json()
     except Exception:
         return {"ok": False, "reason": "invalid_body"}
+    if not isinstance(data, dict):
+        return {"ok": False, "reason": "invalid_body"}
+
+    from ..system_router import _validate_local_mutation_request
+
+    validation_error = _validate_local_mutation_request(
+        request,
+        payload=data,
+        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
+    )
+    if validation_error is not None:
+        return validation_error
 
     raw_lines = data.get("lines")
     if not isinstance(raw_lines, list):

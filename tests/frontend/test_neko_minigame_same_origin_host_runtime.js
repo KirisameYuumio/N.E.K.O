@@ -201,8 +201,13 @@ async function main() {
     session_id: 'attacker-session',
     submission: { summary: 'visible result' },
   });
+  await host.preloadSpeechOutput({
+    session_id: 'attacker-session',
+    lines: ['预载台词'],
+  });
   const contextCall = calls.find((call) => call.url.endsWith('/context/read'));
   const memoryCall = calls.find((call) => call.url.endsWith('/memory/submit'));
+  const speechPreloadCall = calls.find((call) => call.url.endsWith('/speech/preload'));
   assert(contextCall.body.session_id === 'server-session',
     'context read did not bind the authoritative route session');
   assert(contextCall.body._csrf_token === 'test-token'
@@ -211,6 +216,45 @@ async function main() {
   assert(memoryCall.body.session_id === 'server-session'
     && memoryCall.body._csrf_token === 'test-token',
   'memory submission did not bind the authoritative session and CSRF token');
+  assert(speechPreloadCall.body.session_id === 'server-session'
+    && speechPreloadCall.body._csrf_token === 'test-token'
+    && speechPreloadCall.init.headers['X-CSRF-Token'] === 'test-token',
+  'speech preload did not bind the authoritative session and CSRF token');
+
+  let speechChannel = null;
+  class SpeechChannelMock {
+    constructor() { speechChannel = this; this.onmessage = null; }
+    close() {}
+  }
+  const playbackStates = [];
+  host.startSpeechPlaybackBridge({
+    BroadcastChannelImpl: SpeechChannelMock,
+    onState: (state, source) => playbackStates.push({ state, source }),
+  });
+  const sharedPlaybackState = {
+    type: 'speech_playback_state',
+    active: true,
+    speechId: 'dedupe-speech',
+    remainingSeconds: 2,
+    updatedAt: 1700000000000,
+  };
+  speechChannel.onmessage({ data: sharedPlaybackState });
+  windowMock.dispatchEvent(new windowMock.CustomEvent('neko-speech-playback-state', {
+    detail: sharedPlaybackState,
+  }));
+  windowMock.dispatchEvent({
+    type: 'storage',
+    key: 'neko_speech_playback_state',
+    newValue: JSON.stringify(sharedPlaybackState),
+  });
+  assert(playbackStates.length === 1,
+    'identical speech playback state was delivered once per active transport');
+  windowMock.dispatchEvent(new windowMock.CustomEvent('neko-speech-playback-state', {
+    detail: { ...sharedPlaybackState, updatedAt: sharedPlaybackState.updatedAt + 1 },
+  }));
+  assert(playbackStates.length === 2,
+    'a newer speech playback state was incorrectly deduplicated');
+  host.stopSpeechPlaybackBridge();
 
   const controls = [];
   host.startGameControlBridge({ onControl: (control) => controls.push(control) });

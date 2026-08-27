@@ -21,6 +21,7 @@ function createEnvironment() {
   const intervals = new Map();
   const documentListeners = new Map();
   const windowListeners = new Map();
+  const consoleErrors = [];
   const documentImpl = {
     visibilityState: 'visible',
     hidden: false,
@@ -42,7 +43,7 @@ function createEnvironment() {
     },
   };
   const windowImpl = {
-    console: { error() {} },
+    console: { error(...args) { consoleErrors.push(args); } },
     AbortController,
     setInterval(handler, intervalMs) {
       nextTimerId += 1;
@@ -67,7 +68,9 @@ function createEnvironment() {
       for (const handler of Array.from(windowListeners.get(type) || [])) handler({ type });
     },
   };
-  return { windowImpl, documentImpl, intervals, documentListeners, windowListeners };
+  return {
+    windowImpl, documentImpl, intervals, documentListeners, windowListeners, consoleErrors,
+  };
 }
 
 function logger() {
@@ -181,6 +184,11 @@ async function main() {
   const unsubscribeOutput = game.events.on('runtime-output', (event) => envelopes.push(event));
   const stateEvents = [];
   game.events.on('runtime-state', (event) => stateEvents.push(event));
+  game.events.on('runtime-state', (event) => (
+    event.payload.current === 'running'
+      ? Promise.reject(new Error('async listener failed'))
+      : undefined
+  ));
   game.runtime.configure({
     payload: () => ({ score: 1 }),
     heartbeat: { intervalMs: 2500, timeoutMs: 4500 },
@@ -201,6 +209,12 @@ async function main() {
     'managed lifecycle did not own exactly one pagehide listener');
   assert(environment.windowListeners.get('beforeunload')?.size === 1,
     'managed lifecycle did not own exactly one beforeunload listener');
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(environment.consoleErrors.some((args) => (
+    String(args[0]).includes('runtime-state listener failed')
+      && args[1]?.message === 'async listener failed'
+  )), 'fire-and-forget runtime listener rejection was not observed');
 
   await game.runtime.pulse(true);
   await game.runtime.pollOutputs();

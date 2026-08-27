@@ -246,6 +246,27 @@ async function main() {
   assert(states.at(-1).audioContextTime === 0 && states.at(-1).scheduledEndAudioTime === 0,
     'non-finite host playback values escaped the public speech state');
 
+  bridgeOptions.onState({
+    type: 'speech_playback_state',
+    active: true,
+    speech_id: 'stale-suspended-speech',
+    remaining_seconds: 30,
+    audio_context_state: 'suspended',
+    updated_at: Date.now() - 16000,
+  }, 'local_storage_initial');
+  assert(game.speech.getState().active === false,
+    'an expired suspended playback snapshot remained active indefinitely');
+  bridgeOptions.onState({
+    type: 'speech_playback_state',
+    active: true,
+    speech_id: 'fresh-suspended-speech',
+    remaining_seconds: 30,
+    audio_context_state: 'suspended',
+    updated_at: Date.now(),
+  }, 'window_event');
+  assert(game.speech.getState()?.speechId === 'fresh-suspended-speech',
+    'a fresh suspended playback snapshot was rejected');
+
   for (let index = 0; index < 65; index += 1) {
     await game.speech.speak({
       text: `bounded metadata ${index}`,

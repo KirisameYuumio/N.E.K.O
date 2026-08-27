@@ -149,6 +149,8 @@
         storageHandler: null,
         windowEventHandler: null,
         windowEventName: '',
+        acceptState: null,
+        lastStateFingerprint: '',
         onState: null,
         onError: null,
       };
@@ -917,7 +919,7 @@
     }
 
     preloadSpeechOutput(payload, options = {}) {
-      return this._post(this._gameEndpoint('speech/preload'), this._trustedRuntimePayload(payload), {
+      return this._postWithCsrf(this._gameEndpoint('speech/preload'), this._trustedRuntimePayload(payload), {
         timeoutMs: 180000,
         operation: 'speech_preload',
         ...options,
@@ -996,12 +998,17 @@
 
       const acceptState = (data, source) => {
         if (data?.type !== messageType || !bridge.onState) return;
+        let fingerprint = '';
+        try { fingerprint = JSON.stringify(data); } catch (_) { /* skip dedupe for non-serializable legacy payloads */ }
+        if (fingerprint && fingerprint === bridge.lastStateFingerprint) return;
+        if (fingerprint) bridge.lastStateFingerprint = fingerprint;
         try {
           bridge.onState(data, source);
         } catch (error) {
           bridge.onError?.(error, source);
         }
       };
+      bridge.acceptState = acceptState;
       const BroadcastChannelImpl = options.BroadcastChannelImpl || this._window.BroadcastChannel;
       if (typeof BroadcastChannelImpl === 'function') {
         try {
@@ -1043,6 +1050,8 @@
       }
       bridge.onState = null;
       bridge.onError = null;
+      bridge.acceptState = null;
+      bridge.lastStateFingerprint = '';
     }
 
     startSpeechOutputBridge(options = {}) {
@@ -1057,11 +1066,7 @@
       try {
         const stored = JSON.parse(this._window.localStorage?.getItem(storageKey) || 'null');
         if (stored && typeof stored === 'object' && stored.type === messageType) {
-          try {
-            this._speechPlaybackBridge.onState?.(stored, 'local_storage_initial');
-          } catch (error) {
-            this._speechPlaybackBridge.onError?.(error, 'local_storage_initial');
-          }
+          this._speechPlaybackBridge.acceptState?.(stored, 'local_storage_initial');
         }
       } catch (_) { /* ignore malformed state from unrelated/older writers */ }
       return true;

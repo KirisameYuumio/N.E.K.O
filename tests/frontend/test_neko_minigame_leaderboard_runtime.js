@@ -26,8 +26,10 @@ function createTransport({ server = false, shared = null } = {}) {
   const values = shared?.values || new Map();
   const lockTails = shared?.lockTails || new Map();
   const pending = new Set();
+  const pendingLocks = new Set();
   const serverCalls = [];
   let storagePending = false;
+  let lockPending = false;
   let runtimeState = { sessionId: 'leaderboard-session', characterName: 'Yui' };
 
   function pendingRequest(options = {}) {
@@ -74,7 +76,19 @@ function createTransport({ server = false, shared = null } = {}) {
       if (operation === 'delete') values.delete(payload.key);
       return Promise.resolve({ ok: true });
     },
-    async runGameStorageExclusive(lockName, callback) {
+    async runGameStorageExclusive(lockName, callback, options = {}) {
+      if (lockPending) {
+        return new Promise((resolve, reject) => {
+          const entry = { resolve, reject };
+          pendingLocks.add(entry);
+          const abort = () => {
+            pendingLocks.delete(entry);
+            reject(abortError());
+          };
+          if (options.signal?.aborted) abort();
+          else options.signal?.addEventListener('abort', abort, { once: true });
+        });
+      }
       const previous = lockTails.get(lockName) || Promise.resolve();
       let release;
       const gate = new Promise((resolve) => { release = resolve; });
@@ -114,8 +128,10 @@ function createTransport({ server = false, shared = null } = {}) {
     transport,
     values,
     pending,
+    pendingLocks,
     serverCalls,
     setStoragePending(value) { storagePending = value; },
+    setLockPending(value) { lockPending = value; },
   };
 }
 
@@ -175,6 +191,23 @@ async function main() {
   assert(shared.lockTails.size === 0, 'cross-client leaderboard lock remained resident after mutation');
   firstClient.dispose();
   secondClient.dispose();
+
+  const lockWaitHost = createTransport();
+  lockWaitHost.setLockPending(true);
+  const lockWaitClient = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+    transport: lockWaitHost.transport,
+  });
+  const waitingMutation = lockWaitClient.leaderboard.local.submit('main', { score: 33 })
+    .then(() => null, (error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(lockWaitHost.pendingLocks.size === 1 && lockWaitClient.leaderboard.local.pendingCount === 1,
+    'waiting local leaderboard lock was not registered as pending SDK work');
+  lockWaitClient.dispose();
+  const disposedLockError = await waitingMutation;
+  assert(disposedLockError?.code === 'disposed',
+    'client disposal did not cancel a pending local leaderboard lock');
+  assert(lockWaitHost.pendingLocks.size === 0,
+    'disposed local leaderboard lock remained resident in the host');
 
   let clearError = null;
   try { await game.leaderboard.local.clear('main'); }

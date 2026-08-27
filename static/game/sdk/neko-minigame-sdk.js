@@ -58,6 +58,7 @@
   const MAX_SPEECH_EVENT_CHARS = 64 * 1024;
   const MAX_SPEECH_PLAYBACK_SECONDS = 600;
   const SPEECH_PLAYBACK_STALE_MS = 3500;
+  const SPEECH_PLAYBACK_ABSOLUTE_STALE_MS = 15000;
   const MAX_RUNTIME_EVENT_BYTES = 256 * 1024;
   const MAX_RUNTIME_OUTPUTS_PER_POLL = 50;
   const MIN_RUNTIME_INTERVAL_MS = 250;
@@ -1509,6 +1510,7 @@
     const remainingSeconds = audioContextState === 'suspended'
       ? rawRemainingSeconds
       : Math.max(0, rawRemainingSeconds - ageMs / 1000);
+    if (ageMs > SPEECH_PLAYBACK_ABSOLUTE_STALE_MS) return null;
     if (ageMs > SPEECH_PLAYBACK_STALE_MS && remainingSeconds <= 0.5) return null;
     const speechId = boundedSpeechString(raw.speechId || raw.speech_id, 'speech playback id', 128);
     const priorityValue = metadata?.priority ?? raw.priority;
@@ -1678,6 +1680,7 @@
     const memoryPendingRequests = new Set();
     const storagePendingRequests = new Set();
     const localLeaderboardPendingRequests = new Set();
+    const localLeaderboardMutationPendingRequests = new Set();
     const serverLeaderboardPendingRequests = new Set();
     const localLeaderboardMutations = new Set();
     const loadingPresentations = new Set();
@@ -1879,7 +1882,14 @@
       for (const handler of Array.from(bucket)) {
         try {
           const result = handler(envelope);
-          if (waitForHandlers && result && typeof result.then === 'function') await result;
+          if (result && typeof result.then === 'function') {
+            if (waitForHandlers) await result;
+            else {
+              void Promise.resolve(result).catch((error) => {
+                windowImpl.console?.error?.(`[NekoMiniGame] ${normalizedType} listener failed`, error);
+              });
+            }
+          }
         } catch (error) {
           windowImpl.console?.error?.(`[NekoMiniGame] ${normalizedType} listener failed`, error);
         }
@@ -3097,17 +3107,27 @@
       }
       localLeaderboardMutations.add(boardId);
       try {
-        return await transport.runGameStorageExclusive(
-          `leaderboards/${boardId}`,
-          callback,
-          { timeoutMs: 8000, signal: requestOptions.signal },
-        );
+        return await performManagedHostRequest({
+          operation,
+          pendingSet: localLeaderboardMutationPendingRequests,
+          limit: MAX_LEADERBOARD_PENDING_REQUESTS,
+          timeoutMs: 8500,
+          maximumTimeoutMs: 60000,
+          requestOptions,
+          invoke: ({ signal, timeoutMs }) => transport.runGameStorageExclusive(
+            `leaderboards/${boardId}`,
+            callback,
+            { timeoutMs: Math.min(8000, timeoutMs), signal },
+          ),
+        });
       }
       finally { localLeaderboardMutations.delete(boardId); }
     }
 
     const localLeaderboard = Object.freeze({
-      get pendingCount() { return localLeaderboardPendingRequests.size; },
+      get pendingCount() {
+        return localLeaderboardPendingRequests.size + localLeaderboardMutationPendingRequests.size;
+      },
       async submit(boardIdInput, value, requestOptions = {}) {
         requireCapability('leaderboard-local', 'leaderboard.local.submit');
         const { boardId, definition } = leaderboardDefinition(
@@ -4158,6 +4178,7 @@
         abortManagedRequests(memoryPendingRequests, 'disposed');
         abortManagedRequests(storagePendingRequests, 'disposed');
         abortManagedRequests(localLeaderboardPendingRequests, 'disposed');
+        abortManagedRequests(localLeaderboardMutationPendingRequests, 'disposed');
         abortManagedRequests(serverLeaderboardPendingRequests, 'disposed');
         localLeaderboardMutations.clear();
         setRuntimePhase('disposed', 'client-dispose');
