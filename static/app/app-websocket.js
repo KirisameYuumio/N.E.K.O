@@ -3212,7 +3212,7 @@
                             return;
                         }
                         if (
-                            currentRouteInstanceId
+                            (endedRouteInstanceId || currentRouteInstanceId)
                             && endedRouteInstanceId !== currentRouteInstanceId
                         ) {
                             console.log(`[GameVoiceSTT] 忽略过期的 GAME_ROUTE_ENDED | ended_route=${endedRouteInstanceId} current_route=${currentRouteInstanceId}`);
@@ -4848,7 +4848,7 @@
                                 (incomingGameSessionId
                                     && currentGameSessionId
                                     && incomingGameSessionId !== currentGameSessionId)
-                                || (currentGameRouteInstanceId
+                                || ((incomingGameRouteInstanceId || currentGameRouteInstanceId)
                                     && incomingGameRouteInstanceId !== currentGameRouteInstanceId)
                             );
                         if (isStaleGameWindowEvent) {

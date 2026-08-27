@@ -3411,6 +3411,8 @@ async def _route_external_transcript_to_game(
         ),
         **game_chat_kwargs,
     )
+    if result.get("skipped"):
+        return True
     result_ts = time.time()
     _append_game_dialog(state, {
         "type": "assistant",
@@ -3730,6 +3732,31 @@ async def game_realtime_context(game_type: str, request: Request):
     if not lanlan_name:
         return {"ok": False, "reason": "missing_lanlan_name"}
 
+    route_state = _get_active_game_route_state(lanlan_name, game_type)
+    if not isinstance(route_state, dict) or route_state.get("game_route_active") is not True:
+        return {"ok": False, "reason": "game_route_inactive", "lanlan_name": lanlan_name}
+    route_data = dict(data)
+    expected_route_instance_id = str(
+        route_state.get("_sdk_route_instance_id") or ""
+    ).strip()
+    if not expected_route_instance_id and not str(
+        route_data.get("session_id") or route_data.get("sessionId") or ""
+    ).strip():
+        # Legacy built-in games predate SDK route generations. Keep their
+        # active-state identity binding without forcing a page migration into
+        # this pure SDK change; generated SDK routes remain strictly bound.
+        route_data["session_id"] = str(route_state.get("session_id") or "")
+    (
+        _route_lanlan_name,
+        route_session_id,
+        authoritative_route_state,
+        route_error,
+    ) = _sdk_active_route_from_payload(game_type, route_data)
+    if route_error is not None:
+        return {**route_error, "lanlan_name": lanlan_name}
+    if authoritative_route_state is not route_state:
+        return {"ok": False, "reason": "route_superseded", "lanlan_name": lanlan_name}
+
     session_manager = get_session_manager()
     mgr = session_manager.get(lanlan_name)
     if not mgr:
@@ -3750,7 +3777,7 @@ async def game_realtime_context(game_type: str, request: Request):
     # locale 表，短码会把繁体塌成 zh（issue #2500 第 2 步）。
     language = _resolve_game_prompt_locale(lanlan_name, data)
     text = _compact_realtime_context_text(game_type, data, language)
-    session_id = str((data.get("state") or {}).get("sessionId") or data.get("session_id") or "")
+    session_id = route_session_id
     _log_game_debug_material(
         "realtime_context",
         text,
@@ -3803,24 +3830,50 @@ async def game_realtime_context(game_type: str, request: Request):
     append_context = getattr(mgr, "append_context", None)
     if not callable(append_context):
         return {"ok": False, "reason": "context_method_unavailable", "lanlan_name": lanlan_name}
-    if _active_realtime_session(mgr) is not session:
-        return {"ok": False, "reason": "realtime_session_changed", "lanlan_name": lanlan_name}
+    route_lock = _get_route_lock(lanlan_name, game_type)
     try:
-        append_result = await append_context(
-            source="game.realtime_context",
-            role="system",
-            text=text,
-            audience="model",
-            timing="now",
-            lifetime="current_session",
-            request_id=str(data.get("request_id") or "") or None,
-            ordering_key=str((data.get("state") or {}).get("sessionId") or data.get("session_id") or "") or None,
-            metadata={
-                "game_type": game_type,
-                "lanlan_name": lanlan_name,
-                "items": len(data.get("pendingItems") or []),
-            },
-        )
+        async with route_lock:
+            current_route_state = _get_active_game_route_state(lanlan_name, game_type)
+            current_route_instance_id = str(
+                (current_route_state or {}).get("_sdk_route_instance_id") or ""
+            ).strip()
+            if (
+                current_route_state is not route_state
+                or current_route_state.get("game_route_active") is not True
+                or str(current_route_state.get("session_id") or "") != route_session_id
+                or current_route_instance_id != expected_route_instance_id
+            ):
+                return {
+                    "ok": False,
+                    "reason": "route_superseded",
+                    "lanlan_name": lanlan_name,
+                }
+            if _active_realtime_session(mgr) is not session:
+                return {
+                    "ok": False,
+                    "reason": "realtime_session_changed",
+                    "lanlan_name": lanlan_name,
+                }
+            append_result = await asyncio.wait_for(
+                append_context(
+                    source="game.realtime_context",
+                    role="system",
+                    text=text,
+                    audience="model",
+                    timing="now",
+                    lifetime="current_session",
+                    request_id=str(data.get("request_id") or "") or None,
+                    ordering_key=route_session_id or None,
+                    metadata={
+                        "game_type": game_type,
+                        "lanlan_name": lanlan_name,
+                        "items": len(data.get("pendingItems") or []),
+                    },
+                ),
+                timeout=15.0,
+            )
+    except asyncio.TimeoutError:
+        return {"ok": False, "reason": "context_timeout", "lanlan_name": lanlan_name}
     except Exception as e:
         logger.warning("🎮 Realtime 上下文注入失败: game=%s lanlan=%s err=%s", game_type, lanlan_name, e)
         _append_game_session_debug_log(

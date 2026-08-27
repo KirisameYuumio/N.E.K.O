@@ -4678,15 +4678,22 @@ async def test_realtime_context_skips_gemini_prime_to_avoid_hidden_response(monk
     mgr = _FakeRealtimeManager(session)
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
 
-    result = await gr_runtime.game_realtime_context(
-        "soccer",
-        _FakeRequest({
-            "lanlan_name": "Lan",
-            "source": "game_event",
-            "currentState": {"score": {"player": 1, "ai": 2}},
-            "pendingItems": [{"type": "game_event", "kind": "goal-scored"}],
-        }),
-    )
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route(
+            "example-game", "context-session", "Lan"
+        )
+        state["_sdk_route_instance_id"] = "context-route"
+        result = await gr_runtime.game_realtime_context(
+            "example-game",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "context-session",
+                "sdk_route_instance_id": "context-route",
+                "source": "game_event",
+                "currentState": {"phase": "active"},
+                "pendingItems": [{"type": "game_event", "kind": "phase-changed"}],
+            }),
+        )
 
     assert result["ok"] is True
     assert result["action"] == "skip"
@@ -4733,20 +4740,68 @@ async def test_realtime_context_aborts_when_active_session_changes_before_append
 
     _gr_patch_all(monkeypatch, "_compact_realtime_context_text", swap_session)
 
-    result = await gr_runtime.game_realtime_context(
-        "soccer",
-        _FakeRequest({
-            "lanlan_name": "Lan",
-            "source": "game_event",
-            "currentState": {"score": {"player": 1, "ai": 2}},
-            "pendingItems": [{"type": "game_event", "kind": "goal-scored"}],
-        }, path="/api/game/soccer/realtime-context"),
-    )
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route(
+            "example-game", "context-session", "Lan"
+        )
+        state["_sdk_route_instance_id"] = "context-route"
+        result = await gr_runtime.game_realtime_context(
+            "example-game",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "context-session",
+                "sdk_route_instance_id": "context-route",
+                "source": "game_event",
+                "currentState": {"phase": "active"},
+                "pendingItems": [{"type": "game_event", "kind": "phase-changed"}],
+            }, path="/api/game/example-game/realtime-context"),
+        )
 
     assert result == {"ok": False, "reason": "realtime_session_changed", "lanlan_name": "Lan"}
     assert mgr.append_context_calls == []
     assert original.prime_context_calls == []
     assert replacement.prime_context_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_realtime_context_revalidates_route_at_append_boundary(monkeypatch, _fake_realtime):
+    session = _fake_realtime(model_lower="qwen-realtime", delivered=True)
+    mgr = _FakeRealtimeManager(session)
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+    with reset_game_route_state():
+        route_a = gr_runtime._activate_game_route(
+            "example-game", "reused-session", "Lan"
+        )
+        route_a["_sdk_route_instance_id"] = "route-A"
+
+        def replace_route(_game_type, _payload, _language=None):
+            route_b = gr_runtime._activate_game_route(
+                "example-game", "reused-session", "Lan"
+            )
+            route_b["_sdk_route_instance_id"] = "route-B"
+            return "[Game Realtime Context]\nstale"
+
+        _gr_patch_all(monkeypatch, "_compact_realtime_context_text", replace_route)
+        result = await gr_runtime.game_realtime_context(
+            "example-game",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "reused-session",
+                "sdk_route_instance_id": "route-A",
+                "source": "game_event",
+                "currentState": {"phase": "active"},
+            }, path="/api/game/example-game/realtime-context"),
+        )
+
+    assert result == {
+        "ok": False,
+        "reason": "route_superseded",
+        "lanlan_name": "Lan",
+    }
+    assert mgr.append_context_calls == []
+    assert session.prime_context_calls == []
 
 
 class _FakeGameRouteManager:
@@ -5691,6 +5746,44 @@ async def test_route_external_voice_transcript_to_game_llm(monkeypatch):
     assert state["pending_outputs"][1]["meta"]["hasUserSpeech"] is True
     assert "skipOrdinaryMemory" not in state["pending_outputs"][1]["meta"]
     assert state["pending_outputs"][1]["meta"]["voiceAlreadyHandled"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_external_route_drops_a_superseded_chat_result_without_post_side_effects(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route(
+            "example-game", "reused-session", "Lan"
+        )
+        state["_sdk_route_instance_id"] = "route-A"
+        _gr_patch_all(
+            monkeypatch,
+            "_run_game_chat",
+            AsyncMock(return_value={
+                "line": "",
+                "control": {},
+                "skipped": "route_superseded",
+            }),
+        )
+
+        handled = await gr_runtime.route_external_voice_transcript(
+            "Lan",
+            "stale input",
+            request_id="voice-stale-result",
+            game_type="example-game",
+            session_id="reused-session",
+            sdk_route_instance_id="route-A",
+        )
+
+    assert handled is True
+    assert [item["type"] for item in state["game_dialog_log"]] == ["user"]
+    assert [item["type"] for item in state["pending_outputs"]] == [
+        "game_external_input"
+    ]
+    assert not any("GAME_ROUTE_LLM_FAILED" in status for status in mgr.statuses)
 
 
 @pytest.mark.unit

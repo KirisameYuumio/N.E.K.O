@@ -1,6 +1,7 @@
 import asyncio
 from collections import deque
 import queue
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
@@ -958,6 +959,75 @@ async def test_game_speech_preload_rejects_worker_without_completion_before_star
         }
         assert worker_started is False
         assert mgr._game_speech_preload_active_workers == {}
+    finally:
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_speech_preload_retires_legacy_worker_after_item_timeout():
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr._game_speech_preload_item_timeout_seconds = 0.05
+    mgr.game_speech_audio_cache_identity = lambda text: (
+        f"legacy-timeout:{text}",
+        "legacy-timeout-signature",
+    )
+    mgr.current_game_speech_audio_runtime_signature = (
+        lambda: "legacy-timeout-signature"
+    )
+    requested_speech_ids = []
+
+    def late_raw_worker(request_queue, response_queue, _api_key, _voice_id):
+        response_queue.put(("__ready__", True))
+        active_speech_id = None
+        first_item = True
+        while True:
+            speech_id, _text = request_queue.get()
+            if speech_id == "__shutdown__":
+                return
+            if speech_id is not None:
+                active_speech_id = speech_id
+                requested_speech_ids.append(speech_id)
+                continue
+            if not active_speech_id:
+                continue
+            if first_item:
+                first_item = False
+                time.sleep(0.1)
+                response_queue.put(b"late-untagged-first-item")
+            else:
+                response_queue.put(b"second-item-audio")
+            response_queue.put(("__audio_done__", active_speech_id))
+            active_speech_id = None
+
+    mgr._resolve_tts_worker_spec = lambda: (
+        late_raw_worker,
+        "",
+        "voice",
+        None,
+        False,
+        {},
+    )
+    try:
+        result = await core_module.LLMSessionManager.preload_game_speech_audio(
+            mgr,
+            ["first", "second"],
+        )
+
+        assert result["ok"] is False
+        assert result["results"] == [
+            {"index": 0, "status": "failed", "reason": "timeout"},
+            {
+                "index": 1,
+                "status": "failed",
+                "reason": "tts_worker_reset_required",
+            },
+        ]
+        assert len(requested_speech_ids) == 1
+        assert GAME_SPEECH_AUDIO_CACHE.get("legacy-timeout:second") is None
+        assert mgr._game_speech_preload_active_workers == {}
+        assert GAME_SPEECH_AUDIO_CACHE.stats()["captures"] == 0
     finally:
         GAME_SPEECH_AUDIO_CACHE.clear()
 

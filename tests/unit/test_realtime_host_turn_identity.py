@@ -409,6 +409,7 @@ def test_evicted_server_vad_item_does_not_consume_the_next_utterance_owner():
         None,
         get_input_route_identity=lambda: current_route[0],
     )
+    client._has_server_vad = True
 
     for index in range(_transport._INPUT_ROUTE_IDENTITY_ITEM_LIMIT + 1):
         current_route[0] = (
@@ -426,6 +427,24 @@ def test_evicted_server_vad_item_does_not_consume_the_next_utterance_owner():
     assert client._take_input_route_identity() == (
         "example-game", "session-next", "route-next",
     )
+
+
+@pytest.mark.unit
+def test_manual_vad_item_id_consumes_the_ingress_owner_without_an_item_mapping():
+    current_route = [("example-game", "session-a", "route-a")]
+    client = _free_client(
+        None,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._has_server_vad = False
+
+    client._capture_input_route_identity()
+
+    assert client._take_input_route_identity("provider-manual-item") == (
+        "example-game", "session-a", "route-a",
+    )
+    assert client._input_route_identity is None
+    assert client._input_route_identity_captured is False
 
 
 # ---------------------------------------------------------------------------

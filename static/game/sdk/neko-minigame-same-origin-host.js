@@ -69,6 +69,40 @@
     'badminton_game_memory_archive_enabled', 'badmintonGameMemoryArchiveEnabled',
     'badminton_game_memory_postgame_context_enabled', 'badmintonGameMemoryPostgameContextEnabled',
   ]);
+  const TRUSTED_PAYLOAD_MAX_DEPTH = 24;
+  const TRUSTED_PAYLOAD_MAX_NODES = 4096;
+  const TRUSTED_PAYLOAD_OMIT = Symbol('trusted-payload-omit');
+
+  function cloneTrustedJsonData(value, state = { nodes: 0, seen: new Set() }, depth = 0) {
+    if (depth > TRUSTED_PAYLOAD_MAX_DEPTH || state.nodes >= TRUSTED_PAYLOAD_MAX_NODES) {
+      throw new TypeError('invalid_payload');
+    }
+    state.nodes += 1;
+    if (value == null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (['undefined', 'function', 'symbol'].includes(typeof value)) return TRUSTED_PAYLOAD_OMIT;
+    if (typeof value === 'bigint') throw new TypeError('invalid_payload');
+    if (state.seen.has(value)) throw new TypeError('invalid_payload');
+    state.seen.add(value);
+    try {
+      if (Array.isArray(value)) {
+        return value.map((item) => {
+          const cloned = cloneTrustedJsonData(item, state, depth + 1);
+          return cloned === TRUSTED_PAYLOAD_OMIT ? null : cloned;
+        });
+      }
+      const result = {};
+      for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+        if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
+        if (key === 'toJSON') continue;
+        const cloned = cloneTrustedJsonData(descriptor.value, state, depth + 1);
+        if (cloned !== TRUSTED_PAYLOAD_OMIT) result[key] = cloned;
+      }
+      return result;
+    } finally {
+      state.seen.delete(value);
+    }
+  }
 
   class NekoMiniGameHostError extends Error {
     constructor(code, message, details = {}) {
@@ -833,10 +867,17 @@
       const source = payload && typeof payload === 'object' && !Array.isArray(payload)
         ? payload
         : {};
-      const trusted = { ...source };
+      let trusted;
+      try {
+        trusted = cloneTrustedJsonData(source);
+      } catch (cause) {
+        throw this._hostError('invalid_payload', `${this.displayName} host payload is invalid`, {
+          operation: 'trusted_runtime_payload',
+          cause,
+        });
+      }
       for (const key of MEMORY_POLICY_PAYLOAD_KEYS) delete trusted[key];
       if (trusted.event && typeof trusted.event === 'object' && !Array.isArray(trusted.event)) {
-        trusted.event = { ...trusted.event };
         for (const key of MEMORY_POLICY_PAYLOAD_KEYS) delete trusted.event[key];
       }
       const memoryEnabled = (
@@ -2569,13 +2610,24 @@
 
     async end(payload, options = {}) {
       this._requireGrantedCapability('runtime', 'route_end');
+      let parsedPayload = payload;
+      if (typeof payload === 'string') {
+        try {
+          parsedPayload = JSON.parse(payload);
+        } catch (cause) {
+          throw this._hostError('invalid_payload', `${this.displayName} route end payload is invalid`, {
+            operation: 'route_end',
+            cause,
+          });
+        }
+      }
+      if (!parsedPayload || typeof parsedPayload !== 'object' || Array.isArray(parsedPayload)) {
+        throw this._hostError('invalid_payload', `${this.displayName} route end payload must be an object`, {
+          operation: 'route_end',
+        });
+      }
+      const body = JSON.stringify(this._trustedRuntimePayload(parsedPayload));
       void this.flushLogger({ final: true });
-      const trustedPayload = typeof payload === 'string'
-        ? payload
-        : this._trustedRuntimePayload(payload);
-      const body = typeof trustedPayload === 'string'
-        ? trustedPayload
-        : JSON.stringify(trustedPayload);
       if (options.signal?.aborted) {
         throw this._hostError('cancelled', `${this.displayName} host request was cancelled`, {
           operation: 'route_end',

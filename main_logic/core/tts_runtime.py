@@ -545,7 +545,19 @@ class TtsRuntimeMixin:
         max_lines = 32
         max_pending_batches = 4
         ready_timeout_seconds = 30.0
-        item_timeout_seconds = 90.0
+        item_timeout_seconds = max(
+            0.05,
+            min(
+                float(
+                    getattr(
+                        self,
+                        "_game_speech_preload_item_timeout_seconds",
+                        90.0,
+                    )
+                ),
+                90.0,
+            ),
+        )
         poll_seconds = 0.01
         unique_lines: list[str] = []
         seen: set[str] = set()
@@ -714,7 +726,12 @@ class TtsRuntimeMixin:
                             }
                         return summarize(results_by_index, "tts_unavailable")
 
-                    for index, clean, cache_key, runtime_signature in pending_lines:
+                    for position, (
+                        index,
+                        clean,
+                        cache_key,
+                        runtime_signature,
+                    ) in enumerate(pending_lines):
                         if GAME_SPEECH_AUDIO_CACHE.get(cache_key) is not None:
                             results_by_index[index] = {"index": index, "status": "hit"}
                             continue
@@ -804,6 +821,26 @@ class TtsRuntimeMixin:
                                 "reason": failure_reason,
                             }
                         )
+                        if not loaded and failure_reason in {
+                            "timeout",
+                            "tts_unavailable",
+                        }:
+                            # Legacy workers may emit raw, untagged bytes. Once an
+                            # item ends without its matching completion, late raw
+                            # bytes cannot be distinguished from the next item.
+                            # Retire this isolated worker instead of reusing it.
+                            for (
+                                remaining_index,
+                                _remaining_clean,
+                                _remaining_key,
+                                _remaining_signature,
+                            ) in pending_lines[position + 1:]:
+                                results_by_index[remaining_index] = {
+                                    "index": remaining_index,
+                                    "status": "failed",
+                                    "reason": "tts_worker_reset_required",
+                                }
+                            break
                 finally:
                     try:
                         request_queue.put((TTS_SHUTDOWN_SENTINEL, None))

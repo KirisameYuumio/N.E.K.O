@@ -21,12 +21,14 @@ def test_game_route_close_events_require_matching_generation_when_one_is_active(
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
 
     assert re.search(
-        r"currentRouteInstanceId\s*&&\s*"
+        r"\(endedRouteInstanceId \|\| currentRouteInstanceId\)\s*"
+        r"&&\s*"
         r"endedRouteInstanceId !== currentRouteInstanceId",
         source,
     )
     assert re.search(
-        r"currentGameRouteInstanceId\s*&&\s*"
+        r"\(incomingGameRouteInstanceId \|\| currentGameRouteInstanceId\)\s*"
+        r"&&\s*"
         r"incomingGameRouteInstanceId !== currentGameRouteInstanceId",
         source,
     )

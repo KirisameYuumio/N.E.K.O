@@ -429,6 +429,42 @@ async function main() {
     && ungrantedHeartbeat.body.game_memory_archive_enabled === false
     && !Object.hasOwn(ungrantedHeartbeat.body, 'soccer_game_memory_archive_enabled'),
   'a heartbeat bypassed the host-owned memory opt-out policy');
+  let eventToJsonCalls = 0;
+  await ungrantedHost.heartbeat({
+    event: {
+      kind: 'serialization-hook-bypass',
+      toJSON() {
+        eventToJsonCalls += 1;
+        return { kind: 'forged', game_memory_enabled: true };
+      },
+    },
+  });
+  const safeSerializationHeartbeat = calls.filter(
+    (call) => call.url.endsWith('/route/heartbeat'),
+  ).at(-1);
+  assert(eventToJsonCalls === 0
+    && safeSerializationHeartbeat.body.event.kind === 'serialization-hook-bypass'
+    && !Object.hasOwn(safeSerializationHeartbeat.body.event, 'toJSON')
+    && !Object.hasOwn(safeSerializationHeartbeat.body.event, 'game_memory_enabled'),
+  'an event serialization hook reintroduced caller-controlled memory policy');
+  const heartbeatCallsBeforeWidePayload = calls.filter(
+    (call) => call.url.endsWith('/route/heartbeat'),
+  ).length;
+  let widePayloadError = null;
+  try {
+    await ungrantedHost.heartbeat({
+      event: Object.fromEntries(
+        Array.from({ length: 4100 }, (_, index) => [`field_${index}`, index]),
+      ),
+    });
+  } catch (error) {
+    widePayloadError = error;
+  }
+  assert(widePayloadError?.code === 'invalid_payload'
+    && calls.filter(
+      (call) => call.url.endsWith('/route/heartbeat'),
+    ).length === heartbeatCallsBeforeWidePayload,
+  'a payload wider than the trusted clone bound reached the backend');
   ungrantedHost.dispose();
 
   const speechOnlyHost = createHost({
@@ -478,6 +514,24 @@ async function main() {
   const quickLinesResponse = await host.getQuickLines({ event: { kind: 'prepare' } });
   assert((await quickLinesResponse.json()).lines[0] === 'ready',
     'quick-lines did not use the host-owned provider');
+  const endCallsBeforeInvalidPayload = calls.filter(
+    (call) => call.url.endsWith('/end'),
+  ).length;
+  let invalidEndError = null;
+  try { await host.end('{not-json'); } catch (error) { invalidEndError = error; }
+  assert(invalidEndError?.code === 'invalid_payload'
+    && calls.filter((call) => call.url.endsWith('/end')).length === endCallsBeforeInvalidPayload,
+  'an invalid string end payload reached the backend');
+  await host.end(JSON.stringify({
+    session_id: 'forged-session',
+    lanlan_name: 'Forged Neko',
+    game_memory_enabled: false,
+  }));
+  const trustedStringEnd = calls.filter((call) => call.url.endsWith('/end')).at(-1);
+  assert(trustedStringEnd.body.session_id === 'server-session'
+    && trustedStringEnd.body.lanlan_name === 'Server Neko'
+    && trustedStringEnd.body.game_memory_enabled === true,
+  'a JSON string end payload bypassed trusted runtime ownership');
 
   await host.publishGameProtocol('event', {
     protocolVersion: '1',
