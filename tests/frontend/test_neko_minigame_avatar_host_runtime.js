@@ -225,6 +225,48 @@ async function main() {
   assert(pendingDisposeError?.code === 'disposed', 'pending mount did not observe host disposal');
   assert(pendingRawDisposed === 1, 'controller resolved after disposal was not released exactly once');
 
+  let releaseInitialModel;
+  const initialModelGate = new Promise((resolve) => { releaseInitialModel = resolve; });
+  let stalledRawDisposed = 0;
+  const stalledModelHost = windowMock.NekoMiniGameAvatarHost.create({
+    slots: {
+      stalled: {
+        container: { clientWidth: 200, clientHeight: 300 },
+        async createController() {
+          return {
+            async setModel() { await initialModelGate; },
+            focus() {},
+            setEmotion() {},
+            pause() {},
+            resume() {},
+            getState() { return {}; },
+            async resize() {},
+            dispose() { stalledRawDisposed += 1; },
+          };
+        },
+      },
+    },
+    windowImpl: windowMock,
+    documentImpl: {},
+    ResizeObserverImpl: ResizeObserverMock,
+  });
+  const stalledMount = stalledModelHost.mount({
+    ...base,
+    slot: 'stalled',
+    viewport: { mode: 'fixed', width: 200, height: 300 },
+    resize: { mode: 'fixed' },
+  }).then(() => null, (error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  stalledModelHost.dispose();
+  const stalledMountError = await stalledMount;
+  assert(stalledMountError?.code === 'disposed',
+    'host disposal did not settle an initial model load that ignored cancellation');
+  assert(stalledModelHost.pendingCount === 0 && stalledRawDisposed === 1,
+    'cancelled initial model load did not release its pending slot and raw controller');
+  releaseInitialModel();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(stalledRawDisposed === 1, 'late initial model completion disposed the raw controller twice');
+
   let releaseBlockedModel;
   const blockedModelGate = new Promise((resolve) => { releaseBlockedModel = resolve; });
   let modelCalls = 0;

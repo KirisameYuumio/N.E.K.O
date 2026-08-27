@@ -1114,8 +1114,6 @@ class TtsRuntimeMixin:
         accidentally killing resources that have been recreated by a
         concurrent start_session.
         """
-        self._cancel_game_speech_completion_wait()
-        self._clear_game_speech_correlation()
         if handler_task_ref and not handler_task_ref.done():
             handler_task_ref.cancel()
             try:
@@ -1159,6 +1157,8 @@ class TtsRuntimeMixin:
         # 只在被拆除的 runtime 仍是当前 runtime 时才清全局 TTS 状态，
         # 避免新 session 已创建新队列/worker 后被旧 teardown 误重置
         if resp_queue_ref is self.tts_response_queue:
+            self._cancel_game_speech_completion_wait()
+            self._clear_game_speech_correlation()
             self.cancel_game_speech_preloads()
             GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
             async with self.tts_cache_lock:

@@ -562,6 +562,7 @@ async function main() {
   const blockedStart = deferred();
   let startAborted = false;
   let startingExitEndCalls = 0;
+  let startingExitDisposed = 0;
   const startingExitTransport = {
     ...transport,
     logger: logger(),
@@ -575,11 +576,12 @@ async function main() {
       }, { once: true });
       return blockedStart.promise;
     },
-    async end() {
+    async end(_payload, options = {}) {
       startingExitEndCalls += 1;
+      assert(options.useBeacon === true, 'starting page exit did not request beacon delivery');
       return { ok: true };
     },
-    dispose() {},
+    dispose() { startingExitDisposed += 1; },
   };
   const startingExitGame = await window.NekoMiniGame.connect({
     id: 'lifecycle-starting-exit',
@@ -596,20 +598,24 @@ async function main() {
     outputs: false,
     pageExit: true,
   });
-  const pageExitStart = startingExitGame.runtime.start({});
+  const pageExitStart = startingExitGame.runtime.start({})
+    .then(() => null, (error) => error);
   await Promise.resolve();
   startingExitEnvironment.windowImpl.dispatch('pagehide');
   await Promise.resolve();
-  assert(!startAborted && startingExitEndCalls === 0 && !startingExitGame.disposed,
-    'page exit overtook or cancelled an in-flight runtime start');
+  assert(startAborted && startingExitEndCalls === 1 && startingExitDisposed === 1,
+    'page exit did not synchronously dispatch end before cancelling the in-flight start');
+  assert(startingExitGame.disposed,
+    'page exit did not dispose immediately after the synchronous end dispatch');
   blockedStart.resolve({
     ok: true,
     state: { game_route_active: true, session_id: 'starting-exit' },
   });
-  await pageExitStart;
+  const pageExitStartError = await pageExitStart;
   await new Promise((resolve) => setImmediate(resolve));
-  assert(!startAborted, 'page exit cancelled the route start before serialized end');
-  assert(startingExitEndCalls === 1 && startingExitGame.disposed,
+  assert(pageExitStartError?.code === 'cancelled',
+    'page exit did not settle the abandoned runtime start as cancelled');
+  assert(startingExitEndCalls === 1 && startingExitDisposed === 1,
     'page exit during runtime start did not end and dispose exactly once');
   assert(startingExitEnvironment.windowListeners.size === 0,
     'page exit during runtime start left listeners resident');

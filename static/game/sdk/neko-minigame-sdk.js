@@ -67,7 +67,15 @@
   const DEFAULT_HEARTBEAT_TIMEOUT_MS = 4500;
   const DEFAULT_OUTPUT_INTERVAL_MS = 700;
   const DEFAULT_OUTPUT_TIMEOUT_MS = 8000;
-  const PAGE_EXIT_START_SETTLEMENT_TIMEOUT_MS = 65000;
+  const MANIFEST_TOP_LEVEL_FIELDS = Object.freeze(new Set([
+    'id',
+    'version',
+    'protocolVersion',
+    'requiredCapabilities',
+    'optionalCapabilities',
+    'contracts',
+    'leaderboards',
+  ]));
   const RUNTIME_EVENT_PATTERN = /^[a-z][a-z0-9:-]{0,63}$/;
   const CONTRACT_KINDS = Object.freeze(['events', 'states', 'controls', 'results']);
   const CONTRACT_SCHEMA_TYPES = Object.freeze([
@@ -461,6 +469,11 @@
   function normalizeManifest(manifest) {
     if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
       fail('invalid_manifest', 'A mini-game manifest object is required');
+    }
+    for (const key of Object.keys(manifest)) {
+      if (!MANIFEST_TOP_LEVEL_FIELDS.has(key)) {
+        fail('invalid_manifest', 'manifest contains an unsupported field', { field: key });
+      }
     }
     const id = String(manifest.id || '').trim();
     const version = String(manifest.version || '').trim();
@@ -2203,25 +2216,18 @@
             error,
           });
         }
-        const waitingForStart = runtimePhase === 'starting' && !!runtimeStartSettlement;
-        const endRequest = runtime.end(
-          payload == null ? {} : payload,
-          { useBeacon: true },
-        ).catch(() => null);
-        if (!waitingForStart) {
-          client.dispose({ preserveRuntimeEnd: true });
-          return;
-        }
-
-        const setTimer = windowImpl.setTimeout?.bind(windowImpl) || globalThis.setTimeout;
-        const clearTimer = windowImpl.clearTimeout?.bind(windowImpl) || globalThis.clearTimeout;
-        const forceDisposeTimer = setTimer(() => {
-          client.dispose({ preserveRuntimeEnd: true });
-        }, PAGE_EXIT_START_SETTLEMENT_TIMEOUT_MS);
-        void endRequest.finally(() => {
-          clearTimer(forceDisposeTimer);
-          client.dispose({ preserveRuntimeEnd: true });
-        });
+        // Invoke the host transport directly: an unload handler cannot rely on
+        // a Promise continuation after an in-flight start settles. The
+        // same-origin host calls sendBeacon synchronously before this returns;
+        // the backend orders an early end against the matching start.
+        try {
+          const endRequest = transport.end(
+            payload == null ? {} : payload,
+            { useBeacon: true },
+          );
+          Promise.resolve(endRequest).catch(() => null);
+        } catch (_) { /* page exit remains best effort */ }
+        client.dispose({ preserveRuntimeEnd: true });
       };
       windowImpl.addEventListener?.('pagehide', pageExitHandler);
       windowImpl.addEventListener?.('beforeunload', pageExitHandler);

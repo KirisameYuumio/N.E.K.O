@@ -215,6 +215,17 @@
       catch (error) { windowImpl.console?.error?.(`[NekoMiniGameAvatarHost] ${operation} failed`, error); }
     }
 
+    function pendingMountDisposed(slot) {
+      fail('disposed', 'Avatar host was disposed while mounting', { slot });
+    }
+
+    function racePendingMount(operation, pendingState, slot) {
+      return Promise.race([
+        Promise.resolve(operation),
+        pendingState.disposal.then(() => pendingMountDisposed(slot)),
+      ]);
+    }
+
     function ensureController(raw, slot) {
       if (!raw || typeof raw !== 'object') {
         fail('invalid_renderer', `Avatar slot "${slot}" returned no controller`);
@@ -407,7 +418,9 @@
       }
       const viewport = measureViewport(config, descriptor);
       const abortController = typeof AbortControllerImpl === 'function' ? new AbortControllerImpl() : null;
-      const pendingState = { abortController };
+      let resolveDisposal = null;
+      const disposal = new Promise((resolve) => { resolveDisposal = resolve; });
+      const pendingState = { abortController, disposal, resolveDisposal };
       pending.set(slot, pendingState);
       let raw = null;
       let state = null;
@@ -440,7 +453,7 @@
           resolveOperationDisposal,
           pendingOperations: 0,
         };
-        await raw.setModel(config.model);
+        await racePendingMount(raw.setModel(config.model), pendingState, slot);
         await resizeState(state, 'mounted');
         if (disposed || abortController?.signal?.aborted) {
           fail('disposed', 'Avatar host was disposed while mounting', { slot });
@@ -464,7 +477,11 @@
       dispose() {
         if (disposed) return;
         disposed = true;
-        for (const pendingState of pending.values()) pendingState.abortController?.abort?.();
+        for (const pendingState of pending.values()) {
+          pendingState.abortController?.abort?.();
+          pendingState.resolveDisposal?.();
+          pendingState.resolveDisposal = null;
+        }
         for (const state of Array.from(active.values())) disposeState(state);
         hostWindowStates.clear();
         syncHostWindowListener();

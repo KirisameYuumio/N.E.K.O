@@ -281,6 +281,66 @@ async def test_soccer_route_start_enables_session_debug_log_under_route_locks(mo
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_route_end_before_start_consumes_exact_session_without_activation(monkeypatch):
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    with reset_game_route_state():
+        end_result = await gr_runtime._complete_game_end_from_payload(
+            "soccer",
+            {
+                "lanlan_name": "Lan",
+                "session_id": "page-exit-before-start",
+                "reason": "pagehide",
+            },
+        )
+        key = ("Lan", "soccer", "page-exit-before-start")
+        assert end_result["ok"] is True
+        assert key in gr_runtime._game_route_end_tombstones
+
+        start_result = await gr_runtime.game_route_start(
+            "soccer",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "page-exit-before-start",
+            }),
+        )
+
+        assert start_result == {
+            "ok": True,
+            "reason": "ended_before_start",
+            "state": {"game_route_active": False},
+        }
+        assert key not in gr_runtime._game_route_end_tombstones
+        assert gr_runtime._game_route_states == {}
+
+
+@pytest.mark.unit
+def test_route_end_before_start_tombstones_expire_and_stay_bounded(monkeypatch):
+    clock = {"now": 100.0}
+    patch_module_clock(monkeypatch, gr_runtime, monotonic=lambda: clock["now"])
+
+    with reset_game_route_state():
+        gr_runtime._remember_game_route_end_before_start("Lan", "soccer", "expired")
+        clock["now"] += gr_runtime._GAME_ROUTE_END_TOMBSTONE_TTL_SECONDS + 1
+        assert gr_runtime._consume_game_route_end_before_start(
+            "Lan", "soccer", "expired"
+        ) is False
+
+        for index in range(gr_runtime._GAME_ROUTE_END_TOMBSTONE_LIMIT + 1):
+            gr_runtime._remember_game_route_end_before_start(
+                "Lan",
+                "soccer",
+                f"bounded-{index}",
+            )
+
+        assert len(gr_runtime._game_route_end_tombstones) == (
+            gr_runtime._GAME_ROUTE_END_TOMBSTONE_LIMIT
+        )
+        assert ("Lan", "soccer", "bounded-0") not in gr_runtime._game_route_end_tombstones
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_icebreaker_is_rejected_from_game_route_start(monkeypatch):
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
 

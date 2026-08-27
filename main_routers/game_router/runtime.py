@@ -242,6 +242,52 @@ _SDK_GAME_MEMORY_MAX_BYTES = 256 * 1024
 _SDK_GAME_MEMORY_SUBMISSION_LIMIT = 16
 _SDK_GAME_SPEECH_PENDING_LIMIT = 4
 _SDK_GAME_SPEECH_PRELOAD_TIMEOUT_SECONDS = 300.0
+_GAME_ROUTE_END_TOMBSTONE_TTL_SECONDS = 120.0
+_GAME_ROUTE_END_TOMBSTONE_LIMIT = 256
+
+
+# A page-exit beacon can reach the backend before its already-dispatched
+# route/start request enters the activation lock. Keep a short, bounded marker
+# so that exact start is consumed instead of resurrecting a route after the
+# page is gone. Entries are removed on match, expiry, and capacity eviction.
+_game_route_end_tombstones: OrderedDict[tuple[str, str, str], float] = OrderedDict()
+
+
+def _prune_game_route_end_tombstones(now: float | None = None) -> None:
+    current = time.monotonic() if now is None else now
+    expired = [
+        key for key, expires_at in _game_route_end_tombstones.items()
+        if expires_at <= current
+    ]
+    for key in expired:
+        _game_route_end_tombstones.pop(key, None)
+    while len(_game_route_end_tombstones) > _GAME_ROUTE_END_TOMBSTONE_LIMIT:
+        _game_route_end_tombstones.popitem(last=False)
+
+
+def _remember_game_route_end_before_start(
+    lanlan_name: str,
+    game_type: str,
+    session_id: str,
+) -> None:
+    now = time.monotonic()
+    _prune_game_route_end_tombstones(now)
+    key = (str(lanlan_name or ""), str(game_type or ""), str(session_id or "default"))
+    _game_route_end_tombstones.pop(key, None)
+    _game_route_end_tombstones[key] = now + _GAME_ROUTE_END_TOMBSTONE_TTL_SECONDS
+    _prune_game_route_end_tombstones(now)
+
+
+def _consume_game_route_end_before_start(
+    lanlan_name: str,
+    game_type: str,
+    session_id: str,
+) -> bool:
+    now = time.monotonic()
+    _prune_game_route_end_tombstones(now)
+    key = (str(lanlan_name or ""), str(game_type or ""), str(session_id or "default"))
+    expires_at = _game_route_end_tombstones.pop(key, None)
+    return expires_at is not None and expires_at > now
 
 
 _EXTERNAL_VOICE_DEDUP_TTL_SECONDS = 30.0
@@ -1430,6 +1476,18 @@ async def game_route_start(game_type: str, request: Request):
     route_lock = _get_route_lock(lanlan_name, game_type)
     async with supersede_lock:
         async with route_lock:
+            if _consume_game_route_end_before_start(lanlan_name, game_type, session_id):
+                logger.info(
+                    "🎮 route/start 被先到达的页面退出请求抵消: game=%s session=%s lanlan=%s",
+                    game_type,
+                    session_id,
+                    lanlan_name,
+                )
+                return {
+                    "ok": True,
+                    "reason": "ended_before_start",
+                    "state": {"game_route_active": False},
+                }
             for old_state in [
                 candidate
                 for candidate in list(_game_route_states.values())
@@ -3369,6 +3427,23 @@ async def _complete_game_end_from_payload(
     exit_reason = str(data.get("reason") or default_reason)
     postgame_options = _normalize_postgame_options(data.get("postgameProactive"), reason=exit_reason)
     state = _get_active_game_route_state(lanlan_name, game_type) if lanlan_name else None
+    if lanlan_name and not (state and str(state.get("session_id") or "") == session_id):
+        # Serialize the no-match decision against route/start. If this end won
+        # the lock before activation, leave a bounded exact-session tombstone;
+        # if start won, adopt the now-active state and finalize it normally.
+        supersede_lock = _get_supersede_lock(lanlan_name)
+        end_route_lock = _get_route_lock(lanlan_name, game_type)
+        async with supersede_lock:
+            async with end_route_lock:
+                candidate = _get_active_game_route_state(lanlan_name, game_type)
+                if candidate and str(candidate.get("session_id") or "") == session_id:
+                    state = candidate
+                else:
+                    _remember_game_route_end_before_start(
+                        lanlan_name,
+                        game_type,
+                        session_id,
+                    )
     _append_game_session_debug_log(
         game_type,
         session_id,

@@ -542,6 +542,21 @@ async function main() {
   assert(quickLinesDependencyError?.code === 'invalid_manifest',
     'quick-lines was accepted without the dialogue capability');
 
+  let unknownManifestFieldError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'unknown-manifest-field',
+      version: '1',
+      requiredCapabilities: ['logging'],
+      undocumentedExtension: true,
+    }, { transport });
+  } catch (error) {
+    unknownManifestFieldError = error;
+  }
+  assert(unknownManifestFieldError?.code === 'invalid_manifest'
+    && unknownManifestFieldError?.details?.field === 'undocumentedExtension',
+  'runtime manifest validation did not reject an unknown top-level field');
+
   let versionError = null;
   try {
     await window.NekoMiniGame.connect({

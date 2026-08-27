@@ -419,6 +419,55 @@ async def test_game_speech_timeout_clears_pipeline_before_returning():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_stale_tts_teardown_preserves_new_runtime_speech_state():
+    mgr = _make_manager()
+    old_request_queue = _FakeQueue()
+    old_response_queue = _FakeQueue()
+    new_response_queue = _FakeQueue()
+    mgr.tts_response_queue = new_response_queue
+    completion = core_module.LLMSessionManager._begin_game_speech_completion_wait(
+        mgr,
+        "new-runtime-speech",
+    )
+    core_module.LLMSessionManager._remember_game_speech_correlation(
+        mgr,
+        "new-runtime-speech",
+        "new-runtime-correlation",
+    )
+
+    await core_module.LLMSessionManager._teardown_tts_runtime(
+        mgr,
+        None,
+        None,
+        old_request_queue,
+        old_response_queue,
+    )
+
+    assert mgr._game_speech_completion_waiter == (
+        "new-runtime-speech",
+        completion,
+    )
+    assert mgr._game_speech_correlation == (
+        "new-runtime-speech",
+        "new-runtime-correlation",
+    )
+    assert completion.done() is False
+
+    await core_module.LLMSessionManager._teardown_tts_runtime(
+        mgr,
+        None,
+        None,
+        mgr.tts_request_queue,
+        new_response_queue,
+    )
+
+    assert await completion is False
+    assert mgr._game_speech_completion_waiter is None
+    assert mgr._game_speech_correlation is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_tts_audio_done_resolves_game_speech_completion_slot():
     mgr = _make_manager()
     mgr.tts_response_queue = queue.Queue()
