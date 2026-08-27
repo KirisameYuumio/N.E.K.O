@@ -139,6 +139,27 @@ class TtsRuntimeMixin:
         if slot and not slot[1].done():
             slot[1].set_result(False)
 
+    def _remember_game_speech_correlation(self, speech_id: object, correlation_id: object) -> None:
+        speech_key = str(speech_id or "")
+        correlation_key = str(correlation_id or "")[:128]
+        self._game_speech_correlation = (
+            (speech_key, correlation_key)
+            if speech_key and correlation_key
+            else None
+        )
+
+    def _game_speech_correlation_for(self, speech_id: object) -> str:
+        slot = getattr(self, "_game_speech_correlation", None)
+        if not slot or slot[0] != str(speech_id or ""):
+            return ""
+        return slot[1]
+
+    def _clear_game_speech_correlation(self, speech_id: object | None = None) -> None:
+        slot = getattr(self, "_game_speech_correlation", None)
+        if speech_id is not None and slot and slot[0] != str(speech_id or ""):
+            return
+        self._game_speech_correlation = None
+
     async def _wait_for_game_speech_completion(
         self,
         speech_id: object,
@@ -795,6 +816,7 @@ class TtsRuntimeMixin:
         # 置回 True 的情况兜底，与这里要修的取消残留是两件事。
         self._tts_done_queued_for_turn = False
         self._cancel_game_speech_completion_wait()
+        self._clear_game_speech_correlation()
         GAME_SPEECH_AUDIO_CACHE.discard_owner(self)
         if self.tts_thread and self.tts_thread.is_alive():
             while not self.tts_response_queue.empty():
@@ -1093,6 +1115,7 @@ class TtsRuntimeMixin:
         concurrent start_session.
         """
         self._cancel_game_speech_completion_wait()
+        self._clear_game_speech_correlation()
         if handler_task_ref and not handler_task_ref.done():
             handler_task_ref.cancel()
             try:
@@ -1434,6 +1457,9 @@ class TtsRuntimeMixin:
                     "type": "audio_chunk",
                     "speech_id": effective_speech_id
                 }
+                correlation_id = self._game_speech_correlation_for(effective_speech_id)
+                if correlation_id:
+                    header["sdk_speech_correlation_id"] = correlation_id
                 playback_gain = self.speech_playback_gain(effective_speech_id)
                 if playback_gain != 1.0:
                     header["playback_gain"] = playback_gain
@@ -1476,10 +1502,14 @@ class TtsRuntimeMixin:
             return False
         try:
             if self.websocket and hasattr(self.websocket, 'client_state') and self.websocket.client_state == self.websocket.client_state.CONNECTED:
-                await self.websocket.send_json({
+                message = {
                     "type": "audio_done",
                     "speech_id": speech_id
-                })
+                }
+                correlation_id = self._game_speech_correlation_for(speech_id)
+                if correlation_id:
+                    message["sdk_speech_correlation_id"] = correlation_id
+                await self.websocket.send_json(message)
                 logger.debug(f"🔚 send_audio_done OK: speech_id={speech_id}")
                 return True
             else:
@@ -1495,6 +1525,7 @@ class TtsRuntimeMixin:
         finally:
             # The stream lifecycle is over even when the client disconnected.
             self.release_speech_playback_gain(speech_id)
+            self._clear_game_speech_correlation(speech_id)
 
     async def tts_response_handler(self):
         q = self.tts_response_queue

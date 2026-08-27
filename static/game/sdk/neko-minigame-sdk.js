@@ -67,6 +67,7 @@
   const DEFAULT_HEARTBEAT_TIMEOUT_MS = 4500;
   const DEFAULT_OUTPUT_INTERVAL_MS = 700;
   const DEFAULT_OUTPUT_TIMEOUT_MS = 8000;
+  const PAGE_EXIT_START_SETTLEMENT_TIMEOUT_MS = 65000;
   const RUNTIME_EVENT_PATTERN = /^[a-z][a-z0-9:-]{0,63}$/;
   const CONTRACT_KINDS = Object.freeze(['events', 'states', 'controls', 'results']);
   const CONTRACT_SCHEMA_TYPES = Object.freeze([
@@ -1559,6 +1560,11 @@
     return Object.freeze({
       active: raw.active === true,
       speechId: boundedSpeechString(raw.speechId || raw.speech_id, 'speech playback id', 128),
+      correlationId: boundedSpeechString(
+        raw.correlationId || raw.correlation_id || raw.sdk_speech_correlation_id,
+        'speech playback correlation id',
+        128,
+      ),
       turnId: boundedSpeechString(raw.turnId || raw.turn_id, 'speech turn id', 128),
       playbackTurnId: boundedSpeechString(
         raw.playbackTurnId || raw.playback_turn_id,
@@ -1672,6 +1678,8 @@
     let speechPlaybackRawState = null;
     let speechPlaybackTransportSource = '';
     const speechRequestMetadata = new Map();
+    const speechCorrelationMetadata = new Map();
+    let speechCorrelationSequence = 0;
     const speechPendingRequests = new Set();
     const speechPreloadPendingRequests = new Set();
     const protocolPendingRequests = new Set();
@@ -1696,6 +1704,8 @@
     const localLeaderboardClientId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
     let runtimePhase = 'idle';
     let runtimeRouteEstablished = false;
+    let runtimeStartSettlement = null;
+    let runtimeEndWaitingForStart = false;
     let runtimeEventSequence = 0;
     let runtimeConfig = null;
 
@@ -1981,6 +1991,32 @@
       runtimeOperation.externalAbortHandler = null;
     }
 
+    async function waitForRuntimeStartSettlement(requestOptions = {}) {
+      const settlement = runtimeStartSettlement;
+      if (!settlement) return;
+      const signal = requestOptions?.signal || null;
+      if (signal?.aborted) {
+        fail('cancelled', 'The runtime end request was cancelled', { operation: 'runtime.end' });
+      }
+      let abortHandler = null;
+      try {
+        await Promise.race([
+          settlement.promise,
+          new Promise((_, reject) => {
+            if (!signal?.addEventListener) return;
+            abortHandler = () => reject(new NekoMiniGameError(
+              'cancelled',
+              'The runtime end request was cancelled',
+              { operation: 'runtime.end' },
+            ));
+            signal.addEventListener('abort', abortHandler, { once: true });
+          }),
+        ]);
+      } finally {
+        signal?.removeEventListener?.('abort', abortHandler);
+      }
+    }
+
     function isRuntimeOperationCurrent(entry) {
       return !!entry && !disposed && runtimeOperation.controller === entry.controller;
     }
@@ -2167,8 +2203,25 @@
             error,
           });
         }
-        void runtime.end(payload == null ? {} : payload, { useBeacon: true }).catch(() => null);
-        client.dispose({ preserveRuntimeEnd: true });
+        const waitingForStart = runtimePhase === 'starting' && !!runtimeStartSettlement;
+        const endRequest = runtime.end(
+          payload == null ? {} : payload,
+          { useBeacon: true },
+        ).catch(() => null);
+        if (!waitingForStart) {
+          client.dispose({ preserveRuntimeEnd: true });
+          return;
+        }
+
+        const setTimer = windowImpl.setTimeout?.bind(windowImpl) || globalThis.setTimeout;
+        const clearTimer = windowImpl.clearTimeout?.bind(windowImpl) || globalThis.clearTimeout;
+        const forceDisposeTimer = setTimer(() => {
+          client.dispose({ preserveRuntimeEnd: true });
+        }, PAGE_EXIT_START_SETTLEMENT_TIMEOUT_MS);
+        void endRequest.finally(() => {
+          clearTimer(forceDisposeTimer);
+          client.dispose({ preserveRuntimeEnd: true });
+        });
       };
       windowImpl.addEventListener?.('pagehide', pageExitHandler);
       windowImpl.addEventListener?.('beforeunload', pageExitHandler);
@@ -2214,6 +2267,18 @@
       }
     }
 
+    function beginSpeechCorrelation(metadata) {
+      speechCorrelationSequence = (speechCorrelationSequence % Number.MAX_SAFE_INTEGER) + 1;
+      const correlationId = `sdk-speech-${Date.now().toString(36)}-${speechCorrelationSequence.toString(36)}`;
+      speechCorrelationMetadata.set(correlationId, Object.freeze({ ...(metadata || {}) }));
+      while (speechCorrelationMetadata.size > MAX_SPEECH_REQUEST_METADATA) {
+        const oldestKey = speechCorrelationMetadata.keys().next().value;
+        if (oldestKey === undefined) break;
+        speechCorrelationMetadata.delete(oldestKey);
+      }
+      return correlationId;
+    }
+
     function currentSpeechPlaybackState() {
       const speechId = String(
         speechPlaybackRawState?.speechId || speechPlaybackRawState?.speech_id || '',
@@ -2230,7 +2295,15 @@
         const transportSource = safeSpeechTransportSource(source);
         const boundedRawState = sanitizeSpeechPlaybackRawState(rawState);
         const speechId = String(boundedRawState?.speechId || '');
-        const metadata = speechRequestMetadata.get(speechId) || null;
+        const correlationId = String(boundedRawState?.correlationId || '');
+        const correlatedMetadata = correlationId
+          ? speechCorrelationMetadata.get(correlationId) || null
+          : null;
+        if (correlatedMetadata && speechId) {
+          rememberSpeechRequest(speechId, correlatedMetadata);
+          speechCorrelationMetadata.delete(correlationId);
+        }
+        const metadata = speechRequestMetadata.get(speechId) || correlatedMetadata;
         const normalized = normalizeSpeechPlaybackState(boundedRawState, transportSource, metadata);
         speechPlaybackRawState = boundedRawState;
         speechPlaybackTransportSource = transportSource;
@@ -2724,6 +2797,7 @@
         abortManagedRequests(serverLeaderboardPendingRequests, 'cancelled');
         abortPendingSpeechRequests('cancelled');
         speechRequestMetadata.clear();
+        speechCorrelationMetadata.clear();
         speechPlaybackRawState = null;
         speechPlaybackTransportSource = '';
         pageExitDispatched = false;
@@ -2768,6 +2842,12 @@
         stopRuntimeMonitoring();
         startPageExitLifecycle();
         const operation = beginRuntimeOperation('start', requestOptions);
+        let resolveStartSettlement;
+        const startSettlement = {
+          promise: new Promise((resolve) => { resolveStartSettlement = resolve; }),
+          resolve: () => resolveStartSettlement?.(),
+        };
+        runtimeStartSettlement = startSettlement;
         setRuntimePhase('starting', 'start-request');
         try {
           const response = await normalizeTransportResponse(await transport.start(
@@ -2814,10 +2894,24 @@
           throw normalizedError;
         } finally {
           finishRuntimeOperation(operation);
+          startSettlement.resolve();
+          if (runtimeStartSettlement === startSettlement) runtimeStartSettlement = null;
         }
       },
       async end(payload = {}, requestOptions = {}) {
         requireCapability('runtime', 'runtime.end');
+        if (runtimePhase === 'starting' && runtimeStartSettlement) {
+          if (runtimeEndWaitingForStart) {
+            fail('busy', 'The runtime lifecycle is already waiting to end');
+          }
+          runtimeEndWaitingForStart = true;
+          try {
+            await waitForRuntimeStartSettlement(requestOptions);
+          } finally {
+            runtimeEndWaitingForStart = false;
+          }
+          ensureActive('runtime.end');
+        }
         if (runtimePhase === 'ending') {
           fail('busy', 'The runtime lifecycle is already ending');
         }
@@ -3632,7 +3726,6 @@
       get pendingCount() { return dialoguePendingRequests.size; },
       async quickLines(payload = {}, requestOptions = {}) {
         requireCapability('quick-lines', 'dialogue.quickLines');
-        requireActiveRuntimeRoute('dialogue.quickLines');
         if (typeof transport.getQuickLines !== 'function') {
           fail('transport_unavailable', 'The host does not support dialogue quick lines');
         }
@@ -3804,6 +3897,12 @@
         fail('transport_unavailable', 'The host speech output bridge is unavailable');
       }
       const request = normalizeSpeechRequest(requestInput);
+      const speechMetadata = Object.freeze({
+        priority: request.priority,
+        requestId: request.requestId,
+        eventKey: request.eventKey,
+      });
+      let correlationId = '';
       const session = runtimeSession();
       const payload = Object.freeze({
         line: request.text,
@@ -3821,25 +3920,43 @@
         ...(request.renderLanguage ? { render_language: request.renderLanguage } : {}),
         event: request.event,
       });
-      const response = await normalizeTransportResponse(await performManagedHostRequest({
-        operation: 'speech.speak',
-        pendingSet: speechPendingRequests,
-        limit: MAX_SPEECH_PENDING_REQUESTS,
-        timeoutMs: DEFAULT_SPEECH_REQUEST_TIMEOUT_MS,
-        requestOptions,
-        invoke: (options) => transport.requestSpeechOutput(payload, options),
-      }));
-      const speechId = boundedSpeechString(
-        response.data?.speech_id || response.data?.speechId,
-        'speech response id',
-        128,
-      );
-      if (speechId) {
-        rememberSpeechRequest(speechId, {
-          priority: request.priority,
-          requestId: request.requestId,
-          eventKey: request.eventKey,
-        });
+      let response;
+      try {
+        response = await normalizeTransportResponse(await performManagedHostRequest({
+          operation: 'speech.speak',
+          pendingSet: speechPendingRequests,
+          limit: MAX_SPEECH_PENDING_REQUESTS,
+          timeoutMs: DEFAULT_SPEECH_REQUEST_TIMEOUT_MS,
+          requestOptions,
+          invoke: (options) => {
+            correlationId = beginSpeechCorrelation(speechMetadata);
+            return transport.requestSpeechOutput(Object.freeze({
+              ...payload,
+              sdk_speech_correlation_id: correlationId,
+            }), options);
+          },
+        }));
+      } catch (error) {
+        speechCorrelationMetadata.delete(correlationId);
+        throw error;
+      }
+      let speechId;
+      try {
+        speechId = boundedSpeechString(
+          response.data?.speech_id || response.data?.speechId,
+          'speech response id',
+          128,
+        );
+      } catch (error) {
+        speechCorrelationMetadata.delete(correlationId);
+        throw error;
+      }
+      const pendingMetadata = speechCorrelationMetadata.get(correlationId) || null;
+      if (speechId && pendingMetadata) {
+        rememberSpeechRequest(speechId, pendingMetadata);
+        speechCorrelationMetadata.delete(correlationId);
+      } else if (response.ok === false || response.data?.audio_sent === false) {
+        speechCorrelationMetadata.delete(correlationId);
       }
       return response;
     }
@@ -4255,6 +4372,7 @@
         speechPlaybackRawState = null;
         speechPlaybackTransportSource = '';
         speechRequestMetadata.clear();
+        speechCorrelationMetadata.clear();
         for (const controllerState of Array.from(audioControllers)) {
           disposeAudioController(controllerState);
         }

@@ -1488,6 +1488,7 @@
         S.assistantTurnCompletionSource = null;
         clearPendingAssistantTurnStart();
         S.currentPlayingSpeechId = null;
+        S.currentPlayingSpeechCorrelationId = '';
         S.interruptedSpeechId = null;
         S.pendingDecoderReset = false;
         S.skipNextAudioBlob = false;
@@ -2832,7 +2833,14 @@
                             S.pendingDecoderReset = false;
                         }
                         S.currentPlayingSpeechId = speechId;
+                        S.currentPlayingSpeechCorrelationId = String(
+                            response.sdk_speech_correlation_id || ''
+                        );
                         S.interruptedSpeechId = null;
+                    } else if (speechId && response.sdk_speech_correlation_id) {
+                        S.currentPlayingSpeechCorrelationId = String(
+                            response.sdk_speech_correlation_id
+                        );
                     }
 
                     S.pendingAudioChunkMetaQueue.push({

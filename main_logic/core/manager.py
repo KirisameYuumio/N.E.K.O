@@ -131,6 +131,9 @@ class LLMSessionManager(
         # one completion slot.  The slot is resolved by audio_done and cleared
         # on timeout, interruption, or teardown, so it cannot grow per request.
         self._game_speech_completion_waiter: tuple[str, asyncio.Future] | None = None
+        # Exact SDK playback correlation for the one serialized audible game
+        # speech.  Cleared with audio_done, interruption, or TTS teardown.
+        self._game_speech_correlation: tuple[str, str] | None = None
         self._speech_output_total = 0  # diagnostic: chunks actually sent to frontend playback
         self._last_speech_output_time = 0.0
         self._last_speech_output_bytes = 0

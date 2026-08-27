@@ -2100,6 +2100,7 @@ async def _speak_game_line_via_project_tts(
     playback_gain: float = 1.0,
     reuse_synthesized_audio: bool = False,
     event: dict | None = None,
+    speech_correlation_id: str = "",
 ) -> Dict[str, Any]:
     speak = getattr(mgr, "mirror_assistant_speech", None)
     if not callable(speak):
@@ -2123,6 +2124,7 @@ async def _speak_game_line_via_project_tts(
             reuse_synthesized_audio=reuse_synthesized_audio,
             wait_for_audio_completion=True,
             audio_completion_timeout=45.0,
+            speech_correlation_id=speech_correlation_id,
         )
     except Exception as exc:
         return {
@@ -2230,13 +2232,11 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
     if not line:
         return {"ok": False, "reason": "missing_line"}
 
-    lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
-    if not lanlan_name:
-        return {"ok": False, "reason": "missing_lanlan_name"}
-
-    session_id = str(data.get("session_id") or "")
-    state = _get_active_game_route_state(lanlan_name, game_type)
-    if not state:
+    lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
+        game_type,
+        data,
+    )
+    if route_error:
         closed_response = _game_route_closed_session_response(
             data,
             session_id=session_id,
@@ -2245,14 +2245,20 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
         )
         if closed_response:
             return closed_response
-    stale_response = _game_route_stale_session_response(
-        state,
-        session_id,
-        lanlan_name=lanlan_name,
-        method="project_text_mirror",
-    )
-    if stale_response:
-        return stale_response
+        stale_response = _game_route_stale_session_response(
+            state,
+            session_id,
+            lanlan_name=lanlan_name,
+            method="project_text_mirror",
+        )
+        if stale_response:
+            return stale_response
+        return {
+            **route_error,
+            "mirrored": False,
+            "lanlan_name": lanlan_name,
+            "method": "project_text_mirror",
+        }
     _absorb_request_language(data, lanlan_name)
     mgr = get_session_manager().get(lanlan_name)
     if not mgr:
@@ -2431,6 +2437,9 @@ async def game_project_speak(game_type: str, request: Request):
                         interrupt_audio=interrupt_audio,
                         playback_gain=playback_gain,
                         reuse_synthesized_audio=reuse_synthesized_audio,
+                        speech_correlation_id=str(
+                            data.get("sdk_speech_correlation_id") or ""
+                        )[:128],
                         event=_attach_game_memory_flag_to_event(
                             data.get("event") if isinstance(data.get("event"), dict) else {},
                             state,

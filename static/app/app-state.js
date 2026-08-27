@@ -70,6 +70,7 @@
         // --- Audio (打断/解码) ---
         interruptedSpeechId: null,
         currentPlayingSpeechId: null,
+        currentPlayingSpeechCorrelationId: '',
         pendingDecoderReset: false,
         skipNextAudioBlob: false,
         incomingAudioBlobQueue: [],

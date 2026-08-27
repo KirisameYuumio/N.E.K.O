@@ -172,6 +172,30 @@ async def test_per_speech_gain_is_forwarded_and_released_when_stream_closes():
     assert mgr.speech_playback_gain("sid-boost") == 1.0
 
 
+async def test_game_speech_correlation_is_forwarded_and_released_with_stream():
+    ws = _RecordingWebsocket()
+    mgr = _make_mgr(ws)
+    mgr._remember_game_speech_correlation("sid-game", "sdk-speech-correlation-1")
+
+    assert await mgr.send_speech(b"pcm", "sid-game") is True
+    assert await mgr.send_audio_done("sid-game") is True
+
+    assert ws.calls == [
+        ("json", {
+            "type": "audio_chunk",
+            "speech_id": "sid-game",
+            "sdk_speech_correlation_id": "sdk-speech-correlation-1",
+        }),
+        ("bytes", b"pcm"),
+        ("json", {
+            "type": "audio_done",
+            "speech_id": "sid-game",
+            "sdk_speech_correlation_id": "sdk-speech-correlation-1",
+        }),
+    ]
+    assert mgr._game_speech_correlation is None
+
+
 def test_per_speech_gain_registry_has_a_hard_capacity_and_clear_path():
     mgr = _make_mgr(_RecordingWebsocket())
     max_items = 32

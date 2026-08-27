@@ -1725,6 +1725,7 @@ class TurnMixin:
         reuse_synthesized_audio: bool = False,
         wait_for_audio_completion: bool = False,
         audio_completion_timeout: float = 45.0,
+        speech_correlation_id: str = "",
     ) -> dict:
         """Mirror an assistant line + play it through the project TTS pipeline.
 
@@ -1791,6 +1792,8 @@ class TurnMixin:
                 cache_for_new_session=False,
             )
 
+        self._remember_game_speech_correlation(turn_id, speech_correlation_id)
+
         if cached_chunks is not None:
             audio_sent = bool(cached_chunks)
             for audio_chunk in cached_chunks:
@@ -1856,6 +1859,7 @@ class TurnMixin:
         except BaseException:
             if completion_future is not None:
                 self._cancel_game_speech_completion_wait()
+            self._clear_game_speech_correlation(turn_id)
             raise
 
         audio_completed = False
@@ -1878,6 +1882,7 @@ class TurnMixin:
                 await self._clear_tts_pipeline()
         elif completion_future is not None:
             self._cancel_game_speech_completion_wait()
+            self._clear_game_speech_correlation(turn_id)
 
         return {
             "ok": not (wait_for_audio_completion and audio_queued and not audio_completed),

@@ -29,6 +29,7 @@ async function main() {
   let ignoreSpeechAbortMode = false;
   let ignorePreloadAbortMode = false;
   let malformedResponseId = false;
+  let stateBeforeResponseMode = false;
   const speechCalls = [];
   const mirrorCalls = [];
   const preloadCalls = [];
@@ -100,9 +101,30 @@ async function main() {
     requestSpeechOutput(payload, options = {}) {
       speechCalls.push({ payload, options });
       if (!pendingMode) {
+        const speechId = malformedResponseId ? 'x'.repeat(129) : `speech-${nextSpeechId++}`;
+        if (stateBeforeResponseMode) {
+          bridgeOptions.onState({
+            type: 'speech_playback_state',
+            active: true,
+            speech_id: speechId,
+            sdk_speech_correlation_id: payload.sdk_speech_correlation_id,
+            remaining_seconds: 1,
+            updated_at: Date.now(),
+            source: 'project-tts',
+          }, 'window_event');
+          bridgeOptions.onState({
+            type: 'speech_playback_state',
+            active: false,
+            speech_id: speechId,
+            sdk_speech_correlation_id: payload.sdk_speech_correlation_id,
+            remaining_seconds: 0,
+            updated_at: Date.now(),
+            source: 'project-tts',
+          }, 'window_event');
+        }
         return Promise.resolve({
           ok: true,
-          speech_id: malformedResponseId ? 'x'.repeat(129) : `speech-${nextSpeechId++}`,
+          speech_id: speechId,
           audio_sent: true,
         });
       }
@@ -184,6 +206,8 @@ async function main() {
   assert(firstCall.payload.reuse_synthesized_audio === true,
     'speech audio reuse opt-in was not forwarded');
   assert(firstCall.payload.event.kind === 'goal', 'bounded speech event data was not forwarded');
+  assert(/^sdk-speech-/.test(firstCall.payload.sdk_speech_correlation_id),
+    'speech request did not receive an SDK-owned playback correlation id');
   assert(firstCall.options.signal instanceof AbortSignal,
     'speech request did not receive an SDK-owned AbortSignal');
 
@@ -247,6 +271,32 @@ async function main() {
   assert(mappedState.eventKey === 'goal:happy', 'speech event key was not retained');
   assert(mappedState.ignored_large_field === undefined,
     'unknown host playback fields escaped the bounded public state');
+
+  stateBeforeResponseMode = true;
+  const beforeResponseStateStart = states.length;
+  const earlyStateResponse = await game.speech.speak({
+    text: '播放状态先于 HTTP 响应',
+    requestId: 'early-state-request',
+    eventKey: 'early-state-event',
+    priority: 8,
+  });
+  stateBeforeResponseMode = false;
+  const earlyStates = states.slice(beforeResponseStateStart);
+  assert(earlyStateResponse.ok && earlyStates.length === 2,
+    'pre-response playback states were not delivered');
+  assert(earlyStates.every((state) => state.priority === 8
+    && state.requestId === 'early-state-request'
+    && state.eventKey === 'early-state-event'),
+  'pre-response playback states lost their exact request metadata');
+  bridgeOptions.onState({
+    type: 'speech_playback_state',
+    active: true,
+    speech_id: earlyStateResponse.data.speech_id,
+    remaining_seconds: 1,
+    updated_at: Date.now(),
+  }, 'window_event');
+  assert(states.at(-1).priority === null && states.at(-1).requestId === '',
+    'terminal playback state was reinserted as stale metadata after the HTTP response');
 
   bridgeOptions.onState({
     active: true,
@@ -363,7 +413,10 @@ async function main() {
     'timed-out speech request was retained in the pending set');
 
   ignoreSpeechAbortMode = true;
-  const pending = [game.speech.speak({ text: 'dispose while transport ignores abort' })
+  const pending = [game.speech.speak({
+    text: 'dispose while transport ignores abort',
+    requestId: 'pending-correlation-owner',
+  })
     .then(() => null, (error) => error)];
   ignoreSpeechAbortMode = false;
   pending.push(...Array.from({ length: 3 }, (_, index) => (
@@ -375,6 +428,17 @@ async function main() {
   try { await game.speech.speak({ text: 'fifth pending request' }); }
   catch (error) { busyError = error; }
   assert(busyError?.code === 'busy', 'speech pending request limit was not enforced');
+  const firstPendingCall = speechCalls.at(-4);
+  bridgeOptions.onState({
+    type: 'speech_playback_state',
+    active: true,
+    speech_id: 'pending-correlation-speech',
+    sdk_speech_correlation_id: firstPendingCall.payload.sdk_speech_correlation_id,
+    remaining_seconds: 1,
+    updated_at: Date.now(),
+  }, 'window_event');
+  assert(states.at(-1).requestId === 'pending-correlation-owner',
+    'a rejected fifth request evicted metadata for an accepted pending speech request');
 
   game.dispose();
   const pendingErrors = await Promise.all(pending);

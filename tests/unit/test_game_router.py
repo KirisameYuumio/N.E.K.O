@@ -5670,6 +5670,7 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
                 "session_id": "match_1",
                 "request_id": "req-2",
                 "render_language": "ja",
+                "sdk_speech_correlation_id": "sdk-correlation-1",
             }),
         )
 
@@ -5694,6 +5695,7 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
         "reuse_synthesized_audio": False,
         "wait_for_audio_completion": True,
         "audio_completion_timeout": 45.0,
+        "speech_correlation_id": "sdk-correlation-1",
     })]
 
 
@@ -5735,6 +5737,7 @@ async def test_project_speak_can_skip_text_mirror_for_frontend_arbiter(monkeypat
         "reuse_synthesized_audio": False,
         "wait_for_audio_completion": True,
         "audio_completion_timeout": 45.0,
+        "speech_correlation_id": "",
     })]
 
 
@@ -5777,6 +5780,7 @@ async def test_project_speak_forwards_interrupt_audio(monkeypatch):
         "reuse_synthesized_audio": False,
         "wait_for_audio_completion": True,
         "audio_completion_timeout": 45.0,
+        "speech_correlation_id": "",
     })]
 
 
@@ -6052,6 +6056,12 @@ async def test_project_mirror_assistant_uses_text_only_mirror(monkeypatch):
     mgr = _FakeGameRouteManager()
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+    route_state = {"game_route_active": True, "session_id": "match_1", "lanlan_name": "Lan"}
+    _gr_patch_all(
+        monkeypatch,
+        "_sdk_active_route_from_payload",
+        lambda _game_type, _data: ("Lan", "match_1", route_state, None),
+    )
 
     result = await gr_runtime.game_project_mirror_assistant(
         "soccer",
@@ -6068,12 +6078,14 @@ async def test_project_mirror_assistant_uses_text_only_mirror(monkeypatch):
     assert result["ok"] is True
     assert result["method"] == "project_text_mirror"
     assert mgr.render_language_at_mirror == ["ja"]
+    mirrored_event = mgr.assistant_mirrored[0][1]["metadata"]["mirror"]["event"]
+    assert mirrored_event["soccer_game_memory_enabled"] is False
     assert mgr.assistant_mirrored == [("文字先进入主聊天窗", {
         "metadata": {
             "source": "game-llm-result",
             "kind": "soccer",
             "session_id": "match_1",
-            "mirror": {"kind": "soccer", "session_id": "match_1", "event": {}},
+            "mirror": {"kind": "soccer", "session_id": "match_1", "event": mirrored_event},
         },
         "request_id": "req-mirror",
         "turn_id": "turn-mirror",
@@ -6145,10 +6157,41 @@ async def test_project_mirror_assistant_rejects_closed_game_route_output(monkeyp
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_project_mirror_assistant_rejects_inactive_route_without_side_effects(monkeypatch):
+    with reset_game_route_state():
+        mgr = _FakeGameRouteManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+        result = await gr_runtime.game_project_mirror_assistant(
+            "soccer",
+            _FakeRequest({
+                "line": "route 已结束后不应镜像",
+                "session_id": "inactive-session",
+                "lanlan_name": "Lan",
+                "source": "game",
+            }),
+        )
+
+        assert result["ok"] is False
+        assert result["reason"] == "game_route_inactive"
+        assert result["method"] == "project_text_mirror"
+        assert result["mirrored"] is False
+        assert mgr.assistant_mirrored == []
+        assert mgr.spoken == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_project_mirror_assistant_finalizes_user_reply_by_default(monkeypatch):
     mgr = _FakeGameRouteManager()
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
     _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+    route_state = {"game_route_active": True, "session_id": "match_1", "lanlan_name": "Lan"}
+    _gr_patch_all(
+        monkeypatch,
+        "_sdk_active_route_from_payload",
+        lambda _game_type, _data: ("Lan", "match_1", route_state, None),
+    )
 
     result = await gr_runtime.game_project_mirror_assistant(
         "soccer",
@@ -6165,6 +6208,10 @@ async def test_project_mirror_assistant_finalizes_user_reply_by_default(monkeypa
     )
 
     assert result["ok"] is True
+    mirrored_event = mgr.assistant_mirrored[0][1]["metadata"]["mirror"]["event"]
+    assert mirrored_event["kind"] == "user-text"
+    assert mirrored_event["hasUserText"] is True
+    assert mirrored_event["soccer_game_memory_enabled"] is False
     assert mgr.assistant_mirrored == [("听见啦，我会放慢一点。", {
         "metadata": {
             "source": "game-llm-result",
@@ -6173,7 +6220,7 @@ async def test_project_mirror_assistant_finalizes_user_reply_by_default(monkeypa
             "mirror": {
                 "kind": "soccer",
                 "session_id": "match_1",
-                "event": {"kind": "user-text", "hasUserText": True},
+                "event": mirrored_event,
             },
         },
         "request_id": "req-user-reply",

@@ -402,6 +402,7 @@ async function main() {
   const blockedTransitionStart = deferred();
   const blockedTransitionEnd = deferred();
   let transitionStartAborted = false;
+  let transitionEndCalls = 0;
   const transitionTransport = {
     ...transport,
     logger: logger(),
@@ -415,7 +416,7 @@ async function main() {
       }, { once: true });
       return blockedTransitionStart.promise;
     },
-    end() { return blockedTransitionEnd.promise; },
+    end() { transitionEndCalls += 1; return blockedTransitionEnd.promise; },
     async heartbeat() { return { ok: true, active: true }; },
     async drain() { return { ok: true, outputs: [] }; },
     dispose() {},
@@ -435,15 +436,22 @@ async function main() {
     outputs: { intervalMs: 700, timeoutMs: 8000 },
     pageExit: false,
   });
-  const supersededStart = transitionGame.runtime.start({}).catch((error) => error);
+  const supersededStart = transitionGame.runtime.start({});
   await Promise.resolve();
   const transitionEnd = transitionGame.runtime.end({});
-  const supersededStartError = await supersededStart;
   await Promise.resolve();
-  assert(transitionStartAborted && supersededStartError.code === 'cancelled',
-    'ending did not cancel the in-flight start request');
+  assert(!transitionStartAborted && transitionEndCalls === 0,
+    'runtime end overtook or cancelled the in-flight start request');
+  blockedTransitionStart.resolve({
+    ok: true,
+    state: { game_route_active: true, session_id: 'transition-session' },
+  });
+  await supersededStart;
+  await new Promise((resolve) => setImmediate(resolve));
   assert(transitionGame.runtime.state === 'ending',
-    'cancelled start completion overwrote the newer ending state');
+    'runtime end did not begin after the start request settled');
+  assert(transitionEndCalls === 1,
+    'runtime end was not sent exactly once after start settlement');
   assert(transitionEnvironment.intervals.size === 0,
     'cancelled start completion restarted runtime monitoring');
   blockedTransitionEnd.resolve({ ok: true });
@@ -485,6 +493,7 @@ async function main() {
   const staleEnd = staleSuccessGame.runtime.end({});
   blockedStaleStart.resolve({ ok: true, state: { game_route_active: true, lanlan_name: 'stale' } });
   await staleStart;
+  await new Promise((resolve) => setImmediate(resolve));
   assert(staleSuccessGame.runtime.state === 'ending' && staleSuccessEnvironment.intervals.size === 0,
     'stale successful start completion replaced the newer lifecycle state');
   blockedStaleEnd.resolve({ ok: true });
@@ -587,13 +596,19 @@ async function main() {
     outputs: false,
     pageExit: true,
   });
-  const rejectedStart = startingExitGame.runtime.start({}).catch((error) => error);
+  const pageExitStart = startingExitGame.runtime.start({});
   await Promise.resolve();
   startingExitEnvironment.windowImpl.dispatch('pagehide');
-  const startError = await rejectedStart;
   await Promise.resolve();
-  assert(startAborted && startError.code === 'cancelled',
-    'page exit did not cancel an in-flight runtime start');
+  assert(!startAborted && startingExitEndCalls === 0 && !startingExitGame.disposed,
+    'page exit overtook or cancelled an in-flight runtime start');
+  blockedStart.resolve({
+    ok: true,
+    state: { game_route_active: true, session_id: 'starting-exit' },
+  });
+  await pageExitStart;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(!startAborted, 'page exit cancelled the route start before serialized end');
   assert(startingExitEndCalls === 1 && startingExitGame.disposed,
     'page exit during runtime start did not end and dispose exactly once');
   assert(startingExitEnvironment.windowListeners.size === 0,
@@ -653,7 +668,6 @@ async function main() {
   await routeTruthGame.runtime.start({});
   const activeOnlyCalls = [
     () => routeTruthGame.dialogue.request({ event: 'after-rejected-start' }),
-    () => routeTruthGame.dialogue.quickLines({ kind: 'goal' }),
     () => routeTruthGame.speech.speak({ text: 'after rejected start' }),
     () => routeTruthGame.speech.mirror({ text: 'after rejected start' }),
     () => routeTruthGame.memory.submit({ summary: 'after rejected start' }),
@@ -664,9 +678,10 @@ async function main() {
     assert(routeError?.code === 'invalid_state',
       'a rejected runtime start permitted an active-route capability');
   }
-  assert(dialogueCalls === 0 && quickLineCalls === 0 && speechCalls === 0
+  await routeTruthGame.dialogue.quickLines({ kind: 'pregame-after-rejected-start' });
+  assert(dialogueCalls === 0 && quickLineCalls === 1 && speechCalls === 0
     && speechMirrorCalls === 0 && memorySubmitCalls === 0,
-  'a rejected runtime start reached an active-route transport');
+  'a rejected runtime start leaked route-bound work or blocked pre-route quick lines');
 
   routeStartMode = 'throw';
   let failedStartError = null;
@@ -678,6 +693,7 @@ async function main() {
     assert(routeError?.code === 'invalid_state',
       'a failed runtime start permitted an active-route capability');
   }
+  await routeTruthGame.dialogue.quickLines({ kind: 'pregame-after-failed-start' });
 
   routeStartMode = 'active';
   await routeTruthGame.runtime.start({});
@@ -689,7 +705,7 @@ async function main() {
   await routeTruthGame.speech.speak({ text: 'after rejected end' });
   await routeTruthGame.speech.mirror({ text: 'after rejected end' });
   await routeTruthGame.memory.submit({ summary: 'after rejected end' });
-  assert(dialogueCalls === 1 && quickLineCalls === 1 && speechCalls === 1
+  assert(dialogueCalls === 1 && quickLineCalls === 3 && speechCalls === 1
     && speechMirrorCalls === 1 && memorySubmitCalls === 1,
     'a failed runtime end discarded a route that may still be active');
   const startsBeforeInvalidRetry = routeStartCalls;

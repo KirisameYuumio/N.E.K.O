@@ -459,6 +459,7 @@
             type: 'speech_playback_state',
             active: remaining > 0.05 || S.scheduledSources.length > 0 || S.audioBufferQueue.length > 0 || pendingAudioWork,
             speechId: S.currentPlayingSpeechId || null,
+            correlationId: S.currentPlayingSpeechCorrelationId || '',
             turnId: S.assistantSpeechActiveTurnId || S.assistantTurnId || null,
             playbackTurnId: S.assistantSpeechPlaybackTurnId || null,
             playbackStartAudioTime: Number.isFinite(S.assistantSpeechPlaybackStartAudioTime) ? S.assistantSpeechPlaybackStartAudioTime : 0,
@@ -635,6 +636,7 @@
             S.incomingAudioBlobQueue.length === 0 &&
             !S.assistantSpeechActiveTurnId) {
             S.currentPlayingSpeechId = null;
+            S.currentPlayingSpeechCorrelationId = '';
         }
 
         logAudioLifecycle('pruneStalledPendingAudioMetaQueue:removed', {
