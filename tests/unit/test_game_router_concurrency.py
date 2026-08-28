@@ -1174,23 +1174,28 @@ async def test_cross_game_route_start_waits_for_old_route_slot_lock(monkeypatch)
             )
         )
         try:
-            for _ in range(50):
-                await asyncio.sleep(0.01)
-                if old_lock._waiters:  # type: ignore[attr-defined]
-                    break
-            assert old_lock._waiters, (  # type: ignore[attr-defined]
-                "cross-game start did not wait for the old route slot lock"
-            )
-            assert not start_task.done(), (
-                "new route activated before old-slot publication could settle"
-            )
-        finally:
-            old_lock.release()
+            try:
+                for _ in range(50):
+                    await asyncio.sleep(0.01)
+                    if old_lock._waiters:  # type: ignore[attr-defined]
+                        break
+                assert old_lock._waiters, (  # type: ignore[attr-defined]
+                    "cross-game start did not wait for the old route slot lock"
+                )
+                assert not start_task.done(), (
+                    "new route activated before old-slot publication could settle"
+                )
+            finally:
+                old_lock.release()
 
-        result = await asyncio.wait_for(start_task, timeout=5.0)
-        assert result.get("ok") is True
-        assert old_state.get("game_route_active") is False
-        assert gr_runtime._get_active_game_route_state("Lan", "soccer") is not None
+            result = await asyncio.wait_for(start_task, timeout=5.0)
+            assert result.get("ok") is True
+            assert old_state.get("game_route_active") is False
+            assert gr_runtime._get_active_game_route_state("Lan", "soccer") is not None
+        finally:
+            if not start_task.done():
+                start_task.cancel()
+                await asyncio.gather(start_task, return_exceptions=True)
 
 
 @pytest.mark.unit
@@ -2778,17 +2783,22 @@ async def test_heartbeat_sweep_waits_for_character_supersede_lock(monkeypatch):
         await supersede_lock.acquire()
         sweep_task = asyncio.create_task(gr_runtime.cleanup_expired_sessions())
         try:
-            await asyncio.sleep(0.08)
-            assert not finalized.is_set(), (
-                "heartbeat sweep finalized without the character supersede lock"
-            )
-        finally:
-            supersede_lock.release()
+            try:
+                await asyncio.sleep(0.08)
+                assert not finalized.is_set(), (
+                    "heartbeat sweep finalized without the character supersede lock"
+                )
+            finally:
+                supersede_lock.release()
 
-        await asyncio.wait_for(finalized.wait(), timeout=5.0)
-        sweep_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await sweep_task
+            await asyncio.wait_for(finalized.wait(), timeout=5.0)
+            sweep_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await sweep_task
+        finally:
+            if not sweep_task.done():
+                sweep_task.cancel()
+                await asyncio.gather(sweep_task, return_exceptions=True)
 
 
 @pytest.mark.unit
