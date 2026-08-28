@@ -175,11 +175,22 @@ async function main() {
   const errors = [];
   const unsubscribeState = game.speech.onState((state) => states.push(state));
   const unsubscribeError = game.speech.onError((error) => errors.push(error));
-  let preStartSpeechError = null;
-  try { await game.speech.speak({ text: 'must wait for route' }); }
-  catch (error) { preStartSpeechError = error; }
-  assert(preStartSpeechError?.code === 'invalid_state' && speechCalls.length === 0,
-    'speech output ran before the runtime route was accepted');
+  const preStartSpeech = await game.speech.speak({ text: 'opening speech before route' });
+  assert(preStartSpeech.ok && speechCalls.length === 1,
+    'pre-route speech output was not delivered through the trusted transport');
+  assert(speechCalls[0].payload.session_id === 'speech-session-1'
+    && speechCalls[0].payload.lanlan_name === '测试猫娘'
+    && speechCalls[0].payload.sdk_route_instance_id === undefined,
+  'pre-route speech did not use the resolved session/character without inventing a route generation');
+  const preStartMirror = await game.speech.mirror({ text: 'opening mirror before route' });
+  assert(preStartMirror.ok && mirrorCalls.length === 1,
+    'pre-route text mirror was not delivered through the trusted transport');
+  assert(mirrorCalls[0].payload.session_id === 'speech-session-1'
+    && mirrorCalls[0].payload.lanlan_name === '测试猫娘'
+    && mirrorCalls[0].payload.sdk_route_instance_id === undefined,
+  'pre-route mirror did not use the resolved session/character without inventing a route generation');
+  speechCalls.length = 0;
+  mirrorCalls.length = 0;
   await game.runtime.start({});
   const routeInstanceId = lastStartPayload.sdk_route_instance_id;
   const response = await game.speech.speak({
@@ -198,8 +209,9 @@ async function main() {
     renderLanguage: 'ja-JP',
     event: { kind: 'goal', score: [1, 0] },
   });
-  assert(response.ok && response.data.speech_id === 'speech-1',
+  assert(response.ok && response.data.speech_id === 'speech-2',
     'speech output response was not normalized');
+  const activeSpeechId = response.data.speech_id;
   const firstCall = speechCalls[0];
   assert(firstCall.payload.line === 'SDK 语音输出测试', 'speech text was not normalized');
   assert(firstCall.payload.session_id === 'speech-session-1',
@@ -277,7 +289,7 @@ async function main() {
   bridgeOptions.onState({
     type: 'speech_playback_state',
     active: true,
-    speech_id: 'speech-1',
+    speech_id: activeSpeechId,
     remaining_seconds: 3,
     updated_at: Date.now(),
     source: 'project-tts',

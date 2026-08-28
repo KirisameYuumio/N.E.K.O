@@ -7001,7 +7001,7 @@ async def test_project_speak_clamps_per_game_voice_playback_gain(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_project_speak_rejects_inactive_route_before_tts(monkeypatch):
+async def test_project_speak_allows_preroute_output_without_generation(monkeypatch):
     with reset_game_route_state():
         mgr = _FakeGameRouteManager()
         _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
@@ -7009,18 +7009,16 @@ async def test_project_speak_rejects_inactive_route_before_tts(monkeypatch):
         result = await gr_runtime.game_project_speak(
             "soccer",
             _FakeRequest({
-                "line": "must not speak",
+                "line": "opening speech before route",
                 "session_id": "match_1",
                 "lanlan_name": "Lan",
                 "source": "game",
             }),
         )
 
-    assert result["ok"] is False
-    assert result["reason"] == "game_route_inactive"
-    assert result["audio_sent"] is False
-    assert mgr.spoken == []
-    assert mgr.assistant_mirrored == []
+    assert result["ok"] is True
+    assert mgr.spoken[0][0] == "opening speech before route"
+    assert mgr.spoken[0][1]["metadata"]["session_id"] == "match_1"
 
 
 @pytest.mark.unit
@@ -7093,7 +7091,7 @@ async def test_project_mirror_assistant_uses_text_only_mirror(monkeypatch):
     _gr_patch_all(
         monkeypatch,
         "_sdk_active_route_from_payload",
-        lambda _game_type, _data: ("Lan", "match_1", route_state, None),
+        lambda _game_type, _data, **_kwargs: ("Lan", "match_1", route_state, None),
     )
     _gr_patch_all(
         monkeypatch,
@@ -7195,7 +7193,7 @@ async def test_project_mirror_assistant_rejects_closed_game_route_output(monkeyp
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_project_mirror_assistant_rejects_inactive_route_without_side_effects(monkeypatch):
+async def test_project_mirror_assistant_allows_preroute_output_without_generation(monkeypatch):
     with reset_game_route_state():
         mgr = _FakeGameRouteManager()
         _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
@@ -7203,19 +7201,47 @@ async def test_project_mirror_assistant_rejects_inactive_route_without_side_effe
         result = await gr_runtime.game_project_mirror_assistant(
             "soccer",
             _FakeRequest({
-                "line": "route 已结束后不应镜像",
+                "line": "开局前镜像",
                 "session_id": "inactive-session",
                 "lanlan_name": "Lan",
                 "source": "game",
             }),
         )
 
-        assert result["ok"] is False
-        assert result["reason"] == "game_route_inactive"
-        assert result["method"] == "project_text_mirror"
-        assert result["mirrored"] is False
-        assert mgr.assistant_mirrored == []
-        assert mgr.spoken == []
+    assert result["ok"] is True
+    assert result["method"] == "project_text_mirror"
+    assert result["mirrored"] is True
+    assert mgr.assistant_mirrored[0][0] == "开局前镜像"
+    assert mgr.assistant_mirrored[0][1]["metadata"]["session_id"] == "inactive-session"
+    assert mgr.spoken == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["speak", "mirror"])
+async def test_preroute_speech_rejects_stale_route_generation(monkeypatch, endpoint):
+    with reset_game_route_state():
+        mgr = _FakeGameRouteManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+        payload = {
+            "line": "stale opening output",
+            "session_id": "new-session",
+            "lanlan_name": "Lan",
+            "sdk_route_instance_id": "ended-route",
+        }
+        if endpoint == "speak":
+            result = await gr_runtime.game_project_speak(
+                "example-game", _FakeRequest(payload)
+            )
+        else:
+            result = await gr_runtime.game_project_mirror_assistant(
+                "example-game", _FakeRequest(payload)
+            )
+
+    assert result["ok"] is False
+    assert result["reason"] == "route_instance_id_mismatch"
+    assert mgr.spoken == []
+    assert mgr.assistant_mirrored == []
 
 
 @pytest.mark.unit
@@ -7228,7 +7254,7 @@ async def test_project_mirror_assistant_finalizes_user_reply_by_default(monkeypa
     _gr_patch_all(
         monkeypatch,
         "_sdk_active_route_from_payload",
-        lambda _game_type, _data: ("Lan", "match_1", route_state, None),
+        lambda _game_type, _data, **_kwargs: ("Lan", "match_1", route_state, None),
     )
     _gr_patch_all(
         monkeypatch,

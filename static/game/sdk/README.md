@@ -206,6 +206,15 @@ available without sending heartbeats. `runtime.end()` and `game.dispose()` stop
 timers, remove the listener, and abort in-flight lifecycle requests. Games can
 inspect `game.runtime.state` and the immutable `game.runtime.session` snapshot.
 
+After the host has resolved the session character, `context.read()`,
+`dialogue.quickLines()`, `speech.preload()`, `speech.speak()`, and
+`speech.mirror()` may be used before `runtime.start()` for opening-screen work.
+Such pre-route speech requests carry the trusted session and character but no
+route generation. If an active route already exists, speech and mirroring are
+bound to that exact route generation; a stale generation is rejected. Standard
+`dialogue.request()` remains an active-route operation because its host Prompt,
+state and side effects belong to a concrete game round.
+
 `runtime.reset()` also cancels in-flight protocol, context, dialogue, memory and
 speech operations that were bound to the previous session, clears local speech
 correlation state, and resets memory consent to default-off. Official game

@@ -569,13 +569,23 @@ def _sdk_route_instance_error(state: dict | None, data: dict) -> dict | None:
     }
 
 
-def _sdk_active_route_from_payload(game_type: str, data: dict) -> tuple[str, str, dict | None, dict | None]:
+def _sdk_active_route_from_payload(
+    game_type: str,
+    data: dict,
+    *,
+    allow_pre_route: bool = False,
+) -> tuple[str, str, dict | None, dict | None]:
     lanlan_name = _resolve_lanlan_name(data.get("lanlan_name"))
     session_id = str(data.get("session_id") or data.get("sessionId") or "").strip()
     if not lanlan_name:
         return "", session_id, None, {"ok": False, "reason": "missing_lanlan_name"}
     state = _get_active_game_route_state(lanlan_name, game_type)
     if not state:
+        if allow_pre_route:
+            route_instance_error = _sdk_route_instance_error(None, data)
+            if route_instance_error is not None:
+                return lanlan_name, session_id, None, route_instance_error
+            return lanlan_name, session_id, None, None
         return lanlan_name, session_id, None, {
             "ok": False,
             "reason": "game_route_inactive",
@@ -2686,8 +2696,9 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
     lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
         game_type,
         data,
+        allow_pre_route=True,
     )
-    if route_error:
+    if state is None:
         closed_response = _game_route_closed_session_response(
             data,
             session_id=session_id,
@@ -2696,6 +2707,7 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
         )
         if closed_response:
             return closed_response
+    if route_error:
         stale_response = _game_route_stale_session_response(
             state,
             session_id,
@@ -2772,7 +2784,11 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
                 "lanlan_name": lanlan_name,
                 "method": "project_text_mirror",
             }
-        if result.get("ok") and str(event.get("kind") or "") == "opening-line":
+        if (
+            result.get("ok")
+            and current_state is not None
+            and str(event.get("kind") or "") == "opening-line"
+        ):
             _append_game_dialog(current_state, {
                 "type": "assistant",
                 "source": "opening_line",
@@ -2812,8 +2828,9 @@ async def game_project_speak(game_type: str, request: Request):
     lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
         game_type,
         data,
+        allow_pre_route=True,
     )
-    if route_error:
+    if state is None:
         closed_response = _game_route_closed_session_response(
             data,
             session_id=session_id,
@@ -2822,6 +2839,7 @@ async def game_project_speak(game_type: str, request: Request):
         )
         if closed_response:
             return closed_response
+    if route_error:
         stale_response = _game_route_stale_session_response(
             state,
             session_id,
@@ -2897,10 +2915,15 @@ async def game_project_speak(game_type: str, request: Request):
             # launching a worker so stale queued speech can never leak into the
             # next session.
             current_state = _get_active_game_route_state(lanlan_name, game_type)
-            if current_state is not state or not state.get("game_route_active"):
+            route_still_authoritative = (
+                current_state is None
+                if state is None
+                else current_state is state and state.get("game_route_active") is True
+            )
+            if not route_still_authoritative:
                 result = {
                     "ok": False,
-                    "reason": "game_route_inactive",
+                    "reason": "route_superseded",
                     "audio_sent": False,
                 }
             else:
@@ -2917,13 +2940,14 @@ async def game_project_speak(game_type: str, request: Request):
                     speech_correlation_id = str(
                         data.get("sdk_speech_correlation_id") or ""
                     ).strip()[:128]
-                    state["_sdk_active_speech_task"] = speech_task
-                    if speech_correlation_id:
-                        state["_sdk_active_speech_correlation_id"] = (
-                            speech_correlation_id
-                        )
-                    else:
-                        state.pop("_sdk_active_speech_correlation_id", None)
+                    if state is not None:
+                        state["_sdk_active_speech_task"] = speech_task
+                        if speech_correlation_id:
+                            state["_sdk_active_speech_correlation_id"] = (
+                                speech_correlation_id
+                            )
+                        else:
+                            state.pop("_sdk_active_speech_correlation_id", None)
                     try:
                         result = await _speak_game_line_via_project_tts(
                             mgr,
@@ -2944,7 +2968,10 @@ async def game_project_speak(game_type: str, request: Request):
                             ),
                         )
                     finally:
-                        if state.get("_sdk_active_speech_task") is speech_task:
+                        if (
+                            state is not None
+                            and state.get("_sdk_active_speech_task") is speech_task
+                        ):
                             state.pop("_sdk_active_speech_task", None)
     finally:
         remaining = max(0, int(getattr(mgr, "_sdk_game_speech_pending_count", 1) or 1) - 1)

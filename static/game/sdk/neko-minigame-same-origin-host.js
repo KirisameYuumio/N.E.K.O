@@ -48,30 +48,33 @@
   const HOST_LAUNCH_REGISTRY_LIMIT = 64;
   const HOST_REGISTRATION_CAPABILITY_LIMIT = 32;
   const GLOBAL_CONSOLE_CAPTURE_REGISTRIES = new WeakMap();
-  const MEMORY_POLICY_PAYLOAD_KEYS = Object.freeze([
-    'game_memory_enabled', 'gameMemoryEnabled', 'memoryEnabled', 'enableGameMemory',
-    'game_player_interaction_memory_enabled', 'gamePlayerInteractionMemoryEnabled',
-    'game_memory_player_interaction_enabled', 'gameMemoryPlayerInteractionEnabled',
-    'game_event_reply_memory_enabled', 'gameEventReplyMemoryEnabled',
-    'game_memory_event_reply_enabled', 'gameMemoryEventReplyEnabled',
-    'game_archive_memory_enabled', 'gameArchiveMemoryEnabled',
-    'game_memory_archive_enabled', 'gameMemoryArchiveEnabled',
-    'game_postgame_context_memory_enabled', 'gamePostgameContextMemoryEnabled',
-    'game_memory_postgame_context_enabled', 'gameMemoryPostgameContextEnabled',
-    'soccer_game_memory_enabled', 'soccerGameMemoryEnabled',
-    'soccer_game_memory_player_interaction_enabled', 'soccerGameMemoryPlayerInteractionEnabled',
-    'soccer_game_memory_event_reply_enabled', 'soccerGameMemoryEventReplyEnabled',
-    'soccer_game_memory_archive_enabled', 'soccerGameMemoryArchiveEnabled',
-    'soccer_game_memory_postgame_context_enabled', 'soccerGameMemoryPostgameContextEnabled',
-    'badminton_game_memory_enabled', 'badmintonGameMemoryEnabled',
-    'badminton_game_memory_player_interaction_enabled', 'badmintonGameMemoryPlayerInteractionEnabled',
-    'badminton_game_memory_event_reply_enabled', 'badmintonGameMemoryEventReplyEnabled',
-    'badminton_game_memory_archive_enabled', 'badmintonGameMemoryArchiveEnabled',
-    'badminton_game_memory_postgame_context_enabled', 'badmintonGameMemoryPostgameContextEnabled',
+  const MEMORY_POLICY_NORMALIZED_SUFFIXES = Object.freeze([
+    'gamememoryenabled',
+    'gameplayerinteractionmemoryenabled',
+    'gamememoryplayerinteractionenabled',
+    'gameeventreplymemoryenabled',
+    'gamememoryeventreplyenabled',
+    'gamearchivememoryenabled',
+    'gamememoryarchiveenabled',
+    'gamepostgamecontextmemoryenabled',
+    'gamememorypostgamecontextenabled',
   ]);
   const TRUSTED_PAYLOAD_MAX_DEPTH = 24;
   const TRUSTED_PAYLOAD_MAX_NODES = 4096;
   const TRUSTED_PAYLOAD_OMIT = Symbol('trusted-payload-omit');
+
+  function isMemoryPolicyPayloadKey(key) {
+    const normalized = String(key || '').replace(/[^A-Za-z0-9]/g, '').toLowerCase();
+    if (normalized === 'memoryenabled' || normalized === 'enablegamememory') return true;
+    return MEMORY_POLICY_NORMALIZED_SUFFIXES.some((suffix) => normalized.endsWith(suffix));
+  }
+
+  function removeMemoryPolicyPayloadKeys(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    for (const key of Object.keys(value)) {
+      if (isMemoryPolicyPayloadKey(key)) delete value[key];
+    }
+  }
 
   function cloneTrustedJsonData(value, state = { nodes: 0, seen: new Set() }, depth = 0) {
     if (depth > TRUSTED_PAYLOAD_MAX_DEPTH || state.nodes >= TRUSTED_PAYLOAD_MAX_NODES) {
@@ -876,9 +879,9 @@
           cause,
         });
       }
-      for (const key of MEMORY_POLICY_PAYLOAD_KEYS) delete trusted[key];
+      removeMemoryPolicyPayloadKeys(trusted);
       if (trusted.event && typeof trusted.event === 'object' && !Array.isArray(trusted.event)) {
-        for (const key of MEMORY_POLICY_PAYLOAD_KEYS) delete trusted.event[key];
+        removeMemoryPolicyPayloadKeys(trusted.event);
       }
       const memoryEnabled = (
         this._grantedCapabilities.has('memory')

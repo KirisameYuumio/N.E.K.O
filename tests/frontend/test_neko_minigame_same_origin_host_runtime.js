@@ -328,8 +328,8 @@ async function main() {
     session_id: 'attacker-session',
     lanlan_name: 'Attacker Neko',
     game_memory_archive_enabled: false,
-    soccerGameMemoryEnabled: false,
-    badminton_game_memory_event_reply_enabled: false,
+    legacyGameMemoryEnabled: false,
+    legacy_game_memory_event_reply_enabled: false,
   });
   const startData = await startResponse.clone().json();
   host.applyRouteState(startData.state);
@@ -343,8 +343,8 @@ async function main() {
     && startCall.body.game_memory_archive_enabled === true
     && startCall.body.game_memory_postgame_context_enabled === true,
   'trusted host did not derive the complete memory policy from consent');
-  assert(!Object.hasOwn(startCall.body, 'soccerGameMemoryEnabled')
-    && !Object.hasOwn(startCall.body, 'badminton_game_memory_event_reply_enabled'),
+  assert(!Object.hasOwn(startCall.body, 'legacyGameMemoryEnabled')
+    && !Object.hasOwn(startCall.body, 'legacy_game_memory_event_reply_enabled'),
   'caller-controlled legacy memory aliases survived the trusted host boundary');
   assert(/^[a-f0-9]{48}$/.test(startCall.body.sdk_voice_control_credential || ''),
     'capability-granted route start did not carry its opaque voice credential');
@@ -392,13 +392,13 @@ async function main() {
     sdk_voice_control_credential: 'f'.repeat(48),
     gameMemoryEnabled: true,
     game_archive_memory_enabled: true,
-    soccer_game_memory_enabled: true,
-    badmintonGameMemoryArchiveEnabled: true,
+    legacy_game_memory_enabled: true,
+    legacyGameMemoryArchiveEnabled: true,
     event: {
       kind: 'nested-memory-bypass',
       game_memory_enabled: true,
-      soccerGameMemoryArchiveEnabled: true,
-      badminton_game_memory_event_reply_enabled: true,
+      legacyGameMemoryArchiveEnabled: true,
+      legacy_game_memory_event_reply_enabled: true,
     },
   });
   const ungrantedStart = calls.filter((call) => call.url.endsWith('/route/start')).at(-1);
@@ -412,22 +412,22 @@ async function main() {
   'a game without memory grant overrode the host-owned memory policy');
   assert(!Object.hasOwn(ungrantedStart.body, 'gameMemoryEnabled')
     && !Object.hasOwn(ungrantedStart.body, 'game_archive_memory_enabled')
-    && !Object.hasOwn(ungrantedStart.body, 'soccer_game_memory_enabled')
-    && !Object.hasOwn(ungrantedStart.body, 'badmintonGameMemoryArchiveEnabled'),
+    && !Object.hasOwn(ungrantedStart.body, 'legacy_game_memory_enabled')
+    && !Object.hasOwn(ungrantedStart.body, 'legacyGameMemoryArchiveEnabled'),
   'ungranted legacy memory aliases were forwarded to the backend');
   assert(ungrantedStart.body.event.kind === 'nested-memory-bypass'
     && !Object.hasOwn(ungrantedStart.body.event, 'game_memory_enabled')
-    && !Object.hasOwn(ungrantedStart.body.event, 'soccerGameMemoryArchiveEnabled')
-    && !Object.hasOwn(ungrantedStart.body.event, 'badminton_game_memory_event_reply_enabled'),
+    && !Object.hasOwn(ungrantedStart.body.event, 'legacyGameMemoryArchiveEnabled')
+    && !Object.hasOwn(ungrantedStart.body.event, 'legacy_game_memory_event_reply_enabled'),
   'nested legacy memory aliases bypassed the host-owned memory policy');
   await ungrantedHost.heartbeat({
     game_memory_enabled: true,
-    soccer_game_memory_archive_enabled: true,
+    legacy_game_memory_archive_enabled: true,
   });
   const ungrantedHeartbeat = calls.filter((call) => call.url.endsWith('/route/heartbeat')).at(-1);
   assert(ungrantedHeartbeat.body.game_memory_enabled === false
     && ungrantedHeartbeat.body.game_memory_archive_enabled === false
-    && !Object.hasOwn(ungrantedHeartbeat.body, 'soccer_game_memory_archive_enabled'),
+    && !Object.hasOwn(ungrantedHeartbeat.body, 'legacy_game_memory_archive_enabled'),
   'a heartbeat bypassed the host-owned memory opt-out policy');
   let eventToJsonCalls = 0;
   await ungrantedHost.heartbeat({

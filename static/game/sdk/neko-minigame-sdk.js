@@ -4038,7 +4038,6 @@
 
     async function requestSpeechOutput(requestInput, requestOptions = {}) {
       requireCapability('speech-output', 'speech.speak');
-      requireActiveRuntimeRoute('speech.speak');
       if (!speechBridgeStarted) {
         fail('transport_unavailable', 'The host speech output bridge is unavailable');
       }
@@ -4109,7 +4108,6 @@
 
     async function mirrorSpeechOutput(requestInput, requestOptions = {}) {
       requireCapability('speech-output', 'speech.mirror');
-      requireActiveRuntimeRoute('speech.mirror');
       if (!speechBridgeStarted) {
         fail('transport_unavailable', 'The host speech output bridge is unavailable');
       }
