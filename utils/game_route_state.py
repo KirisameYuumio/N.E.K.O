@@ -80,9 +80,9 @@ _route_state_locks: WeakValueDictionary[_RouteStateKey, "asyncio.Lock"] = (
 # Per-``lanlan_name`` supersede lock registry.
 #
 # OUTER lock (acquired BEFORE ``_route_state_locks``) for the
-# ``/route/start`` flow that scans ``_game_route_states`` for "any active
-# route for this lanlan_name regardless of game_type" and finalizes them
-# before activating a new one. Without this outer lock, two concurrent
+# lifecycle flows that scan or finalize a character's active route across
+# game types (start supersede, explicit end, and heartbeat expiry). Without
+# this outer lock, two concurrent
 # ``/route/start`` calls for the SAME ``lanlan_name`` but DIFFERENT
 # ``game_type`` acquire DIFFERENT per-(lanlan, game_type) locks, so each
 # scan misses the other's pending activation and both end up activating

@@ -1757,6 +1757,40 @@ async def game_passive_guard(game_type: str, request: Request):
         return {"ok": False, "reason": "exception", "recommendedAction": "observe_more", "exitPromptType": "none"}
 
 
+async def _finalize_superseded_route_if_current(
+    old_state: dict,
+    *,
+    lanlan_name: str,
+    old_game_type: str,
+    old_session_id: str,
+    new_game_type: str,
+    new_session_id: str,
+) -> None:
+    current_old_state = _game_route_states.get(
+        _route_state_key(lanlan_name, old_game_type)
+    )
+    if current_old_state is not old_state:
+        return
+    if old_state.get("_exit_task"):
+        await asyncio.shield(old_state["_exit_task"])
+        return
+    if not old_state.get("game_route_active"):
+        return
+    logger.warning(
+        "🎮 新游戏路由启动前发现旧 active route，先结束旧局: old_game=%s old_session=%s new_game=%s new_session=%s lanlan=%s",
+        old_game_type,
+        old_session_id,
+        new_game_type,
+        new_session_id,
+        lanlan_name,
+    )
+    await _finalize_game_route_state(
+        old_state,
+        reason="superseded_by_route_start",
+        close_game_session=True,
+    )
+
+
 @router.post("/{game_type}/route/start")
 async def game_route_start(game_type: str, request: Request):
     """Declare that the game window is open and main external inputs are hijacked."""
@@ -1812,7 +1846,7 @@ async def game_route_start(game_type: str, request: Request):
     # before the per-(lanlan, game_type) route lock. Acquisition order
     # (documented in `utils/game_route_state.py`) is OUTER->INNER; only
     # the start-flow goes outer->inner, never the other direction, so no
-    # deadlock with finalize/end paths that only take the inner lock.
+    # deadlock with lifecycle paths, which use the same OUTER->INNER order.
     supersede_lock = _get_supersede_lock(lanlan_name)
     route_lock = _get_route_lock(lanlan_name, game_type)
     async with supersede_lock:
@@ -1839,19 +1873,26 @@ async def game_route_start(game_type: str, request: Request):
             ]:
                 old_game_type = str(old_state.get("game_type") or "")
                 old_session_id = str(old_state.get("session_id") or "default")
-                logger.warning(
-                    "🎮 新游戏路由启动前发现旧 active route，先结束旧局: old_game=%s old_session=%s new_game=%s new_session=%s lanlan=%s",
-                    old_game_type,
-                    old_session_id,
-                    game_type,
-                    session_id,
-                    lanlan_name,
-                )
-                await _finalize_game_route_state(
-                    old_state,
-                    reason="superseded_by_route_start",
-                    close_game_session=True,
-                )
+                old_route_lock = _get_route_lock(lanlan_name, old_game_type)
+                if old_route_lock is route_lock:
+                    await _finalize_superseded_route_if_current(
+                        old_state,
+                        lanlan_name=lanlan_name,
+                        old_game_type=old_game_type,
+                        old_session_id=old_session_id,
+                        new_game_type=game_type,
+                        new_session_id=session_id,
+                    )
+                else:
+                    async with old_route_lock:
+                        await _finalize_superseded_route_if_current(
+                            old_state,
+                            lanlan_name=lanlan_name,
+                            old_game_type=old_game_type,
+                            old_session_id=old_session_id,
+                            new_game_type=game_type,
+                            new_session_id=session_id,
+                        )
 
             if game_type == "soccer":
                 _enable_game_session_debug_log(game_type, session_id, lanlan_name=lanlan_name)
@@ -4583,35 +4624,37 @@ async def cleanup_expired_sessions():
                 now - last_heartbeat,
                 now - last_activity,
             )
-            # B2: serialize against any concurrent /route/start (which may
-            # be supersede-finalizing this same slot) under the per-slot
-            # route lock so we don't double-finalize or interleave with
-            # an incoming route activation.
+            # B2: serialize against any concurrent /route/start or /route/end
+            # under the character OUTER lock and the per-slot INNER lock, in
+            # that order. This prevents an old cross-game sweep from clearing
+            # shared takeover state after a replacement route activates.
             sweep_lanlan = str(state.get("lanlan_name") or "")
             sweep_game_type = str(state.get("game_type") or "")
+            sweep_supersede_lock = _get_supersede_lock(sweep_lanlan)
             sweep_lock = _get_route_lock(sweep_lanlan, sweep_game_type)
             try:
-                async with sweep_lock:
-                    # Peer (e.g. /route/start supersede or /route/end) may
-                    # have already finalized the slot while we waited for
-                    # the lock; recheck and skip if so.
-                    if not state.get("game_route_active") or state.get("_exit_task"):
-                        if state.get("_exit_task"):
-                            await asyncio.shield(state["_exit_task"])
-                        continue
-                    # Why: a concurrent ``/route/heartbeat`` may have
-                    # bumped ``last_heartbeat_at`` between the lock-free
-                    # expired-scan and the lock acquisition above. The
-                    # browser is alive; finalizing here would kill a
-                    # live route. Re-check inside the lock with a fresh
-                    # ``time.time()`` and skip if the route recovered.
-                    if not _route_heartbeat_expired(state, time.time()):
-                        continue
-                    await _finalize_game_route_state(
-                        state,
-                        reason="heartbeat_timeout",
-                        close_game_session=True,
-                    )
+                async with sweep_supersede_lock:
+                    async with sweep_lock:
+                        # Peer (e.g. /route/start supersede or /route/end) may
+                        # have already finalized the slot while we waited for
+                        # the locks; recheck and skip if so.
+                        if not state.get("game_route_active") or state.get("_exit_task"):
+                            if state.get("_exit_task"):
+                                await asyncio.shield(state["_exit_task"])
+                            continue
+                        # Why: a concurrent ``/route/heartbeat`` may have
+                        # bumped ``last_heartbeat_at`` between the lock-free
+                        # expired-scan and the lock acquisition above. The
+                        # browser is alive; finalizing here would kill a
+                        # live route. Re-check inside the lock with a fresh
+                        # ``time.time()`` and skip if the route recovered.
+                        if not _route_heartbeat_expired(state, time.time()):
+                            continue
+                        await _finalize_game_route_state(
+                            state,
+                            reason="heartbeat_timeout",
+                            close_game_session=True,
+                        )
             except Exception as e:
                 logger.warning("🎮 游戏页心跳超时退出兜底失败: key=%s err=%s", key, e, exc_info=True)
 

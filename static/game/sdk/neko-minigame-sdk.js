@@ -3351,11 +3351,18 @@
           timeoutMs: 8500,
           maximumTimeoutMs: 60000,
           requestOptions,
-          invoke: ({ signal, timeoutMs }) => transport.runGameStorageExclusive(
-            `leaderboards/${boardId}`,
-            callback,
-            { timeoutMs: Math.min(8000, timeoutMs), signal },
-          ),
+          invoke: ({ signal, timeoutMs }) => {
+            const managedRequestOptions = Object.freeze({
+              ...requestOptions,
+              timeoutMs: Math.min(8000, timeoutMs),
+              signal,
+            });
+            return transport.runGameStorageExclusive(
+              `leaderboards/${boardId}`,
+              () => callback(managedRequestOptions),
+              managedRequestOptions,
+            );
+          },
         });
       }
       finally { localLeaderboardMutations.delete(boardId); }
@@ -3373,8 +3380,8 @@
           'leaderboard.local.submit',
         );
         const normalized = normalizeLeaderboardEntryData(value, definition);
-        return mutateLocalLeaderboard(boardId, 'leaderboard.local.submit', async () => {
-          const current = await readLocalLeaderboard(boardId, definition, requestOptions);
+        return mutateLocalLeaderboard(boardId, 'leaderboard.local.submit', async (managedRequestOptions) => {
+          const current = await readLocalLeaderboard(boardId, definition, managedRequestOptions);
           localLeaderboardSequence = (localLeaderboardSequence + 1) % Number.MAX_SAFE_INTEGER;
           const entry = Object.freeze({
             id: `local-${localLeaderboardClientId}-${localLeaderboardSequence.toString(36)}`,
@@ -3392,7 +3399,7 @@
           const stored = await writeLocalLeaderboard(
             boardId,
             { definition, entries },
-            requestOptions,
+            managedRequestOptions,
           );
           const ranked = [...stored.entries]
             .sort((left, right) => leaderboardEntryCompare(left, right, definition, 'rank'));
@@ -3449,8 +3456,8 @@
         if (!plainObject(options) || options.confirm !== true) {
           fail('invalid_request', 'leaderboard.local.clear requires { confirm: true }');
         }
-        return mutateLocalLeaderboard(boardId, 'leaderboard.local.clear', async () => {
-          await requestLocalLeaderboardStorage('delete', boardId, {}, requestOptions);
+        return mutateLocalLeaderboard(boardId, 'leaderboard.local.clear', async (managedRequestOptions) => {
+          await requestLocalLeaderboardStorage('delete', boardId, {}, managedRequestOptions);
           return localLeaderboardResult({ boardId, cleared: true });
         }, requestOptions);
       },

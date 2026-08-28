@@ -1142,6 +1142,59 @@ async def test_route_start_serializes_supersede_across_game_types_for_same_lanla
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_cross_game_route_start_waits_for_old_route_slot_lock(monkeypatch):
+    """A cross-game supersede must wait for work already inside the old slot.
+
+    The character-level supersede lock serializes lifecycle owners, but normal
+    route publication only owns its per-game slot lock.  Finalizing without
+    that old lock lets a publication complete after the new route activates.
+    """
+    _stub_archive_calls(monkeypatch)
+
+    async def _fake_pregame(**_kwargs):
+        return (
+            gr_pregame._default_soccer_pregame_context(initial_difficulty="lv2"),
+            "fallback",
+            "",
+        )
+
+    _gr_patch_all(monkeypatch, "_build_soccer_pregame_context", _fake_pregame)
+
+    with reset_game_route_state():
+        old_state = _activate_route("Lan", "chess", "chess_old")
+        old_lock = gr_runtime._get_route_lock("Lan", "chess")
+        await old_lock.acquire()
+        start_task = asyncio.create_task(
+            gr_runtime.game_route_start(
+                "soccer",
+                _FakeRouteStartRequest({
+                    "lanlan_name": "Lan",
+                    "session_id": "soccer_new",
+                }),
+            )
+        )
+        try:
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if old_lock._waiters:  # type: ignore[attr-defined]
+                    break
+            assert old_lock._waiters, (  # type: ignore[attr-defined]
+                "cross-game start did not wait for the old route slot lock"
+            )
+            assert not start_task.done(), (
+                "new route activated before old-slot publication could settle"
+            )
+        finally:
+            old_lock.release()
+
+        result = await asyncio.wait_for(start_task, timeout=5.0)
+        assert result.get("ok") is True
+        assert old_state.get("game_route_active") is False
+        assert gr_runtime._get_active_game_route_state("Lan", "soccer") is not None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_slow_pregame_start_cannot_publish_after_new_generation_takes_over(monkeypatch):
     _stub_archive_calls(monkeypatch)
     first_started = asyncio.Event()
@@ -2696,6 +2749,46 @@ async def test_heartbeat_sweep_rechecks_expired_inside_lock(monkeypatch):
             "sweep finalized a route whose heartbeat had recovered "
             "before the lock was acquired; in-lock recheck is missing"
         )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_heartbeat_sweep_waits_for_character_supersede_lock(monkeypatch):
+    """Expiry finalization and cross-game start share the OUTER lifecycle lock."""
+    _stub_archive_calls(monkeypatch)
+    with reset_game_route_state():
+        _gr_patch_all(monkeypatch, "_GAME_ROUTE_HEARTBEAT_SWEEP_SECONDS", 0.01)
+        finalized = asyncio.Event()
+
+        async def _track_finalize(state, *, reason, close_game_session):
+            assert reason == "heartbeat_timeout"
+            assert close_game_session is True
+            state["game_route_active"] = False
+            finalized.set()
+            return {"game_session_closed": False}
+
+        _gr_patch_all(monkeypatch, "_finalize_game_route_state", _track_finalize)
+        state = _activate_route("Lan", "soccer", "expired_match")
+        state["heartbeat_timeout_seconds"] = 1.0
+        state["last_heartbeat_at"] = gr_runtime.time.time() - 60.0
+        state["last_activity"] = gr_runtime.time.time() - 60.0
+        state["created_at"] = gr_runtime.time.time() - 60.0
+
+        supersede_lock = gr_runtime._get_supersede_lock("Lan")
+        await supersede_lock.acquire()
+        sweep_task = asyncio.create_task(gr_runtime.cleanup_expired_sessions())
+        try:
+            await asyncio.sleep(0.08)
+            assert not finalized.is_set(), (
+                "heartbeat sweep finalized without the character supersede lock"
+            )
+        finally:
+            supersede_lock.release()
+
+        await asyncio.wait_for(finalized.wait(), timeout=5.0)
+        sweep_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweep_task
 
 
 @pytest.mark.unit

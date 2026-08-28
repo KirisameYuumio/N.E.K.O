@@ -60,6 +60,29 @@
         return S.gameRouteStateRevision;
     }
 
+    function rememberEndedGameRouteIdentity(gameType, sessionId, routeInstanceId) {
+        S.gameRouteLastEndedIdentity = {
+            gameType: String(gameType || ''),
+            sessionId: String(sessionId || ''),
+            routeInstanceId: String(routeInstanceId || '')
+        };
+    }
+
+    function isRecentlyEndedGameRouteIdentity(gameType, sessionId, routeInstanceId) {
+        var endedIdentity = S.gameRouteLastEndedIdentity;
+        if (!endedIdentity || !sessionId || !endedIdentity.sessionId) return false;
+        if (String(sessionId) !== String(endedIdentity.sessionId)) return false;
+        if (gameType && endedIdentity.gameType
+                && String(gameType) !== String(endedIdentity.gameType)) return false;
+        // A different non-empty generation is a genuinely newer route reusing
+        // the same session label. Missing generation remains stale when the
+        // just-ended route had one, because legacy/new opens clear this fixed
+        // tombstone before their STT gate can become authoritative.
+        if (routeInstanceId && endedIdentity.routeInstanceId
+                && String(routeInstanceId) !== String(endedIdentity.routeInstanceId)) return false;
+        return true;
+    }
+
     // ---- DOM element shortcuts (resolved lazily / once) ----
     function $id(id) { return document.getElementById(id); }
     function micButton()          { return $id('micButton'); }
@@ -3219,6 +3242,11 @@
                             return;
                         }
                         advanceGameRouteStateRevision();
+                        rememberEndedGameRouteIdentity(
+                            (statusDetails && statusDetails.game_type) || S.gameRouteGameType || '',
+                            endedSessionId || currentSessionId,
+                            endedRouteInstanceId || currentRouteInstanceId
+                        );
                         S.gameRouteActive = false;
                         S.gameRouteGameType = '';
                         S.gameRouteLanlanName = '';
@@ -3267,13 +3295,22 @@
                         var currentSttGameType = S.gameRouteGameType || '';
                         var currentSttSessionId = S.gameRouteSessionId || '';
                         var currentSttRouteInstanceId = S.gameRouteInstanceId || '';
-                        var staleSttGate = S.gameRouteActive === true && (
-                            (incomingSttGameType && currentSttGameType
-                                && incomingSttGameType !== currentSttGameType)
-                            || (incomingSttSessionId && currentSttSessionId
-                                && incomingSttSessionId !== currentSttSessionId)
-                            || ((incomingSttRouteInstanceId || currentSttRouteInstanceId)
-                                && incomingSttRouteInstanceId !== currentSttRouteInstanceId)
+                        var staleSttGate = (
+                            S.gameRouteActive === true && (
+                                (incomingSttGameType && currentSttGameType
+                                    && incomingSttGameType !== currentSttGameType)
+                                || (incomingSttSessionId && currentSttSessionId
+                                    && incomingSttSessionId !== currentSttSessionId)
+                                || ((incomingSttRouteInstanceId || currentSttRouteInstanceId)
+                                    && incomingSttRouteInstanceId !== currentSttRouteInstanceId)
+                            )
+                        ) || (
+                            S.gameRouteActive !== true
+                            && isRecentlyEndedGameRouteIdentity(
+                                incomingSttGameType,
+                                incomingSttSessionId,
+                                incomingSttRouteInstanceId
+                            )
                         );
                         if (staleSttGate) {
                             console.warn('[GameVoiceSTT] 忽略迟到的语音门禁状态:', statusDetails);
@@ -4875,6 +4912,7 @@
                             console.log(`[GameWindow] 忽略过期窗口事件 | action=${detail.action} incoming=${incomingGameSessionId} current=${currentGameSessionId}`);
                         } else if (detail.action === 'opened') {
                             advanceGameRouteStateRevision();
+                            S.gameRouteLastEndedIdentity = null;
                             S.gameRouteActive = true;
                             S.gameRouteGameType = detail.gameType || '';
                             S.gameRouteLanlanName = detail.lanlanName || '';
@@ -4888,6 +4926,11 @@
                         } else if (detail.action === 'closed') {
                             advanceGameRouteStateRevision();
                             var wasGameRouteActive = !!S.gameRouteActive;
+                            rememberEndedGameRouteIdentity(
+                                detail.gameType || S.gameRouteGameType || '',
+                                incomingGameSessionId || currentGameSessionId,
+                                incomingGameRouteInstanceId || currentGameRouteInstanceId
+                            );
                             S.gameRouteActive = false;
                             S.gameRouteGameType = '';
                             S.gameRouteLanlanName = '';

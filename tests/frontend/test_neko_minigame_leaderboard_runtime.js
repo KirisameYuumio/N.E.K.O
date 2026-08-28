@@ -29,6 +29,7 @@ function createTransport({ server = false, shared = null } = {}) {
   const pendingLocks = new Set();
   const serverCalls = [];
   let storagePending = false;
+  let storagePendingOperation = '';
   let lockPending = false;
   let runtimeState = { sessionId: 'leaderboard-session', characterName: 'Yui' };
 
@@ -66,7 +67,7 @@ function createTransport({ server = false, shared = null } = {}) {
       };
     },
     requestGameStorage(operation, payload, options = {}) {
-      if (storagePending) return pendingRequest(options);
+      if (storagePending || storagePendingOperation === operation) return pendingRequest(options);
       if (operation === 'get') {
         return Promise.resolve(values.has(payload.key)
           ? { ok: true, found: true, value: values.get(payload.key) }
@@ -133,6 +134,7 @@ function createTransport({ server = false, shared = null } = {}) {
     pendingLocks,
     serverCalls,
     setStoragePending(value) { storagePending = value; },
+    setStoragePendingOperation(value) { storagePendingOperation = String(value || ''); },
     setLockPending(value) { lockPending = value; },
   };
 }
@@ -210,6 +212,34 @@ async function main() {
     'client disposal did not cancel a pending local leaderboard lock');
   assert(lockWaitHost.pendingLocks.size === 0,
     'disposed local leaderboard lock remained resident in the host');
+
+  const timeoutHost = createTransport();
+  timeoutHost.setStoragePendingOperation('set');
+  const timeoutClient = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+    transport: timeoutHost.transport,
+  });
+  const timedOutMutation = timeoutClient.leaderboard.local.submit(
+    'main',
+    { score: 44 },
+    { timeoutMs: 250 },
+  ).then(() => null, (error) => error);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert(timeoutHost.pending.size === 1,
+    'timed local leaderboard mutation did not enter its nested storage request');
+  const timeoutError = await timedOutMutation;
+  assert(timeoutError?.code === 'timeout',
+    'local leaderboard mutation did not report its managed timeout');
+  assert(timeoutHost.pending.size === 0,
+    'timed-out local leaderboard mutation left its nested storage request resident');
+  assert(!timeoutHost.values.has('leaderboards/main'),
+    'timed-out local leaderboard mutation committed a late storage write');
+  assert(timeoutClient.leaderboard.local.pendingCount === 0,
+    'timed-out local leaderboard mutation left SDK pending state resident');
+  timeoutHost.setStoragePendingOperation('');
+  const recoveredMutation = await timeoutClient.leaderboard.local.submit('main', { score: 45 });
+  assert(recoveredMutation.data.entry.score === 45,
+    'local leaderboard could not mutate after a timed-out nested storage request');
+  timeoutClient.dispose();
 
   let clearError = null;
   try { await game.leaderboard.local.clear('main'); }

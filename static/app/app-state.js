@@ -137,6 +137,10 @@
         gameRouteLanlanName: '',
         gameRouteSessionId: '',
         gameRouteInstanceId: '',
+        // Fixed single-slot tombstone for rejecting a late STT-gate event
+        // after the corresponding route has already been closed. It is
+        // overwritten by the next close and released by the next open.
+        gameRouteLastEndedIdentity: null,
         gameRouteStateRevision: 0,
         gameVoiceControlCredential: '',
         gameVoiceSttGateActive: false,

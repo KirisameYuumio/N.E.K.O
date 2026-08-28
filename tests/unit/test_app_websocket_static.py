@@ -92,6 +92,82 @@ def test_reconnect_route_snapshot_cannot_overwrite_a_newer_websocket_route_event
     assert source.count("advanceGameRouteStateRevision();") >= 4
 
 
+def test_late_stt_gate_cannot_reactivate_the_most_recently_ended_route():
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    state_source = APP_STATE_PATH.read_text(encoding="utf-8")
+    function_opener = (
+        "function isRecentlyEndedGameRouteIdentity(gameType, sessionId, routeInstanceId) {"
+    )
+    function_body = _block_after(source, function_opener)
+    node_path = shutil.which("node")
+    if not node_path:
+        pytest.skip("node is not installed; skipping ended-route identity harness")
+
+    result = run_node_script(
+        node_path,
+        textwrap.dedent(
+            f"""
+            const S = {{
+              gameRouteLastEndedIdentity: {{
+                gameType: 'example-game',
+                sessionId: 'ended-session',
+                routeInstanceId: 'ended-generation'
+              }}
+            }};
+            {function_opener}
+            {function_body}
+            }}
+            function assert(value, message) {{ if (!value) throw new Error(message); }}
+            assert(isRecentlyEndedGameRouteIdentity(
+              'example-game', 'ended-session', 'ended-generation'
+            ), 'exact ended identity was not rejected');
+            assert(isRecentlyEndedGameRouteIdentity(
+              'example-game', 'ended-session', ''
+            ), 'generation-less late gate for an identified ended route was not rejected');
+            assert(!isRecentlyEndedGameRouteIdentity(
+              'example-game', 'ended-session', 'new-generation'
+            ), 'new generation reusing a session was rejected');
+            assert(!isRecentlyEndedGameRouteIdentity(
+              'example-game', 'new-session', 'ended-generation'
+            ), 'different session was rejected');
+            S.gameRouteLastEndedIdentity = null;
+            assert(!isRecentlyEndedGameRouteIdentity(
+              'example-game', 'ended-session', 'ended-generation'
+            ), 'cleared tombstone remained active');
+            """
+        ),
+        cwd=str(Path(__file__).resolve().parents[2]),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+    ended_block = _block_after(source, "if (statusCode === 'GAME_ROUTE_ENDED') {")
+    stt_gate_block = _block_after(
+        source,
+        "if (statusCode === 'GAME_VOICE_STT_GATE_ACTIVE') {",
+    )
+    window_block = _block_after(
+        source,
+        "} else if (response.type === 'game_window_state_change') {",
+    )
+    assert "gameRouteLastEndedIdentity: null" in state_source
+    assert ended_block.index("rememberEndedGameRouteIdentity(") < ended_block.index(
+        "S.gameRouteActive = false;"
+    )
+    assert stt_gate_block.index("isRecentlyEndedGameRouteIdentity(") < stt_gate_block.index(
+        "advanceGameRouteStateRevision();"
+    )
+    assert window_block.index("S.gameRouteLastEndedIdentity = null;") < window_block.index(
+        "S.gameRouteActive = true;"
+    )
+    assert window_block.index("rememberEndedGameRouteIdentity(") < window_block.index(
+        "S.gameRouteActive = false;"
+    )
+
+
 def _block_after(js: str, opener: str) -> str:
     """Return the brace-balanced body that follows ``opener``.
 
