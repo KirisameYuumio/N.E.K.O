@@ -67,6 +67,7 @@ from .session_pool import (
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 from config.prompts.prompts_minigame_route import (
     get_game_postgame_context_labels,
@@ -75,6 +76,7 @@ from config.prompts.prompts_minigame_route import (
 )
 from ..shared_state import get_session_manager
 from utils.game_log import mark_game_session_debug_log_ended as _mark_game_session_debug_log_ended
+from utils.game_route_state import _game_route_states, _get_supersede_lock
 
 
 _POSTGAME_SKIP_REASONS = {"heartbeat_timeout", "session_cleanup", "cleanup", "manual_return_to_start"}
@@ -90,6 +92,35 @@ _POSTGAME_REALTIME_UNORGANIZED_MAX_TOKENS = 1500
 
 
 _GAME_SPEECH_CANCEL_SETTLE_SECONDS = 2.0
+
+
+def _postgame_replacement_route_active(source_state: Optional[dict]) -> bool:
+    """Return whether another active game route now owns the same character."""
+    if not isinstance(source_state, dict):
+        return False
+    lanlan_name = str(source_state.get("lanlan_name") or "")
+    if not lanlan_name:
+        return False
+    return any(
+        candidate is not source_state
+        and candidate.get("game_route_active") is True
+        and str(candidate.get("lanlan_name") or "") == lanlan_name
+        for candidate in list(_game_route_states.values())
+    )
+
+
+@asynccontextmanager
+async def _postgame_delivery_guard(source_state: Optional[dict]):
+    """Serialize an irreversible postgame publish against route takeover."""
+    if not isinstance(source_state, dict):
+        yield True
+        return
+    lanlan_name = str(source_state.get("lanlan_name") or "")
+    if not lanlan_name:
+        yield True
+        return
+    async with _get_supersede_lock(lanlan_name):
+        yield not _postgame_replacement_route_active(source_state)
 
 
 async def _cancel_route_game_speech(state: dict, mgr: Any) -> None:
@@ -426,6 +457,7 @@ async def _run_postgame_realtime_nudge_task(
     delays: tuple[float, ...],
     *,
     expected_session: Any | None = None,
+    source_state: Optional[dict] = None,
 ) -> None:
     lanlan_name = str(archive.get("lanlan_name") or "")
     instruction = _build_game_postgame_realtime_nudge_instruction(archive, options)
@@ -440,38 +472,48 @@ async def _run_postgame_realtime_nudge_task(
     for attempt, delay in enumerate(delays, start=1):
         try:
             await asyncio.sleep(delay)
-            active_session = _active_realtime_session(mgr)
-            if not active_session:
-                logger.info(
-                    "🎮 赛后 Realtime 主动搭话跳过: game=%s session=%s lanlan=%s attempt=%d reason=no_active_realtime_session",
-                    archive.get("game_type"),
-                    archive.get("session_id"),
-                    lanlan_name,
-                    attempt,
-                )
-                return
-            if expected_session is not None and active_session is not expected_session:
-                logger.info(
-                    "🎮 赛后 Realtime 主动搭话跳过: game=%s session=%s lanlan=%s attempt=%d reason=realtime_session_changed",
-                    archive.get("game_type"),
-                    archive.get("session_id"),
-                    lanlan_name,
-                    attempt,
-                )
-                return
+            async with _postgame_delivery_guard(source_state) as may_deliver:
+                if not may_deliver:
+                    logger.info(
+                        "🎮 赛后 Realtime 主动搭话跳过: game=%s session=%s lanlan=%s attempt=%d reason=route_superseded",
+                        archive.get("game_type"),
+                        archive.get("session_id"),
+                        lanlan_name,
+                        attempt,
+                    )
+                    return
+                active_session = _active_realtime_session(mgr)
+                if not active_session:
+                    logger.info(
+                        "🎮 赛后 Realtime 主动搭话跳过: game=%s session=%s lanlan=%s attempt=%d reason=no_active_realtime_session",
+                        archive.get("game_type"),
+                        archive.get("session_id"),
+                        lanlan_name,
+                        attempt,
+                    )
+                    return
+                if expected_session is not None and active_session is not expected_session:
+                    logger.info(
+                        "🎮 赛后 Realtime 主动搭话跳过: game=%s session=%s lanlan=%s attempt=%d reason=realtime_session_changed",
+                        archive.get("game_type"),
+                        archive.get("session_id"),
+                        lanlan_name,
+                        attempt,
+                    )
+                    return
 
-            trigger = getattr(mgr, "trigger_voice_proactive_nudge", None)
-            if not callable(trigger):
-                logger.info(
-                    "🎮 赛后 Realtime 主动搭话跳过: game=%s session=%s lanlan=%s attempt=%d reason=trigger_unavailable",
-                    archive.get("game_type"),
-                    archive.get("session_id"),
-                    lanlan_name,
-                    attempt,
-                )
-                return
+                trigger = getattr(mgr, "trigger_voice_proactive_nudge", None)
+                if not callable(trigger):
+                    logger.info(
+                        "🎮 赛后 Realtime 主动搭话跳过: game=%s session=%s lanlan=%s attempt=%d reason=trigger_unavailable",
+                        archive.get("game_type"),
+                        archive.get("session_id"),
+                        lanlan_name,
+                        attempt,
+                    )
+                    return
 
-            delivered = bool(await trigger())
+                delivered = bool(await trigger())
             logger.info(
                 "🎮 赛后 Realtime 主动搭话尝试: game=%s session=%s lanlan=%s attempt=%d delay=%.1fs delivered=%s",
                 archive.get("game_type"),
@@ -512,7 +554,13 @@ def _postgame_context_request_id(archive: dict) -> Optional[str]:
     return f"{game_type}:{session_id}:{ended_at}"
 
 
-async def _deliver_postgame_to_realtime(mgr: Any, archive: dict, options: dict) -> dict:
+async def _deliver_postgame_to_realtime(
+    mgr: Any,
+    archive: dict,
+    options: dict,
+    *,
+    source_state: Optional[dict] = None,
+) -> dict:
     session = _active_realtime_session(mgr)
     if not session:
         return {"ok": False, "mode": "realtime", "action": "skip", "reason": "no_active_realtime_session"}
@@ -562,7 +610,22 @@ async def _deliver_postgame_to_realtime(mgr: Any, archive: dict, options: dict) 
                 "reason": "gemini_create_response_unavailable",
             }
         try:
-            await create_response(text + "\n\n" + instruction)
+            async with _postgame_delivery_guard(source_state) as may_deliver:
+                if not may_deliver:
+                    return {
+                        "ok": True,
+                        "mode": "realtime",
+                        "action": "skip",
+                        "reason": "route_superseded",
+                    }
+                if _active_realtime_session(mgr) is not session:
+                    return {
+                        "ok": False,
+                        "mode": "realtime",
+                        "action": "skip",
+                        "reason": "realtime_session_changed",
+                    }
+                await create_response(text + "\n\n" + instruction)
         except Exception as exc:
             logger.warning(
                 "🎮 赛后 Gemini Realtime 直接触发失败: game=%s session=%s lanlan=%s err=%s",
@@ -593,21 +656,36 @@ async def _deliver_postgame_to_realtime(mgr: Any, archive: dict, options: dict) 
         return {"ok": False, "mode": "realtime", "action": "skip", "reason": "context_method_unavailable"}
     postgame_request_id = _postgame_context_request_id(archive)
     try:
-        append_result = await append_context(
-            source="game.postgame",
-            role="system",
-            text=text,
-            audience="model",
-            timing="now",
-            lifetime="current_session",
-            request_id=postgame_request_id,
-            ordering_key=postgame_request_id,
-            metadata={
-                "game_type": archive.get("game_type"),
-                "lanlan_name": archive.get("lanlan_name"),
-                "kind": "postgame",
-            },
-        )
+        async with _postgame_delivery_guard(source_state) as may_deliver:
+            if not may_deliver:
+                return {
+                    "ok": True,
+                    "mode": "realtime",
+                    "action": "skip",
+                    "reason": "route_superseded",
+                }
+            if _active_realtime_session(mgr) is not session:
+                return {
+                    "ok": False,
+                    "mode": "realtime",
+                    "action": "skip",
+                    "reason": "realtime_session_changed",
+                }
+            append_result = await append_context(
+                source="game.postgame",
+                role="system",
+                text=text,
+                audience="model",
+                timing="now",
+                lifetime="current_session",
+                request_id=postgame_request_id,
+                ordering_key=postgame_request_id,
+                metadata={
+                    "game_type": archive.get("game_type"),
+                    "lanlan_name": archive.get("lanlan_name"),
+                    "kind": "postgame",
+                },
+            )
     except Exception as exc:
         logger.warning(
             "🎮 赛后 Realtime 上下文注入失败: game=%s session=%s lanlan=%s err=%s",
@@ -666,6 +744,7 @@ async def _deliver_postgame_to_realtime(mgr: Any, archive: dict, options: dict) 
                 dict(options),
                 _POSTGAME_REALTIME_NUDGE_DELAYS,
                 expected_session=session,
+                source_state=source_state,
             ))
             nudge_scheduled = True
             nudge_reason = "scheduled"
@@ -698,6 +777,7 @@ async def _deliver_postgame_text_bubble(
     options: dict,
     *,
     postgame_snapshot: Optional[dict] = None,
+    source_state: Optional[dict] = None,
 ) -> dict:
     # Late import: ``_run_game_chat`` lives in ``.runtime``, the layer above
     # this module, so a module-level import would be a package import cycle.
@@ -777,32 +857,41 @@ async def _deliver_postgame_text_bubble(
                 "llm_source": llm_result.get("llm_source") or {},
             }
 
-        tts_fed = False
-        feed_tts = getattr(mgr, "feed_tts_chunk", None)
-        if callable(feed_tts):
-            try:
-                await feed_tts(line, expected_speech_id=proactive_sid)
-                tts_fed = True
-            except Exception as exc:
-                logger.warning(
-                    "🎮 赛后文本气泡 TTS 投喂失败: game=%s session=%s lanlan=%s err=%s",
-                    game_type,
-                    session_id,
-                    archive.get("lanlan_name"),
-                    exc,
-                )
+        async with _postgame_delivery_guard(source_state) as may_deliver:
+            if not may_deliver:
+                return {
+                    "ok": True,
+                    "mode": "text",
+                    "action": "skip",
+                    "reason": "route_superseded",
+                    "llm_source": llm_result.get("llm_source") or {},
+                }
+            tts_fed = False
+            feed_tts = getattr(mgr, "feed_tts_chunk", None)
+            if callable(feed_tts):
+                try:
+                    await feed_tts(line, expected_speech_id=proactive_sid)
+                    tts_fed = True
+                except Exception as exc:
+                    logger.warning(
+                        "🎮 赛后文本气泡 TTS 投喂失败: game=%s session=%s lanlan=%s err=%s",
+                        game_type,
+                        session_id,
+                        archive.get("lanlan_name"),
+                        exc,
+                    )
 
-        committed = bool(await finish(line, expected_speech_id=proactive_sid))
-        return {
-            "ok": committed,
-            "mode": "text",
-            "action": "chat" if committed else "pass",
-            "reason": "delivered" if committed else "user_took_over",
-            "line": line,
-            "turn_id": proactive_sid,
-            "tts_fed": tts_fed,
-            "llm_source": llm_result.get("llm_source") or {},
-        }
+            committed = bool(await finish(line, expected_speech_id=proactive_sid))
+            return {
+                "ok": committed,
+                "mode": "text",
+                "action": "chat" if committed else "pass",
+                "reason": "delivered" if committed else "user_took_over",
+                "line": line,
+                "turn_id": proactive_sid,
+                "tts_fed": tts_fed,
+                "llm_source": llm_result.get("llm_source") or {},
+            }
     except Exception as exc:
         logger.warning(
             "🎮 赛后文本气泡投递失败: game=%s session=%s lanlan=%s err=%s",
@@ -872,18 +961,25 @@ async def _deliver_game_postgame(
     options: dict,
     *,
     postgame_snapshot: Optional[dict] = None,
+    source_state: Optional[dict] = None,
 ) -> dict:
     if not options.get("enabled", True):
         return {"ok": True, "action": "skip", "reason": "disabled"}
     mgr = get_session_manager().get(lanlan_name) if lanlan_name else None
     mode = str(options.get("mode") or "auto").lower()
     if mode in {"auto", "realtime"} and _active_realtime_session(mgr):
-        return await _deliver_postgame_to_realtime(mgr, archive, options)
+        return await _deliver_postgame_to_realtime(
+            mgr,
+            archive,
+            options,
+            source_state=source_state,
+        )
     if mode == "realtime":
         return {"ok": False, "mode": "realtime", "action": "skip", "reason": "no_active_realtime_session"}
     return await _deliver_postgame_text_bubble(
         game_type, session_id, mgr, archive, options,
         postgame_snapshot=postgame_snapshot,
+        source_state=source_state,
     )
 
 

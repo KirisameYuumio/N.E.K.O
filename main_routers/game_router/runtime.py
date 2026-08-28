@@ -4236,6 +4236,7 @@ async def _complete_game_end_from_payload(
                     archive,
                     postgame_options,
                     postgame_snapshot=finalized.get("postgame_context_snapshot"),
+                    source_state=state,
                 )
                 # B5: closing the LLM session is the inner finalize's job (now
                 # that ``close_game_session=True`` reliably propagates via

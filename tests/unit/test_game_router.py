@@ -7903,6 +7903,120 @@ async def test_postgame_realtime_context_aborts_when_active_session_changes(monk
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_postgame_realtime_publish_serializes_against_route_takeover(
+    monkeypatch,
+    _fake_realtime,
+):
+    session = _fake_realtime(model_lower="qwen-realtime", delivered=True)
+    mgr = _FakeRealtimeManager(session)
+    append_started = asyncio.Event()
+    release_append = asyncio.Event()
+    replacement_activated = asyncio.Event()
+
+    async def blocking_append(**kwargs):
+        mgr.append_context_calls.append(kwargs)
+        append_started.set()
+        await release_append.wait()
+        return SimpleNamespace(
+            appended=True,
+            deduped=False,
+            targets=("realtime_prime",),
+            reason=None,
+        )
+
+    mgr.append_context = blocking_append
+    with reset_game_route_state():
+        source_state = {
+            "game_route_active": False,
+            "game_type": "example-game",
+            "session_id": "route-A",
+            "lanlan_name": "Lan",
+        }
+        route_key = gr_runtime._route_state_key("Lan", "example-game")
+        gr_runtime._game_route_states[route_key] = source_state
+
+        delivery_task = asyncio.create_task(
+            gr_runtime._deliver_postgame_to_realtime(
+                mgr,
+                {
+                    "game_type": "example-game",
+                    "session_id": "route-A",
+                    "lanlan_name": "Lan",
+                    "ended_at": "100.0",
+                },
+                {"trigger_voice": False},
+                source_state=source_state,
+            )
+        )
+        await asyncio.wait_for(append_started.wait(), timeout=1.0)
+
+        async def activate_replacement():
+            async with gr_runtime._get_supersede_lock("Lan"):
+                gr_runtime._game_route_states[route_key] = {
+                    "game_route_active": True,
+                    "game_type": "example-game",
+                    "session_id": "route-B",
+                    "lanlan_name": "Lan",
+                }
+                replacement_activated.set()
+
+        replacement_task = asyncio.create_task(activate_replacement())
+        await asyncio.sleep(0)
+        assert replacement_activated.is_set() is False
+
+        release_append.set()
+        result = await asyncio.wait_for(delivery_task, timeout=1.0)
+        await asyncio.wait_for(replacement_task, timeout=1.0)
+
+        assert result["context_injected"] is True
+        assert replacement_activated.is_set() is True
+        assert len(mgr.append_context_calls) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_postgame_nudge_skips_when_replacement_route_activates(
+    monkeypatch,
+    _fake_realtime,
+):
+    session = _fake_realtime(model_lower="qwen-realtime", delivered=True)
+    mgr = _FakeRealtimeManager(session)
+    _gr_patch_all(monkeypatch, "_POSTGAME_REALTIME_NUDGE_DELAYS", (0.02,))
+
+    with reset_game_route_state():
+        source_state = {
+            "game_route_active": False,
+            "game_type": "example-game",
+            "session_id": "route-A",
+            "lanlan_name": "Lan",
+        }
+        route_key = gr_runtime._route_state_key("Lan", "example-game")
+        gr_runtime._game_route_states[route_key] = source_state
+        result = await gr_runtime._deliver_postgame_to_realtime(
+            mgr,
+            {
+                "game_type": "example-game",
+                "session_id": "route-A",
+                "lanlan_name": "Lan",
+                "ended_at": "100.0",
+            },
+            {"trigger_voice": True},
+            source_state=source_state,
+        )
+        gr_runtime._game_route_states[route_key] = {
+            "game_route_active": True,
+            "game_type": "example-game",
+            "session_id": "route-B",
+            "lanlan_name": "Lan",
+        }
+        await asyncio.sleep(0.05)
+
+        assert result["nudge_scheduled"] is True
+        assert mgr.voice_nudge_calls == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_end_uses_direct_response_for_gemini_postgame(monkeypatch, _fake_realtime):
     session = _fake_realtime(model_lower="gemini-2.5-flash-native-audio-preview", delivered=True)
     mgr = _FakeRealtimeManager(session)
@@ -7974,6 +8088,59 @@ class _FakePostgameTextManager:
 
     async def feed_tts_chunk(self, text, **kwargs):
         self.feed_tts_calls.append((text, kwargs))
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_postgame_text_drops_llm_result_after_route_takeover(monkeypatch):
+    mgr = _FakePostgameTextManager()
+    llm_started = asyncio.Event()
+    release_llm = asyncio.Event()
+
+    async def blocking_run_game_chat(*_args, **_kwargs):
+        llm_started.set()
+        await release_llm.wait()
+        return {"line": "late postgame line", "llm_source": {"provider": "fake"}}
+
+    _gr_patch_all(monkeypatch, "_run_game_chat", blocking_run_game_chat)
+
+    with reset_game_route_state():
+        source_state = {
+            "game_route_active": False,
+            "game_type": "example-game",
+            "session_id": "route-A",
+            "lanlan_name": "Lan",
+        }
+        route_key = gr_runtime._route_state_key("Lan", "example-game")
+        gr_runtime._game_route_states[route_key] = source_state
+        delivery_task = asyncio.create_task(
+            gr_runtime._deliver_postgame_text_bubble(
+                "example-game",
+                "route-A",
+                mgr,
+                {
+                    "game_type": "example-game",
+                    "session_id": "route-A",
+                    "lanlan_name": "Lan",
+                },
+                {"enabled": True},
+                source_state=source_state,
+            )
+        )
+        await asyncio.wait_for(llm_started.wait(), timeout=1.0)
+        gr_runtime._game_route_states[route_key] = {
+            "game_route_active": True,
+            "game_type": "example-game",
+            "session_id": "route-B",
+            "lanlan_name": "Lan",
+        }
+        release_llm.set()
+        result = await asyncio.wait_for(delivery_task, timeout=1.0)
+
+        assert result["action"] == "skip"
+        assert result["reason"] == "route_superseded"
+        assert mgr.feed_tts_calls == []
+        assert mgr.finish_calls == []
 
 
 @pytest.mark.unit
