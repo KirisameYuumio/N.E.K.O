@@ -127,6 +127,13 @@ def test_late_stt_gate_cannot_reactivate_the_most_recently_ended_route():
             assert(!isRecentlyEndedGameRouteIdentity(
               'example-game', 'ended-session', 'new-generation'
             ), 'new generation reusing a session was rejected');
+            S.gameRouteLastEndedIdentity.routeInstanceId = '';
+            assert(!isRecentlyEndedGameRouteIdentity(
+              'example-game', 'ended-session', 'identified-successor'
+            ), 'identified successor of a generation-less route was rejected');
+            assert(isRecentlyEndedGameRouteIdentity(
+              'example-game', 'ended-session', ''
+            ), 'generation-less late gate for a generation-less route was not rejected');
             assert(!isRecentlyEndedGameRouteIdentity(
               'example-game', 'new-session', 'ended-generation'
             ), 'different session was rejected');

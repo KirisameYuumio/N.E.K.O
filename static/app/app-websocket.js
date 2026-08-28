@@ -74,12 +74,12 @@
         if (String(sessionId) !== String(endedIdentity.sessionId)) return false;
         if (gameType && endedIdentity.gameType
                 && String(gameType) !== String(endedIdentity.gameType)) return false;
-        // A different non-empty generation is a genuinely newer route reusing
-        // the same session label. Missing generation remains stale when the
-        // just-ended route had one, because legacy/new opens clear this fixed
-        // tombstone before their STT gate can become authoritative.
-        if (routeInstanceId && endedIdentity.routeInstanceId
-                && String(routeInstanceId) !== String(endedIdentity.routeInstanceId)) return false;
+        // Any identified generation that differs from the just-ended route is
+        // a genuinely newer successor, including when the ended legacy route
+        // had no generation. An unidentified incoming gate remains stale when
+        // the game/session still matches this fixed tombstone.
+        if (routeInstanceId
+                && String(routeInstanceId) !== String(endedIdentity.routeInstanceId || '')) return false;
         return true;
     }
 
