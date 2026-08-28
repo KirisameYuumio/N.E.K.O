@@ -2984,6 +2984,7 @@
             setRuntimePhase('inactive', 'start-inactive');
             await publishRuntimeEvent('runtime-inactive', data, { waitForHandlers: true });
           } else {
+            resolveRuntimeRouteInstanceId(routeInstanceId);
             setRuntimePhase('degraded', 'start-rejected');
             if (isRuntimeOperationCurrent(operation) && runtimePhase === 'degraded') {
               startRuntimeMonitoring({ heartbeat: false });
@@ -4017,7 +4018,7 @@
       }
       const request = normalizeSpeechPreloadRequest(linesInput, options);
       const session = runtimeSession();
-      const payload = Object.freeze({
+      const payload = runtimeCapabilityPayload({
         lines: request.lines,
         session_id: session.id,
         ...(session.characterName ? { lanlan_name: session.characterName } : {}),

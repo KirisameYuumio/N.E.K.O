@@ -3259,6 +3259,26 @@
                     }
 
                     if (statusCode === 'GAME_VOICE_STT_GATE_ACTIVE') {
+                        var incomingSttGameType = (statusDetails && statusDetails.game_type) || '';
+                        var incomingSttSessionId = (statusDetails && statusDetails.session_id) || '';
+                        var incomingSttRouteInstanceId = (
+                            statusDetails && statusDetails.sdk_route_instance_id
+                        ) || '';
+                        var currentSttGameType = S.gameRouteGameType || '';
+                        var currentSttSessionId = S.gameRouteSessionId || '';
+                        var currentSttRouteInstanceId = S.gameRouteInstanceId || '';
+                        var staleSttGate = S.gameRouteActive === true && (
+                            (incomingSttGameType && currentSttGameType
+                                && incomingSttGameType !== currentSttGameType)
+                            || (incomingSttSessionId && currentSttSessionId
+                                && incomingSttSessionId !== currentSttSessionId)
+                            || ((incomingSttRouteInstanceId || currentSttRouteInstanceId)
+                                && incomingSttRouteInstanceId !== currentSttRouteInstanceId)
+                        );
+                        if (staleSttGate) {
+                            console.warn('[GameVoiceSTT] 忽略迟到的语音门禁状态:', statusDetails);
+                            return;
+                        }
                         var sttProvider = (statusDetails && statusDetails.stt_provider) || 'browser';
                         var transcriptionMode = (statusDetails && statusDetails.transcription_mode) || (
                             sttProvider === 'realtime' ? 'backend_pending' : 'browser_fallback'
@@ -3270,12 +3290,12 @@
                         var transcriptionReady = !!(statusDetails && statusDetails.ready === true);
                         advanceGameRouteStateRevision();
                         S.gameRouteActive = true;
-                        S.gameRouteGameType = (statusDetails && statusDetails.game_type) || '';
+                        S.gameRouteGameType = incomingSttGameType;
                         S.gameRouteLanlanName = (statusDetails && statusDetails.lanlan_name) || '';
-                        S.gameRouteSessionId = (statusDetails && statusDetails.session_id) || '';
-                        S.gameRouteInstanceId = (statusDetails && statusDetails.sdk_route_instance_id) || S.gameRouteInstanceId || '';
-                        S.gameVoiceSttGameType = (statusDetails && statusDetails.game_type) || '';
-                        S.gameVoiceSttSessionId = (statusDetails && statusDetails.session_id) || '';
+                        S.gameRouteSessionId = incomingSttSessionId;
+                        S.gameRouteInstanceId = incomingSttRouteInstanceId || S.gameRouteInstanceId || '';
+                        S.gameVoiceSttGameType = incomingSttGameType;
+                        S.gameVoiceSttSessionId = incomingSttSessionId;
                         // The route-resolution status may have arrived before
                         // this game-takeover edge. Preserve that authoritative
                         // verdict rather than regressing to backend_pending.

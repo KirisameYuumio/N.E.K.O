@@ -74,6 +74,16 @@ def test_reconnect_route_snapshot_cannot_overwrite_a_newer_websocket_route_event
         source,
         "if (statusCode === 'GAME_VOICE_STT_GATE_ACTIVE') {",
     )
+    assert "incomingSttSessionId !== currentSttSessionId" in stt_gate_block
+    assert re.search(
+        r"\(incomingSttRouteInstanceId \|\| currentSttRouteInstanceId\)\s*"
+        r"&&\s*"
+        r"incomingSttRouteInstanceId !== currentSttRouteInstanceId",
+        stt_gate_block,
+    )
+    assert stt_gate_block.index("if (staleSttGate) {") < stt_gate_block.index(
+        "advanceGameRouteStateRevision();"
+    )
     assert stt_gate_block.index(
         "advanceGameRouteStateRevision();"
     ) < stt_gate_block.index(

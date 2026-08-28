@@ -2244,6 +2244,7 @@ async def game_sdk_context_read(game_type: str, request: Request):
     lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
         game_type,
         data,
+        allow_pre_route=True,
     )
     if route_error is not None:
         return route_error
@@ -2276,6 +2277,8 @@ async def game_sdk_context_read(game_type: str, request: Request):
                 "language_preference_resolved": language_resolved,
                 "game_type": game_type,
             }
+        elif state is None:
+            unavailable.append(scope)
         elif scope == "recent-chat-summary":
             available[scope] = {
                 "summary": _normalize_short_text(
@@ -2936,20 +2939,11 @@ async def game_project_speak(game_type: str, request: Request):
                 if stale_response:
                     result = stale_response
                 else:
-                    speech_task = asyncio.current_task()
                     speech_correlation_id = str(
                         data.get("sdk_speech_correlation_id") or ""
                     ).strip()[:128]
-                    if state is not None:
-                        state["_sdk_active_speech_task"] = speech_task
-                        if speech_correlation_id:
-                            state["_sdk_active_speech_correlation_id"] = (
-                                speech_correlation_id
-                            )
-                        else:
-                            state.pop("_sdk_active_speech_correlation_id", None)
-                    try:
-                        result = await _speak_game_line_via_project_tts(
+                    speech_task = asyncio.create_task(
+                        _speak_game_line_via_project_tts(
                             mgr,
                             line,
                             request_id=str(data.get("request_id") or "") or None,
@@ -2962,12 +2956,57 @@ async def game_project_speak(game_type: str, request: Request):
                             reuse_synthesized_audio=reuse_synthesized_audio,
                             speech_correlation_id=speech_correlation_id,
                             event=_attach_game_memory_flag_to_event(
-                                data.get("event") if isinstance(data.get("event"), dict) else {},
+                                data.get("event")
+                                if isinstance(data.get("event"), dict)
+                                else {},
                                 state,
                                 game_type=game_type,
                             ),
                         )
+                    )
+                    if state is not None:
+                        state["_sdk_active_speech_task"] = speech_task
+                        if speech_correlation_id:
+                            state["_sdk_active_speech_correlation_id"] = (
+                                speech_correlation_id
+                            )
+                        else:
+                            state.pop("_sdk_active_speech_correlation_id", None)
+                    disconnected = False
+                    is_disconnected = getattr(request, "is_disconnected", None)
+                    try:
+                        while not speech_task.done():
+                            done, _ = await asyncio.wait({speech_task}, timeout=0.1)
+                            if done:
+                                break
+                            if callable(is_disconnected):
+                                try:
+                                    disconnected = bool(await is_disconnected())
+                                except Exception:
+                                    disconnected = False
+                                if disconnected:
+                                    speech_task.cancel()
+                                    break
+                        if disconnected:
+                            try:
+                                await speech_task
+                            except asyncio.CancelledError:
+                                pass
+                            result = {
+                                "ok": False,
+                                "reason": "cancelled",
+                                "audio_sent": False,
+                                "audio_committed": False,
+                            }
+                        else:
+                            result = await speech_task
                     finally:
+                        if not speech_task.done():
+                            speech_task.cancel()
+                            try:
+                                await speech_task
+                            except asyncio.CancelledError:
+                                pass
                         if (
                             state is not None
                             and state.get("_sdk_active_speech_task") is speech_task

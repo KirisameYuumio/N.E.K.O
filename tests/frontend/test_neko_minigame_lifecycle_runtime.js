@@ -693,10 +693,13 @@ async function main() {
   const routeTruthEnvironment = createEnvironment();
   let routeStartMode = 'reject';
   let routeStartCalls = 0;
+  let routeTruthLastStartPayload = null;
   let dialogueCalls = 0;
   let quickLineCalls = 0;
   let speechCalls = 0;
   let speechMirrorCalls = 0;
+  const speechPayloads = [];
+  const speechMirrorPayloads = [];
   let memorySubmitCalls = 0;
   const routeTruthTransport = {
     ...transport,
@@ -704,8 +707,9 @@ async function main() {
     resetRuntime() { return { sessionId: 'route-truth-session', characterName: 'Yui' }; },
     getRuntimeState() { return { sessionId: 'route-truth-session', characterName: 'Yui' }; },
     applyRuntimeState() { return { sessionId: 'route-truth-session', characterName: 'Yui' }; },
-    async start() {
+    async start(payload) {
       routeStartCalls += 1;
+      routeTruthLastStartPayload = payload;
       if (routeStartMode === 'throw') throw Object.assign(new Error('start failed'), { code: 'network_error' });
       if (routeStartMode === 'inactive') {
         return { ok: true, state: { game_route_active: false, session_id: 'route-truth-session' } };
@@ -724,11 +728,16 @@ async function main() {
     startSpeechOutputBridge() { return true; },
     stopSpeechOutputBridge() {},
     async preloadSpeechOutput() { return { ok: true, results: [] }; },
-    async requestSpeechOutput() {
+    async requestSpeechOutput(payload) {
       speechCalls += 1;
+      speechPayloads.push(payload);
       return { ok: true, speech_id: 'route-truth-speech' };
     },
-    async mirrorSpeechOutput() { speechMirrorCalls += 1; return { ok: true, mirrored: true }; },
+    async mirrorSpeechOutput(payload) {
+      speechMirrorCalls += 1;
+      speechMirrorPayloads.push(payload);
+      return { ok: true, mirrored: true };
+    },
     dispose() {},
   };
   const routeTruthGame = await window.NekoMiniGame.connect({
@@ -744,8 +753,6 @@ async function main() {
   await routeTruthGame.runtime.start({});
   const activeOnlyCalls = [
     () => routeTruthGame.dialogue.request({ event: 'after-rejected-start' }),
-    () => routeTruthGame.speech.speak({ text: 'after rejected start' }),
-    () => routeTruthGame.speech.mirror({ text: 'after rejected start' }),
     () => routeTruthGame.memory.submit({ summary: 'after rejected start' }),
   ];
   for (const invoke of activeOnlyCalls) {
@@ -755,9 +762,14 @@ async function main() {
       'a rejected runtime start permitted an active-route capability');
   }
   await routeTruthGame.dialogue.quickLines({ kind: 'pregame-after-rejected-start' });
-  assert(dialogueCalls === 0 && quickLineCalls === 1 && speechCalls === 0
-    && speechMirrorCalls === 0 && memorySubmitCalls === 0,
-  'a rejected runtime start leaked route-bound work or blocked pre-route quick lines');
+  await routeTruthGame.speech.speak({ text: 'after rejected start' });
+  await routeTruthGame.speech.mirror({ text: 'after rejected start' });
+  assert(dialogueCalls === 0 && quickLineCalls === 1 && speechCalls === 1
+    && speechMirrorCalls === 1 && memorySubmitCalls === 0,
+  'a rejected runtime start leaked route-bound work or blocked pre-route capabilities');
+  assert(speechPayloads[0].sdk_route_instance_id === undefined
+    && speechMirrorPayloads[0].sdk_route_instance_id === undefined,
+  'pre-route speech after a rejected start invented a route generation');
 
   routeStartMode = 'throw';
   let failedStartError = null;
@@ -770,6 +782,11 @@ async function main() {
       'a failed runtime start permitted an active-route capability');
   }
   await routeTruthGame.dialogue.quickLines({ kind: 'pregame-after-failed-start' });
+  await routeTruthGame.speech.speak({ text: 'after failed start' });
+  await routeTruthGame.speech.mirror({ text: 'after failed start' });
+  assert(speechPayloads[1].sdk_route_instance_id === routeTruthLastStartPayload.sdk_route_instance_id
+    && speechMirrorPayloads[1].sdk_route_instance_id === routeTruthLastStartPayload.sdk_route_instance_id,
+  'speech after an uncertain start did not preserve the bounded unresolved generation');
 
   routeStartMode = 'active';
   await routeTruthGame.runtime.start({});
@@ -781,9 +798,12 @@ async function main() {
   await routeTruthGame.speech.speak({ text: 'after rejected end' });
   await routeTruthGame.speech.mirror({ text: 'after rejected end' });
   await routeTruthGame.memory.submit({ summary: 'after rejected end' });
-  assert(dialogueCalls === 1 && quickLineCalls === 3 && speechCalls === 1
-    && speechMirrorCalls === 1 && memorySubmitCalls === 1,
+  assert(dialogueCalls === 1 && quickLineCalls === 3 && speechCalls === 3
+    && speechMirrorCalls === 3 && memorySubmitCalls === 1,
     'a failed runtime end discarded a route that may still be active');
+  assert(speechPayloads[2].sdk_route_instance_id
+    && speechMirrorPayloads[2].sdk_route_instance_id,
+  'established-route speech omitted the active route generation');
   const startsBeforeInvalidRetry = routeStartCalls;
   let establishedStartError = null;
   try { await routeTruthGame.runtime.start({}); } catch (error) { establishedStartError = error; }

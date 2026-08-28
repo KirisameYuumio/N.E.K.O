@@ -189,8 +189,16 @@ async function main() {
     && mirrorCalls[0].payload.lanlan_name === '测试猫娘'
     && mirrorCalls[0].payload.sdk_route_instance_id === undefined,
   'pre-route mirror did not use the resolved session/character without inventing a route generation');
+  const preStartPreload = await game.speech.preload(['opening preload before route']);
+  assert(preStartPreload.ok && preloadCalls.length === 1,
+    'pre-route speech preload was not delivered through the trusted transport');
+  assert(preloadCalls[0].payload.session_id === 'speech-session-1'
+    && preloadCalls[0].payload.lanlan_name === '测试猫娘'
+    && preloadCalls[0].payload.sdk_route_instance_id === undefined,
+  'pre-route preload did not use the resolved session/character without inventing a route generation');
   speechCalls.length = 0;
   mirrorCalls.length = 0;
+  preloadCalls.length = 0;
   await game.runtime.start({});
   const routeInstanceId = lastStartPayload.sdk_route_instance_id;
   const response = await game.speech.speak({
@@ -277,6 +285,8 @@ async function main() {
   assert(preloadCalls[0].payload.session_id === 'speech-session-1'
     && preloadCalls[0].payload.lanlan_name === '测试猫娘',
   'speech preload did not inject the runtime session and character');
+  assert(preloadCalls[0].payload.sdk_route_instance_id === routeInstanceId,
+    'speech preload was not bound to the active route generation');
   assert(preloadCalls[0].payload.i18n_language === 'zh-CN'
     && preloadCalls[0].payload.render_language === 'ja-JP',
   'speech preload language identity was not forwarded');
