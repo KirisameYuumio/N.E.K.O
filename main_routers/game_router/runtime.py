@@ -243,6 +243,25 @@ _SDK_AUTHOR_CONTROL_MAX_BYTES = 64 * 1024
 _SDK_GAME_MEMORY_SUBMISSION_LIMIT = 16
 _SDK_GAME_SPEECH_PENDING_LIMIT = 4
 _SDK_GAME_SPEECH_PRELOAD_TIMEOUT_SECONDS = 300.0
+_SDK_GAME_ROUTE_PRELOAD_TASK_LIMIT = 8
+_SDK_GAME_SPEECH_PRELOAD_CANCEL_SETTLE_SECONDS = 2.0
+
+
+async def _cancel_preload_task_bounded(task: asyncio.Task) -> None:
+    task.cancel()
+    done, _ = await asyncio.wait(
+        {task},
+        timeout=_SDK_GAME_SPEECH_PRELOAD_CANCEL_SETTLE_SECONDS,
+    )
+    if task not in done:
+        logger.warning("⚠️ 小游戏语音预载任务未在取消上限内结束")
+        return
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 _SDK_GAME_MIRROR_PUBLISH_TIMEOUT_SECONDS = 15.0
 _GAME_ROUTE_END_TOMBSTONE_TTL_SECONDS = 120.0
 _GAME_ROUTE_END_TOMBSTONE_LIMIT = 256
@@ -1865,6 +1884,13 @@ async def game_route_start(game_type: str, request: Request):
                     "reason": "ended_before_start",
                     "state": {"game_route_active": False},
                 }
+            # Persist takeover history on every older state object, including
+            # routes that already entered postgame and are now inactive. A
+            # quickly opened-and-closed successor must not make an older
+            # postgame delivery eligible again once no active peer remains.
+            for candidate in list(_game_route_states.values()):
+                if str(candidate.get("lanlan_name") or "") == lanlan_name:
+                    candidate["_sdk_route_superseded"] = True
             for old_state in [
                 candidate
                 for candidate in list(_game_route_states.values())
@@ -3194,7 +3220,42 @@ async def game_project_speech_preload(game_type: str, request: Request):
         message="小游戏项目语音静默预载开始",
         details={"line_count": len(lines), "total_characters": total_characters},
     )
-    preload_task = asyncio.create_task(preload(lines))
+    route_preload_tasks: set[asyncio.Task] | None = None
+    if state and state.get("game_route_active"):
+        preload_route_lock = _get_route_lock(lanlan_name, game_type)
+        async with preload_route_lock:
+            current_state = _get_active_game_route_state(lanlan_name, game_type)
+            if current_state is not state or not state.get("game_route_active"):
+                return {
+                    "ok": False,
+                    "reason": "route_superseded",
+                    "lanlan_name": lanlan_name,
+                    "method": "project_tts_preload",
+                    "results": [],
+                }
+            raw_route_tasks = state.get("_sdk_active_speech_preload_tasks")
+            if not isinstance(raw_route_tasks, set):
+                raw_route_tasks = set()
+                state["_sdk_active_speech_preload_tasks"] = raw_route_tasks
+            raw_route_tasks.difference_update([
+                task
+                for task in raw_route_tasks
+                if not isinstance(task, asyncio.Task) or task.done()
+            ])
+            if len(raw_route_tasks) >= _SDK_GAME_ROUTE_PRELOAD_TASK_LIMIT:
+                return {
+                    "ok": False,
+                    "reason": "preload_busy",
+                    "limit": _SDK_GAME_ROUTE_PRELOAD_TASK_LIMIT,
+                    "lanlan_name": lanlan_name,
+                    "method": "project_tts_preload",
+                    "results": [],
+                }
+            preload_task = asyncio.create_task(preload(lines))
+            raw_route_tasks.add(preload_task)
+            route_preload_tasks = raw_route_tasks
+    else:
+        preload_task = asyncio.create_task(preload(lines))
     is_disconnected = getattr(request, "is_disconnected", None)
     preload_deadline = (
         asyncio.get_running_loop().time()
@@ -3219,20 +3280,22 @@ async def game_project_speech_preload(game_type: str, request: Request):
                 preload_task.cancel()
                 break
         if cancel_reason:
-            try:
-                await preload_task
-            except asyncio.CancelledError:
-                pass
+            await _cancel_preload_task_bounded(preload_task)
             result = {"ok": False, "reason": cancel_reason, "results": []}
         else:
             result = await preload_task
     except asyncio.CancelledError:
-        preload_task.cancel()
-        try:
-            await preload_task
-        except asyncio.CancelledError:
-            pass
+        await _cancel_preload_task_bounded(preload_task)
         result = {"ok": False, "reason": "cancelled", "results": []}
+    finally:
+        if route_preload_tasks is not None:
+            route_preload_tasks.discard(preload_task)
+            if (
+                not route_preload_tasks
+                and state is not None
+                and state.get("_sdk_active_speech_preload_tasks") is route_preload_tasks
+            ):
+                state.pop("_sdk_active_speech_preload_tasks", None)
     if not isinstance(result, dict):
         result = {"ok": False, "reason": "invalid_preload_result", "results": []}
     result.setdefault("lanlan_name", lanlan_name)

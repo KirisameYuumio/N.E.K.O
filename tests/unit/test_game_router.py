@@ -5506,6 +5506,7 @@ async def test_route_start_finalizes_old_active_route_before_replacing(monkeypat
     assert result["state"]["session_id"] == "new_match"
     assert old_state["game_route_active"] is False
     assert old_state["exit_reason"] == "superseded_by_route_start"
+    assert old_state["_sdk_route_superseded"] is True
     assert submitted[0]["session_id"] == "old_match"
     assert submitted[0]["exit_reason"] == "superseded_by_route_start"
     fake_session.close.assert_awaited_once()
@@ -6978,6 +6979,99 @@ async def test_project_speech_preload_disconnect_cancels_backend_work(monkeypatc
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_project_speech_preload_is_cancelled_with_its_active_route(monkeypatch):
+    class BlockingPreloadManager(_FakeGameRouteManager):
+        def __init__(self):
+            super().__init__()
+            self.preload_started = asyncio.Event()
+            self.preload_cancelled = asyncio.Event()
+
+        async def preload_game_speech_audio(self, lines):
+            self.preloaded.append(list(lines))
+            self.preload_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.preload_cancelled.set()
+                raise
+
+    mgr = BlockingPreloadManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("example-game", "route-A", "Lan")
+        state["_sdk_route_instance_id"] = "generation-A"
+        preload_request = asyncio.create_task(
+            gr_runtime.game_project_speech_preload(
+                "example-game",
+                _FakeRequest({
+                    "lines": ["owned preload"],
+                    "lanlan_name": "Lan",
+                    "session_id": "route-A",
+                    "sdk_route_instance_id": "generation-A",
+                }),
+            )
+        )
+        await asyncio.wait_for(mgr.preload_started.wait(), timeout=1.0)
+        assert len(state["_sdk_active_speech_preload_tasks"]) == 1
+
+        route_lock = gr_runtime._get_route_lock("Lan", "example-game")
+        supersede_lock = gr_runtime._get_supersede_lock("Lan")
+        async with supersede_lock:
+            async with route_lock:
+                await gr_runtime._finalize_game_route_state(
+                    state,
+                    reason="test_route_end",
+                    close_game_session=False,
+                )
+        result = await asyncio.wait_for(preload_request, timeout=1.0)
+
+        assert result["ok"] is False
+        assert result["reason"] == "cancelled"
+        assert mgr.preload_cancelled.is_set() is True
+        assert "_sdk_active_speech_preload_tasks" not in state
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speech_preload_rejects_above_route_task_limit(monkeypatch):
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+    blockers = {
+        asyncio.create_task(asyncio.Event().wait())
+        for _ in range(gr_runtime._SDK_GAME_ROUTE_PRELOAD_TASK_LIMIT)
+    }
+
+    try:
+        with reset_game_route_state():
+            state = gr_runtime._activate_game_route("example-game", "route-A", "Lan")
+            state["_sdk_route_instance_id"] = "generation-A"
+            state["_sdk_active_speech_preload_tasks"] = blockers
+            result = await gr_runtime.game_project_speech_preload(
+                "example-game",
+                _FakeRequest({
+                    "lines": ["over capacity"],
+                    "lanlan_name": "Lan",
+                    "session_id": "route-A",
+                    "sdk_route_instance_id": "generation-A",
+                }),
+            )
+
+            assert result["ok"] is False
+            assert result["reason"] == "preload_busy"
+            assert result["limit"] == gr_runtime._SDK_GAME_ROUTE_PRELOAD_TASK_LIMIT
+            assert len(state["_sdk_active_speech_preload_tasks"]) == len(blockers)
+            assert mgr.preloaded == []
+    finally:
+        for task in blockers:
+            task.cancel()
+        await asyncio.gather(*blockers, return_exceptions=True)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_project_speech_preload_rejects_non_object_manager_result(monkeypatch):
     mgr = _FakeGameRouteManager()
     mgr.preload_game_speech_audio = AsyncMock(return_value=["not", "an", "object"])
@@ -7975,6 +8069,66 @@ async def test_postgame_realtime_publish_serializes_against_route_takeover(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_postgame_realtime_publish_timeout_releases_takeover_lock(
+    monkeypatch,
+    _fake_realtime,
+):
+    session = _fake_realtime(model_lower="qwen-realtime", delivered=True)
+    mgr = _FakeRealtimeManager(session)
+    append_started = asyncio.Event()
+    append_cancelled = asyncio.Event()
+    replacement_activated = asyncio.Event()
+
+    async def blocking_append(**_kwargs):
+        append_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            append_cancelled.set()
+            raise
+
+    mgr.append_context = blocking_append
+    monkeypatch.setattr(gr_postgame, "_POSTGAME_DELIVERY_LOCK_TIMEOUT_SECONDS", 0.01)
+
+    with reset_game_route_state():
+        source_state = {
+            "game_route_active": False,
+            "game_type": "example-game",
+            "session_id": "route-A",
+            "lanlan_name": "Lan",
+        }
+        route_key = gr_runtime._route_state_key("Lan", "example-game")
+        gr_runtime._game_route_states[route_key] = source_state
+        delivery_task = asyncio.create_task(
+            gr_runtime._deliver_postgame_to_realtime(
+                mgr,
+                {
+                    "game_type": "example-game",
+                    "session_id": "route-A",
+                    "lanlan_name": "Lan",
+                    "ended_at": "100.0",
+                },
+                {"trigger_voice": False},
+                source_state=source_state,
+            )
+        )
+        await asyncio.wait_for(append_started.wait(), timeout=1.0)
+
+        async def activate_replacement():
+            async with gr_runtime._get_supersede_lock("Lan"):
+                replacement_activated.set()
+
+        replacement_task = asyncio.create_task(activate_replacement())
+        result = await asyncio.wait_for(delivery_task, timeout=1.0)
+        await asyncio.wait_for(replacement_task, timeout=1.0)
+
+        assert result["reason"] == "postgame_delivery_timeout"
+        assert append_cancelled.is_set() is True
+        assert replacement_activated.is_set() is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_postgame_nudge_skips_when_replacement_route_activates(
     monkeypatch,
     _fake_realtime,
@@ -8141,6 +8295,93 @@ async def test_postgame_text_drops_llm_result_after_route_takeover(monkeypatch):
         assert result["reason"] == "route_superseded"
         assert mgr.feed_tts_calls == []
         assert mgr.finish_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_postgame_text_stays_superseded_after_replacement_route_ends(monkeypatch):
+    mgr = _FakePostgameTextManager()
+
+    async def completed_run_game_chat(*_args, **_kwargs):
+        return {"line": "stale postgame line", "llm_source": {"provider": "fake"}}
+
+    _gr_patch_all(monkeypatch, "_run_game_chat", completed_run_game_chat)
+    source_state = {
+        "game_route_active": False,
+        "game_type": "example-game",
+        "session_id": "route-A",
+        "lanlan_name": "Lan",
+        "_sdk_route_superseded": True,
+    }
+
+    result = await gr_runtime._deliver_postgame_text_bubble(
+        "example-game",
+        "route-A",
+        mgr,
+        {
+            "game_type": "example-game",
+            "session_id": "route-A",
+            "lanlan_name": "Lan",
+        },
+        {"enabled": True},
+        source_state=source_state,
+    )
+
+    assert result["action"] == "skip"
+    assert result["reason"] == "route_superseded"
+    assert mgr.feed_tts_calls == []
+    assert mgr.finish_calls == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_postgame_text_publish_timeout_releases_takeover_lock(monkeypatch):
+    mgr = _FakePostgameTextManager()
+    feed_started = asyncio.Event()
+    feed_cancelled = asyncio.Event()
+
+    async def completed_run_game_chat(*_args, **_kwargs):
+        return {"line": "bounded postgame line", "llm_source": {"provider": "fake"}}
+
+    async def blocking_feed_tts(*_args, **_kwargs):
+        feed_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            feed_cancelled.set()
+            raise
+
+    _gr_patch_all(monkeypatch, "_run_game_chat", completed_run_game_chat)
+    mgr.feed_tts_chunk = blocking_feed_tts
+    monkeypatch.setattr(gr_postgame, "_POSTGAME_DELIVERY_LOCK_TIMEOUT_SECONDS", 0.01)
+    source_state = {
+        "game_route_active": False,
+        "game_type": "example-game",
+        "session_id": "route-A",
+        "lanlan_name": "Lan",
+    }
+
+    with reset_game_route_state():
+        gr_runtime._game_route_states[
+            gr_runtime._route_state_key("Lan", "example-game")
+        ] = source_state
+        result = await gr_runtime._deliver_postgame_text_bubble(
+            "example-game",
+            "route-A",
+            mgr,
+            {
+                "game_type": "example-game",
+                "session_id": "route-A",
+                "lanlan_name": "Lan",
+            },
+            {"enabled": True},
+            source_state=source_state,
+        )
+
+    assert result["reason"] == "postgame_delivery_timeout"
+    assert feed_started.is_set() is True
+    assert feed_cancelled.is_set() is True
+    assert mgr.finish_calls == []
 
 
 @pytest.mark.unit

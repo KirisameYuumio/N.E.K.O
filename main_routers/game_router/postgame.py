@@ -92,12 +92,15 @@ _POSTGAME_REALTIME_UNORGANIZED_MAX_TOKENS = 1500
 
 
 _GAME_SPEECH_CANCEL_SETTLE_SECONDS = 2.0
+_POSTGAME_DELIVERY_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 def _postgame_replacement_route_active(source_state: Optional[dict]) -> bool:
     """Return whether another active game route now owns the same character."""
     if not isinstance(source_state, dict):
         return False
+    if source_state.get("_sdk_route_superseded") is True:
+        return True
     lanlan_name = str(source_state.get("lanlan_name") or "")
     if not lanlan_name:
         return False
@@ -119,8 +122,41 @@ async def _postgame_delivery_guard(source_state: Optional[dict]):
     if not lanlan_name:
         yield True
         return
-    async with _get_supersede_lock(lanlan_name):
-        yield not _postgame_replacement_route_active(source_state)
+    async with asyncio.timeout(_POSTGAME_DELIVERY_LOCK_TIMEOUT_SECONDS):
+        async with _get_supersede_lock(lanlan_name):
+            yield not _postgame_replacement_route_active(source_state)
+
+
+async def _cancel_route_game_speech_preloads(state: dict) -> None:
+    """Cancel and drain the bounded preload tasks owned by this route."""
+    raw_tasks = state.pop("_sdk_active_speech_preload_tasks", None)
+    if not isinstance(raw_tasks, set):
+        return
+    current = asyncio.current_task()
+    tasks = {
+        task
+        for task in raw_tasks
+        if isinstance(task, asyncio.Task) and task is not current and not task.done()
+    }
+    raw_tasks.clear()
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=_GAME_SPEECH_CANCEL_SETTLE_SECONDS,
+    )
+    for task in done:
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+    if pending:
+        logger.warning(
+            "⚠️ 游戏路由退出时有 %d 个语音预载任务未在上限内结束",
+            len(pending),
+        )
 
 
 async def _cancel_route_game_speech(state: dict, mgr: Any) -> None:
@@ -527,6 +563,15 @@ async def _run_postgame_realtime_nudge_task(
                 return
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            logger.warning(
+                "🎮 赛后 Realtime 主动搭话超时: game=%s session=%s lanlan=%s attempt=%d",
+                archive.get("game_type"),
+                archive.get("session_id"),
+                lanlan_name,
+                attempt,
+            )
+            return
         except Exception as exc:
             logger.warning(
                 "🎮 赛后 Realtime 主动搭话异常: game=%s session=%s lanlan=%s attempt=%d err=%s",
@@ -626,6 +671,19 @@ async def _deliver_postgame_to_realtime(
                         "reason": "realtime_session_changed",
                     }
                 await create_response(text + "\n\n" + instruction)
+        except TimeoutError:
+            logger.warning(
+                "🎮 赛后 Gemini Realtime 直接触发超时: game=%s session=%s lanlan=%s",
+                archive.get("game_type"),
+                archive.get("session_id"),
+                archive.get("lanlan_name"),
+            )
+            return {
+                "ok": False,
+                "mode": "realtime",
+                "action": "skip",
+                "reason": "postgame_delivery_timeout",
+            }
         except Exception as exc:
             logger.warning(
                 "🎮 赛后 Gemini Realtime 直接触发失败: game=%s session=%s lanlan=%s err=%s",
@@ -686,6 +744,19 @@ async def _deliver_postgame_to_realtime(
                     "kind": "postgame",
                 },
             )
+    except TimeoutError:
+        logger.warning(
+            "🎮 赛后 Realtime 上下文注入超时: game=%s session=%s lanlan=%s",
+            archive.get("game_type"),
+            archive.get("session_id"),
+            archive.get("lanlan_name"),
+        )
+        return {
+            "ok": False,
+            "mode": "realtime",
+            "action": "skip",
+            "reason": "postgame_delivery_timeout",
+        }
     except Exception as exc:
         logger.warning(
             "🎮 赛后 Realtime 上下文注入失败: game=%s session=%s lanlan=%s err=%s",
@@ -797,6 +868,19 @@ async def _deliver_postgame_text_bubble(
 
     try:
         prepared = await prepare(min_idle_secs=float(options.get("min_idle_secs") or 0.0))
+    except TimeoutError:
+        logger.warning(
+            "🎮 赛后文本气泡投递超时: game=%s session=%s lanlan=%s",
+            game_type,
+            session_id,
+            archive.get("lanlan_name"),
+        )
+        return {
+            "ok": False,
+            "mode": "text",
+            "action": "skip",
+            "reason": "postgame_delivery_timeout",
+        }
     except Exception as exc:
         logger.warning(
             "🎮 赛后文本气泡准备失败: game=%s session=%s lanlan=%s err=%s",
@@ -892,6 +976,19 @@ async def _deliver_postgame_text_bubble(
                 "tts_fed": tts_fed,
                 "llm_source": llm_result.get("llm_source") or {},
             }
+    except TimeoutError:
+        logger.warning(
+            "🎮 赛后文本气泡投递超时: game=%s session=%s lanlan=%s",
+            game_type,
+            session_id,
+            archive.get("lanlan_name"),
+        )
+        return {
+            "ok": False,
+            "mode": "text",
+            "action": "skip",
+            "reason": "postgame_delivery_timeout",
+        }
     except Exception as exc:
         logger.warning(
             "🎮 赛后文本气泡投递失败: game=%s session=%s lanlan=%s err=%s",
@@ -1134,6 +1231,7 @@ async def _finalize_game_route_state_inner(
     state["heartbeat_enabled"] = False
     lanlan_name = str(state.get("lanlan_name") or "")
     mgr = get_session_manager().get(lanlan_name) if lanlan_name else None
+    await _cancel_route_game_speech_preloads(state)
     await _cancel_route_game_speech(state, mgr)
     # 推 closed 事件让前端还原 chat.html 折叠态 + 显回 pet 容器。所有 finalize
     # 路径（/route/end / heartbeat sweep / supersede）都走本 inner，与 active
