@@ -137,10 +137,11 @@
         gameRouteLanlanName: '',
         gameRouteSessionId: '',
         gameRouteInstanceId: '',
-        // Fixed single-slot tombstone for rejecting a late STT-gate event
-        // after the corresponding route has already been closed. It is
-        // overwritten by the next close and released by the next open.
-        gameRouteLastEndedIdentity: null,
+        // Bounded, expiring route tombstones reject delayed STT-gate events
+        // after multiple rapid route generations have already closed.
+        // app-websocket prunes on record/check/open; page teardown releases
+        // the array with the rest of this state object.
+        gameRouteRecentlyEndedIdentities: [],
         gameRouteStateRevision: 0,
         gameVoiceControlCredential: '',
         gameVoiceSttGateActive: false,

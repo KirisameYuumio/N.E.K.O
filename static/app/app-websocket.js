@@ -35,6 +35,8 @@
     const CAPTURE_BRIDGE_REANNOUNCE_INTERVAL_MS = 250;
     const CAPTURE_BRIDGE_REANNOUNCE_MAX_ATTEMPTS = 40;
     const CAPTURE_BRIDGE_REGION_IMAGE_MAX_CHARS = 9 * 1024 * 1024;
+    const GAME_ROUTE_ENDED_IDENTITY_LIMIT = 8;
+    const GAME_ROUTE_ENDED_IDENTITY_TTL_MS = 2 * 60 * 1000;
     let _pendingUserActivityCancelTimer = 0;
     let _pendingUserActivityCancelTurnId = null;
     let _gameRouteReconciliationGeneration = 0;
@@ -60,27 +62,54 @@
         return S.gameRouteStateRevision;
     }
 
+    function pruneRecentlyEndedGameRouteIdentities() {
+        var cutoff = Date.now() - GAME_ROUTE_ENDED_IDENTITY_TTL_MS;
+        var identities = Array.isArray(S.gameRouteRecentlyEndedIdentities)
+            ? S.gameRouteRecentlyEndedIdentities
+            : [];
+        identities = identities.filter(function (identity) {
+            return identity && identity.sessionId && Number(identity.endedAt || 0) > cutoff;
+        });
+        if (identities.length > GAME_ROUTE_ENDED_IDENTITY_LIMIT) {
+            identities = identities.slice(-GAME_ROUTE_ENDED_IDENTITY_LIMIT);
+        }
+        S.gameRouteRecentlyEndedIdentities = identities;
+        return identities;
+    }
+
     function rememberEndedGameRouteIdentity(gameType, sessionId, routeInstanceId) {
-        S.gameRouteLastEndedIdentity = {
+        var normalized = {
             gameType: String(gameType || ''),
             sessionId: String(sessionId || ''),
-            routeInstanceId: String(routeInstanceId || '')
+            routeInstanceId: String(routeInstanceId || ''),
+            endedAt: Date.now()
         };
+        if (!normalized.sessionId) return;
+        var identities = pruneRecentlyEndedGameRouteIdentities().filter(function (identity) {
+            return identity.gameType !== normalized.gameType
+                || identity.sessionId !== normalized.sessionId
+                || identity.routeInstanceId !== normalized.routeInstanceId;
+        });
+        identities.push(normalized);
+        if (identities.length > GAME_ROUTE_ENDED_IDENTITY_LIMIT) {
+            identities.splice(0, identities.length - GAME_ROUTE_ENDED_IDENTITY_LIMIT);
+        }
+        S.gameRouteRecentlyEndedIdentities = identities;
     }
 
     function isRecentlyEndedGameRouteIdentity(gameType, sessionId, routeInstanceId) {
-        var endedIdentity = S.gameRouteLastEndedIdentity;
-        if (!endedIdentity || !sessionId || !endedIdentity.sessionId) return false;
-        if (String(sessionId) !== String(endedIdentity.sessionId)) return false;
-        if (gameType && endedIdentity.gameType
-                && String(gameType) !== String(endedIdentity.gameType)) return false;
-        // Any identified generation that differs from the just-ended route is
-        // a genuinely newer successor, including when the ended legacy route
-        // had no generation. An unidentified incoming gate remains stale when
-        // the game/session still matches this fixed tombstone.
-        if (routeInstanceId
-                && String(routeInstanceId) !== String(endedIdentity.routeInstanceId || '')) return false;
-        return true;
+        if (!sessionId) return false;
+        var incomingGameType = String(gameType || '');
+        var incomingSessionId = String(sessionId || '');
+        var incomingRouteInstanceId = String(routeInstanceId || '');
+        return pruneRecentlyEndedGameRouteIdentities().some(function (endedIdentity) {
+            if (incomingSessionId !== String(endedIdentity.sessionId || '')) return false;
+            if (incomingGameType && endedIdentity.gameType
+                    && incomingGameType !== String(endedIdentity.gameType)) return false;
+            if (!incomingRouteInstanceId) return true;
+            return !!endedIdentity.routeInstanceId
+                && incomingRouteInstanceId === String(endedIdentity.routeInstanceId);
+        });
     }
 
     // ---- DOM element shortcuts (resolved lazily / once) ----
@@ -4912,7 +4941,7 @@
                             console.log(`[GameWindow] 忽略过期窗口事件 | action=${detail.action} incoming=${incomingGameSessionId} current=${currentGameSessionId}`);
                         } else if (detail.action === 'opened') {
                             advanceGameRouteStateRevision();
-                            S.gameRouteLastEndedIdentity = null;
+                            pruneRecentlyEndedGameRouteIdentities();
                             S.gameRouteActive = true;
                             S.gameRouteGameType = detail.gameType || '';
                             S.gameRouteLanlanName = detail.lanlanName || '';

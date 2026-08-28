@@ -95,10 +95,14 @@ def test_reconnect_route_snapshot_cannot_overwrite_a_newer_websocket_route_event
 def test_late_stt_gate_cannot_reactivate_the_most_recently_ended_route():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     state_source = APP_STATE_PATH.read_text(encoding="utf-8")
-    function_opener = (
+    prune_opener = "function pruneRecentlyEndedGameRouteIdentities() {"
+    remember_opener = "function rememberEndedGameRouteIdentity(gameType, sessionId, routeInstanceId) {"
+    check_opener = (
         "function isRecentlyEndedGameRouteIdentity(gameType, sessionId, routeInstanceId) {"
     )
-    function_body = _block_after(source, function_opener)
+    prune_body = _block_after(source, prune_opener)
+    remember_body = _block_after(source, remember_opener)
+    check_body = _block_after(source, check_opener)
     node_path = shutil.which("node")
     if not node_path:
         pytest.skip("node is not installed; skipping ended-route identity harness")
@@ -107,40 +111,66 @@ def test_late_stt_gate_cannot_reactivate_the_most_recently_ended_route():
         node_path,
         textwrap.dedent(
             f"""
-            const S = {{
-              gameRouteLastEndedIdentity: {{
-                gameType: 'example-game',
-                sessionId: 'ended-session',
-                routeInstanceId: 'ended-generation'
-              }}
-            }};
-            {function_opener}
-            {function_body}
+            const GAME_ROUTE_ENDED_IDENTITY_LIMIT = 8;
+            const GAME_ROUTE_ENDED_IDENTITY_TTL_MS = 2 * 60 * 1000;
+            let now = 1000000;
+            Date.now = () => now;
+            const S = {{ gameRouteRecentlyEndedIdentities: [] }};
+            {prune_opener}
+            {prune_body}
+            }}
+            {remember_opener}
+            {remember_body}
+            }}
+            {check_opener}
+            {check_body}
             }}
             function assert(value, message) {{ if (!value) throw new Error(message); }}
-            assert(isRecentlyEndedGameRouteIdentity(
-              'example-game', 'ended-session', 'ended-generation'
-            ), 'exact ended identity was not rejected');
-            assert(isRecentlyEndedGameRouteIdentity(
-              'example-game', 'ended-session', ''
-            ), 'generation-less late gate for an identified ended route was not rejected');
+
+            rememberEndedGameRouteIdentity('example-game', 'legacy-session', '');
             assert(!isRecentlyEndedGameRouteIdentity(
-              'example-game', 'ended-session', 'new-generation'
-            ), 'new generation reusing a session was rejected');
-            S.gameRouteLastEndedIdentity.routeInstanceId = '';
-            assert(!isRecentlyEndedGameRouteIdentity(
-              'example-game', 'ended-session', 'identified-successor'
+              'example-game', 'legacy-session', 'identified-successor'
             ), 'identified successor of a generation-less route was rejected');
             assert(isRecentlyEndedGameRouteIdentity(
-              'example-game', 'ended-session', ''
+              'example-game', 'legacy-session', ''
             ), 'generation-less late gate for a generation-less route was not rejected');
+
+            now += 1;
+            rememberEndedGameRouteIdentity('example-game', 'reused-session', 'generation-A');
+            now += 1;
+            rememberEndedGameRouteIdentity('example-game', 'reused-session', 'generation-B');
+            assert(isRecentlyEndedGameRouteIdentity(
+              'example-game', 'reused-session', 'generation-A'
+            ), 'older ended generation was forgotten after its successor closed');
+            assert(isRecentlyEndedGameRouteIdentity(
+              'example-game', 'reused-session', 'generation-B'
+            ), 'latest ended generation was not rejected');
             assert(!isRecentlyEndedGameRouteIdentity(
-              'example-game', 'new-session', 'ended-generation'
+              'example-game', 'reused-session', 'generation-C'
+            ), 'new generation reusing a session was rejected');
+            assert(isRecentlyEndedGameRouteIdentity(
+              'example-game', 'reused-session', ''
+            ), 'generation-less late gate for an identified ended route was not rejected');
+            assert(!isRecentlyEndedGameRouteIdentity(
+              'example-game', 'new-session', 'generation-A'
             ), 'different session was rejected');
-            S.gameRouteLastEndedIdentity = null;
+
+            S.gameRouteRecentlyEndedIdentities = [];
+            for (let i = 0; i < 10; i += 1) {{
+              now += 1;
+              rememberEndedGameRouteIdentity('example-game', `session-${{i}}`, `generation-${{i}}`);
+            }}
+            assert(S.gameRouteRecentlyEndedIdentities.length === 8, 'ended identity history exceeded capacity');
             assert(!isRecentlyEndedGameRouteIdentity(
-              'example-game', 'ended-session', 'ended-generation'
-            ), 'cleared tombstone remained active');
+              'example-game', 'session-0', 'generation-0'
+            ), 'capacity eviction did not release the oldest identity');
+            assert(isRecentlyEndedGameRouteIdentity(
+              'example-game', 'session-9', 'generation-9'
+            ), 'capacity pruning removed the newest identity');
+
+            now += GAME_ROUTE_ENDED_IDENTITY_TTL_MS + 1;
+            pruneRecentlyEndedGameRouteIdentities();
+            assert(S.gameRouteRecentlyEndedIdentities.length === 0, 'expired identities were not released');
             """
         ),
         cwd=str(Path(__file__).resolve().parents[2]),
@@ -160,14 +190,16 @@ def test_late_stt_gate_cannot_reactivate_the_most_recently_ended_route():
         source,
         "} else if (response.type === 'game_window_state_change') {",
     )
-    assert "gameRouteLastEndedIdentity: null" in state_source
+    assert "gameRouteRecentlyEndedIdentities: []" in state_source
+    assert "GAME_ROUTE_ENDED_IDENTITY_LIMIT = 8" in source
+    assert "GAME_ROUTE_ENDED_IDENTITY_TTL_MS = 2 * 60 * 1000" in source
     assert ended_block.index("rememberEndedGameRouteIdentity(") < ended_block.index(
         "S.gameRouteActive = false;"
     )
     assert stt_gate_block.index("isRecentlyEndedGameRouteIdentity(") < stt_gate_block.index(
         "advanceGameRouteStateRevision();"
     )
-    assert window_block.index("S.gameRouteLastEndedIdentity = null;") < window_block.index(
+    assert window_block.index("pruneRecentlyEndedGameRouteIdentities();") < window_block.index(
         "S.gameRouteActive = true;"
     )
     assert window_block.index("rememberEndedGameRouteIdentity(") < window_block.index(
