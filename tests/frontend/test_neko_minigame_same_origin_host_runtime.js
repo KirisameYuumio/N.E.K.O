@@ -74,6 +74,8 @@ async function main() {
   let markProtocolTwoStarted;
   let releaseDelayedDrain;
   let markDelayedDrainStarted;
+  let slowLogEnableGate = null;
+  let releaseSlowLogEnable = null;
   const protocolTwoGate = new Promise((resolve) => { releaseProtocolTwo = resolve; });
   const protocolTwoStarted = new Promise((resolve) => { markProtocolTwoStarted = resolve; });
   const delayedDrainGate = new Promise((resolve) => { releaseDelayedDrain = resolve; });
@@ -82,6 +84,10 @@ async function main() {
     const pathName = String(url);
     if (pathName.startsWith('/api/config/page_config')) {
       return jsonResponse({ autostart_csrf_token: 'test-token' });
+    }
+    if (pathName === '/api/game/logs/enable') {
+      if (slowLogEnableGate) await slowLogEnableGate;
+      return jsonResponse({ ok: true, enabled: true });
     }
     const body = init.body ? JSON.parse(init.body) : {};
     calls.push({ url: pathName, init, body });
@@ -178,6 +184,7 @@ async function main() {
       'no-lock-game',
       'logger-one',
       'logger-two',
+      'log-timeout-game',
     ], ...Array.from({ length: 70 }, (_unused, index) => `overflow-game-${index}`)]
       .map((gameId) => [gameId, {
       mode: gameId === 'example-game' ? 'registered' : 'development',
@@ -1066,6 +1073,39 @@ async function main() {
   }
   assert(runtimeOnlyProjection.archive.finalScore.player === 2,
     'a runtime-only game lost its own outcome fields');
+
+  // --- a timed-out logger enable must not commit when it finally lands ---
+  // The generation guard only tracks teardown, so without an attempt token a
+  // slow POST (30s default) landing after the 3.5s enable timeout would flip
+  // logger.enabled AFTER the caller was told enabling failed, and console
+  // output would start being transmitted unexpectedly.
+  slowLogEnableGate = new Promise((resolve) => { releaseSlowLogEnable = resolve; });
+  const timeoutLogHost = createHost({
+    gameType: 'log-timeout-game',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  await timeoutLogHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'log-timeout-game', version: '1.0.0',
+      requiredCapabilities: ['logging'], optionalCapabilities: [],
+    },
+  });
+  timeoutLogHost.configureLogger({ enableTimeoutMs: 5 });
+  const timedOutEnable = await timeoutLogHost.enableLogger('test');
+  assert(timedOutEnable?.ok === false && timedOutEnable.reason === 'enable_timeout',
+    'the slow logger enable did not time out as set up: ' + JSON.stringify(timedOutEnable));
+  assert(timeoutLogHost._logger.enabled !== true,
+    'logging was enabled even though the caller was told it timed out');
+
+  releaseSlowLogEnable();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert(timeoutLogHost._logger.enabled !== true,
+    'a timed-out logger enable committed after it finally settled');
+  timeoutLogHost.dispose();
+  slowLogEnableGate = null;
 
   noLockHost.dispose();
   genericHost.dispose();

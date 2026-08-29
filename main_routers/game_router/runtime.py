@@ -3336,7 +3336,25 @@ async def game_project_speech_preload(game_type: str, request: Request):
         else:
             result = await preload_task
     except asyncio.CancelledError:
+        # Two different producers reach this handler, and they must not share an
+        # outcome:
+        #   * the CHILD was cancelled by someone else -- route teardown calls
+        #     _cancel_route_game_speech_preloads(), which cancels the tasks it
+        #     owns. ``await preload_task`` then re-raises the child's
+        #     cancellation here, and turning that into a normal ``cancelled``
+        #     response is correct: an ordinary end-of-round must not 500.
+        #   * THIS request task was cancelled. Reporting a value to a caller
+        #     that asked us to stop is the same defect that was fixed one layer
+        #     down in ``preload_game_speech_audio`` -- the coroutine would keep
+        #     running cleanup, logging and response construction after being
+        #     told to terminate.
+        # ``Task.cancelling()`` is what distinguishes them: it counts cancels
+        # delivered to US, so it stays 0 when only the child was cancelled.
+        current_task = asyncio.current_task()
+        self_cancelled = bool(current_task is not None and current_task.cancelling())
         await _cancel_preload_task_bounded(preload_task)
+        if self_cancelled:
+            raise
         result = {"ok": False, "reason": "cancelled", "results": []}
     finally:
         if route_preload_tasks is not None:

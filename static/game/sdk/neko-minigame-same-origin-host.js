@@ -2471,6 +2471,20 @@
     _startLoggerEnablePromise(workPromise, generation) {
       const logger = this._logger;
       const isCurrentGeneration = () => logger.enableGeneration === generation;
+      // The generation only tracks TEARDOWN (resetLogger/dispose bump it), but an
+      // attempt can stop being the live one in two further ways: its own timeout
+      // fires, or a retry supersedes it. The work promise keeps running in both
+      // cases -- the POST carries no explicit timeout, so it falls back to the
+      // 30s default and can land ~26s after a 3.5s enable timeout -- and would
+      // then flip logger.enabled after the caller was told enabling failed,
+      // silently starting to transmit console output, or clobber the retry that
+      // replaced it. One token retires the attempt for all three reasons.
+      const attemptToken = {};
+      logger.enableAttempt = attemptToken;
+      const isCurrentAttempt = () => isCurrentGeneration() && logger.enableAttempt === attemptToken;
+      const retireAttempt = () => {
+        if (logger.enableAttempt === attemptToken) logger.enableAttempt = null;
+      };
       this._cancelLoggerEnableTimeout();
       let timeoutId = null;
       const timeoutPromise = new Promise((resolve) => {
@@ -2480,17 +2494,20 @@
             logger.enableTimeoutId = null;
             logger.enableTimeoutResolve = null;
           }
+          retireAttempt();
           resolve({ ok: false, reason: 'enable_timeout' });
         }, logger.enableTimeoutMs);
         logger.enableTimeoutId = timeoutId;
       });
       const guardedWork = Promise.resolve(workPromise)
         .then((result) => {
-          if (!isCurrentGeneration()) return { ok: false, reason: 'stale_enable_result' };
+          if (!isCurrentAttempt()) return { ok: false, reason: 'stale_enable_result' };
           return this._onLoggerEnabled(result);
         })
         .catch((error) => {
-          if (!isCurrentGeneration()) return { ok: false, reason: 'stale_enable_error' };
+          // Symmetric on purpose: a late rejection must not overwrite the state
+          // of whatever replaced this attempt either.
+          if (!isCurrentAttempt()) return { ok: false, reason: 'stale_enable_error' };
           return this._onLoggerEnableFailed(error);
         });
       const enablePromise = Promise.race([guardedWork, timeoutPromise])

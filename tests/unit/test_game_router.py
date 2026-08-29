@@ -7082,6 +7082,63 @@ async def test_project_speech_preload_is_cancelled_with_its_active_route(monkeyp
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_project_speech_preload_propagates_cancellation_of_its_own_request(monkeypatch):
+    """Cancelling the REQUEST must stop it, not produce a response.
+
+    The sibling test above covers the other producer of the same exception: the
+    child preload cancelled by route teardown, which must degrade to a normal
+    ``cancelled`` response so an ordinary end-of-round does not 500. Those two
+    have to be told apart -- converting our own cancellation into a value means
+    the handler keeps running cleanup, logging and response construction after
+    being asked to terminate, which is the defect that was already fixed one
+    layer down in ``preload_game_speech_audio``.
+    """
+    class BlockingPreloadManager(_FakeGameRouteManager):
+        def __init__(self):
+            super().__init__()
+            self.preload_started = asyncio.Event()
+            self.preload_cancelled = asyncio.Event()
+
+        async def preload_game_speech_audio(self, lines):
+            self.preloaded.append(list(lines))
+            self.preload_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.preload_cancelled.set()
+                raise
+
+    mgr = BlockingPreloadManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("example-game", "route-A", "Lan")
+        state["_sdk_route_instance_id"] = "generation-A"
+        preload_request = asyncio.create_task(
+            gr_runtime.game_project_speech_preload(
+                "example-game",
+                _FakeRequest({
+                    "lines": ["cancelled request"],
+                    "lanlan_name": "Lan",
+                    "session_id": "route-A",
+                    "sdk_route_instance_id": "generation-A",
+                }),
+            )
+        )
+        await asyncio.wait_for(mgr.preload_started.wait(), timeout=1.0)
+
+        preload_request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(preload_request, timeout=1.0)
+
+        # The child is still torn down, and the route-owned set is released.
+        assert mgr.preload_cancelled.is_set() is True
+        assert "_sdk_active_speech_preload_tasks" not in state
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_project_speech_preload_rejects_above_route_task_limit(monkeypatch):
     mgr = _FakeGameRouteManager()
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
