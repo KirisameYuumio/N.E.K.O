@@ -385,12 +385,19 @@ async function main() {
   // instead of serving the pre-route call.
   inactiveHeartbeats.length = 0;
   await inactiveGame.runtime.pulse(true);
+  // every() on an empty array is true, so prove a request was actually sent:
+  // otherwise a pulse that stops issuing heartbeats would silently turn the
+  // generation check below into a no-op that passes forever.
+  assert(inactiveHeartbeats.length > 0,
+    'no request was sent after the route loss, so the generation check proves nothing');
   assert(inactiveHeartbeats.every((payload) => !payload?.sdk_route_instance_id),
     'a request after a heartbeat-detected route loss still asserted the dead generation');
 
   inactiveGame.runtime.reset({ newSession: true });
   inactiveHeartbeats.length = 0;
   await inactiveGame.runtime.pulse(true);
+  assert(inactiveHeartbeats.length > 0,
+    'no request was sent after reset, so the generation check proves nothing');
   assert(inactiveHeartbeats.every((payload) => !payload?.sdk_route_instance_id),
     'reset() left the previous route generation attached to later requests');
   inactiveGame.dispose();
