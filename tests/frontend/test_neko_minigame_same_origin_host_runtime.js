@@ -26,6 +26,43 @@ function storage() {
   };
 }
 
+// Shape of the server's /route/end response: the full internal archive.
+const RAW_END_RESPONSE = {
+  ok: true,
+  closed: true,
+  route_closed: true,
+  session_id: 'server-session',
+  should_resume_external_on_exit: true,
+  before_game_external_mode: 'audio',
+  archive: {
+    game_type: 'generic-game',
+    session_id: 'server-session',
+    finalScore: { player: 2, ai: 1 },
+    last_state: { round: 4 },
+    dialog_count: 7,
+    full_dialogues: [{ role: 'user', text: 'private speech' }],
+    last_full_dialogues: [{ role: 'user', text: 'private speech' }],
+    key_events: ['private event'],
+    summary: 'private summary',
+    game_context_summary: 'private rolling summary',
+    game_context_signals: { private: true },
+    game_context_recent_ids: ['id-1'],
+    route_activations: [{ kind: 'internal' }],
+    nekoInviteText: 'private invite',
+    preGameContext: { stance: 'private' },
+    pre_game_context_source: 'ai',
+    sdk_memory_submissions: [{ summary: 'game submitted this itself' }],
+  },
+  archive_memory: { text: 'private memory write' },
+  postgame: { ok: true, action: 'chat', line: 'assistant postgame line', llm_source: { p: 1 } },
+};
+
+const LEAKY_ARCHIVE_FIELDS = [
+  'full_dialogues', 'last_full_dialogues', 'key_events', 'summary',
+  'game_context_signals', 'game_context_recent_ids', 'route_activations',
+  'nekoInviteText',
+];
+
 async function main() {
   const sourcePath = path.resolve(
     __dirname,
@@ -51,6 +88,9 @@ async function main() {
     if (pathName.endsWith('/protocol') && body.sequence === 2) {
       markProtocolTwoStarted();
       await protocolTwoGate;
+    }
+    if (/\/api\/game\/[^/]+\/end$/.test(pathName)) {
+      return jsonResponse(RAW_END_RESPONSE);
     }
     if (pathName.endsWith('/route/start')) {
       return jsonResponse({
@@ -972,6 +1012,60 @@ async function main() {
     && windowMock.console.warn === originalConsoleWarn
     && windowMock.console.error === originalConsoleError,
   'disposing the final host did not restore and release global console capture');
+
+  // --- route-end archive is projected against granted capabilities ---
+  // The server returns its full internal archive on /route/end. Game code is
+  // the untrusted party, so captured dialogue, the in-session summary and the
+  // pregame context must not reach it just because it holds `runtime`.
+  // Drive the real transport boundary first: projecting correctly is useless if
+  // end() stops calling the projection.
+  const endResult = await host.end({ session_id: 'server-session' });
+  for (const field of LEAKY_ARCHIVE_FIELDS) {
+    assert(!(field in endResult.archive),
+      `end() returned ${field} from the raw server archive`);
+  }
+  assert(!('archive_memory' in endResult),
+    'end() returned the host memory-write result to game code');
+  assert(!('line' in endResult.postgame),
+    'end() returned the assistant postgame line to game code');
+  assert(endResult.archive.finalScore.player === 2 && endResult.ok === true,
+    'end() dropped fields the game legitimately needs');
+
+  const rawEndResponse = RAW_END_RESPONSE;
+  const grantedProjection = host._projectRouteEndResponse(rawEndResponse);
+  for (const field of LEAKY_ARCHIVE_FIELDS) {
+    assert(!(field in grantedProjection.archive),
+      `route-end archive leaked ${field} to game code`);
+  }
+  assert(!('archive_memory' in grantedProjection),
+    'route-end response leaked the host memory-write result to game code');
+  assert(!('line' in grantedProjection.postgame),
+    'route-end response leaked the assistant postgame line to game code');
+  assert(!('should_resume_external_on_exit' in grantedProjection),
+    'route-end response leaked host-internal session state to game code');
+  assert(grantedProjection.archive.finalScore.player === 2
+    && grantedProjection.archive.last_state.round === 4
+    && grantedProjection.ok === true
+    && grantedProjection.postgame.action === 'chat',
+  'route-end projection dropped fields the game legitimately needs');
+  // This host holds context-read and memory, so those scopes survive.
+  assert(grantedProjection.archive.preGameContext?.stance === 'private'
+    && grantedProjection.archive.game_context_summary === 'private rolling summary'
+    && Array.isArray(grantedProjection.archive.sdk_memory_submissions),
+  'route-end projection withheld scopes the game was actually granted');
+
+  const restoreGrants = host._grantedCapabilities;
+  host._grantedCapabilities = new Set(['logging', 'runtime']);
+  const runtimeOnlyProjection = host._projectRouteEndResponse(rawEndResponse);
+  host._grantedCapabilities = restoreGrants;
+  for (const field of [...LEAKY_ARCHIVE_FIELDS,
+    'preGameContext', 'pre_game_context_source', 'game_context_summary',
+    'sdk_memory_submissions']) {
+    assert(!(field in runtimeOnlyProjection.archive),
+      `a runtime-only game received ${field} without the capability granting it`);
+  }
+  assert(runtimeOnlyProjection.archive.finalScore.player === 2,
+    'a runtime-only game lost its own outcome fields');
 
   noLockHost.dispose();
   genericHost.dispose();

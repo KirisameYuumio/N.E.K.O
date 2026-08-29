@@ -59,6 +59,45 @@
     'gamepostgamecontextmemoryenabled',
     'gamememorypostgamecontextenabled',
   ]);
+  // The route-end response carries the host's internal archive, which includes
+  // captured dialogue, the in-session summary and the pregame context. Game
+  // code is the untrusted party here, so the archive is projected against the
+  // capabilities the game was actually granted before it leaves this adapter.
+  // Allow-list, never deny-list: a new archive field must be classified on
+  // purpose rather than leak by default.
+  const ROUTE_END_ARCHIVE_BASE_FIELDS = Object.freeze([
+    'game_type',
+    'session_id',
+    'lanlan_name',
+    'created_at',
+    'ended_at',
+    'game_started',
+    'game_started_elapsed_ms',
+    'dialog_count',
+    'finalScore',
+    'last_state',
+    'nekoInitiated',
+    'user_language',
+    'user_language_source',
+    'game_context_degraded',
+  ]);
+  // Exactly what the capability-gated context endpoint already exposes.
+  const ROUTE_END_ARCHIVE_CONTEXT_FIELDS = Object.freeze([
+    'preGameContext',
+    'pre_game_context_source',
+    'pre_game_context_error',
+    'game_context_summary',
+  ]);
+  // The game's own submissions, handed back to the game that made them.
+  const ROUTE_END_ARCHIVE_MEMORY_FIELDS = Object.freeze(['sdk_memory_submissions']);
+  const ROUTE_END_RESULT_FIELDS = Object.freeze([
+    'ok',
+    'closed',
+    'route_closed',
+    'session_id',
+    'reason',
+  ]);
+  const ROUTE_END_POSTGAME_FIELDS = Object.freeze(['ok', 'action', 'reason', 'mode']);
   const TRUSTED_PAYLOAD_MAX_DEPTH = 24;
   const TRUSTED_PAYLOAD_MAX_NODES = 4096;
   const TRUSTED_PAYLOAD_OMIT = Symbol('trusted-payload-omit');
@@ -2611,6 +2650,36 @@
       this.resetLogger();
     }
 
+    _pickFields(source, fields, target) {
+      if (!source || typeof source !== 'object') return target;
+      for (const field of fields) {
+        if (Object.prototype.hasOwnProperty.call(source, field)) target[field] = source[field];
+      }
+      return target;
+    }
+
+    _projectRouteEndResponse(data) {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+      const projected = this._pickFields(data, ROUTE_END_RESULT_FIELDS, {});
+      if (data.archive && typeof data.archive === 'object' && !Array.isArray(data.archive)) {
+        const archive = this._pickFields(data.archive, ROUTE_END_ARCHIVE_BASE_FIELDS, {});
+        if (this._grantedCapabilities.has('context-read')) {
+          this._pickFields(data.archive, ROUTE_END_ARCHIVE_CONTEXT_FIELDS, archive);
+        }
+        if (this._grantedCapabilities.has('memory')) {
+          this._pickFields(data.archive, ROUTE_END_ARCHIVE_MEMORY_FIELDS, archive);
+        }
+        projected.archive = archive;
+      }
+      // ``archive_memory`` is the host's own memory-write result and
+      // ``postgame.line`` is assistant speech the host owns; neither is game
+      // material, so only the postgame outcome survives.
+      if (data.postgame && typeof data.postgame === 'object' && !Array.isArray(data.postgame)) {
+        projected.postgame = this._pickFields(data.postgame, ROUTE_END_POSTGAME_FIELDS, {});
+      }
+      return projected;
+    }
+
     async end(payload, options = {}) {
       this._requireGrantedCapability('runtime', 'route_end');
       let parsedPayload = payload;
@@ -2653,7 +2722,8 @@
         timeoutMs: 8000,
         signal: options.signal,
       });
-      return response.json().catch(() => ({ ok: response.ok, status: response.status }));
+      const data = await response.json().catch(() => ({ ok: response.ok, status: response.status }));
+      return this._projectRouteEndResponse(data);
     }
 
     dispose(options = {}) {

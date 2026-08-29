@@ -123,3 +123,31 @@ def test_server_leaderboard_requires_runtime(validator: Draft202012Validator) ->
     assert_invalid(validator, value)
     value["requiredCapabilities"].append("runtime")
     validator.validate(value)
+
+
+@pytest.mark.parametrize("capability", ["voice-input", "speech-output"])
+def test_host_driven_voice_capabilities_require_runtime(
+    validator: Draft202012Validator,
+    capability: str,
+) -> None:
+    """Voice input and project speech are only meaningful inside a live route.
+
+    Both are delivered through the runtime lifecycle: the host owns microphone
+    capture and TTS routing, and hands results to the game against an active
+    route generation. A manifest that asks for either without ``runtime``
+    declares a combination the host cannot honour, so reject it at the contract
+    layer rather than failing at call time.
+    """
+    invalid = deepcopy(manifest())
+    invalid["requiredCapabilities"] = ["logging", capability]
+    assert_invalid(validator, invalid)
+
+    with_required = deepcopy(manifest())
+    with_required["requiredCapabilities"] = ["logging", "runtime", capability]
+    validator.validate(with_required)
+
+    # ``runtime`` may also satisfy the dependency from the optional list.
+    with_optional = deepcopy(manifest())
+    with_optional["requiredCapabilities"] = ["logging", capability]
+    with_optional["optionalCapabilities"] = ["runtime"]
+    validator.validate(with_optional)
