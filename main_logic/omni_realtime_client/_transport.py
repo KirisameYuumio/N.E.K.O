@@ -193,12 +193,28 @@ class _TransportMixin:
         self._input_route_identity_stream_owner = identity
 
     def _resolve_input_route_identity_owner(self):
-        """Return the route that owned the audio currently buffered, if provable."""
+        """Return the route that owned the audio currently buffered, if provable.
+
+        Ownership comes only from observed frames or a local onset snapshot,
+        never from the route that happens to be active when a provider event
+        lands. With no evidence at all the answer is ``None``, not a guess.
+
+        That last case is reachable and must stay fail-closed: ``stream_audio``
+        calls ``clear_audio_buffer()`` itself on detected silence, which drops
+        the frame observation, so a ``speech_started`` the server had already
+        emitted for the pre-clear audio can arrive afterwards -- possibly after
+        the route moved on. Reading the live route there would tag the old audio
+        with the new route. Nothing is dropped by refusing: every frame arms the
+        observation (for Gemini too, which reaches this via ``stream_audio``
+        before its provider branch), so a genuine utterance always has evidence
+        by the time its onset is reported, and the buffer is only cleared here
+        because there was silence rather than speech.
+        """
         if self._input_route_identity_captured:
             return self._input_route_identity
         if self._input_route_identity_stream_armed:
             return self._input_route_identity_stream_owner
-        return self._read_input_route_identity()
+        return None
 
     def _read_input_route_identity(self):
         identity = None

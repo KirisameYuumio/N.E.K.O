@@ -439,6 +439,51 @@ async def test_a_finished_utterance_does_not_poison_the_next_one():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_a_silence_buffer_clear_does_not_let_a_late_onset_grab_the_new_route():
+    """With no frame evidence left, refuse rather than read the live route.
+
+    ``stream_audio`` clears the input buffer itself on detected silence, which
+    drops the frame observation. A ``speech_started`` the server already emitted
+    for the pre-clear audio can land after that clear and after the route moved
+    on. Answering with the live route would tag route A's audio as B and pass
+    the ``handle_input_transcript`` comparison. Nothing legitimate is lost by
+    refusing: real speech streams frames, and frames re-arm the observation.
+    """
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def discard_event(_event):
+        return None
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._has_server_vad = True
+    client.send_event = discard_event
+
+    quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
+    await client.stream_audio(quiet_frame)
+    assert client._input_route_identity_stream_armed is True
+
+    # Silence clears the buffer, taking the frame evidence with it.
+    await client.clear_audio_buffer()
+    assert client._input_route_identity_stream_armed is False
+
+    # The route moves on, then A's already-emitted onset finally lands.
+    current_route[0] = ("example-game", "session-b", "route-b")
+    client._bind_input_route_identity_to_item("provider-item-late")
+    await client._deliver_input_transcript("stale A", item_id="provider-item-late")
+
+    assert delivered == [("stale A", None)]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_idle_frames_before_a_route_switch_do_not_strand_the_next_utterance():
     """Stale ownership must never outlive the frames that produced it.
 
