@@ -56,7 +56,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from main_logic.omni_realtime_client import _transport
+from main_logic.omni_realtime_client import _gemini_support, _transport
 
 
 class _RecordingSocket:
@@ -814,9 +814,33 @@ async def test_a_turn_that_began_before_the_host_had_an_id_is_not_guarded():
     assert host.calls == ["response_done", "sid_rotate"]
 
 
+class _StubGeminiTypes:
+    """Minimal stand-in for ``google.genai.types`` at the MANUAL commit."""
+
+    class ActivityEnd:
+        pass
+
+
+class _StubGeminiSession:
+    """Records activity_end sends and can fail on a still-usable connection."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.activity_ends = 0
+        self._error = error
+
+    async def send_realtime_input(self, **kwargs):
+        # Gemini audio streaming uses this same method, so only the turn
+        # boundary is counted here.
+        if "activity_end" not in kwargs:
+            return
+        if self._error is not None:
+            raise self._error
+        self.activity_ends += 1
+
+
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_manual_commit_freezes_ownership_before_a_later_route_streams():
+async def test_manual_commit_freezes_ownership_before_a_later_route_streams(monkeypatch):
     """MANUAL mode has no `speech_started`, so the commit must pin the owner.
 
     Server VAD binds an owner when it reports the onset; MANUAL disables server
@@ -845,16 +869,16 @@ async def test_manual_commit_freezes_ownership_before_a_later_route_streams():
     client.turn_detection_mode = TurnDetectionMode.MANUAL
     client._has_server_vad = False
     client.send_event = discard_event
-    # Take the Gemini branch and stop at the missing session, so the commit
-    # boundary runs without needing the provider transport.
     client._is_gemini = True
-    client._gemini_session = None
+    client._gemini_session = _StubGeminiSession()
+    monkeypatch.setattr(_gemini_support, "types", _StubGeminiTypes)
 
     quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
     await client.stream_audio(quiet_frame)
     assert client._input_route_identity_captured is False
 
     await client.signal_user_activity_end()
+    assert client._gemini_session.activity_ends == 1
     assert client._input_route_identity_captured is True
 
     # A replacement route opens and streams before the transcript lands.
@@ -864,4 +888,57 @@ async def test_manual_commit_freezes_ownership_before_a_later_route_streams():
 
     assert delivered == [
         ("committed under A", ("example-game", "session-a", "route-a")),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_failed_manual_commit_leaves_ownership_unfrozen(monkeypatch):
+    """A commit that never reached the provider must not pin an owner.
+
+    ``send_realtime_input`` can raise on a connection that stays usable (only a
+    "closed" error is treated as fatal). That buffer is never committed, so it
+    will never produce a transcript -- but a freeze left behind outlives it and
+    answers for the NEXT utterance instead. After a route change every one of
+    those is rejected as a mismatch and dropped before the takeover dispatcher,
+    which is silent: the player speaks and the game receives nothing.
+    """
+    from main_logic.omni_realtime_client import TurnDetectionMode
+
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def discard_event(_event):
+        return None
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client.turn_detection_mode = TurnDetectionMode.MANUAL
+    client._has_server_vad = False
+    client.send_event = discard_event
+    client._is_gemini = True
+    client._gemini_session = _StubGeminiSession(error=RuntimeError("transient send failure"))
+    monkeypatch.setattr(_gemini_support, "types", _StubGeminiTypes)
+
+    quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
+    await client.stream_audio(quiet_frame)
+    await client.signal_user_activity_end()
+
+    # Not fatal, so the connection is reused -- and nothing may be pinned.
+    assert client._fatal_error_occurred is False
+    assert client._input_route_identity_captured is False
+
+    # The next utterance, under a new route, must still reach that new route.
+    current_route[0] = ("example-game", "session-b", "route-b")
+    await client.stream_audio(quiet_frame)
+    await client._deliver_input_transcript("spoken under B", item_id="manual-item-2")
+
+    assert delivered == [
+        ("spoken under B", ("example-game", "session-b", "route-b")),
     ]

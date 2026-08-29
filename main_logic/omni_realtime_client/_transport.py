@@ -67,6 +67,9 @@ _STUCK_RELEASE_STEP_TIMEOUT = 0.5
 # interleaved between them; it is a leak guard, not a history.
 _USAGE_RECORDED_ID_LIMIT = 32
 _INPUT_ROUTE_IDENTITY_ITEM_LIMIT = 8
+# ``None`` is a valid route owner (no active game route), so the "nothing to
+# freeze" answer needs its own sentinel.
+_NO_ROUTE_IDENTITY_COMMIT = object()
 
 # `error` 事件的致命性判定是一串子串匹配（'429' / '1008' / '503' / 'quota' ...）。它
 # 过去匹配在 `str(event['error'])` 上，也就是整个 dict 的 repr —— 里面回显着我们自己
@@ -192,25 +195,42 @@ class _TransportMixin:
         self._input_route_identity_stream_armed = True
         self._input_route_identity_stream_owner = identity
 
-    def _freeze_input_route_identity_at_commit(self) -> None:
-        """Pin ownership at the MANUAL turn boundary.
+    def _pending_input_route_identity_commit(self):
+        """Read the owner a MANUAL commit would freeze, without freezing it.
 
         MANUAL mode disables server VAD, so no ``speech_started`` ever arrives
         and nothing binds an owner for the buffer being committed. The commit
         itself IS that boundary, exactly as ``speech_started`` is in server-VAD
-        mode. Without pinning here, a route that starts after the commit streams
-        frames that move the last-write-wins mark, and the already-committed
-        utterance is then delivered to the newer route while its transcription
-        is still in flight.
+        mode. The value is read here, at the boundary, so that frames streamed
+        while the commit is in flight cannot move it.
 
-        Idempotent, and never overrides a local onset snapshot: that snapshot is
-        strictly better evidence than the frame mark.
+        Returns ``_NO_ROUTE_IDENTITY_COMMIT`` when there is nothing to freeze --
+        a distinct sentinel because ``None`` is itself a valid owner (no route).
+        Never overrides a local onset snapshot: that is stronger evidence than
+        the frame mark.
         """
         if self._input_route_identity_captured:
+            return _NO_ROUTE_IDENTITY_COMMIT
+        if not self._input_route_identity_stream_armed:
+            return _NO_ROUTE_IDENTITY_COMMIT
+        return self._input_route_identity_stream_owner
+
+    def _apply_input_route_identity_commit(self, pending) -> None:
+        """Pin ownership once the MANUAL boundary actually reached the provider.
+
+        Only called on the success paths. A commit that never went out (no
+        session, missing SDK types, a send that raised on a still-usable
+        connection) leaves ownership unfrozen on purpose: that buffer will never
+        produce a transcript, so a freeze left behind would answer for the NEXT
+        utterance instead, and after a route change every one of those would be
+        rejected as a mismatch and silently dropped.
+        """
+        if pending is _NO_ROUTE_IDENTITY_COMMIT:
             return
-        if self._input_route_identity_stream_armed:
-            self._input_route_identity = self._input_route_identity_stream_owner
-            self._input_route_identity_captured = True
+        if self._input_route_identity_captured:
+            return
+        self._input_route_identity = pending
+        self._input_route_identity_captured = True
 
     def _resolve_input_route_identity_owner(self):
         """Return the route that owned the audio currently buffered, if provable.
