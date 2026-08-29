@@ -351,7 +351,11 @@ async def test_mirror_assistant_speech_replays_opted_in_cached_audio_without_req
         assert second["method"] == "project_tts_cache"
         assert second["cache_status"] == "hit"
         assert second["audio_sent"] is True
-        assert second["audio_completed"] is True
+        # A cache hit only writes chunks to the socket, so completion is never
+        # observed on this path and must not be claimed either way. Delivery is
+        # reported by audio_sent; the sibling non-cache path likewise answers
+        # None whenever completion was not awaited.
+        assert second["audio_completed"] is None
         # A cache hit is written straight to the websocket: there is no worker
         # completion sentinel and no client acknowledgement, so "it was
         # delivered" is all this path can honestly report. Claiming completion
@@ -408,7 +412,11 @@ async def test_cached_speech_replay_reports_failed_audio_delivery():
         assert replay["method"] == "project_tts_cache"
         assert replay["ok"] is False
         assert replay["audio_sent"] is False
-        assert replay["audio_completed"] is False
+        # A cache hit only writes chunks to the socket, so completion is never
+        # observed on this path and must not be claimed either way. Delivery is
+        # reported by audio_sent; the sibling non-cache path likewise answers
+        # None whenever completion was not awaited.
+        assert replay["audio_completed"] is None
         assert completed_audio == [replay["speech_id"]]
     finally:
         GAME_SPEECH_AUDIO_CACHE.clear()
@@ -450,7 +458,11 @@ async def test_cached_speech_replay_reports_failed_audio_done_delivery():
         assert replay["method"] == "project_tts_cache"
         assert replay["ok"] is False
         assert replay["audio_sent"] is False
-        assert replay["audio_completed"] is False
+        # A cache hit only writes chunks to the socket, so completion is never
+        # observed on this path and must not be claimed either way. Delivery is
+        # reported by audio_sent; the sibling non-cache path likewise answers
+        # None whenever completion was not awaited.
+        assert replay["audio_completed"] is None
         mgr.send_audio_done.assert_awaited_once_with(replay["speech_id"])
     finally:
         GAME_SPEECH_AUDIO_CACHE.clear()

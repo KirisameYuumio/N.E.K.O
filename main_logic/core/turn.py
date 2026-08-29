@@ -1870,7 +1870,12 @@ class TurnMixin:
                 "speech_id": turn_id,
                 "audio_sent": audio_sent,
                 "audio_queued": False,
-                "audio_completed": audio_sent,
+                # Not observed, so not claimed. The sibling path below already
+                # answers None when completion was not awaited, and delivery is
+                # carried separately by audio_sent -- reusing it here would both
+                # duplicate that signal and read as a completion that never
+                # happened, since these chunks were only written to the socket.
+                "audio_completed": None,
                 "audio_completion_supported": False,
                 **(
                     {"completion_note": "cache_hit_completion_not_observable"}
