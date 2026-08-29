@@ -139,30 +139,39 @@ class _TransportMixin:
         """Forget the per-buffer route observation after it was consumed."""
         self._input_route_identity_stream_armed = False
         self._input_route_identity_stream_owner = None
-        self._input_route_identity_stream_mixed = False
 
     def _note_input_route_identity_frame(self, identity) -> None:
-        """Record which route owned each streamed frame of the current buffer.
+        """Track the route owning the most recent frame before an onset.
 
         The local onset gate (RMS / RNNoise) and the provider's server VAD are
         independent detectors with independent thresholds, so "server VAD fired
         but the local gate never armed a snapshot" is an ordinary outcome rather
         than an anomaly. This observation covers that case: the frames
         themselves still prove which route was active while they were captured.
+
+        Deliberately last-write-wins rather than accumulating a per-buffer
+        verdict. An accumulated verdict has to decide when its window ends, and
+        every window it fails to close leaks a stale owner into the next
+        utterance -- which surfaces as an unroutable ``None`` and a silently
+        dropped transcript, exactly the failure this observation exists to
+        prevent. Overwriting is self-correcting: a stale owner survives at most
+        until the next frame. The residual misattribution window is one audio
+        frame (~10-32ms), far inside the seconds-scale STT latency that route
+        ownership is actually guarding against, and ``handle_input_transcript``
+        still rejects a final whose owner no longer matches the live route.
+
+        No "an utterance is already open" guard: once ``speech_started`` has
+        bound an item, that binding is fixed, and every frame between two onsets
+        is equally "before the next onset", so suppressing the ones after an
+        onset cannot change any outcome.
         """
-        if not self._input_route_identity_stream_armed:
-            self._input_route_identity_stream_armed = True
-            self._input_route_identity_stream_owner = identity
-            return
-        if self._input_route_identity_stream_owner != identity:
-            self._input_route_identity_stream_mixed = True
+        self._input_route_identity_stream_armed = True
+        self._input_route_identity_stream_owner = identity
 
     def _resolve_input_route_identity_owner(self):
         """Return the route that owned the audio currently buffered, if provable."""
         if self._input_route_identity_captured:
             return self._input_route_identity
-        if self._input_route_identity_stream_mixed:
-            return None
         if self._input_route_identity_stream_armed:
             return self._input_route_identity_stream_owner
         return self._read_input_route_identity()

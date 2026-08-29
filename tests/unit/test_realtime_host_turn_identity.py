@@ -390,12 +390,65 @@ async def test_soft_speech_under_a_stable_route_still_reaches_that_route():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_a_route_switch_inside_one_buffer_leaves_no_provable_owner():
-    """When the route really changed mid-buffer, fail closed with ``None``.
+async def test_a_finished_utterance_does_not_poison_the_next_one():
+    """Ownership observed for utterance N must not leak into utterance N+1.
 
-    This is the case the ownership binding exists for: the buffer genuinely
-    spans two routes, so no single owner can be proven and the final must not
-    be delivered to either one.
+    ``speech_started`` binds the open utterance and clears the observation, but
+    the rest of that utterance keeps streaming and re-arms it. If that stale
+    owner survives into the next utterance, the first frame under a new route
+    reads as a mid-buffer route switch and the new, entirely valid transcript is
+    delivered as ``None`` and dropped.
+    """
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def discard_event(_event):
+        return None
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._has_server_vad = True
+    client.send_event = discard_event
+    quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
+
+    # Utterance A: frames, server onset, more frames, then its transcript.
+    await client.stream_audio(quiet_frame)
+    client._bind_input_route_identity_to_item("item-a")
+    client._audio_in_buffer = True
+    await client.stream_audio(quiet_frame)
+    client._audio_in_buffer = False
+    await client._deliver_input_transcript("first", item_id="item-a")
+
+    # The route moves on, then an ordinary quiet utterance B arrives.
+    current_route[0] = ("example-game", "session-b", "route-b")
+    await client.stream_audio(quiet_frame)
+    client._bind_input_route_identity_to_item("item-b")
+    await client._deliver_input_transcript("second", item_id="item-b")
+
+    assert delivered == [
+        ("first", ("example-game", "session-a", "route-a")),
+        ("second", ("example-game", "session-b", "route-b")),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_idle_frames_before_a_route_switch_do_not_strand_the_next_utterance():
+    """Stale ownership must never outlive the frames that produced it.
+
+    An open microphone streams background frames under route A. The route then
+    switches while still idle and the user speaks under B. Deriving a
+    per-buffer verdict here used to leave A's ownership armed, read B's first
+    frame as a mid-buffer route switch, and deliver B's perfectly valid final
+    as an unroutable ``None`` -- silently dropping the first thing the player
+    said after every route switch. Ownership is last-write-wins, so it
+    self-corrects on the very next frame.
     """
     current_route = [("example-game", "session-a", "route-a")]
     delivered = []
@@ -415,14 +468,19 @@ async def test_a_route_switch_inside_one_buffer_leaves_no_provable_owner():
     client.send_event = discard_event
 
     quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
+    # Idle background audio under A; too quiet to arm the local onset gate.
     await client.stream_audio(quiet_frame)
+    await client.stream_audio(quiet_frame)
+
+    # The route moves on while idle, then the player actually speaks under B.
     current_route[0] = ("example-game", "session-b", "route-b")
     await client.stream_audio(quiet_frame)
+    client._bind_input_route_identity_to_item("provider-item-b")
+    await client._deliver_input_transcript("hello B", item_id="provider-item-b")
 
-    client._bind_input_route_identity_to_item("provider-item-split")
-    await client._deliver_input_transcript("split", item_id="provider-item-split")
-
-    assert delivered == [("split", None)]
+    assert delivered == [
+        ("hello B", ("example-game", "session-b", "route-b")),
+    ]
 
 
 @pytest.mark.unit
