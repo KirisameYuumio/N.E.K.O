@@ -342,6 +342,7 @@ async function main() {
   assert(reentrantDisposeError?.code === 'disposed',
     'a synchronous dispose listener could reopen a host request during cleanup');
 
+  const inactiveHeartbeats = [];
   const inactiveEnvironment = createEnvironment();
   const inactiveTransport = {
     ...transport,
@@ -349,7 +350,7 @@ async function main() {
     resetRuntime() { return { sessionId: 'inactive-session', characterName: '' }; },
     getRuntimeState() { return { sessionId: 'inactive-session', characterName: '' }; },
     applyRuntimeState() { return { sessionId: 'inactive-session', characterName: '' }; },
-    async heartbeat() { return { ok: true, active: false, reason: 'route-gone' }; },
+    async heartbeat(payload) { inactiveHeartbeats.push(payload); return { ok: true, active: false, reason: 'route-gone' }; },
     async drain() { return { ok: true, outputs: [] }; },
     dispose() {},
   };
@@ -376,6 +377,22 @@ async function main() {
   assert(inactiveEnvironment.windowListeners.size === 0
     && inactiveEnvironment.documentListeners.size === 0,
   'inactive heartbeat left lifecycle listeners resident');
+
+  // Losing the route through a heartbeat must retire its generation too.
+  // Capabilities that are allowed before a route exists would otherwise keep
+  // asserting a dead sdk_route_instance_id, and the host rejects
+  // "no active route + caller asserts a generation" as route_instance_id_mismatch
+  // instead of serving the pre-route call.
+  inactiveHeartbeats.length = 0;
+  await inactiveGame.runtime.pulse(true);
+  assert(inactiveHeartbeats.every((payload) => !payload?.sdk_route_instance_id),
+    'a request after a heartbeat-detected route loss still asserted the dead generation');
+
+  inactiveGame.runtime.reset({ newSession: true });
+  inactiveHeartbeats.length = 0;
+  await inactiveGame.runtime.pulse(true);
+  assert(inactiveHeartbeats.every((payload) => !payload?.sdk_route_instance_id),
+    'reset() left the previous route generation attached to later requests');
   inactiveGame.dispose();
 
   const failedEndEnvironment = createEnvironment();

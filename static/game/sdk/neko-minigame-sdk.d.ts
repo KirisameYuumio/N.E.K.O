@@ -300,6 +300,12 @@ declare namespace NekoMiniGame {
     sort?: 'rank' | 'recent';
     limit?: number;
     offset?: number;
+    /**
+     * Server leaderboard only. Forwarded to the host as the request query.
+     * The local board defines no matching semantics and rejects this field
+     * with `invalid_request` rather than returning an unfiltered page that
+     * would look filtered.
+     */
     query?: JsonValue;
   }
 

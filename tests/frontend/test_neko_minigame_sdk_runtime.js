@@ -242,6 +242,9 @@ async function main() {
   const controlErrors = [];
   const removeControl = game.controls.on('stance', (control) => controls.push(control));
   const removeControlError = game.controls.onError((error) => controlErrors.push(error));
+  // Controls only ever originate from drain outputs, which require an active
+  // route, so a control arriving without one is dropped -- same rule the voice
+  // transcript and dialogue assertions below already enforce.
   controlBridgeOptions.onControl({
     protocolVersion: '1',
     sequence: 1,
@@ -250,24 +253,8 @@ async function main() {
     timestamp: 123,
     payload: 'press',
   });
-  controlBridgeOptions.onControl({
-    protocolVersion: '1',
-    sequence: 1,
-    type: 'stance',
-    sessionId: 'sdk-test-session',
-    payload: 'retreat',
-  });
-  controlBridgeOptions.onControl({
-    protocolVersion: '1',
-    sequence: 2,
-    type: 'stance',
-    sessionId: 'sdk-test-session',
-    payload: 'not-declared',
-  });
-  assert(controls.length === 1 && controls[0].payload === 'press',
-    'declared host control was not validated and delivered exactly once');
-  assert(controlErrors.length === 1 && controlErrors[0].code === 'invalid_contract',
-    'invalid host control did not produce a bounded public error');
+  assert(controls.length === 0 && controlErrors.length === 0,
+    'a host control escaped before an active runtime route existed');
   assert(game.capabilities.has('runtime'), 'required runtime capability was not granted');
   assert(game.capabilities.has('voice-input'), 'available optional voice capability was not granted');
   assert(game.capabilities.has('avatar-renderer'), 'available avatar capability was not granted');
@@ -296,9 +283,39 @@ async function main() {
   const started = await game.runtime.start({ mode: 'default' });
   assert(started.data.payload.mode === 'default', 'runtime start did not use the host transport');
   const routeInstanceId = started.data.payload.sdk_route_instance_id;
+  // Validation and delivery, now that a route actually exists.
+  controlBridgeOptions.onControl({
+    protocolVersion: '1',
+    sequence: 2,
+    type: 'stance',
+    sessionId: 'sdk-test-session',
+    routeInstanceId,
+    timestamp: 123,
+    payload: 'press',
+  });
+  controlBridgeOptions.onControl({
+    protocolVersion: '1',
+    sequence: 2,
+    type: 'stance',
+    sessionId: 'sdk-test-session',
+    routeInstanceId,
+    payload: 'retreat',
+  });
+  assert(controls.length === 1 && controls[0].payload === 'press',
+    'declared host control was not validated and delivered exactly once');
   controlBridgeOptions.onControl({
     protocolVersion: '1',
     sequence: 3,
+    type: 'stance',
+    sessionId: 'sdk-test-session',
+    routeInstanceId,
+    payload: 'not-declared',
+  });
+  assert(controlErrors.length === 1 && controlErrors[0].code === 'invalid_contract',
+    'invalid host control did not produce a bounded public error');
+  controlBridgeOptions.onControl({
+    protocolVersion: '1',
+    sequence: 4,
     type: 'stance',
     sessionId: 'sdk-test-session',
     routeInstanceId: 'stale-route-instance',
@@ -310,7 +327,7 @@ async function main() {
     'a stale route-generation control did not produce a bounded public error');
   controlBridgeOptions.onControl({
     protocolVersion: '1',
-    sequence: 4,
+    sequence: 5,
     type: 'stance',
     sessionId: 'sdk-test-session',
     routeInstanceId,

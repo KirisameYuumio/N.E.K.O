@@ -171,6 +171,16 @@ async function main() {
   assert(ranked.data.entries.map((entry) => entry.score).join(',') === '40,30,20',
     'local leaderboard did not rank and bound retained entries');
   const recent = await game.leaderboard.local.list('main', { sort: 'recent', limit: 10 });
+
+  // `query` is shared with the server board, where it is forwarded to the host.
+  // The local board has no matching semantics anywhere in the public surface,
+  // so accepting and dropping it would hand back an unfiltered page that looks
+  // filtered. It must be rejected instead.
+  let localQueryError = null;
+  try { await game.leaderboard.local.list('main', { query: { player: 'a' } }); }
+  catch (error) { localQueryError = error; }
+  assert(localQueryError?.code === 'invalid_request',
+    'the local leaderboard silently accepted a query it does not implement');
   assert(recent.data.entries.map((entry) => entry.score).join(',') === '40,20,30',
     'local leaderboard did not preserve recent ordering');
   const best = await game.leaderboard.local.getBest('main');

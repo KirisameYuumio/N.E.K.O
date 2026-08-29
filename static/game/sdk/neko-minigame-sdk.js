@@ -806,10 +806,16 @@
     return Object.freeze({ version: 1, entries: Object.freeze(entries) });
   }
 
-  function normalizeLeaderboardListOptions(value) {
+  function normalizeLeaderboardListOptions(value, { allowQuery = true } = {}) {
     const input = value ?? {};
     if (!plainObject(input)) fail('invalid_request', 'leaderboard list options must be an object');
-    const allowed = new Set(['sort', 'limit', 'offset', 'query']);
+    // `query` is shared with the server leaderboard, where it is forwarded to
+    // the host as the request payload. The local board has no matching
+    // semantics defined anywhere -- not in the .d.ts, the README or the
+    // manifest schema -- so accepting it locally and dropping it would return
+    // an unfiltered page that looks filtered. Reject instead of inventing a
+    // meaning that a future server implementation would then have to match.
+    const allowed = new Set(allowQuery ? ['sort', 'limit', 'offset', 'query'] : ['sort', 'limit', 'offset']);
     for (const key of Object.keys(input)) {
       if (!allowed.has(key)) fail('invalid_request', 'leaderboard list options contain an unsupported field', { key });
     }
@@ -2189,6 +2195,12 @@
         if (response.ok && data.ok !== false && data.active === false) {
           heartbeatLifecycle.failures = 0;
           runtimeRouteEstablished = false;
+          // Retire the generation with the route. Capabilities that are allowed
+          // before a route exists (speech.speak/mirror/preload, context.read)
+          // would otherwise keep asserting a dead sdk_route_instance_id, and the
+          // host rejects "no active route + caller asserts a generation" as
+          // route_instance_id_mismatch instead of serving the pre-route call.
+          clearRuntimeRouteInstanceIds();
           stopRuntimeMonitoring();
           setRuntimePhase('inactive', String(data.reason || 'host-inactive'));
           await publishRuntimeEvent('runtime-inactive', data, { waitForHandlers: true });
@@ -2685,6 +2697,17 @@
         const routeInstanceId = String(
           rawEnvelope.routeInstanceId || rawEnvelope.sdk_route_instance_id || '',
         ).trim();
+        // The generation comparison below fails OPEN when we hold no generation,
+        // and runtime.end() clears exactly that (clearRuntimeRouteInstanceIds),
+        // so after a route ends a straggling control matched everything: the
+        // session id still matches too, because ending does not rotate it.
+        // Gate on the live route first, like voicePayloadMatchesActiveRoute
+        // does. Output polling only runs in these two phases (monitoring is
+        // started for 'running' and 'degraded' only), so this cannot drop a
+        // control that legitimately belongs to the current route.
+        if (!runtimeRouteEstablished || !['running', 'degraded'].includes(runtimePhase)) {
+          return false;
+        }
         const currentRouteInstanceId = String(runtimeRouteInstanceId || '').trim();
         if (
           currentRouteInstanceId
@@ -2921,6 +2944,11 @@
         speechPlaybackTransportSource = '';
         pageExitDispatched = false;
         runtimeRouteEstablished = false;
+        // No clearRuntimeRouteInstanceIds() here: every route-loss outcome now
+        // retires the generation at its own boundary (end() clears, an inactive
+        // start removes its own id, a heartbeat-detected loss clears), so a
+        // fifth clear here is unreachable and would be an untestable guard.
+        // If a new route-loss path is ever added, retire the generation THERE.
         const state = transport.resetRuntime({ newSession: resetOptions.newSession === true });
         memoryConsentEnabled = false;
         memoryConsentLocked = false;
@@ -3432,7 +3460,7 @@
           boardIdInput,
           'leaderboard.local.list',
         );
-        const normalizedOptions = normalizeLeaderboardListOptions(options);
+        const normalizedOptions = normalizeLeaderboardListOptions(options, { allowQuery: false });
         const current = await readLocalLeaderboard(boardId, definition, requestOptions);
         const sorted = [...current.entries]
           .sort((left, right) => leaderboardEntryCompare(left, right, definition, normalizedOptions.sort));
