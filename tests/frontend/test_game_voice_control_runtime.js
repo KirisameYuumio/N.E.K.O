@@ -298,8 +298,13 @@ async function main() {
   appState.isRecording = true;
   await new Promise((resolve) => setTimeout(resolve, 180));
   holdMicStart = false;
-  assert(appState.isRecording === false,
-    `a superseded route start left the replacement route microphone active: ${JSON.stringify(posted.slice(-8))}`);
+  // Route C took over while B's start was settling, and the microphone is
+  // process-global. B must not reach in and tear it down: C (or the user) may be
+  // mid-utterance on that capture, and killing it loses what they were saying
+  // with no transcript and nothing logged. B only releases a microphone it
+  // opened itself AND only when no route remains -- neither holds here.
+  assert(appState.isRecording === true,
+    `a superseded route tore down the replacement route's live microphone: ${JSON.stringify(posted.slice(-4))}`);
   assert(posted.some((message) => message.request_id === 'superseded-start'
     && message.reason === 'route_superseded'
     && message.sdk_route_instance_id === 'route-instance-b'),

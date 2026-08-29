@@ -210,6 +210,11 @@
         return predicate();
     }
 
+    // Set only when this command issued the micButton click itself, so a
+    // superseded command can tell "the mic I opened" from "a mic that was
+    // already someone else's" and never tear down the latter.
+    var commandClickedMicButton = false;
+
     async function startOfficialVoiceSession() {
         if (S.isRecording === true) return true;
         if (S.voiceStartPending === true || window.isMicStarting === true) {
@@ -218,6 +223,7 @@
         }
         var micButton = document.getElementById('micButton');
         if (!micButton || micButton.disabled) return false;
+        commandClickedMicButton = true;
         micButton.click();
         await waitFor(voiceStartSettled, COMMAND_TIMEOUT_MS);
         return S.isRecording === true;
@@ -265,6 +271,7 @@
         }
 
         commandInFlight = true;
+        commandClickedMicButton = false;
         broadcastState({ ok: true, reason: 'working', request_id: requestId }, true, acceptedRoute);
         try {
             var voiceWasActive = S.isRecording === true
@@ -277,15 +284,22 @@
                 ? await startOfficialVoiceSession()
                 : await stopOfficialVoiceSession();
             if (!routeSnapshotIsCurrent(acceptedRoute)) {
-                // The microphone is process-global. If route A was superseded
-                // while its command awaited settlement, restore the state seen
-                // before A's command once, then report only to A's identity.
-                var voiceIsActive = S.isRecording === true
-                    || S.voiceStartPending === true
-                    || window.isMicStarting === true;
-                if (voiceWasActive !== voiceIsActive) {
-                    if (voiceWasActive) await startOfficialVoiceSession();
-                    else await stopOfficialVoiceSession();
+                // The microphone is process-global, and this module does not own
+                // it -- the host page owns MicLease, teardown and the micButton
+                // flow (see the header). A superseded command therefore only
+                // releases what IT opened, and only when nothing took over:
+                //
+                //  * never re-start. `voiceWasActive` was sampled before this
+                //    command ran and carries no attribution, so "restoring" it
+                //    could switch the microphone on for a route that ended and
+                //    a user who never asked.
+                //  * never stop on a route -> route handoff. The replacement
+                //    route (or the user) may be mid-utterance on that capture,
+                //    and tearing it down loses what they were saying with no
+                //    transcript and nothing logged.
+                var noRouteRemains = currentRoute().active !== true;
+                if (commandClickedMicButton && noRouteRemains && !disposed) {
+                    await stopOfficialVoiceSession();
                 }
                 broadcastState({
                     ok: false,
