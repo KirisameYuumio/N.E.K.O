@@ -149,16 +149,40 @@ class _TransportMixin:
         than an anomaly. This observation covers that case: the frames
         themselves still prove which route was active while they were captured.
 
-        Deliberately last-write-wins rather than accumulating a per-buffer
-        verdict. An accumulated verdict has to decide when its window ends, and
-        every window it fails to close leaks a stale owner into the next
-        utterance -- which surfaces as an unroutable ``None`` and a silently
-        dropped transcript, exactly the failure this observation exists to
-        prevent. Overwriting is self-correcting: a stale owner survives at most
-        until the next frame. The residual misattribution window is one audio
-        frame (~10-32ms), far inside the seconds-scale STT latency that route
-        ownership is actually guarding against, and ``handle_input_transcript``
-        still rejects a final whose owner no longer matches the live route.
+        Deliberately last-write-wins. Read the alternatives before changing it;
+        this line has already oscillated across four revisions, because every
+        variant that tries to be stricter here fails in the OTHER direction:
+
+        * Arming once and keeping the first owner (or freezing on one raw-RMS
+          frame) strands the mark on a pre-switch route, so the first utterance
+          after entering or replacing a route is rejected.
+        * Accumulating a per-buffer verdict and binding ``None`` when the buffer
+          looks like it spans two routes has to decide when its window ends, and
+          every window it fails to close leaks a stale owner into the next
+          utterance. Tried; it drops the player's first line whenever the mic was
+          already open across a route switch. See
+          ``test_idle_frames_before_a_route_switch_do_not_strand_the_next_utterance``
+          and ``test_a_finished_utterance_does_not_poison_the_next_one``.
+
+        Every one of those failures is a SILENT drop: the mismatch is rejected in
+        ``handle_input_transcript`` above the takeover dispatcher, so the game
+        receives nothing and nothing is logged. Overwriting is self-correcting
+        instead -- a stale owner survives at most until the next frame.
+
+        The accepted residual is the reverse error: if the route switches inside
+        the provider's onset delay and a post-switch frame is streamed before the
+        delayed ``speech_started``, that utterance binds the new route. The
+        exposure window is that onset delay (hundreds of ms), an order of
+        magnitude below the seconds-scale STT latency this ownership guards
+        against, and it additionally needs speech quiet enough that the local
+        gate never fired. Before this mechanism existed the misattribution window
+        was the entire STT latency, unconditionally -- so this is a much smaller
+        instance of a pre-existing error, not a new one.
+
+        Eliminating that residual needs the input buffer isolated when the route
+        changes, not another ownership heuristic. That belongs to the realtime
+        audio subsystem and must also cover Gemini, where ``clear_audio_buffer``
+        is a no-op and transcripts arrive with no ``item_id`` at all.
 
         No "an utterance is already open" guard: once ``speech_started`` has
         bound an item, that binding is fixed, and every frame between two onsets
