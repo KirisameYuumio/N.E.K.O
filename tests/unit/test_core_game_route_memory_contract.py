@@ -352,7 +352,12 @@ async def test_mirror_assistant_speech_replays_opted_in_cached_audio_without_req
         assert second["cache_status"] == "hit"
         assert second["audio_sent"] is True
         assert second["audio_completed"] is True
-        assert second["audio_completion_supported"] is True
+        # A cache hit is written straight to the websocket: there is no worker
+        # completion sentinel and no client acknowledgement, so "it was
+        # delivered" is all this path can honestly report. Claiming completion
+        # is supported here would tell a caller that asked to be notified when
+        # the line finished playing that it had, when it was only queued.
+        assert second["audio_completion_supported"] is False
         assert mgr.tts_request_queue.messages == queued_before_hit
         assert sent_audio == [(b"cached-pcm", second["speech_id"])]
         assert completed_audio == [second["speech_id"]]
@@ -861,7 +866,7 @@ async def test_game_speech_preload_captures_audio_without_sending_playback():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_game_speech_preload_cancellation_stops_and_releases_worker():
+async def test_game_speech_preload_propagates_real_cancellation_and_releases_worker():
     GAME_SPEECH_AUDIO_CACHE.clear()
     mgr = _make_manager()
     mgr.game_speech_audio_cache_identity = lambda _text: (
@@ -899,7 +904,69 @@ async def test_game_speech_preload_cancellation_stops_and_releases_worker():
                 break
             await asyncio.sleep(0.01)
         assert mgr._game_speech_preload_active_workers
+
+        # A real cancellation must NOT be converted into a normal return value:
+        # the request task asked this coroutine to stop, and reporting a result
+        # instead makes it effectively uncancellable. Only the internal
+        # supersede/teardown signal is absorbed (covered by the test below).
         task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Cancelling still has to release everything the batch owned.
+        assert mgr._game_speech_preload_pending_batches == 0
+        assert mgr._game_speech_preload_active_workers == {}
+        assert GAME_SPEECH_AUDIO_CACHE.stats()["captures"] == 0
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_game_speech_preload_supersede_returns_cancelled_without_killing_the_caller():
+    """The internal supersede signal is the one that yields a normal result.
+
+    Route teardown and a superseding batch bump the cancel epoch rather than
+    cancelling the request task, so this path must resolve to a plain
+    ``cancelled`` result while still releasing the isolated worker.
+    """
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr.game_speech_audio_cache_identity = lambda _text: (
+        "supersede-cache-key",
+        "supersede-runtime-signature",
+    )
+    mgr.current_game_speech_audio_runtime_signature = (
+        lambda: "supersede-runtime-signature"
+    )
+
+    def blocking_worker(request_queue, response_queue, _api_key, _voice_id):
+        response_queue.put(("__ready__", True))
+        while True:
+            speech_id, _text = request_queue.get()
+            if speech_id == "__shutdown__":
+                return
+
+    mgr._resolve_tts_worker_spec = lambda: (
+        blocking_worker, "", "voice", None, False, {},
+    )
+    task = asyncio.create_task(
+        core_module.LLMSessionManager.preload_game_speech_audio(mgr, ["被顶替的预载"])
+    )
+    try:
+        for _ in range(100):
+            if getattr(mgr, "_game_speech_preload_active_workers", None):
+                break
+            await asyncio.sleep(0.01)
+        assert mgr._game_speech_preload_active_workers
+
+        mgr.cancel_game_speech_preloads()
         result = await task
 
         assert result == {"ok": False, "reason": "cancelled", "results": []}

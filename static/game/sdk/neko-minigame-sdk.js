@@ -4067,6 +4067,14 @@
         ...(request.emitTurnEnd !== undefined ? { emit_turn_end: request.emitTurnEnd } : {}),
         interrupt_audio: request.interruptExisting,
         reuse_synthesized_audio: request.reuseSynthesizedAudio,
+        // `speech.speak()` is awaited by game code, so it must resolve when the
+        // line has actually been spoken. The host endpoint defaults to
+        // returning as soon as the line is queued (the pre-SDK contract its
+        // built-in callers rely on), so the SDK opts in explicitly. Without
+        // this, two awaited speaks run concurrently and the second overwrites
+        // the host's single speech-correlation slot, leaving the first
+        // utterance uncancellable when the route ends.
+        wait_for_audio_completion: true,
         playback_gain: request.relativeGain,
         ...(request.reason ? { voice_arbiter_reason: request.reason } : {}),
         ...(request.language ? { i18n_language: request.language } : {}),

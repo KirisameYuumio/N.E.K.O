@@ -53,13 +53,22 @@ from threading import Thread
 from queue import Queue
 from ._shared import logger, NO_RETRY_TTS_CODES, IMMEDIATE_REPORT_TTS_CODES
 from .notices import enqueue_voice_migration_notice
-from .game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE
+from .game_speech_audio_cache import GAME_SPEECH_AUDIO_CACHE, GameSpeechCaptureOwner
 
 # Late-binding read point for symbols that tests rebind on the facade via
 # ``monkeypatch.setattr("main_logic.core.<attr>", ...)``. Do NOT from-import
 # those names here: a from-import snapshots the value at import time and the
 # facade patch would no longer reach this module's methods.
 from main_logic import core as _core_facade
+
+
+class _GameSpeechPreloadCancelled(Exception):
+    """Internal signal that a preload batch was superseded or torn down.
+
+    Deliberately not ``asyncio.CancelledError``: absorbing that one to return
+    a normal result swallows a genuine cancellation of the request task, so
+    the coroutine reports a value to a caller that asked it to stop.
+    """
 
 
 class TtsRuntimeMixin:
@@ -608,7 +617,7 @@ class TtsRuntimeMixin:
         try:
             async with self._game_speech_preload_lock:
                 if epoch != self._game_speech_preload_cancel_epoch:
-                    raise asyncio.CancelledError
+                    raise _GameSpeechPreloadCancelled
                 active_workers = self._game_speech_preload_active_workers
                 for active_thread in list(active_workers):
                     if not active_thread.is_alive():
@@ -661,7 +670,7 @@ class TtsRuntimeMixin:
                 normalize_spaces = not meta or meta.category != "ws_bistream"
                 request_queue = Queue()
                 response_queue = Queue()
-                capture_owner = object()
+                capture_owner = GameSpeechCaptureOwner()
                 thread = Thread(
                     target=worker,
                     args=(request_queue, response_queue, api_key, route_voice_id),
@@ -674,7 +683,7 @@ class TtsRuntimeMixin:
                     deadline = time.monotonic() + timeout_seconds
                     while True:
                         if epoch != self._game_speech_preload_cancel_epoch:
-                            raise asyncio.CancelledError
+                            raise _GameSpeechPreloadCancelled
                         try:
                             return response_queue.get_nowait()
                         except Exception:
@@ -854,7 +863,9 @@ class TtsRuntimeMixin:
                         GAME_SPEECH_AUDIO_CACHE.discard_owner(capture_owner)
 
                 return summarize(results_by_index)
-        except asyncio.CancelledError:
+        except _GameSpeechPreloadCancelled:
+            # Only our own supersede/teardown signal is absorbed here; a real
+            # CancelledError propagates so the request task actually stops.
             return {"ok": False, "reason": "cancelled", "results": []}
         finally:
             self._game_speech_preload_pending_batches = max(

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from main_logic.core.game_speech_audio_cache import GameSpeechAudioCache
+from main_logic.core.game_speech_audio_cache import (
+    GameSpeechAudioCache,
+    GameSpeechCaptureOwner,
+)
 
 
 class _Clock:
@@ -30,7 +33,7 @@ def _capture(
 @pytest.mark.unit
 def test_completed_audio_is_immutable_and_lru_bounded() -> None:
     cache = GameSpeechAudioCache(max_entries=2, max_total_bytes=12, max_entry_bytes=8)
-    owner = object()
+    owner = GameSpeechCaptureOwner()
 
     assert _capture(cache, owner, "s1", "one", b"a")
     assert _capture(cache, owner, "s2", "two", b"bb")
@@ -58,7 +61,7 @@ def test_completed_audio_expires_and_total_bytes_evict_oldest() -> None:
         entry_ttl_seconds=10,
         clock=clock,
     )
-    owner = object()
+    owner = GameSpeechCaptureOwner()
 
     assert _capture(cache, owner, "s1", "one", b"aaa")
     assert _capture(cache, owner, "s2", "two", b"bbb")
@@ -80,9 +83,9 @@ def test_capture_limits_signature_guard_and_release_paths() -> None:
         capture_ttl_seconds=10,
         clock=clock,
     )
-    owner_a = object()
-    owner_b = object()
-    owner_c = object()
+    owner_a = GameSpeechCaptureOwner()
+    owner_b = GameSpeechCaptureOwner()
+    owner_c = GameSpeechCaptureOwner()
 
     assert cache.begin_capture(owner_a, "a", "key-a", "voice-a")
     assert cache.append_capture(owner_a, "a", b"aaa")
@@ -117,7 +120,7 @@ def test_capture_limits_signature_guard_and_release_paths() -> None:
 @pytest.mark.unit
 def test_unscoped_audio_is_discarded_when_capture_identity_is_ambiguous() -> None:
     cache = GameSpeechAudioCache(max_captures=3)
-    owner = object()
+    owner = GameSpeechCaptureOwner()
 
     assert cache.begin_capture(owner, "one", "key-one", "voice")
     assert cache.begin_capture(owner, "two", "key-two", "voice")
@@ -128,3 +131,27 @@ def test_unscoped_audio_is_discarded_when_capture_identity_is_ambiguous() -> Non
     assert cache.append_unscoped_capture(owner, "legacy-worker-id", b"safe")
     assert cache.complete_capture(owner, "only", "voice")
     assert cache.get("key-only") == (b"safe",)
+
+
+def test_owner_identity_is_never_reused_across_owner_lifetimes():
+    """A dead owner's identity must never be handed to a new owner.
+
+    Keying captures on ``id(owner)`` looks fine until CPython recycles the
+    address of a freed owner -- the isolated preload batches are exactly the
+    short-lived, same-sized allocations that get recycled -- at which point a
+    fresh owner inherits the previous one's still-live captures and its audio
+    is appended to someone else's utterance.
+    """
+    import gc
+
+    cache = GameSpeechAudioCache()
+    tokens = []
+    for _ in range(50):
+        owner = GameSpeechCaptureOwner()
+        tokens.append(cache._owner_token(owner))
+        del owner
+        gc.collect()
+
+    assert len(set(tokens)) == len(tokens), (
+        "owner identity was recycled across owner lifetimes"
+    )

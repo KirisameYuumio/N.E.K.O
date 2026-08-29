@@ -232,6 +232,13 @@ async function main() {
   assert(firstCall.payload.interrupt_audio === true, 'speech interrupt policy was not forwarded');
   assert(firstCall.payload.reuse_synthesized_audio === true,
     'speech audio reuse opt-in was not forwarded');
+  // game.speech.speak() is awaited by game code, so it must resolve only once
+  // the line has actually been spoken. The host endpoint defaults to returning
+  // as soon as the line is queued, so the SDK has to opt in explicitly --
+  // otherwise two awaited speaks overlap and the second overwrites the host's
+  // single speech-correlation slot, leaving the first uncancellable at route end.
+  assert(firstCall.payload.wait_for_audio_completion === true,
+    'speech request did not opt into waiting for playback completion');
   assert(firstCall.payload.event.kind === 'goal', 'bounded speech event data was not forwarded');
   assert(/^sdk-speech-/.test(firstCall.payload.sdk_speech_correlation_id),
     'speech request did not receive an SDK-owned playback correlation id');

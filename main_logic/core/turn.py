@@ -1857,6 +1857,12 @@ class TurnMixin:
                     request_id=request_id,
                     log_context="mirror cached speech",
                 )
+            # Cached audio is handed straight to the websocket, so there is no
+            # worker completion sentinel to await and no client acknowledgement
+            # to wait on. Report that honestly instead of claiming a completion
+            # that was never observed: the caller asked to be told when the line
+            # finished playing, and on this path we only know it was delivered.
+            # (Ordering still holds -- the browser plays its queue in order.)
             return {
                 "ok": audio_sent,
                 "method": "project_tts_cache",
@@ -1865,7 +1871,11 @@ class TurnMixin:
                 "audio_sent": audio_sent,
                 "audio_queued": False,
                 "audio_completed": audio_sent,
-                "audio_completion_supported": True,
+                "audio_completion_supported": False,
+                **(
+                    {"completion_note": "cache_hit_completion_not_observable"}
+                    if wait_for_audio_completion else {}
+                ),
                 "turn_end_emitted": bool(emit_turn_end_after),
                 "interrupt_audio": bool(interrupt_audio),
                 "playback_gain": normalized_playback_gain,

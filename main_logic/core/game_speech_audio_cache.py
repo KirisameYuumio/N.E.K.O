@@ -21,9 +21,11 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from itertools import count
 from threading import RLock
 import time
 from typing import Callable
+from weakref import WeakKeyDictionary
 
 
 DEFAULT_MAX_ENTRIES = 96
@@ -33,6 +35,16 @@ DEFAULT_ENTRY_TTL_SECONDS = 6 * 60 * 60
 DEFAULT_MAX_CAPTURES = 16
 DEFAULT_MAX_CAPTURE_TOTAL_BYTES = 8 * 1024 * 1024
 DEFAULT_CAPTURE_TTL_SECONDS = 120
+
+
+class GameSpeechCaptureOwner:
+    """Opaque, weak-referenceable handle identifying one capture owner.
+
+    Owners are identified by a monotonic token held in a weak map, so a
+    plain ``object()`` cannot be used: it is not weak-referenceable. Use
+    this when there is no natural owner object (e.g. an isolated preload
+    batch); long-lived owners such as the session manager pass themselves.
+    """
 
 
 @dataclass(frozen=True)
@@ -80,10 +92,30 @@ class GameSpeechAudioCache:
         self._entry_bytes = 0
         self._capture_bytes = 0
         self._lock = RLock()
+        # Owner identity must outlive the owner object without ever being
+        # reused. ``id()`` cannot do that: CPython recycles the address of a
+        # freed object, so a short-lived preload owner can be handed the same
+        # id as a previous one and inherit its still-live captures. Hand out
+        # monotonic tokens instead and let the weak map drop dead owners.
+        self._owner_tokens: WeakKeyDictionary = WeakKeyDictionary()
+        self._next_owner_token = count(1)
 
-    @staticmethod
-    def _capture_id(owner: object, speech_id: object) -> tuple[int, str]:
-        return id(owner), str(speech_id or "")
+    def _owner_token(self, owner: object) -> int:
+        """Return this owner's stable, never-recycled identity.
+
+        The owner must be weak-referenceable; ``GameSpeechCaptureOwner`` is
+        provided for callers with no natural owner object. A non-weak-
+        referenceable owner raises here rather than silently getting a token
+        nothing else can re-derive, which would make every capture vanish.
+        """
+        token = self._owner_tokens.get(owner)
+        if token is None:
+            token = next(self._next_owner_token)
+            self._owner_tokens[owner] = token
+        return token
+
+    def _capture_id(self, owner: object, speech_id: object) -> tuple[int, str]:
+        return self._owner_token(owner), str(speech_id or "")
 
     def _remove_entry_locked(self, key: str) -> None:
         entry = self._entries.pop(key, None)
@@ -166,7 +198,7 @@ class GameSpeechAudioCache:
 
     def append_unscoped_capture(self, owner: object, speech_id: object, chunk: object) -> bool:
         """Append legacy untagged audio only when its owner has one unambiguous capture."""
-        owner_id = id(owner)
+        owner_id = self._owner_token(owner)
         with self._lock:
             self._prune_locked(self._clock())
             owner_captures = [
@@ -227,7 +259,7 @@ class GameSpeechAudioCache:
             return True
 
     def discard_owner(self, owner: object) -> int:
-        owner_id = id(owner)
+        owner_id = self._owner_token(owner)
         with self._lock:
             matches = [key for key, capture in self._captures.items() if capture.owner_id == owner_id]
             for capture_id in matches:
