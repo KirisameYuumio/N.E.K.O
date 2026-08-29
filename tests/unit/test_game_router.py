@@ -6869,6 +6869,134 @@ async def test_project_speak_blocks_on_playback_only_when_asked(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_external_transcript_stops_when_the_route_is_replaced_mid_mirror(monkeypatch):
+    """A replacement route must not inherit the previous route's side effects.
+
+    ``mirror_user_input`` awaits the frontend websocket, so route B can start and
+    finalize route A's state while A is blocked there. Everything after that
+    await is unrecoverable: ``send_user_activity()`` is manager-wide and would
+    interrupt whatever B is currently speaking, and the dialog/output appends
+    land on a route that is already finished. The ownership check further down
+    only guards the LLM call and cannot undo either.
+    """
+    class SwappingMirrorManager(_FakeGameRouteManager):
+        def __init__(self):
+            super().__init__()
+            self.swap = None
+
+        async def mirror_user_input(self, text, **kwargs):
+            await super().mirror_user_input(text, **kwargs)
+            if self.swap is not None:
+                self.swap()
+                self.swap = None
+
+    mgr = SwappingMirrorManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    async def unexpected_chat(*_args, **_kwargs):
+        raise AssertionError("the superseded route still reached the game LLM")
+
+    _gr_patch_all(monkeypatch, "_run_game_chat", unexpected_chat)
+
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("example-game", "route-A", "Lan")
+        dialog_before = len(state.get("game_dialog_log") or [])
+        outputs_before = len(state.get("pending_outputs") or [])
+
+        # While the mirror is awaiting, a replacement route takes the slot.
+        def replace_route():
+            gr_runtime._activate_game_route("example-game", "route-B", "Lan")
+
+        mgr.swap = replace_route
+
+        routed = await gr_runtime._route_external_transcript_to_game(
+            "Lan",
+            state,
+            "说给 A 听的话",
+            source="test",
+            mode="voice",
+            kind="user-voice",
+            request_id="req-1",
+        )
+
+    # Consumed, not retried elsewhere -- the same answer supersession already
+    # gets once the LLM call is skipped.
+    assert routed is True
+    assert mgr.user_activity_count == 0, (
+        "a superseded route interrupted the replacement route's speech"
+    )
+    assert len(state.get("game_dialog_log") or []) == dialog_before
+    assert len(state.get("pending_outputs") or []) == outputs_before
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speak_applies_render_language_under_the_speech_lock(monkeypatch):
+    """Overlapping speaks must not synthesize under each other's locale.
+
+    ``set_render_language()`` mutates the shared session manager. Applying it
+    before the per-character speech lock lets a second request retarget the
+    locale while the first is still queued, so the first synthesizes in the
+    wrong language -- and ``game_speech_audio_cache_identity()`` keys on the
+    same field, so the wrong pronunciation can be cached and replayed later.
+    """
+    class BlockingSpeechManager(_FakeGameRouteManager):
+        def __init__(self):
+            super().__init__()
+            self.first_speech_started = asyncio.Event()
+            self.release_first_speech = asyncio.Event()
+
+        async def mirror_assistant_speech(self, line, **kwargs):
+            self.render_language_at_mirror.append(
+                getattr(self, "_conversation_render_language", None)
+            )
+            if not self.first_speech_started.is_set():
+                self.first_speech_started.set()
+                await self.release_first_speech.wait()
+            self.spoken.append((line, kwargs))
+            return {"ok": True, "audio_sent": True, "speech_id": "sid"}
+
+    mgr = BlockingSpeechManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        gr_runtime._activate_game_route("example-game", "match_1", "Lan")
+        first = asyncio.create_task(gr_runtime.game_project_speak(
+            "example-game",
+            _FakeRequest({
+                "line": "日本語の台詞",
+                "session_id": "match_1",
+                "render_language": "ja-JP",
+            }),
+        ))
+        await asyncio.wait_for(mgr.first_speech_started.wait(), timeout=2.0)
+
+        # A second request arrives with a different locale while the first is
+        # still synthesizing.
+        second = asyncio.create_task(gr_runtime.game_project_speak(
+            "example-game",
+            _FakeRequest({
+                "line": "English line",
+                "session_id": "match_1",
+                "render_language": "en-US",
+            }),
+        ))
+        await asyncio.sleep(0.05)
+        mgr.release_first_speech.set()
+        await asyncio.wait_for(first, timeout=2.0)
+        await asyncio.wait_for(second, timeout=2.0)
+
+    # Locales are stored normalized ("ja-JP" -> "ja").
+    assert mgr.render_language_at_mirror[0] == "ja", (
+        "the first speech synthesized under the second request's locale"
+    )
+    assert mgr.render_language_at_mirror[-1] == "en"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_project_speech_preload_requires_local_mutation_csrf(monkeypatch):
     mgr = _FakeGameRouteManager()
     _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})

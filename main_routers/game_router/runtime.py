@@ -2977,7 +2977,12 @@ async def game_project_speak(game_type: str, request: Request):
     mgr = get_session_manager().get(lanlan_name)
     if not mgr:
         return {"ok": False, "reason": "no_session_manager", "lanlan_name": lanlan_name}
-    _apply_request_render_language(data, mgr)
+    # NOT applied here: set_render_language() mutates the shared session manager,
+    # and this runs BEFORE the per-character speech lock below. Two overlapping
+    # speak requests would each set their own locale and then queue on the lock,
+    # so the first one synthesizes under the second one's language -- and
+    # game_speech_audio_cache_identity() keys on that same field, so the wrong
+    # pronunciation can be cached and replayed later. Applied under the lock.
     _append_game_session_debug_log(
         game_type,
         session_id,
@@ -3040,6 +3045,9 @@ async def game_project_speak(game_type: str, request: Request):
                 if stale_response:
                     result = stale_response
                 else:
+                    # This request now owns the speech slot, so its locale can
+                    # no longer be read by another request's synthesis.
+                    _apply_request_render_language(data, mgr)
                     speech_correlation_id = str(
                         data.get("sdk_speech_correlation_id") or ""
                     ).strip()[:128]
@@ -3599,6 +3607,24 @@ async def _route_external_transcript_to_game(
             ),
             send_to_frontend=kind == "user-voice",
         )
+    # ``mirror_user_input`` awaits the frontend websocket, so a replacement route
+    # can start -- and finalize this state -- while we are blocked there.
+    # Everything below is a side effect that cannot be taken back:
+    # ``send_user_activity()`` is manager-wide and interrupts whatever the
+    # CURRENT route is speaking, and the appends land on a route that may
+    # already be finalized. ``_run_game_chat`` further down validates ownership
+    # for its own call, but that check cannot undo any of these.
+    # Returning True (not False) matches how supersession is already reported
+    # here: the transcript was consumed and must not be retried elsewhere.
+    if _get_active_game_route_state(lanlan_name, game_type) is not state:
+        logger.info(
+            "🎮 外部输入镜像期间路由已被替换，跳过后续副作用: game=%s session=%s lanlan=%s",
+            game_type,
+            session_id,
+            lanlan_name,
+        )
+        return True
+
     if mgr and hasattr(mgr, "send_user_activity"):
         try:
             await mgr.send_user_activity()
