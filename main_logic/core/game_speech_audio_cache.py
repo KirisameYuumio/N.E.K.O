@@ -108,11 +108,17 @@ class GameSpeechAudioCache:
         referenceable owner raises here rather than silently getting a token
         nothing else can re-derive, which would make every capture vanish.
         """
-        token = self._owner_tokens.get(owner)
-        if token is None:
-            token = next(self._next_owner_token)
-            self._owner_tokens[owner] = token
-        return token
+        # Under the lock: the lookup and the assignment are a check-then-act
+        # pair, so two threads first touching the same owner would otherwise
+        # mint two tokens, and captures for one (owner, speech_id) would split
+        # across both. ``RLock`` is reentrant, so callers that already hold it
+        # can still route through here.
+        with self._lock:
+            token = self._owner_tokens.get(owner)
+            if token is None:
+                token = next(self._next_owner_token)
+                self._owner_tokens[owner] = token
+            return token
 
     def _capture_id(self, owner: object, speech_id: object) -> tuple[int, str]:
         return self._owner_token(owner), str(speech_id or "")

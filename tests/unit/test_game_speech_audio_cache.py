@@ -155,3 +155,61 @@ def test_owner_identity_is_never_reused_across_owner_lifetimes():
     assert len(set(tokens)) == len(tokens), (
         "owner identity was recycled across owner lifetimes"
     )
+
+
+def test_owner_token_is_stable_under_concurrent_first_touch():
+    """Two threads first touching one owner must agree on its token.
+
+    ``_owner_token`` is a check-then-act pair over the weak map. Without the
+    lock, both threads miss the lookup and mint separate tokens, so captures for
+    one ``(owner, speech_id)`` split across two identities and neither
+    ``complete_capture`` nor ``discard_owner`` can find the other's rows.
+
+    The barrier makes that window deterministic rather than relying on timing:
+    it is released only once a thread is past the lookup, so an unlocked
+    implementation is guaranteed to interleave, and a locked one is guaranteed
+    to serialize (the second thread blocks before it ever reaches the barrier).
+    """
+    import threading
+
+    cache = GameSpeechAudioCache()
+    owner = GameSpeechCaptureOwner()
+    real_map = cache._owner_tokens
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    class SlowLookupMap:
+        def get(self, key, default=None):
+            value = real_map.get(key, default)
+            if value is None:
+                entered.set()
+                # Bounded: a correct (locked) implementation never has a second
+                # thread waiting here, so this must not hang the suite.
+                proceed.wait(timeout=1.0)
+            return value
+
+        def __setitem__(self, key, value):
+            real_map[key] = value
+
+    cache._owner_tokens = SlowLookupMap()
+    tokens: list[int] = []
+    lock = threading.Lock()
+
+    def take():
+        token = cache._owner_token(owner)
+        with lock:
+            tokens.append(token)
+
+    first = threading.Thread(target=take)
+    first.start()
+    assert entered.wait(timeout=2.0), "the first thread never reached the lookup"
+    second = threading.Thread(target=take)
+    second.start()
+    proceed.set()
+    first.join(timeout=5.0)
+    second.join(timeout=5.0)
+
+    assert len(tokens) == 2
+    assert tokens[0] == tokens[1], (
+        "concurrent first touch minted two identities for one owner"
+    )
