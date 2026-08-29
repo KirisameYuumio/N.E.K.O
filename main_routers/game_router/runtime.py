@@ -492,13 +492,11 @@ def _get_badminton_quick_lines_fallback(language: str | None = None) -> Dict[str
     return get_badminton_quick_lines_fallback(language)
 
 
-def _public_route_state(state: dict | None) -> dict:
-    if not state:
-        return {"game_route_active": False}
-    # Lifecycle responses are deliberately narrower than the internal route
-    # state. In particular, preGameContext may contain recent dialogue/memory
-    # and is only available through the capability-gated context endpoint.
-    lifecycle_fields = (
+# Lifecycle responses to an SDK route are deliberately narrower than the
+# internal route state. In particular, preGameContext may contain recent
+# dialogue/memory and is only available to SDK games through the
+# capability-gated context endpoint.
+_SDK_LIFECYCLE_STATE_FIELDS = (
         "game_type",
         "session_id",
         "lanlan_name",
@@ -545,8 +543,24 @@ def _public_route_state(state: dict | None) -> dict:
         "nekoInitiated",
         "user_language",
         "user_language_source",
-    )
-    public = {key: state[key] for key in lifecycle_fields if key in state}
+)
+
+
+def _public_route_state(state: dict | None) -> dict:
+    if not state:
+        return {"game_route_active": False}
+    public = {k: v for k, v in state.items() if not str(k).startswith("_")}
+    if str(state.get("_sdk_route_instance_id") or "").strip():
+        # Only routes that opted into SDK generations get the capability-gated
+        # projection. Built-in routes predate that gate and keep the historical
+        # full shape — soccer (_applyPreGameContext) and badminton
+        # (applyPreGameContext) read preGameContext straight off this response,
+        # so narrowing it for them would silently drop their pregame context.
+        public = {
+            key: public[key]
+            for key in _SDK_LIFECYCLE_STATE_FIELDS
+            if key in public
+        }
     public["dialog_count"] = len(state.get("game_dialog_log") or [])
     public["pending_output_count"] = len(state.get("pending_outputs") or [])
     return public
@@ -610,7 +624,19 @@ def _sdk_active_route_from_payload(
             "reason": "game_route_inactive",
         }
     current_session_id = str(state.get("session_id") or "")
-    if not session_id or session_id != current_session_id:
+    if not session_id:
+        # Pre-SDK callers may omit session_id entirely, and the endpoints this
+        # helper replaced read that as "no session assertion" rather than as a
+        # mismatch. Only a caller that opted into SDK route generations has to
+        # pin an exact session; everyone else adopts the active one.
+        if str(data.get("sdk_route_instance_id") or "").strip():
+            return lanlan_name, session_id, state, {
+                "ok": False,
+                "reason": "session_id_mismatch",
+                "state": _public_route_state(state),
+            }
+        session_id = current_session_id
+    elif session_id != current_session_id:
         return lanlan_name, session_id, state, {
             "ok": False,
             "reason": "session_id_mismatch",
@@ -2630,6 +2656,7 @@ async def _speak_game_line_via_project_tts(
     interrupt_audio: bool = False,
     playback_gain: float = 1.0,
     reuse_synthesized_audio: bool = False,
+    wait_for_audio_completion: bool = False,
     event: dict | None = None,
     speech_correlation_id: str = "",
 ) -> Dict[str, Any]:
@@ -2653,7 +2680,7 @@ async def _speak_game_line_via_project_tts(
             interrupt_audio=interrupt_audio,
             playback_gain=playback_gain,
             reuse_synthesized_audio=reuse_synthesized_audio,
-            wait_for_audio_completion=True,
+            wait_for_audio_completion=wait_for_audio_completion,
             audio_completion_timeout=45.0,
             speech_correlation_id=speech_correlation_id,
         )
@@ -2894,6 +2921,12 @@ async def game_project_speak(game_type: str, request: Request):
 
     interrupt_audio = _coerce_payload_bool(data.get("interrupt_audio")) is True
     reuse_synthesized_audio = _coerce_payload_bool(data.get("reuse_synthesized_audio")) is True
+    # Opt-in, default off: the pre-SDK contract for this endpoint is "return
+    # once the line is queued". SDK games that sequence speech themselves ask
+    # for the blocking form explicitly; the built-in games keep their latency.
+    wait_for_audio_completion = _coerce_payload_bool(
+        data.get("wait_for_audio_completion")
+    ) is True
     playback_gain = _normalize_game_voice_playback_gain(data.get("playback_gain"))
     lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
         game_type,
@@ -3021,6 +3054,7 @@ async def game_project_speak(game_type: str, request: Request):
                             interrupt_audio=interrupt_audio,
                             playback_gain=playback_gain,
                             reuse_synthesized_audio=reuse_synthesized_audio,
+                            wait_for_audio_completion=wait_for_audio_completion,
                             speech_correlation_id=speech_correlation_id,
                             event=_attach_game_memory_flag_to_event(
                                 data.get("event")

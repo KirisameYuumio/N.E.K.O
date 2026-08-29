@@ -303,7 +303,16 @@ async def test_server_vad_does_not_capture_route_from_idle_silence():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_server_vad_without_local_onset_never_reads_the_event_time_route():
+async def test_server_vad_without_local_onset_binds_the_route_that_owned_the_frames():
+    """Audio recorded under A stays owned by A, even if the route moved to B.
+
+    The local onset gate never arms on these frames, but they were still
+    captured under exactly one route, so that route is the provable owner.
+    Reporting it (instead of an unroutable ``None``) lets
+    ``handle_input_transcript`` do the rejecting: A's owner will not match the
+    live B route, so the stale final is dropped there — while ordinary soft
+    speech under a stable route keeps reaching the game.
+    """
     current_route = [("example-game", "session-a", "route-a")]
     delivered = []
 
@@ -332,7 +341,88 @@ async def test_server_vad_without_local_onset_never_reads_the_event_time_route()
         item_id="provider-item-old-audio",
     )
 
-    assert delivered == [("old audio", None)]
+    # Never the event-time route: that is what would misroute A's audio into B.
+    assert delivered == [
+        ("old audio", ("example-game", "session-a", "route-a")),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_soft_speech_under_a_stable_route_still_reaches_that_route():
+    """The regression guard: a quiet utterance must not become unroutable.
+
+    Server VAD and the client RMS/RNNoise gate are independent detectors with
+    independent thresholds, so "server committed an utterance the local gate
+    never heard" is ordinary. Such a final used to arrive with ``None`` and was
+    dropped by ``handle_input_transcript`` before the takeover dispatcher, i.e.
+    the player spoke and the game got nothing.
+    """
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def discard_event(_event):
+        return None
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._has_server_vad = True
+    client.send_event = discard_event
+
+    quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
+    await client.stream_audio(quiet_frame)
+    await client.stream_audio(quiet_frame)
+    assert client._input_route_identity_captured is False
+
+    client._bind_input_route_identity_to_item("provider-item-soft")
+    await client._deliver_input_transcript("soft line", item_id="provider-item-soft")
+
+    assert delivered == [
+        ("soft line", ("example-game", "session-a", "route-a")),
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_route_switch_inside_one_buffer_leaves_no_provable_owner():
+    """When the route really changed mid-buffer, fail closed with ``None``.
+
+    This is the case the ownership binding exists for: the buffer genuinely
+    spans two routes, so no single owner can be proven and the final must not
+    be delivered to either one.
+    """
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def discard_event(_event):
+        return None
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client._has_server_vad = True
+    client.send_event = discard_event
+
+    quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
+    await client.stream_audio(quiet_frame)
+    current_route[0] = ("example-game", "session-b", "route-b")
+    await client.stream_audio(quiet_frame)
+
+    client._bind_input_route_identity_to_item("provider-item-split")
+    await client._deliver_input_transcript("split", item_id="provider-item-split")
+
+    assert delivered == [("split", None)]
 
 
 @pytest.mark.unit

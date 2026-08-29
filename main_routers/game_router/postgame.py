@@ -93,6 +93,9 @@ _POSTGAME_REALTIME_UNORGANIZED_MAX_TOKENS = 1500
 
 _GAME_SPEECH_CANCEL_SETTLE_SECONDS = 2.0
 _POSTGAME_DELIVERY_LOCK_TIMEOUT_SECONDS = 5.0
+# Covers one postgame LLM reply plus its TTS feed. Only a wedged provider
+# should ever reach it; a healthy delivery finishes well inside this.
+_POSTGAME_DELIVERY_BODY_TIMEOUT_SECONDS = 45.0
 
 
 def _postgame_replacement_route_active(source_state: Optional[dict]) -> bool:
@@ -122,9 +125,21 @@ async def _postgame_delivery_guard(source_state: Optional[dict]):
     if not lanlan_name:
         yield True
         return
+    # Two separate budgets on purpose. The short one bounds ACQUISITION: if a
+    # peer already holds the character lock we give up quickly rather than
+    # queueing. The long one bounds the caller's delivery body so a wedged
+    # provider cannot pin the OUTER supersede lock (and therefore every
+    # ``/route/start`` for this character) forever. Running the body under the
+    # acquisition budget instead would kill an ordinary slow-but-healthy
+    # postgame line — one LLM reply plus a TTS feed routinely exceeds 5s.
+    lock = _get_supersede_lock(lanlan_name)
     async with asyncio.timeout(_POSTGAME_DELIVERY_LOCK_TIMEOUT_SECONDS):
-        async with _get_supersede_lock(lanlan_name):
+        await lock.acquire()
+    try:
+        async with asyncio.timeout(_POSTGAME_DELIVERY_BODY_TIMEOUT_SECONDS):
             yield not _postgame_replacement_route_active(source_state)
+    finally:
+        lock.release()
 
 
 async def _cancel_route_game_speech_preloads(state: dict) -> None:

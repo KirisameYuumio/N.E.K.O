@@ -155,6 +155,13 @@ class OmniRealtimeClient(_ToolingMixin, _AudioMixin, _TransportMixin, _ResponseM
         self._input_route_identity_captured = False
         self._input_route_identity = None
         self._input_route_identity_by_item: dict[str, tuple[str, str, str] | None] = {}
+        # Route ownership observed on the streamed frames themselves, used when
+        # the local onset gate never armed a snapshot. ``mixed`` records that the
+        # route actually changed while this buffer was being filled, which is the
+        # only case where the owner is genuinely unprovable.
+        self._input_route_identity_stream_armed = False
+        self._input_route_identity_stream_owner = None
+        self._input_route_identity_stream_mixed = False
         self.on_output_transcript = on_output_transcript
         self.turn_detection_mode = turn_detection_mode
         self.on_connection_error = on_connection_error

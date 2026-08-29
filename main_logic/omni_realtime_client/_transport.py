@@ -133,6 +133,39 @@ class _TransportMixin:
         self._input_route_identity_captured = False
         self._input_route_identity = None
         self._input_route_identity_by_item.clear()
+        self._reset_input_route_identity_stream()
+
+    def _reset_input_route_identity_stream(self) -> None:
+        """Forget the per-buffer route observation after it was consumed."""
+        self._input_route_identity_stream_armed = False
+        self._input_route_identity_stream_owner = None
+        self._input_route_identity_stream_mixed = False
+
+    def _note_input_route_identity_frame(self, identity) -> None:
+        """Record which route owned each streamed frame of the current buffer.
+
+        The local onset gate (RMS / RNNoise) and the provider's server VAD are
+        independent detectors with independent thresholds, so "server VAD fired
+        but the local gate never armed a snapshot" is an ordinary outcome rather
+        than an anomaly. This observation covers that case: the frames
+        themselves still prove which route was active while they were captured.
+        """
+        if not self._input_route_identity_stream_armed:
+            self._input_route_identity_stream_armed = True
+            self._input_route_identity_stream_owner = identity
+            return
+        if self._input_route_identity_stream_owner != identity:
+            self._input_route_identity_stream_mixed = True
+
+    def _resolve_input_route_identity_owner(self):
+        """Return the route that owned the audio currently buffered, if provable."""
+        if self._input_route_identity_captured:
+            return self._input_route_identity
+        if self._input_route_identity_stream_mixed:
+            return None
+        if self._input_route_identity_stream_armed:
+            return self._input_route_identity_stream_owner
+        return self._read_input_route_identity()
 
     def _read_input_route_identity(self):
         identity = None
@@ -183,15 +216,21 @@ class _TransportMixin:
         item_key = str(item_id or "").strip()
         if not item_key:
             return
-        # The server event can arrive after the active route changes. Without a
-        # locally confirmed ingress snapshot, binding the event-time route would
-        # attribute old microphone audio to a newer game. Preserve explicit None
-        # so the routed transcript is safely rejected instead.
-        identity = (
-            self._input_route_identity
-            if self._input_route_identity_captured
-            else None
-        )
+        # Bind the route that actually owned this audio, in decreasing order of
+        # proof strength:
+        #   1. the local onset snapshot, when the client gate armed one;
+        #   2. otherwise the route observed on the streamed frames themselves —
+        #      the server event can arrive after the active route changes, but
+        #      the frames it is reporting on were still captured under a known
+        #      route, and one stable value across the whole buffer proves it;
+        #   3. None only when the route genuinely changed mid-buffer, so no
+        #      single owner exists.
+        # Pinning None whenever the local gate stayed quiet (its threshold is
+        # independent of the server's) would make ordinary soft speech
+        # unroutable and drop it before the takeover dispatcher ever sees it.
+        # Rejecting audio that predates a route switch stays the caller's job:
+        # ``handle_input_transcript`` compares this owner against the live route.
+        identity = self._resolve_input_route_identity_owner()
         identities = self._input_route_identity_by_item
         identities.pop(item_key, None)
         identities[item_key] = identity
@@ -199,6 +238,7 @@ class _TransportMixin:
             identities.pop(next(iter(identities)))
         self._input_route_identity = None
         self._input_route_identity_captured = False
+        self._reset_input_route_identity_stream()
 
     def _take_input_route_identity(self, item_id: object = None):
         item_key = str(item_id or "").strip()
@@ -212,13 +252,10 @@ class _TransportMixin:
                 # final. MANUAL/client-VAD providers may still attach item IDs
                 # without ever emitting the event that creates this map.
                 return None
-        identity = (
-            self._input_route_identity
-            if self._input_route_identity_captured
-            else None
-        )
+        identity = self._resolve_input_route_identity_owner()
         self._input_route_identity = None
         self._input_route_identity_captured = False
+        self._reset_input_route_identity_stream()
         return identity
 
     async def _deliver_input_transcript(self, transcript: str, *, item_id: object = None) -> None:
@@ -707,6 +744,9 @@ class _TransportMixin:
         current_time = time.time()
         # 本地音量判定：用原始输入做 RMS，避免 VAD 延迟时误清 buffer
         ingress_route_identity = self._read_input_route_identity()
+        # Observe ownership on every frame, not only on frames the local onset
+        # gate accepts: server VAD may commit an utterance the gate never heard.
+        self._note_input_route_identity_frame(ingress_route_identity)
         raw_samples = np.frombuffer(audio_chunk, dtype=np.int16)
         raw_loud = False
         if len(raw_samples) > 0:

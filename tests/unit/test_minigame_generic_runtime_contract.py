@@ -97,6 +97,10 @@ def test_public_lifecycle_state_excludes_context_and_internal_collections():
         "session_id": "round-1",
         "lanlan_name": "Test Neko",
         "game_route_active": True,
+        # Only a route that opted into SDK generations gets the narrowed
+        # projection; that opt-in is what makes /context/read the sole path to
+        # in-session material.
+        "_sdk_route_instance_id": "route-instance-1",
         "preGameContext": {"history": "private context"},
         "game_dialog_log": [{"text": "private dialogue"}],
         "pending_outputs": [{"result": "private output"}],
@@ -112,6 +116,91 @@ def test_public_lifecycle_state_excludes_context_and_internal_collections():
     assert "game_dialog_log" not in visible
     assert "pending_outputs" not in visible
     assert "last_state" not in visible
+
+
+@pytest.mark.unit
+def test_public_lifecycle_state_keeps_the_builtin_shape_for_non_sdk_routes():
+    """Built-in routes predate the capability gate and keep their full shape.
+
+    soccer-demo.js ``_applyPreGameContext`` and badminton_demo.html
+    ``applyPreGameContext`` read ``preGameContext`` (plus its source/error
+    diagnostics) straight off the lifecycle response. Narrowing them to the SDK
+    projection silently drops the pregame opening stance, mood and difficulty.
+    """
+    state = {
+        "game_type": "soccer",
+        "session_id": "match-1",
+        "lanlan_name": "Test Neko",
+        "game_route_active": True,
+        "preGameContext": {"initialMood": "happy"},
+        "pre_game_context_source": "ai",
+        "pre_game_context_error": "",
+        "game_dialog_log": [{"text": "dialogue"}],
+        "pending_outputs": [],
+        "_exit_flow_started": False,
+    }
+
+    visible = runtime._public_route_state(state)
+
+    assert visible["preGameContext"] == {"initialMood": "happy"}
+    assert visible["pre_game_context_source"] == "ai"
+    assert visible["dialog_count"] == 1
+    # Underscore-prefixed internals stay private in both projections.
+    assert "_exit_flow_started" not in visible
+
+
+@pytest.mark.unit
+def test_a_legacy_caller_may_still_omit_session_id(monkeypatch):
+    """Omitting session_id is "no assertion", not a mismatch, for legacy callers.
+
+    The endpoints this helper replaced read a missing ``session_id`` as "skip
+    the check" (``if session_id and session_id != ...``). Treating it as a hard
+    mismatch silently drops e.g. a ``/route/voice-transcript`` POST from any
+    page that never sent one.
+    """
+    state = {
+        "game_type": "example-game",
+        "session_id": "round-1",
+        "lanlan_name": "Lan",
+        "game_route_active": True,
+    }
+    monkeypatch.setattr(runtime, "_resolve_lanlan_name", lambda _value: "Lan")
+    monkeypatch.setattr(
+        runtime, "_get_active_game_route_state", lambda *_a, **_k: state
+    )
+
+    lanlan_name, session_id, resolved, error = runtime._sdk_active_route_from_payload(
+        "example-game", {"lanlan_name": "Lan"}
+    )
+
+    assert error is None
+    assert resolved is state
+    # The active session is adopted so callers still get an authoritative id.
+    assert (lanlan_name, session_id) == ("Lan", "round-1")
+
+
+@pytest.mark.unit
+def test_an_sdk_caller_must_still_pin_an_exact_session_id(monkeypatch):
+    """Opting into SDK route generations keeps the strict session binding."""
+    state = {
+        "game_type": "example-game",
+        "session_id": "round-1",
+        "lanlan_name": "Lan",
+        "game_route_active": True,
+        "_sdk_route_instance_id": "route-instance-1",
+    }
+    monkeypatch.setattr(runtime, "_resolve_lanlan_name", lambda _value: "Lan")
+    monkeypatch.setattr(
+        runtime, "_get_active_game_route_state", lambda *_a, **_k: state
+    )
+
+    _lanlan, _session, _resolved, error = runtime._sdk_active_route_from_payload(
+        "example-game",
+        {"lanlan_name": "Lan", "sdk_route_instance_id": "route-instance-1"},
+    )
+
+    assert error is not None
+    assert error["reason"] == "session_id_mismatch"
 
 
 @pytest.mark.unit

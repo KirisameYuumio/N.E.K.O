@@ -5361,8 +5361,10 @@ async def test_route_start_activates_stt_gate_when_audio_already_active(monkeypa
 
     assert result["ok"] is True
     public_state = result["state"]
-    assert "preGameContext" not in public_state
-    assert "pre_game_context_error" not in public_state
+    # Built-in soccer is not an SDK route, so it keeps the historical full
+    # lifecycle shape that soccer-demo.js ``_applyPreGameContext`` reads.
+    assert "preGameContext" in public_state
+    assert "pre_game_context_error" in public_state
     state = gr_runtime._get_active_game_route_state("Lan", "soccer")
     assert state["before_game_external_mode"] == "audio"
     assert state["before_game_external_active"] is True
@@ -5445,8 +5447,10 @@ async def test_route_start_accepts_neko_invite_context(monkeypatch):
 
     assert result["ok"] is True
     public_state = result["state"]
-    assert "preGameContext" not in public_state
-    assert "nekoInviteText" not in public_state
+    # Built-in soccer keeps the historical full lifecycle shape: the pregame
+    # opening stance/mood/difficulty only reach the game through this field.
+    assert public_state["preGameContext"]["launchIntent"] == "neko_invite"
+    assert public_state["pre_game_context_source"] == "ai"
     state = gr_runtime._get_active_game_route_state("Lan", "soccer")
     assert state["nekoInitiated"] is True
     assert state["nekoInviteText"] == "来踢球吧，玩家。"
@@ -6705,7 +6709,7 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
         "interrupt_audio": False,
         "playback_gain": 1.0,
         "reuse_synthesized_audio": False,
-        "wait_for_audio_completion": True,
+        "wait_for_audio_completion": False,
         "audio_completion_timeout": 45.0,
         "speech_correlation_id": "sdk-correlation-1",
     })]
@@ -6747,7 +6751,7 @@ async def test_project_speak_can_skip_text_mirror_for_frontend_arbiter(monkeypat
         "interrupt_audio": False,
         "playback_gain": 1.0,
         "reuse_synthesized_audio": False,
-        "wait_for_audio_completion": True,
+        "wait_for_audio_completion": False,
         "audio_completion_timeout": 45.0,
         "speech_correlation_id": "",
     })]
@@ -6790,7 +6794,7 @@ async def test_project_speak_forwards_interrupt_audio(monkeypatch):
         "interrupt_audio": True,
         "playback_gain": 1.0,
         "reuse_synthesized_audio": False,
-        "wait_for_audio_completion": True,
+        "wait_for_audio_completion": False,
         "audio_completion_timeout": 45.0,
         "speech_correlation_id": "",
     })]
@@ -6816,6 +6820,37 @@ async def test_project_speak_forwards_synthesized_audio_reuse_opt_in(monkeypatch
 
     assert result["ok"] is True
     assert mgr.spoken[0][1]["reuse_synthesized_audio"] is True
+    # Audio reuse does not imply blocking: that is its own opt-in below.
+    assert mgr.spoken[0][1]["wait_for_audio_completion"] is False
+    assert mgr.spoken[0][1]["audio_completion_timeout"] == 45.0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speak_blocks_on_playback_only_when_asked(monkeypatch):
+    """Blocking until playback finishes is opt-in per request.
+
+    The pre-SDK contract for this endpoint is "return once the line is queued",
+    and the built-in callers depend on it: badminton_demo.html posts /speak with
+    a 3.5s client timeout, so a server that always waited for the whole
+    utterance would fail every badminton line into its browser-TTS fallback.
+    """
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({
+                "line": "等我说完",
+                "session_id": "match_1",
+                "wait_for_audio_completion": True,
+            }),
+        )
+
+    assert result["ok"] is True
     assert mgr.spoken[0][1]["wait_for_audio_completion"] is True
     assert mgr.spoken[0][1]["audio_completion_timeout"] == 45.0
 
@@ -8088,7 +8123,9 @@ async def test_postgame_realtime_publish_timeout_releases_takeover_lock(
             raise
 
     mgr.append_context = blocking_append
-    monkeypatch.setattr(gr_postgame, "_POSTGAME_DELIVERY_LOCK_TIMEOUT_SECONDS", 0.01)
+    # A wedged provider is bounded by the BODY budget. The acquisition budget
+    # is deliberately separate and must not bound the delivery itself.
+    monkeypatch.setattr(gr_postgame, "_POSTGAME_DELIVERY_BODY_TIMEOUT_SECONDS", 0.01)
 
     with reset_game_route_state():
         source_state = {
@@ -8125,6 +8162,61 @@ async def test_postgame_realtime_publish_timeout_releases_takeover_lock(
         assert result["reason"] == "postgame_delivery_timeout"
         assert append_cancelled.is_set() is True
         assert replacement_activated.is_set() is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_postgame_realtime_publish_survives_a_slow_but_healthy_delivery(
+    monkeypatch,
+    _fake_realtime,
+):
+    """A delivery slower than the lock-acquisition budget must still publish.
+
+    One postgame LLM reply plus its TTS feed routinely exceeds the few seconds
+    allowed for taking the character lock. Bounding the delivery body with the
+    acquisition budget turned those ordinary lines into
+    ``postgame_delivery_timeout`` and the player heard nothing after the match.
+    """
+    session = _fake_realtime(model_lower="qwen-realtime", delivered=True)
+    mgr = _FakeRealtimeManager(session)
+    appended = asyncio.Event()
+
+    async def slow_append(**_kwargs):
+        await asyncio.sleep(0.05)
+        appended.set()
+        return {"ok": True}
+
+    mgr.append_context = slow_append
+    # Acquisition is tight; the body budget is what covers the real work.
+    monkeypatch.setattr(gr_postgame, "_POSTGAME_DELIVERY_LOCK_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(gr_postgame, "_POSTGAME_DELIVERY_BODY_TIMEOUT_SECONDS", 5.0)
+
+    with reset_game_route_state():
+        source_state = {
+            "game_route_active": False,
+            "game_type": "example-game",
+            "session_id": "route-A",
+            "lanlan_name": "Lan",
+        }
+        route_key = gr_runtime._route_state_key("Lan", "example-game")
+        gr_runtime._game_route_states[route_key] = source_state
+        result = await asyncio.wait_for(
+            gr_runtime._deliver_postgame_to_realtime(
+                mgr,
+                {
+                    "game_type": "example-game",
+                    "session_id": "route-A",
+                    "lanlan_name": "Lan",
+                    "ended_at": "100.0",
+                },
+                {"trigger_voice": False},
+                source_state=source_state,
+            ),
+            timeout=2.0,
+        )
+
+    assert appended.is_set() is True
+    assert result.get("reason") != "postgame_delivery_timeout"
 
 
 @pytest.mark.unit
