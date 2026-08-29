@@ -151,6 +151,13 @@ MIXIN_SUPPORT_CLASSES = {
         "_HotSwapAudioFrame",
         "_HotSwapAudioBuffer",
     },
+    "tts_runtime": {
+        # Private control-flow signal for the game-speech preload batch. It has
+        # to be a distinct type from asyncio.CancelledError so that absorbing a
+        # supersede/teardown does not also swallow a real task cancellation, and
+        # it lives next to its only raiser and catcher.
+        "_GameSpeechPreloadCancelled",
+    },
 }
 PATCH_CALL_NAMES = {"setattr", "patch", "delattr"}
 
