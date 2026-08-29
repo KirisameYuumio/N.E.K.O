@@ -812,3 +812,56 @@ async def test_a_turn_that_began_before_the_host_had_an_id_is_not_guarded():
     await client._notify_turn_finished()
 
     assert host.calls == ["response_done", "sid_rotate"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_manual_commit_freezes_ownership_before_a_later_route_streams():
+    """MANUAL mode has no `speech_started`, so the commit must pin the owner.
+
+    Server VAD binds an owner when it reports the onset; MANUAL disables server
+    VAD entirely, so nothing bound the buffer being committed. A route starting
+    after the commit streams frames that move the last-write-wins mark, and the
+    already-committed utterance would then be delivered to that newer route
+    while its transcription was still in flight -- the exact misattribution this
+    ownership exists to prevent.
+    """
+    from main_logic.omni_realtime_client import TurnDetectionMode
+
+    current_route = [("example-game", "session-a", "route-a")]
+    delivered = []
+
+    async def on_transcript_with_route(text, *, source_game_route_identity):
+        delivered.append((text, source_game_route_identity))
+
+    async def discard_event(_event):
+        return None
+
+    client = _free_client(
+        None,
+        on_input_transcript_with_route=on_transcript_with_route,
+        get_input_route_identity=lambda: current_route[0],
+    )
+    client.turn_detection_mode = TurnDetectionMode.MANUAL
+    client._has_server_vad = False
+    client.send_event = discard_event
+    # Take the Gemini branch and stop at the missing session, so the commit
+    # boundary runs without needing the provider transport.
+    client._is_gemini = True
+    client._gemini_session = None
+
+    quiet_frame = (100).to_bytes(2, "little", signed=True) * 512
+    await client.stream_audio(quiet_frame)
+    assert client._input_route_identity_captured is False
+
+    await client.signal_user_activity_end()
+    assert client._input_route_identity_captured is True
+
+    # A replacement route opens and streams before the transcript lands.
+    current_route[0] = ("example-game", "session-b", "route-b")
+    await client.stream_audio(quiet_frame)
+    await client._deliver_input_transcript("committed under A", item_id="manual-item")
+
+    assert delivered == [
+        ("committed under A", ("example-game", "session-a", "route-a")),
+    ]

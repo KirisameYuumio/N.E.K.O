@@ -192,6 +192,26 @@ class _TransportMixin:
         self._input_route_identity_stream_armed = True
         self._input_route_identity_stream_owner = identity
 
+    def _freeze_input_route_identity_at_commit(self) -> None:
+        """Pin ownership at the MANUAL turn boundary.
+
+        MANUAL mode disables server VAD, so no ``speech_started`` ever arrives
+        and nothing binds an owner for the buffer being committed. The commit
+        itself IS that boundary, exactly as ``speech_started`` is in server-VAD
+        mode. Without pinning here, a route that starts after the commit streams
+        frames that move the last-write-wins mark, and the already-committed
+        utterance is then delivered to the newer route while its transcription
+        is still in flight.
+
+        Idempotent, and never overrides a local onset snapshot: that snapshot is
+        strictly better evidence than the frame mark.
+        """
+        if self._input_route_identity_captured:
+            return
+        if self._input_route_identity_stream_armed:
+            self._input_route_identity = self._input_route_identity_stream_owner
+            self._input_route_identity_captured = True
+
     def _resolve_input_route_identity_owner(self):
         """Return the route that owned the audio currently buffered, if provable.
 

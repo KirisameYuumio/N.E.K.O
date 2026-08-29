@@ -281,6 +281,9 @@ class _GeminiMixin:
             return
         if self._fatal_error_occurred:
             return
+        # This commit is the turn boundary for both providers below, so freeze
+        # route ownership here before any later frame can move it.
+        self._freeze_input_route_identity_at_commit()
         if self._is_gemini:
             if not self._gemini_session:
                 return

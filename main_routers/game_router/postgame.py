@@ -177,9 +177,15 @@ async def _cancel_route_game_speech_preloads(state: dict) -> None:
 async def _cancel_route_game_speech(state: dict, mgr: Any) -> None:
     """Cancel backend and browser audio owned by this route's latest speech."""
     task = state.pop("_sdk_active_speech_task", None)
-    correlation_id = str(
-        state.pop("_sdk_active_speech_correlation_id", "") or ""
-    )[:128]
+    raw_correlations = state.pop("_sdk_active_speech_correlation_ids", None)
+    correlation_ids = [
+        cleaned
+        for cleaned in (
+            str(value or "").strip()[:128]
+            for value in (raw_correlations if isinstance(raw_correlations, list) else [])
+        )
+        if cleaned
+    ]
     if (
         isinstance(task, asyncio.Task)
         and not task.done()
@@ -207,14 +213,19 @@ async def _cancel_route_game_speech(state: dict, mgr: Any) -> None:
                     logger.warning("⚠️ 游戏路由退出时清理超时语音失败: %s", exc)
             logger.warning("⚠️ 游戏路由退出时语音任务未在上限内结束")
 
-    await _push_game_speech_cancel(
-        mgr,
-        lanlan_name=str(state.get("lanlan_name") or ""),
-        game_type=str(state.get("game_type") or ""),
-        session_id=str(state.get("session_id") or ""),
-        route_instance_id=str(state.get("_sdk_route_instance_id") or ""),
-        speech_correlation_id=correlation_id,
-    )
+    # Cancel every correlation this route handed out, newest first. A cache hit
+    # resolves before its audio finishes playing, so more than one can still be
+    # live in the browser; a cancel that does not match what is playing is
+    # simply ignored there, so the extra sends are harmless.
+    for correlation_id in reversed(correlation_ids):
+        await _push_game_speech_cancel(
+            mgr,
+            lanlan_name=str(state.get("lanlan_name") or ""),
+            game_type=str(state.get("game_type") or ""),
+            session_id=str(state.get("session_id") or ""),
+            route_instance_id=str(state.get("_sdk_route_instance_id") or ""),
+            speech_correlation_id=correlation_id,
+        )
 
 
 def _normalize_postgame_options(raw: Any, *, reason: str) -> dict:

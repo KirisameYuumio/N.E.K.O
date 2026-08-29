@@ -625,6 +625,27 @@ async function main() {
   assert(quickLinesDependencyError?.code === 'invalid_manifest',
     'quick-lines was accepted without the dialogue capability');
 
+  // The JSON schema carries this dependency too, but normalizeManifest() is the
+  // path a real connection runs, so the rule has to be enforced here as well.
+  // `voice-input` without `runtime` is permanently unusable: every voice.*
+  // command goes through requireActiveRuntimeRoute(), and a game with no
+  // runtime API can never establish that route. `speech-output` is excluded on
+  // purpose -- speech.speak() works before a route exists.
+  for (const voiceCapability of ['voice-input']) {
+    let voiceDependencyError = null;
+    try {
+      await window.NekoMiniGame.connect({
+        id: `${voiceCapability}-without-runtime`,
+        version: '1',
+        requiredCapabilities: ['logging', voiceCapability],
+      }, { transport });
+    } catch (error) {
+      voiceDependencyError = error;
+    }
+    assert(voiceDependencyError?.code === 'invalid_manifest',
+      `${voiceCapability} was accepted without the runtime capability`);
+  }
+
   let unknownManifestFieldError = null;
   try {
     await window.NekoMiniGame.connect({

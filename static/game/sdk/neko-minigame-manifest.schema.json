@@ -393,58 +393,6 @@
           }
         ]
       }
-    },
-    {
-      "if": {
-        "anyOf": [
-          {
-            "properties": {
-              "requiredCapabilities": {
-                "contains": {
-                  "const": "speech-output"
-                }
-              }
-            }
-          },
-          {
-            "required": [
-              "optionalCapabilities"
-            ],
-            "properties": {
-              "optionalCapabilities": {
-                "contains": {
-                  "const": "speech-output"
-                }
-              }
-            }
-          }
-        ]
-      },
-      "then": {
-        "anyOf": [
-          {
-            "properties": {
-              "requiredCapabilities": {
-                "contains": {
-                  "const": "runtime"
-                }
-              }
-            }
-          },
-          {
-            "required": [
-              "optionalCapabilities"
-            ],
-            "properties": {
-              "optionalCapabilities": {
-                "contains": {
-                  "const": "runtime"
-                }
-              }
-            }
-          }
-        ]
-      }
     }
   ],
   "$defs": {

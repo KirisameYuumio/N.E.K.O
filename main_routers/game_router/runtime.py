@@ -242,6 +242,7 @@ _SDK_GAME_MEMORY_MAX_BYTES = 256 * 1024
 _SDK_AUTHOR_CONTROL_MAX_BYTES = 64 * 1024
 _SDK_GAME_MEMORY_SUBMISSION_LIMIT = 16
 _SDK_GAME_SPEECH_PENDING_LIMIT = 4
+_SDK_GAME_SPEECH_CORRELATION_LIMIT = 8
 _SDK_GAME_SPEECH_PRELOAD_TIMEOUT_SECONDS = 300.0
 _SDK_GAME_ROUTE_PRELOAD_TASK_LIMIT = 8
 _SDK_GAME_SPEECH_PRELOAD_CANCEL_SETTLE_SECONDS = 2.0
@@ -3068,11 +3069,27 @@ async def game_project_speak(game_type: str, request: Request):
                     if state is not None:
                         state["_sdk_active_speech_task"] = speech_task
                         if speech_correlation_id:
-                            state["_sdk_active_speech_correlation_id"] = (
-                                speech_correlation_id
+                            # Bounded history, not a single slot: a cache hit
+                            # returns before playback finishes, so an earlier
+                            # utterance can still be playing in the browser when
+                            # the next request registers. Cancelling only the
+                            # newest correlation at teardown leaves that one
+                            # playing past the end of the route -- the browser
+                            # ignores a cancel whose correlation does not match
+                            # the audio it is playing.
+                            outstanding = state.get(
+                                "_sdk_active_speech_correlation_ids"
                             )
-                        else:
-                            state.pop("_sdk_active_speech_correlation_id", None)
+                            if not isinstance(outstanding, list):
+                                outstanding = []
+                                state["_sdk_active_speech_correlation_ids"] = (
+                                    outstanding
+                                )
+                            if speech_correlation_id in outstanding:
+                                outstanding.remove(speech_correlation_id)
+                            outstanding.append(speech_correlation_id)
+                            if len(outstanding) > _SDK_GAME_SPEECH_CORRELATION_LIMIT:
+                                del outstanding[:-_SDK_GAME_SPEECH_CORRELATION_LIMIT]
                     disconnected = False
                     is_disconnected = getattr(request, "is_disconnected", None)
                     try:

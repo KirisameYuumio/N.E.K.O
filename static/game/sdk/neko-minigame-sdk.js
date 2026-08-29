@@ -521,12 +521,23 @@
     if (requestedCapabilities.has('quick-lines') && !requestedCapabilities.has('dialogue')) {
       fail('invalid_manifest', 'quick-lines requires the dialogue capability');
     }
+    // Keep this in step with the `allOf` dependencies in
+    // neko-minigame-manifest.schema.json. The schema is the published contract,
+    // but THIS is the path an SDK connection actually runs, so a rule that
+    // exists only there is not enforced at connect time.
+    // `voice-input` only. Every voice.* command goes through
+    // requireActiveRuntimeRoute(), which a game with no runtime API can never
+    // establish, so the granted capability would be permanently unusable.
+    // `speech-output` is deliberately NOT here: speech.speak() does not require
+    // an active route (the host accepts it pre-route), so a game may narrate
+    // without ever taking over the runtime lifecycle.
     const needsRuntime = requestedCapabilities.has('memory')
       || requestedCapabilities.has('context-read')
       || requestedCapabilities.has('leaderboard-server')
+      || requestedCapabilities.has('voice-input')
       || CONTRACT_KINDS.some((kind) => Object.keys(contracts[kind]).length > 0);
     if (needsRuntime && !requestedCapabilities.has('runtime')) {
-      fail('invalid_manifest', 'memory, context, server leaderboards, and game contracts require runtime');
+      fail('invalid_manifest', 'memory, context, server leaderboards, voice input, and game contracts require runtime');
     }
     return Object.freeze({
       id,

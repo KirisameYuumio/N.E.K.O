@@ -625,21 +625,33 @@ async def test_route_speech_cleanup_releases_browser_audio_after_backend_task_do
         "game_type": "neutral-sdk-game",
         "session_id": "session-1",
         "_sdk_route_instance_id": "route-instance-b",
-        "_sdk_active_speech_correlation_id": "speech-correlation-b",
+        # A cache hit resolves before its audio finishes playing, so an earlier
+        # utterance can still be live in the browser when the next request
+        # registers. Every outstanding correlation has to be cancelled, not just
+        # the newest: the browser ignores a cancel that does not match the audio
+        # it is currently playing, so a missed one keeps playing past route end.
+        "_sdk_active_speech_correlation_ids": [
+            "speech-correlation-a",
+            "speech-correlation-b",
+        ],
     }
 
     manager = SimpleNamespace()
     await gr_postgame._cancel_route_game_speech(state, manager)
 
-    assert "_sdk_active_speech_correlation_id" not in state
-    pushed.assert_awaited_once_with(
-        manager,
-        lanlan_name="Lan",
-        game_type="neutral-sdk-game",
-        session_id="session-1",
-        route_instance_id="route-instance-b",
-        speech_correlation_id="speech-correlation-b",
+    assert "_sdk_active_speech_correlation_ids" not in state
+    cancelled = [
+        call.kwargs["speech_correlation_id"] for call in pushed.await_args_list
+    ]
+    assert cancelled == ["speech-correlation-b", "speech-correlation-a"], (
+        "route teardown did not cancel every outstanding speech correlation"
     )
+    for call in pushed.await_args_list:
+        assert call.args == (manager,)
+        assert call.kwargs["lanlan_name"] == "Lan"
+        assert call.kwargs["game_type"] == "neutral-sdk-game"
+        assert call.kwargs["session_id"] == "session-1"
+        assert call.kwargs["route_instance_id"] == "route-instance-b"
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_delayed_old_route_end_does_not_close_reused_session_generation(monkeypatch):
@@ -6690,7 +6702,7 @@ async def test_project_speak_uses_manager_project_tts(monkeypatch):
         )
 
     assert result["ok"] is True
-    assert state["_sdk_active_speech_correlation_id"] == "sdk-correlation-1"
+    assert state["_sdk_active_speech_correlation_ids"] == ["sdk-correlation-1"]
     assert result["method"] == "project_tts"
     assert result["voice_source"]["provider"] == "project_tts"
     assert mgr.render_language_at_mirror == ["ja"]
