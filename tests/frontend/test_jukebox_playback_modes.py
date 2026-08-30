@@ -3467,8 +3467,9 @@ def test_jukebox_fuzzy_distance_stays_linear_in_candidate_length(mock_page: Page
 
     # 这个形状下必须判定为不匹配 —— 先确认量的确实是「未命中」这条最坏路径。
     assert measured["result"] == "inf"
-    # 同一形状实测：旧的双层枚举 20 次要 13 s，线性实现 20 次不到 10 ms。
-    assert measured["elapsed"] < 1000, (
+    # 同一形状在 chromium 实测：旧的双层枚举 20 次约 420 ms，线性实现约 2 ms。
+    # 阈值取 100 ms —— 比实现本身宽 50 倍，又比二次方实现低 4 倍。
+    assert measured["elapsed"] < 100, (
         f"模糊匹配 20 次耗时 {measured['elapsed']:.0f} ms，疑似退回二次方实现"
     )
 
