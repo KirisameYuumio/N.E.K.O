@@ -210,11 +210,6 @@
         return predicate();
     }
 
-    // Set only when this command issued the micButton click itself, so a
-    // superseded command can tell "the mic I opened" from "a mic that was
-    // already someone else's" and never tear down the latter.
-    var commandClickedMicButton = false;
-
     async function startOfficialVoiceSession() {
         if (S.isRecording === true) return true;
         if (S.voiceStartPending === true || window.isMicStarting === true) {
@@ -223,7 +218,6 @@
         }
         var micButton = document.getElementById('micButton');
         if (!micButton || micButton.disabled) return false;
-        commandClickedMicButton = true;
         micButton.click();
         await waitFor(voiceStartSettled, COMMAND_TIMEOUT_MS);
         return S.isRecording === true;
@@ -271,7 +265,6 @@
         }
 
         commandInFlight = true;
-        commandClickedMicButton = false;
         broadcastState({ ok: true, reason: 'working', request_id: requestId }, true, acceptedRoute);
         try {
             var voiceWasActive = S.isRecording === true
@@ -297,10 +290,21 @@
                 //    route (or the user) may be mid-utterance on that capture,
                 //    and tearing it down loses what they were saying with no
                 //    transcript and nothing logged.
-                var noRouteRemains = currentRoute().active !== true;
-                if (commandClickedMicButton && noRouteRemains && !disposed) {
-                    await stopOfficialVoiceSession();
-                }
+                // Nothing is torn down here at all. Two narrower attempts both
+                // failed on the same rock: this module cannot tell "the capture
+                // I started" from "a capture something else now owns", because
+                // the microphone is process-global and no capture identity is
+                // exposed to the bridge.
+                //  * stopping whenever the mic ended up on killed a replacement
+                //    route's (or the user's) live capture mid-utterance;
+                //  * stopping only what this command clicked, and only once no
+                //    route remained, still killed ordinary chat capture -- route
+                //    exit resumes it via startMicCapture() in app-websocket.js,
+                //    so "no route" does not mean "no owner".
+                // The host page owns MicLease, teardown and the micButton flow
+                // (see the header); a command whose route is gone reports and
+                // stops there. A microphone left on is visible in the UI and the
+                // host's own route-exit path decides its fate.
                 broadcastState({
                     ok: false,
                     reason: 'route_superseded',

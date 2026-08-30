@@ -310,6 +310,57 @@ async function main() {
     && message.sdk_route_instance_id === 'route-instance-b'),
   'a voice command crossing route generations did not return the frozen route identity');
 
+  // Same rule when the route does not hand over but simply ENDS. Route exit
+  // resumes ordinary chat capture (startMicCapture in app-websocket.js), so
+  // "no route remains" does not mean "no owner" -- tearing the microphone down
+  // here would kill the chat capture the host just resumed, losing whatever the
+  // user says next with no transcript.
+  // Let the previous command fully settle first, or this one is answered
+  // `busy` and never reaches the code under test.
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  await flush();
+  routeWindowListener({ detail: {
+    action: 'opened',
+    gameType: 'soccer',
+    sessionId: 'soccer-runtime',
+    routeInstanceId: 'route-instance-d',
+  } });
+  appState.gameVoiceControlCredential = 'voice-credential';
+  appState.isRecording = false;
+  appState.voiceStartPending = false;
+  holdMicStart = true;
+  channel.onmessage({ data: {
+    type: 'game_voice_control_request',
+    sender_id: 'soccer-window',
+    request_id: 'ended-start',
+    action: 'start',
+    game_type: 'soccer',
+    session_id: 'soccer-runtime',
+    sdk_route_instance_id: 'route-instance-d',
+    launch_credential: 'voice-credential',
+  } });
+  await flush();
+  routeWindowListener({ detail: {
+    action: 'closed',
+    gameType: 'soccer',
+    sessionId: 'soccer-runtime',
+    routeInstanceId: 'route-instance-d',
+  } });
+  // The host resumes ordinary capture on route exit.
+  appState.voiceStartPending = false;
+  appState.isRecording = true;
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  holdMicStart = false;
+  // Let the held command actually finish its route check and cleanup before
+  // asserting; otherwise this passes without ever reaching the code under test.
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  await flush();
+  assert(posted.some((message) => message.request_id === 'ended-start'
+    && message.reason === 'route_superseded'),
+  'the ended-route command never reached its post-await route check');
+  assert(appState.isRecording === true,
+    'a command whose route ended tore down the resumed ordinary chat microphone');
+
   channel.onmessage({ data: {
     type: 'game_voice_control_request',
     sender_id: 'other-game',
