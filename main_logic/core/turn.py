@@ -1944,12 +1944,12 @@ class TurnMixin:
         self._remember_game_speech_correlation(turn_id, speech_correlation_id)
 
         if cached_chunks is not None:
-            audio_sent = bool(cached_chunks)
-            for audio_chunk in cached_chunks:
-                if not await self.send_speech(audio_chunk, speech_id=turn_id):
-                    audio_sent = False
-                    break
-            done_sent = await self.send_audio_done(turn_id)
+            # One call, one lock hold: sending frame by frame let an overlapping
+            # ordinary/project TTS stream interleave between them, and the
+            # frontend schedules decoded chunks in arrival order.
+            audio_sent, done_sent = await self.send_cached_speech_batch(
+                cached_chunks, turn_id,
+            )
             audio_sent = audio_sent and bool(done_sent)
             if emit_turn_end_after:
                 await self.emit_mirror_turn_end(

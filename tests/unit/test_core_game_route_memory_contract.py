@@ -314,16 +314,15 @@ async def test_mirror_assistant_speech_replays_opted_in_cached_audio_without_req
     sent_audio = []
     completed_audio = []
 
-    async def send_speech(audio, speech_id=None):
-        sent_audio.append((bytes(audio), speech_id))
-        return True
-
-    async def send_audio_done(speech_id):
+    # Cached replay goes out as ONE batch under a single frame-lock hold, so
+    # the double records at that boundary rather than per frame.
+    async def send_cached_speech_batch(chunks, speech_id):
+        for audio in chunks:
+            sent_audio.append((bytes(audio), speech_id))
         completed_audio.append(speech_id)
-        return True
+        return True, True
 
-    mgr.send_speech = send_speech
-    mgr.send_audio_done = send_audio_done
+    mgr.send_cached_speech_batch = send_cached_speech_batch
     try:
         first = await core_module.LLMSessionManager.mirror_assistant_speech(
             mgr,
@@ -380,11 +379,11 @@ async def test_cached_speech_replay_reports_failed_audio_delivery():
     mgr.game_speech_audio_cache_identity = lambda _text, **_kwargs: ("opaque-cache-key", "voice-signature")
     completed_audio = []
 
-    async def send_audio_done(speech_id):
+    async def failing_batch(chunks, speech_id):
+        # Frames failed, terminal signal still went out -- the batch reports the
+        # two independently for exactly this case.
         completed_audio.append(speech_id)
-        return True
-
-    mgr.send_audio_done = send_audio_done
+        return False, True
     try:
         first = await core_module.LLMSessionManager.mirror_assistant_speech(
             mgr,
@@ -397,10 +396,7 @@ async def test_cached_speech_replay_reports_failed_audio_delivery():
         assert GAME_SPEECH_AUDIO_CACHE.append_capture(mgr, first["speech_id"], b"cached-pcm")
         assert GAME_SPEECH_AUDIO_CACHE.complete_capture(mgr, first["speech_id"], "voice-signature")
 
-        async def fail_send_speech(_audio, speech_id=None):
-            return False
-
-        mgr.send_speech = fail_send_speech
+        mgr.send_cached_speech_batch = failing_batch
         replay = await core_module.LLMSessionManager.mirror_assistant_speech(
             mgr,
             "缓存发送失败",
@@ -445,8 +441,7 @@ async def test_cached_speech_replay_reports_failed_audio_done_delivery():
             mgr, first["speech_id"], "voice-signature"
         )
 
-        mgr.send_speech = AsyncMock(return_value=True)
-        mgr.send_audio_done = AsyncMock(return_value=False)
+        mgr.send_cached_speech_batch = AsyncMock(return_value=(True, False))
         replay = await core_module.LLMSessionManager.mirror_assistant_speech(
             mgr,
             "缓存结束帧失败",
@@ -464,7 +459,7 @@ async def test_cached_speech_replay_reports_failed_audio_done_delivery():
         # reported by audio_sent; the sibling non-cache path likewise answers
         # None whenever completion was not awaited.
         assert replay["audio_completed"] is None
-        mgr.send_audio_done.assert_awaited_once_with(replay["speech_id"])
+        mgr.send_cached_speech_batch.assert_awaited_once_with(ANY, replay["speech_id"])
     finally:
         GAME_SPEECH_AUDIO_CACHE.clear()
 
@@ -4512,3 +4507,64 @@ async def test_a_reconnect_mid_frame_cannot_split_it_across_two_sockets():
     # The reconnect really did happen, so the assertion above cannot be
     # satisfied by a probe whose swap never fired.
     assert mgr.websocket is replacement
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cached_replay_is_not_interleaved_by_a_concurrent_stream():
+    """A cached utterance goes out as one run, terminal signal included.
+
+    A per-frame lock keeps each header with its own payload but releases between
+    frames, so a cached replay overlapping ordinary TTS still arrives as A1, B1,
+    A2, B2 -- and the frontend schedules decoded chunks in arrival order, so the
+    two lines are heard interwoven.
+    """
+
+    labels: list[str] = []
+
+    class _ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    class _YieldingWebsocket:
+        client_state = _ConnectedState()
+
+        async def send_json(self, payload):
+            labels.append(str(payload.get("speech_id") or ""))
+            # The yield the defect needs, at every frame boundary.
+            await asyncio.sleep(0)
+
+        async def send_bytes(self, data):
+            labels.append("cached" if data.startswith(b"c") else "live")
+            await asyncio.sleep(0)
+
+    mgr = _make_manager()
+    mgr.websocket = _YieldingWebsocket()
+    mgr._game_speech_correlation_for = lambda _speech_id: ""
+    mgr.speech_playback_gain = lambda _speech_id: 1.0
+    mgr.release_speech_playback_gain = lambda _speech_id: None
+    mgr._clear_game_speech_correlation = lambda _speech_id: None
+    mgr._speech_output_total = 0
+    mgr._last_speech_output_time = 0.0
+    mgr._last_speech_output_bytes = 0
+
+    await asyncio.gather(
+        core_module.LLMSessionManager.send_cached_speech_batch(
+            mgr, [b"c1", b"c2"], "cached",
+        ),
+        core_module.LLMSessionManager.send_speech(mgr, b"live", speech_id="live"),
+    )
+
+    # 2 headers + 2 payloads + the audio_done for the batch, 1 header + 1 payload
+    # for the streaming frame.
+    assert len(labels) == 7, labels
+    cached_positions = [index for index, label in enumerate(labels) if label == "cached"]
+    assert len(cached_positions) == 5, labels
+    assert cached_positions == list(
+        range(cached_positions[0], cached_positions[0] + 5)
+    ), f"the cached utterance was split by the concurrent stream: {labels}"
+    # The concurrent frame really did go out, so the assertion above cannot be
+    # satisfied by a probe where nothing competed with the batch.
+    assert labels.count("live") == 2, labels

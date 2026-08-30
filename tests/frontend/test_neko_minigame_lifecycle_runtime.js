@@ -1152,8 +1152,22 @@ async function main() {
     assert(monitoringError?.code === 'invalid_request',
       `a non-object ${key} (${JSON.stringify(badValue)}) was silently treated as defaults`);
   }
+  // pageExit had its own shape check but skipped `null` (and let any object
+  // through): `pageExit: null` normalized into "disabled" and `new Date()` into
+  // "enabled with defaults" -- both the opposite of what a typo meant to say.
+  for (const badPageExit of [null, new Date(), [], 'off', 0]) {
+    let pageExitError = null;
+    try { monitoringGame.runtime.configure({ pageExit: badPageExit }); }
+    catch (error) { pageExitError = error; }
+    assert(pageExitError?.code === 'invalid_request',
+      `a malformed pageExit (${Object.prototype.toString.call(badPageExit)}) was accepted`);
+  }
   // Absent is still absent.
   monitoringGame.runtime.configure({ pageExit: false });
+  // ...and the declared shapes still pass, so the loop above cannot be
+  // satisfied by an implementation that rejects pageExit outright.
+  monitoringGame.runtime.configure({ pageExit: true });
+  monitoringGame.runtime.configure({ pageExit: {} });
   // The declared shapes still work.
   monitoringGame.runtime.configure({ heartbeat: false, outputs: false, pageExit: false });
   monitoringGame.runtime.configure({

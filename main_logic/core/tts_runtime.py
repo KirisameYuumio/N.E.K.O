@@ -1638,6 +1638,83 @@ class TtsRuntimeMixin:
             self._audio_frame_send_lock = lock
         return lock
 
+    async def _write_audio_frame(self, websocket, header: dict, tts_audio) -> None:
+        """Write one header/payload pair. The caller holds the frame lock."""
+        await websocket.send_json(header)
+        await websocket.send_bytes(tts_audio)
+        # Under the same lock: the monitor mirror consumes this queue in order,
+        # so a frame that is atomic on the wire must not be split here either.
+        self.sync_message_queue.put({"type": "binary", "data": tts_audio})
+
+    def _audio_chunk_header(self, effective_speech_id: str) -> dict:
+        header = {
+            "type": "audio_chunk",
+            "speech_id": effective_speech_id
+        }
+        correlation_id = self._game_speech_correlation_for(effective_speech_id)
+        if correlation_id:
+            header["sdk_speech_correlation_id"] = correlation_id
+        playback_gain = self.speech_playback_gain(effective_speech_id)
+        if playback_gain != 1.0:
+            header["playback_gain"] = playback_gain
+        return header
+
+    async def send_cached_speech_batch(self, audio_chunks, speech_id: str):
+        """Replay a cached utterance as ONE unit, terminal signal included.
+
+        A per-frame lock keeps each header with its own payload but releases
+        between frames, so a cached replay overlapping ordinary/project TTS
+        (``interruptExisting`` defaults to false) still arrives as A1, B1, A2,
+        B2. The frontend schedules decoded chunks in arrival order, so the two
+        utterances are heard interwoven and the streaming decoder keeps
+        switching speech ids. Cached replay is the one path that has every
+        chunk in hand up front, so it can hold the lock across the whole batch
+        -- streaming TTS cannot, and is unchanged.
+
+        Returns ``(audio_sent, done_sent)``.
+        """
+        chunks = list(audio_chunks or ())
+        try:
+            websocket = self.websocket
+            if not (
+                websocket
+                and hasattr(websocket, 'client_state')
+                and websocket.client_state == websocket.client_state.CONNECTED
+            ):
+                ws_state = getattr(websocket, 'client_state', None) if websocket else None
+                logger.warning(
+                    f"⚠️ send_cached_speech_batch skipped: ws={websocket is not None}, state={ws_state}"
+                )
+                return False, False
+            audio_sent = bool(chunks)
+            async with self._ensure_audio_frame_send_lock():
+                for tts_audio in chunks:
+                    header = self._audio_chunk_header(speech_id)
+                    await self._write_audio_frame(websocket, header, tts_audio)
+                    self._speech_output_total += 1
+                    self._last_speech_output_time = time.time()
+                    self._last_speech_output_bytes = len(tts_audio)
+                done_message = {
+                    "type": "audio_done",
+                    "speech_id": speech_id
+                }
+                correlation_id = self._game_speech_correlation_for(speech_id)
+                if correlation_id:
+                    done_message["sdk_speech_correlation_id"] = correlation_id
+                await websocket.send_json(done_message)
+            return audio_sent, True
+        except WebSocketDisconnect:
+            logger.warning("⚠️ send_cached_speech_batch: WebSocket disconnected")
+            return False, False
+        except Exception as exc:
+            logger.warning(f"⚠️ send_cached_speech_batch 发送失败: speech_id={speech_id}, err={exc}")
+            return False, False
+        finally:
+            # Same bookkeeping ``send_audio_done`` performs: the stream
+            # lifecycle is over even when the client disconnected mid-batch.
+            self.release_speech_playback_gain(speech_id)
+            self._clear_game_speech_correlation(speech_id)
+
     async def send_speech(self, tts_audio, speech_id: Optional[str] = None):
         """Send speech data to the frontend, sending the speech_id header first for precise interruption control"""
         try:
@@ -1648,23 +1725,9 @@ class TtsRuntimeMixin:
             websocket = self.websocket
             if websocket and hasattr(websocket, 'client_state') and websocket.client_state == websocket.client_state.CONNECTED:
                 effective_speech_id = speech_id if speech_id is not None else self.current_speech_id
-                header = {
-                    "type": "audio_chunk",
-                    "speech_id": effective_speech_id
-                }
-                correlation_id = self._game_speech_correlation_for(effective_speech_id)
-                if correlation_id:
-                    header["sdk_speech_correlation_id"] = correlation_id
-                playback_gain = self.speech_playback_gain(effective_speech_id)
-                if playback_gain != 1.0:
-                    header["playback_gain"] = playback_gain
+                header = self._audio_chunk_header(effective_speech_id)
                 async with self._ensure_audio_frame_send_lock():
-                    await websocket.send_json(header)
-                    await websocket.send_bytes(tts_audio)
-                    # Inside the lock as well: the monitor mirror consumes this
-                    # queue in order, so a frame that is atomic on the wire must
-                    # not be split here either.
-                    self.sync_message_queue.put({"type": "binary", "data": tts_audio})
+                    await self._write_audio_frame(websocket, header, tts_audio)
                 logger.debug(f"🔊 send_speech OK: {len(tts_audio)} bytes, speech_id={effective_speech_id}")
                 self._speech_output_total += 1
                 self._last_speech_output_time = time.time()

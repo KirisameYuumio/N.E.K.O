@@ -1345,6 +1345,81 @@ async function main() {
     'a 34-code-point property name was rejected by a 64-code-point bound');
   astralGame.dispose();
 
+  // The manifest rule "memory/context/server-leaderboard/voice-input need
+  // runtime" is checked against what the manifest REQUESTS. A host may
+  // legitimately withhold an OPTIONAL runtime, and the dependent grant is then
+  // permanently unusable -- every one of those calls needs an active route the
+  // game can never start.
+  // The fixture transport implements neither memory method, so `memory` would
+  // never be granted here for an unrelated reason. Give the probe transports the
+  // two methods so the grant is genuinely available, and the difference between
+  // the two probes really is whether runtime was granted.
+  const memoryCapableTransport = {
+    ...transport,
+    configureGameMemoryConsent: async () => ({ ok: true }),
+    submitGameMemory: async () => ({ ok: true }),
+  };
+  const withheldRuntimeTransport = {
+    ...memoryCapableTransport,
+    async connectGame(request) {
+      const base = await transport.connectGame(request);
+      return {
+        ...base,
+        grantedCapabilities: base.grantedCapabilities.filter((name) => name !== 'runtime'),
+      };
+    },
+  };
+  let withheldRequiredError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'runtime-withheld-required',
+      version: '1.0.0',
+      requiredCapabilities: ['logging', 'memory'],
+      optionalCapabilities: ['runtime'],
+    }, { transport: withheldRuntimeTransport });
+  } catch (error) { withheldRequiredError = error; }
+  assert(withheldRequiredError?.code === 'capability_unavailable',
+    'a required runtime-dependent capability connected without runtime');
+  // Optional instead of required: the connection stands, but the unusable grant
+  // must not be reported as granted.
+  const withheldOptionalClient = await window.NekoMiniGame.connect({
+    id: 'runtime-withheld-optional',
+    version: '1.0.0',
+    requiredCapabilities: ['logging'],
+    optionalCapabilities: ['runtime', 'memory'],
+  }, { transport: withheldRuntimeTransport });
+  assert(!withheldOptionalClient.capabilities.has('runtime'),
+    'the withheld-runtime probe did not actually withhold runtime');
+  assert(!withheldOptionalClient.capabilities.has('memory'),
+    'memory was reported as granted while runtime was withheld');
+  withheldOptionalClient.dispose();
+  // Contracts are not capabilities and cannot be dropped, so they fail instead.
+  let withheldContractError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'runtime-withheld-contracts',
+      version: '1.0.0',
+      requiredCapabilities: ['logging'],
+      optionalCapabilities: ['runtime'],
+      contracts: { events: { 'round-started': { type: 'object' } } },
+    }, { transport: withheldRuntimeTransport });
+  } catch (error) { withheldContractError = error; }
+  assert(withheldContractError?.code === 'capability_unavailable',
+    'declared contracts connected without the runtime that carries them');
+  // Control: the SAME manifest with runtime granted keeps its memory grant, so
+  // none of the three assertions above can be satisfied by an implementation
+  // that simply stopped granting memory.
+  const grantedRuntimeClient = await window.NekoMiniGame.connect({
+    id: 'runtime-granted-control',
+    version: '1.0.0',
+    requiredCapabilities: ['logging'],
+    optionalCapabilities: ['runtime', 'memory'],
+  }, { transport: memoryCapableTransport });
+  assert(grantedRuntimeClient.capabilities.has('runtime')
+    && grantedRuntimeClient.capabilities.has('memory'),
+  'memory stopped being granted even when runtime was');
+  grantedRuntimeClient.dispose();
+
   process.stdout.write('mini-game SDK runtime test passed\n');
 }
 

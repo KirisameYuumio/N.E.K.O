@@ -82,6 +82,14 @@
     'leaderboards',
   ]));
   const RUNTIME_EVENT_PATTERN = /^[a-z][a-z0-9:-]{0,63}$/;
+  // Every one of these goes through requireActiveRuntimeRoute(), which needs a
+  // route only the runtime API can start -- so a grant without runtime is
+  // permanently unusable. Declared once because both the manifest-time check and
+  // the post-negotiation check below have to mean exactly the same set.
+  // `speech-output` is deliberately absent: speech.speak() is accepted pre-route.
+  const RUNTIME_DEPENDENT_CAPABILITIES = Object.freeze([
+    'memory', 'context-read', 'leaderboard-server', 'voice-input',
+  ]);
   const CONTRACT_KINDS = Object.freeze(['events', 'states', 'controls', 'results']);
   const CONTRACT_SCHEMA_TYPES = Object.freeze([
     'null', 'boolean', 'number', 'integer', 'string', 'array', 'object',
@@ -651,11 +659,9 @@
     // `speech-output` is deliberately NOT here: speech.speak() does not require
     // an active route (the host accepts it pre-route), so a game may narrate
     // without ever taking over the runtime lifecycle.
-    const needsRuntime = requestedCapabilities.has('memory')
-      || requestedCapabilities.has('context-read')
-      || requestedCapabilities.has('leaderboard-server')
-      || requestedCapabilities.has('voice-input')
-      || CONTRACT_KINDS.some((kind) => Object.keys(contracts[kind]).length > 0);
+    const needsRuntime = RUNTIME_DEPENDENT_CAPABILITIES.some(
+      (capability) => requestedCapabilities.has(capability),
+    ) || CONTRACT_KINDS.some((kind) => Object.keys(contracts[kind]).length > 0);
     if (needsRuntime && !requestedCapabilities.has('runtime')) {
       fail('invalid_manifest', 'memory, context, server leaderboards, voice input, and game contracts require runtime');
     }
@@ -1959,8 +1965,18 @@
       && SUPPORTED_CAPABILITIES.includes(capability)
       && supportedByTransport(transport, capability)
     ));
+    // The manifest rule ("these need runtime") is checked against what the
+    // manifest REQUESTS. A host may legitimately withhold an OPTIONAL runtime,
+    // and a dependent grant is then permanently unusable: the game would connect
+    // reporting `memory` as granted while memory.submit() can never pass its
+    // active-route guard. Drop those grants so a required one fails through the
+    // existing path below instead of connecting into a dead end.
+    const runtimeGranted = granted.includes('runtime');
+    const usableGranted = runtimeGranted ? granted : granted.filter(
+      (capability) => !RUNTIME_DEPENDENT_CAPABILITIES.includes(capability),
+    );
     const missingRequired = manifest.requiredCapabilities.filter(
-      (capability) => !granted.includes(capability),
+      (capability) => !usableGranted.includes(capability),
     );
     if (missingRequired.length) {
       try { transport.dispose?.(); } catch (_) { /* rejected capability cleanup */ }
@@ -1968,8 +1984,18 @@
         missing: missingRequired,
       });
     }
+    // Contracts are not capabilities, so they cannot be dropped -- but they need
+    // runtime for the same reason, and the manifest-time rule already says so.
+    if (!runtimeGranted && CONTRACT_KINDS.some(
+      (kind) => Object.keys(manifest.contracts[kind]).length > 0,
+    )) {
+      try { transport.dispose?.(); } catch (_) { /* rejected capability cleanup */ }
+      fail('capability_unavailable', 'Game contracts require the runtime capability', {
+        missing: ['runtime'],
+      });
+    }
 
-    const grantedSet = new Set(granted);
+    const grantedSet = new Set(usableGranted);
     const listeners = new Map();
     const avatarRenderers = new Set();
     let avatarMountsPending = 0;
@@ -3268,14 +3294,16 @@
         if (config.payload != null && typeof config.payload !== 'function') {
           fail('invalid_request', 'runtime payload must be a function');
         }
+        // ABSENT only, and a real configuration object only. `pageExit: null`
+        // used to skip this check and then normalize into "disabled", and
+        // `new Date()` passed as an enabled empty config -- both differ from the
+        // declared `false | true | { payload? }` API, and both turn a typo meant
+        // to ENABLE cleanup into a route left active after navigation.
         if (
-          config.pageExit != null
+          config.pageExit !== undefined
           && config.pageExit !== true
           && config.pageExit !== false
-          && (
-            typeof config.pageExit !== 'object'
-            || Array.isArray(config.pageExit)
-          )
+          && !plainObject(config.pageExit)
         ) {
           fail('invalid_request', 'runtime pageExit must be true, false, or an object');
         }
