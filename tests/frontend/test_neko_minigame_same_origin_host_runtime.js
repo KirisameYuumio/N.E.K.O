@@ -1494,6 +1494,104 @@ async function main() {
     + 'which fails before the request leaves the page');
   hugeSessionHost.dispose();
 
+  // Two windows for the same game each scanned the namespace, each saw the
+  // same pre-write key count, and each committed -- so the documented per-game
+  // bounds could be pushed past what either write checked. Scan and commit are
+  // one critical section now.
+  {
+    const sharedStorage = storage();
+    // A Web Locks stand-in that actually queues per name, which the default
+    // fixture mock does not: `request(name, opts, cb) => cb()` runs both
+    // callbacks concurrently and would make this probe pass without the fix.
+    const heldLocks = new Map();
+    const lockCalls = [];
+    let insideNamespaceLock = 0;
+    let sawConcurrentCriticalSections = false;
+    const serializingNavigator = {
+      sendBeacon: () => false,
+      locks: {
+        request: async (name, _options, callback) => {
+          lockCalls.push(name);
+          const previous = heldLocks.get(name) || Promise.resolve();
+          let release;
+          const mine = new Promise((resolve) => { release = resolve; });
+          heldLocks.set(name, previous.then(() => mine));
+          await previous;
+          insideNamespaceLock += 1;
+          if (insideNamespaceLock > 1) sawConcurrentCriticalSections = true;
+          try { return await callback(); } finally {
+            insideNamespaceLock -= 1;
+            release();
+          }
+        },
+      },
+    };
+    const quotaWindow = {
+      ...windowMock,
+      navigator: serializingNavigator,
+      localStorage: sharedStorage,
+    };
+    const quotaPeers = [];
+    for (const peerIndex of [0, 1]) {
+      const peer = createHost({
+        gameType: 'example-game',
+        sessionId: `quota-peer-${peerIndex}`,
+        fetchImpl,
+        windowImpl: quotaWindow,
+        navigatorImpl: serializingNavigator,
+      });
+      peer.connectGame({
+        protocolVersions: ['1'],
+        manifest: {
+          id: 'example-game',
+          version: '1.0.0',
+          requiredCapabilities: ['runtime', 'logging'],
+          optionalCapabilities: ['storage'],
+        },
+      });
+      quotaPeers.push(peer);
+    }
+    // One key short of the documented limit, so exactly one of the two
+    // concurrent writes below can legitimately land.
+    const quotaPrefix = quotaPeers[0]._gameStoragePrefix();
+    for (let index = 0; index < 255; index += 1) {
+      sharedStorage.setItem(`${quotaPrefix}seed-${index}`, '"x"');
+    }
+    const quotaResults = await Promise.allSettled([
+      Promise.resolve().then(() => quotaPeers[0].requestGameStorage(
+        'set', { key: 'peer-a', value: 'a' },
+      )),
+      Promise.resolve().then(() => quotaPeers[1].requestGameStorage(
+        'set', { key: 'peer-b', value: 'b' },
+      )),
+    ]);
+    const quotaAccepted = quotaResults.filter((entry) => entry.status === 'fulfilled');
+    const quotaRejected = quotaResults.filter((entry) => entry.status === 'rejected');
+    assert(quotaAccepted.length === 1 && quotaRejected.length === 1,
+      `concurrent writes from two windows both passed the key limit: ${
+        quotaResults.map((entry) => entry.status).join(',')}`);
+    assert(quotaRejected[0].reason?.code === 'quota_exceeded',
+      'the losing concurrent write failed for a reason other than the quota');
+    let quotaKeyCount = 0;
+    for (let index = 0; index < sharedStorage.length; index += 1) {
+      if (String(sharedStorage.key(index) || '').startsWith(quotaPrefix)) quotaKeyCount += 1;
+    }
+    assert(quotaKeyCount === 256,
+      `the namespace ended up with ${quotaKeyCount} keys past its 256 bound`);
+    // The two assertions above hold with or without the lock: both hosts live
+    // in ONE JS context here, so their synchronous scan+commit cannot actually
+    // interleave. The real race is across windows, which this harness cannot
+    // stage -- so what is pinned here is the mechanism that closes it: each
+    // write ran inside the namespace-wide Web Lock, and no two critical
+    // sections were ever open at once.
+    const namespaceLockName = `${quotaPrefix}lock:__namespace__`;
+    assert(lockCalls.filter((name) => name === namespaceLockName).length === 2,
+      `storage writes did not take the namespace lock: ${JSON.stringify(lockCalls)}`);
+    assert(!sawConcurrentCriticalSections,
+      'two storage critical sections were open at the same time');
+    for (const peer of quotaPeers) peer.dispose();
+  }
+
   process.stdout.write('mini-game same-origin host runtime test passed\n');
 }
 

@@ -585,6 +585,25 @@
       return typeof this._navigator?.locks?.request === 'function';
     }
 
+    _withGameStorageNamespaceLock(callback) {
+      // Ordinary storage writes read the whole namespace to compute the quota
+      // and then commit, so two windows for the same game could each scan the
+      // same pre-write total, both pass, and both write -- pushing the
+      // documented per-game bounds past what either one checked. Same
+      // origin-wide primitive the leaderboard mutations already use, under one
+      // name for the whole namespace because the bound itself is namespace-wide.
+      //
+      // Returns the callback's value UNCHANGED when the Web Locks API is
+      // missing, so a browser without it behaves exactly as before rather than
+      // suddenly handing callers a promise they never had to await.
+      if (!this._canUseGameStorageLock()) return callback();
+      return this._navigator.locks.request(
+        `${this._gameStoragePrefix()}lock:__namespace__`,
+        { mode: 'exclusive' },
+        callback,
+      );
+    }
+
     async runGameStorageExclusive(lockNameInput, callback, options = {}) {
       this._requireGrantedCapability('leaderboard-local', 'game_storage_lock');
       if (this._disposed) {
@@ -753,36 +772,40 @@
           operation: 'game_storage',
         });
       }
-      let keyCount = 0;
-      let totalBytes = 0;
-      let existingBytes = 0;
-      for (let index = 0; index < storage.length; index += 1) {
-        const candidate = storage.key(index);
-        if (!candidate || !candidate.startsWith(namespace)) continue;
-        keyCount += 1;
-        const candidateValue = storage.getItem(candidate) || '';
-        const candidateBytes = utf8ByteLength(candidateValue);
-        totalBytes += candidateBytes;
-        if (candidate === storageKey) existingBytes = candidateBytes;
-      }
-      if (!existingBytes && keyCount >= GAME_STORAGE_KEY_LIMIT) {
-        throw this._hostError('quota_exceeded', 'Game storage key limit reached', {
-          operation: 'game_storage',
-        });
-      }
-      if (totalBytes - existingBytes + valueBytes > GAME_STORAGE_TOTAL_BYTES) {
-        throw this._hostError('quota_exceeded', 'Game storage quota reached', {
-          operation: 'game_storage',
-        });
-      }
-      try { storage.setItem(storageKey, serialized); }
-      catch (error) {
-        throw this._hostError('quota_exceeded', 'Game storage write failed', {
-          operation: 'game_storage',
-          cause: error,
-        });
-      }
-      return { ok: true, stored: true };
+      // Scan and commit are one critical section: a total measured before
+      // another window's write is not the total this write is bounded by.
+      return this._withGameStorageNamespaceLock(() => {
+        let keyCount = 0;
+        let totalBytes = 0;
+        let existingBytes = 0;
+        for (let index = 0; index < storage.length; index += 1) {
+          const candidate = storage.key(index);
+          if (!candidate || !candidate.startsWith(namespace)) continue;
+          keyCount += 1;
+          const candidateValue = storage.getItem(candidate) || '';
+          const candidateBytes = utf8ByteLength(candidateValue);
+          totalBytes += candidateBytes;
+          if (candidate === storageKey) existingBytes = candidateBytes;
+        }
+        if (!existingBytes && keyCount >= GAME_STORAGE_KEY_LIMIT) {
+          throw this._hostError('quota_exceeded', 'Game storage key limit reached', {
+            operation: 'game_storage',
+          });
+        }
+        if (totalBytes - existingBytes + valueBytes > GAME_STORAGE_TOTAL_BYTES) {
+          throw this._hostError('quota_exceeded', 'Game storage quota reached', {
+            operation: 'game_storage',
+          });
+        }
+        try { storage.setItem(storageKey, serialized); }
+        catch (error) {
+          throw this._hostError('quota_exceeded', 'Game storage write failed', {
+            operation: 'game_storage',
+            cause: error,
+          });
+        }
+        return { ok: true, stored: true };
+      });
     }
 
     async mountAvatar(config) {
