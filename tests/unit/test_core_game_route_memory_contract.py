@@ -4392,3 +4392,65 @@ def test_game_speech_preload_glues_spaces_only_for_chinese_text():
 
     # And the ws_bistream providers still opt out of it entirely.
     assert normalize("你 好", normalize_spaces=False) == "你 好"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_concurrent_speech_sends_never_split_a_frame():
+    """One audio frame is a header plus its payload, and it must stay atomic.
+
+    A mini-game line replayed from the audio cache is written from the HTTP task
+    while ordinary TTS is still streaming from the response handler
+    (``interruptExisting`` defaults to false). ``send_speech`` writes the JSON
+    header and the binary payload in two separate awaits, and the frontend pairs
+    them FIFO -- so an interleave of header A, header B, bytes A makes the
+    browser play A's bytes under B's speech id, gain and correlation.
+    """
+
+    sent: list[tuple[str, str]] = []
+
+    class _ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    class _InterleavingWebsocket:
+        client_state = _ConnectedState()
+
+        async def send_json(self, payload):
+            sent.append(("header", str(payload.get("speech_id") or "")))
+            # The yield the defect needs: without a lock the sibling task runs
+            # here, between a header and its payload.
+            await asyncio.sleep(0)
+
+        async def send_bytes(self, data):
+            sent.append(("payload", data.decode()))
+            await asyncio.sleep(0)
+
+    mgr = _make_manager()
+    mgr.websocket = _InterleavingWebsocket()
+    mgr._game_speech_correlation_for = lambda _speech_id: ""
+    mgr.speech_playback_gain = lambda _speech_id: 1.0
+    mgr._speech_output_total = 0
+    mgr._last_speech_output_time = 0.0
+    mgr._last_speech_output_bytes = 0
+
+    await asyncio.gather(
+        core_module.LLMSessionManager.send_speech(mgr, b"a", speech_id="a"),
+        core_module.LLMSessionManager.send_speech(mgr, b"b", speech_id="b"),
+    )
+
+    assert len(sent) == 4, sent
+    for index in range(0, len(sent), 2):
+        kind, header_id = sent[index]
+        assert kind == "header", sent
+        payload_kind, payload_body = sent[index + 1]
+        assert payload_kind == "payload", sent
+        assert payload_body == header_id, (
+            f"audio payload {payload_body!r} was written under header {header_id!r}: "
+            "concurrent sends split a frame"
+        )
+    # Both frames really did go out, so the assertion above cannot be satisfied
+    # by a send that silently dropped one of them.
+    assert {entry[1] for entry in sent} == {"a", "b"}, sent

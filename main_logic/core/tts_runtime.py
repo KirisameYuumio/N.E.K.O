@@ -1616,6 +1616,28 @@ class TtsRuntimeMixin:
             return ""
         return text
 
+    def _ensure_audio_frame_send_lock(self) -> asyncio.Lock:
+        """Serialize the header/payload pairs that make up one audio frame.
+
+        ``send_speech`` writes a JSON header and then its binary payload in two
+        separate awaits, and the frontend pairs them FIFO. A mini-game line
+        replayed from the audio cache is sent from the HTTP task while ordinary
+        TTS is still streaming from the response handler (``interruptExisting``
+        defaults to false), so without this the two can interleave as header A,
+        header B, bytes A -- and the browser then plays A's bytes under B's
+        speech id, gain and correlation. ``send_audio_done`` takes the same lock
+        so a terminal signal cannot land between a header and its payload.
+
+        Created lazily rather than in ``__init__``: this mixin is also exercised
+        against partially-built manager doubles, and an attribute that only
+        exists on the real constructor would make them diverge here.
+        """
+        lock = getattr(self, "_audio_frame_send_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._audio_frame_send_lock = lock
+        return lock
+
     async def send_speech(self, tts_audio, speech_id: Optional[str] = None):
         """Send speech data to the frontend, sending the speech_id header first for precise interruption control"""
         try:
@@ -1631,13 +1653,17 @@ class TtsRuntimeMixin:
                 playback_gain = self.speech_playback_gain(effective_speech_id)
                 if playback_gain != 1.0:
                     header["playback_gain"] = playback_gain
-                await self.websocket.send_json(header)
-                await self.websocket.send_bytes(tts_audio)
+                async with self._ensure_audio_frame_send_lock():
+                    await self.websocket.send_json(header)
+                    await self.websocket.send_bytes(tts_audio)
+                    # Inside the lock as well: the monitor mirror consumes this
+                    # queue in order, so a frame that is atomic on the wire must
+                    # not be split here either.
+                    self.sync_message_queue.put({"type": "binary", "data": tts_audio})
                 logger.debug(f"🔊 send_speech OK: {len(tts_audio)} bytes, speech_id={effective_speech_id}")
                 self._speech_output_total += 1
                 self._last_speech_output_time = time.time()
                 self._last_speech_output_bytes = len(tts_audio)
-                self.sync_message_queue.put({"type": "binary", "data": tts_audio})
                 return True
             else:
                 ws_state = getattr(self.websocket, 'client_state', None) if self.websocket else None
@@ -1677,7 +1703,8 @@ class TtsRuntimeMixin:
                 correlation_id = self._game_speech_correlation_for(speech_id)
                 if correlation_id:
                     message["sdk_speech_correlation_id"] = correlation_id
-                await self.websocket.send_json(message)
+                async with self._ensure_audio_frame_send_lock():
+                    await self.websocket.send_json(message)
                 logger.debug(f"🔚 send_audio_done OK: speech_id={speech_id}")
                 return True
             else:
