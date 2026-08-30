@@ -166,7 +166,10 @@
 
 - Agent：`agent_notification`、`agent_task_update`、`agent_status_update`。
 - 截图：`request_screenshot`、`capture_bridge_request`、`screen_share_error`。
-- 小游戏：`mini_game_invite_options`、`mini_game_invite_resolved`、`game_window_state_change`。
+- 小游戏：`mini_game_invite_options`、`mini_game_invite_resolved`、`game_window_state_change`、
+  `game_route_voice_control_credential`（客户端动作 `game_route_credential_resync` 的回复；
+  把游戏语音凭证补发给「路由仍在活跃时重新加载过」的宿主页，仅在请求的身份与当前活跃路由
+  完全一致时才发送）。
 - 音乐/工具：`music_play_url`、`music_allowlist_add`。
 - 活动/引导：`activity_context_prompt`。
 - 兼容/同步：`system`、`cozy_audio`。

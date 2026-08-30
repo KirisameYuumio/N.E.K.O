@@ -7040,3 +7040,85 @@ def test_game_voice_command_commits_its_teardown_before_it_can_yield():
             f"the superseded branch reaches for {teardown}; a command whose route "
             "is gone must not touch the process-global microphone"
         )
+
+
+def test_credential_resync_handler_does_exactly_one_thing():
+    """The credential reply must repair the credential and nothing else.
+
+    It exists because re-pushing ``game_window_state_change: opened`` would have
+    been the obvious repair and is the wrong one: that branch performs eleven
+    writes plus a four-listener DOM fan-out, has no identity guard of its own,
+    and assigns the credential unconditionally -- so an ``opened`` whose payload
+    lacked a credential would CLEAR a good one, re-creating the failure it was
+    sent to repair. This handler therefore compares the full identity, refuses
+    to clear, and touches nothing else; each of those is easy to lose in an edit.
+    """
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    marker = "} else if (response.type === 'game_route_voice_control_credential') {"
+    assert source.count(marker) == 1, "the credential handler is missing or duplicated"
+    start = source.index(marker)
+    end = source.index(chr(10) + "                }", start)
+    handler = source[start:end]
+
+    # Never clears: an empty value means the backend has nothing to give.
+    assert "if (!incomingCredential) return;" in handler, (
+        "the credential handler does not refuse an empty value, so it can clear "
+        "a good credential"
+    )
+    # Full identity, every field.
+    for field in ("game_type", "session_id", "sdk_route_instance_id"):
+        assert f"response.{field}" in handler, (
+            f"the credential handler does not compare {field}"
+        )
+    assert "S.gameRouteActive !== true" in handler, (
+        "the credential handler accepts a reply while no route is active"
+    )
+    # And nothing else. Absence assertions, so each is mutation-checked.
+    for forbidden in (
+        "advanceGameRouteStateRevision",
+        "dispatchEvent",
+        "stopProactiveChatSchedule",
+        "broadcastState",
+        "rememberEndedGameRouteIdentity",
+    ):
+        assert forbidden not in handler, (
+            f"the credential handler reaches for {forbidden}; its whole point is "
+            "that a redundant delivery costs one string assignment"
+        )
+    assert handler.count("S.gameVoiceControlCredential") == 1, (
+        "the credential handler writes the credential more than once"
+    )
+
+
+def test_credential_resync_action_answers_only_the_exact_live_route():
+    """Silence, not an error frame, is the answer to a mismatched request.
+
+    The action hands back a bearer credential that opens the user's microphone.
+    It is answered on the requesting socket precisely so it does not have to ride
+    ``/api/game/route/active``, which is an unauthenticated GET on an origin that
+    also serves the workshop static mount. What keeps that safe is that every
+    field of the requested identity must equal the live route's.
+    """
+    source = WEBSOCKET_ROUTER_PATH.read_text(encoding="utf-8")
+    marker = 'elif action == "game_route_credential_resync":'
+    assert source.count(marker) == 1, "the credential resync action is missing"
+    start = source.index(marker)
+    end = source.index('elif action == "ping":', start)
+    block = source[start:end]
+
+    assert "_push_game_route_voice_control_credential(" in block, (
+        "the credential resync action does not push anything"
+    )
+    for field in ("game_type", "session_id", "sdk_route_instance_id"):
+        assert f'message.get("{field}")' in block, (
+            f"the credential resync action does not compare the requested {field}, "
+            "so it would answer for a route the caller does not hold"
+        )
+    assert "_get_active_game_route_state(lanlan_name)" in block, (
+        "the credential resync action does not resolve the live route"
+    )
+    # Answered on the requesting socket, never on mgr.websocket: the reply
+    # belongs to the page that knows it is missing a credential.
+    assert "websocket," in block and "mgr.websocket" not in block, (
+        "the credential resync reply does not go to the requesting socket"
+    )

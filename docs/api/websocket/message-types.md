@@ -218,7 +218,11 @@ These are current UI integration events, not a stable external contract:
 
 - Agent: `agent_notification`, `agent_task_update`, `agent_status_update`.
 - Capture: `request_screenshot`, `capture_bridge_request`, `screen_share_error`.
-- Mini-games: `mini_game_invite_options`, `mini_game_invite_resolved`, `game_window_state_change`.
+- Mini-games: `mini_game_invite_options`, `mini_game_invite_resolved`, `game_window_state_change`,
+  `game_route_voice_control_credential` (reply to the client action
+  `game_route_credential_resync`; re-delivers the game-voice credential to a host
+  page that reloaded while a route was still active, and is sent only when the
+  requested identity matches the live route).
 - Music/tools: `music_play_url`, `music_allowlist_add`.
 - Activity/onboarding: `activity_context_prompt`.
 - Legacy/synchronization: `system`, `cozy_audio`.

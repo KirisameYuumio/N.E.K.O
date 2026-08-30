@@ -734,6 +734,132 @@ async def test_game_window_state_change_push_has_a_hard_timeout(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_voice_control_credential_push_carries_the_exact_route_identity():
+    """The credential reply names the route it belongs to, on the asking socket.
+
+    It is a separate message from ``game_window_state_change`` on purpose: the
+    frontend's ``opened`` branch assigns the credential unconditionally, so a
+    re-pushed ``opened`` without one would clear a good credential. Here the
+    identity is what lets the receiver refuse a reply for a route it no longer
+    holds.
+    """
+    class ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    websocket = SimpleNamespace(client_state=ConnectedState(), send_json=AsyncMock())
+
+    sent = await gr_route_lifecycle._push_game_route_voice_control_credential(
+        websocket,
+        lanlan_name="Lan",
+        game_type="neutral-sdk-game",
+        session_id="session-1",
+        route_instance_id="route-instance-b",
+        voice_control_credential="a" * 48,
+    )
+
+    assert sent is True
+    websocket.send_json.assert_awaited_once_with({
+        "type": "game_route_voice_control_credential",
+        "lanlan_name": "Lan",
+        "game_type": "neutral-sdk-game",
+        "session_id": "session-1",
+        "sdk_route_instance_id": "route-instance-b",
+        "sdk_voice_control_credential": "a" * 48,
+    })
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "overrides"),
+    [
+        ("no credential", {"voice_control_credential": ""}),
+        ("no lanlan_name", {"lanlan_name": ""}),
+        ("no socket", {"websocket": None}),
+    ],
+)
+async def test_voice_control_credential_push_stays_silent_without_its_preconditions(
+    case, overrides,
+):
+    """Every branch where there is nothing legitimate to hand back."""
+    class ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    websocket = SimpleNamespace(client_state=ConnectedState(), send_json=AsyncMock())
+    kwargs = {
+        "lanlan_name": "Lan",
+        "game_type": "neutral-sdk-game",
+        "session_id": "session-1",
+        "route_instance_id": "route-instance-b",
+        "voice_control_credential": "a" * 48,
+    }
+    target = overrides.pop("websocket", websocket)
+    kwargs.update(overrides)
+
+    sent = await gr_route_lifecycle._push_game_route_voice_control_credential(
+        target, **kwargs,
+    )
+
+    assert sent is False, case
+    websocket.send_json.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_voice_control_credential_push_stays_silent_on_a_disconnected_socket():
+    """A socket that is not CONNECTED gets nothing, like every sibling pusher."""
+    class DisconnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return False
+
+    websocket = SimpleNamespace(client_state=DisconnectedState(), send_json=AsyncMock())
+
+    sent = await gr_route_lifecycle._push_game_route_voice_control_credential(
+        websocket,
+        lanlan_name="Lan",
+        game_type="neutral-sdk-game",
+        session_id="session-1",
+        route_instance_id="route-instance-b",
+        voice_control_credential="a" * 48,
+    )
+
+    assert sent is False
+    websocket.send_json.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_active_reconciliation_never_returns_the_voice_credential(monkeypatch):
+    """The credential must not ride the unauthenticated GET.
+
+    ``/api/game/route/active`` has no auth and no CSRF dependency, its only
+    parameter is ``lanlan_name``, and this origin also serves the workshop static
+    mount -- so returning a bearer credential there would hand any same-origin
+    page a token that opens the user's microphone. The repair path is the
+    websocket instead.
+    """
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    with reset_game_route_state():
+        state = gr_runtime._activate_game_route("neutral-sdk-game", "session-1", "Lan")
+        state["_sdk_route_instance_id"] = "route-instance-b"
+        state["_sdk_voice_control_credential"] = "a" * 48
+
+        result = await gr_runtime.game_route_any_active("Lan")
+
+    assert "sdk_voice_control_credential" not in result
+    assert "a" * 48 not in json.dumps(result)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_speech_cancel_carries_exact_route_and_correlation_identity():
     class ConnectedState:
         CONNECTED = "connected"

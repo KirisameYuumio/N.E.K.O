@@ -5062,6 +5062,25 @@
                     } catch (gwErr) {
                         console.warn('[GameWindow] dispatch failed:', gwErr);
                     }
+
+                // -------- game_route_voice_control_credential --------
+                // The reply to `game_route_credential_resync`: a host page that
+                // reloaded while a route was still live gets its voice-control
+                // credential back. Deliberately its own message rather than a
+                // re-pushed `opened` -- that branch performs eleven writes plus a
+                // four-listener DOM fan-out, has no identity guard, and assigns
+                // the credential unconditionally, so an `opened` without one would
+                // CLEAR a good credential. This handler does exactly one thing.
+                } else if (response.type === 'game_route_voice_control_credential') {
+                    var incomingCredential = String(response.sdk_voice_control_credential || '');
+                    // Never clear on this path: an empty value means the backend
+                    // has nothing to give, not that ours is wrong.
+                    if (!incomingCredential) return;
+                    if (S.gameRouteActive !== true) return;
+                    if (String(response.game_type || '') !== String(S.gameRouteGameType || '')) return;
+                    if (String(response.session_id || '') !== String(S.gameRouteSessionId || '')) return;
+                    if (String(response.sdk_route_instance_id || '') !== String(S.gameRouteInstanceId || '')) return;
+                    S.gameVoiceControlCredential = incomingCredential;
                 }
 
             } catch (parseError) {

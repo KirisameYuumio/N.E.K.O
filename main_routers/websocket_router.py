@@ -1242,6 +1242,43 @@ async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
                     ),
                 )
 
+            elif action == "game_route_credential_resync":
+                # A host page that reloaded while a game route was still active
+                # has the route identity back (from /api/game/route/active) but
+                # not the voice-control credential -- that only ever travels on
+                # the edge-triggered ``opened`` push, and without it
+                # ``routeMatches()`` rejects every voice command for the rest of
+                # the round. Answer on THIS socket, and only when the requested
+                # identity is exactly the live route: silence is the correct
+                # answer to a mismatch, not an error frame.
+                from .game_router.route_lifecycle import (
+                    _push_game_route_voice_control_credential,
+                )
+                from utils.game_route_state import _get_active_game_route_state
+
+                _credential_state = _get_active_game_route_state(lanlan_name)
+                if (
+                    _credential_state is not None
+                    and str(_credential_state.get("game_type") or "")
+                    == str(message.get("game_type") or "")
+                    and str(_credential_state.get("session_id") or "")
+                    == str(message.get("session_id") or "")
+                    and str(_credential_state.get("_sdk_route_instance_id") or "")
+                    == str(message.get("sdk_route_instance_id") or "")
+                ):
+                    await _push_game_route_voice_control_credential(
+                        websocket,
+                        lanlan_name=lanlan_name,
+                        game_type=str(_credential_state.get("game_type") or ""),
+                        session_id=str(_credential_state.get("session_id") or ""),
+                        route_instance_id=str(
+                            _credential_state.get("_sdk_route_instance_id") or ""
+                        ),
+                        voice_control_credential=str(
+                            _credential_state.get("_sdk_voice_control_credential") or ""
+                        ),
+                    )
+
             elif action == "ping":
                 # 心跳保活消息，回复pong
                 await websocket.send_text(json.dumps({"type": "pong"}))

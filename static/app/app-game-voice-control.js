@@ -165,6 +165,44 @@
         return state;
     }
 
+    var credentialResyncTimer = null;
+    var credentialResyncAttempts = 0;
+    var CREDENTIAL_RESYNC_MAX_ATTEMPTS = 20;
+
+    function requestVoiceControlCredential() {
+        // index.html dispatches `opened` from its own bootstrap IIFE, which is
+        // NOT inside socket.onopen -- so on the exact page-reload this repairs,
+        // the socket can still be CONNECTING when we get here, and a raw send is
+        // dropped silently. Retry on the same 100ms cadence the bootstrap itself
+        // uses while it waits for lanlan_name, and stop as soon as the credential
+        // lands, the route goes away, or we run out of attempts.
+        if (credentialResyncTimer !== null) return;
+        credentialResyncAttempts = 0;
+        var attempt = function () {
+            credentialResyncTimer = null;
+            if (disposed) return;
+            // The only credential-presence check on this path, deliberately:
+            // it also has to hold on every retry, and a duplicate at the call
+            // site would be an inert guard.
+            if (S.gameVoiceControlCredential) return;
+            if (S.gameRouteActive !== true) return;
+            var bridge = window.appWebSocket;
+            if (bridge && typeof bridge.isOpen === 'function' && bridge.isOpen()) {
+                bridge.send({
+                    action: 'game_route_credential_resync',
+                    game_type: String(S.gameRouteGameType || ''),
+                    session_id: String(S.gameRouteSessionId || ''),
+                    sdk_route_instance_id: String(S.gameRouteInstanceId || '')
+                });
+                return;
+            }
+            credentialResyncAttempts += 1;
+            if (credentialResyncAttempts >= CREDENTIAL_RESYNC_MAX_ATTEMPTS) return;
+            credentialResyncTimer = setTimeout(attempt, 100);
+        };
+        attempt();
+    }
+
     function routeMatches(request) {
         var route = currentRoute();
         if (!route.active) return false;
@@ -386,6 +424,15 @@
             S.gameRouteLanlanName = String(detail.lanlanName || '');
             S.gameRouteSessionId = incomingSessionId;
             S.gameRouteInstanceId = incomingRouteInstanceId;
+            // The credential rides only the edge-triggered `opened` PUSH. A page
+            // that reloads while the route is still live gets its identity back
+            // from /api/game/route/active, but never the credential -- and
+            // routeMatches() then rejects every voice command, including `query`,
+            // for the rest of the round. Ask for it back over the socket, which
+            // is where it already travels. Only this module consumes the
+            // credential (index.html is the only page that loads this file), so
+            // asking from here keeps chat.html from ever holding one.
+            requestVoiceControlCredential();
         } else if (action === 'closed') {
             var currentSessionId = String(S.gameRouteSessionId || '');
             if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) return;
