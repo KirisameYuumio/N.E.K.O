@@ -1043,6 +1043,59 @@ async function main() {
   assert(coercedMaxEntriesError?.code === 'invalid_manifest',
     'a coerced leaderboard maxEntries was accepted instead of rejected');
 
+  // `required` entries are property NAMES and the schema types them as strings;
+  // String(1) matched a property literally named "1".
+  let numericRequiredError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'numeric-required-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      contracts: {
+        events: {
+          'numeric-required': {
+            type: 'object',
+            properties: { 1: { type: 'integer' } },
+            required: [1],
+          },
+        },
+      },
+    }, { transport });
+  } catch (error) { numericRequiredError = error; }
+  assert(numericRequiredError?.code === 'invalid_manifest',
+    'a non-string required entry was coerced into a matching property name');
+
+  // `String(true)` is 'true', which matches the score-field pattern, so a boolean
+  // silently became a board keyed on a field no entry will ever carry.
+  let booleanScoreFieldError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'boolean-scorefield-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      optionalCapabilities: ['leaderboard-local'],
+      leaderboards: {
+        main: { scoreField: true, order: 'descending', maxEntries: 3, retention: 'recent' },
+      },
+    }, { transport });
+  } catch (error) { booleanScoreFieldError = error; }
+  assert(booleanScoreFieldError?.code === 'invalid_manifest',
+    'a boolean scoreField was coerced into the field name "true"');
+
+  // manifest.version is bounded at 64 in the schema, where JSON Schema counts
+  // CODE POINTS; version.length charged two per astral character.
+  const astralVersion = `1.0-${'🎮'.repeat(31)}`;
+  assert(astralVersion.length > 64 && [...astralVersion].length <= 64,
+    'the astral version fixture no longer straddles the UTF-16 and code-point bounds');
+  const astralVersionGame = await window.NekoMiniGame.connect({
+    id: 'astral-version-test',
+    version: astralVersion,
+    requiredCapabilities: ['logging'],
+  }, { transport });
+  assert(astralVersionGame.manifest.version === astralVersion,
+    'a 35-code-point version was rejected by a 64-code-point bound');
+  astralVersionGame.dispose();
+
   // Declared property names are bounded at 64 in the published schema, where
   // JSON Schema counts CODE POINTS. `name.length` charged two per astral
   // character, so the runtime was stricter than its own published contract.

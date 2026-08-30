@@ -383,7 +383,15 @@
       const required = [];
       const requiredSeen = new Set();
       for (const rawName of requiredInput) {
-        const name = String(rawName || '');
+        // `required` entries are declared property NAMES, and the schema types
+        // them as strings. `String(1)` matched a property literally named "1",
+        // so a manifest the schema rejects connected with a different shape.
+        if (typeof rawName !== 'string') {
+          fail('invalid_manifest', `${fieldName}.required entries must be strings`, {
+            entry: rawName,
+          });
+        }
+        const name = rawName;
         if (!Object.prototype.hasOwnProperty.call(properties, name) || requiredSeen.has(name)) {
           fail('invalid_manifest', `${fieldName}.required contains an unknown or duplicate field`, { name });
         }
@@ -468,6 +476,13 @@
           });
         }
       }
+      // Type first: `String(true)` is `'true'`, which matches the field-name
+      // pattern, so a boolean silently became a board keyed on a field no entry
+      // will ever carry. Absent still defaults to 'score'.
+      if (rawDefinition.scoreField !== undefined
+          && typeof rawDefinition.scoreField !== 'string') {
+        fail('invalid_manifest', `manifest.leaderboards.${boardId}.scoreField must be a string`);
+      }
       const scoreField = String(rawDefinition.scoreField || 'score').trim();
       if (!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(scoreField)
           || scoreField === 'prototype' || scoreField === 'constructor') {
@@ -530,7 +545,9 @@
     if (!/^[a-z][a-z0-9-]{0,63}$/.test(id)) {
       fail('invalid_manifest', 'manifest.id must be a lowercase game identifier');
     }
-    if (!version || version.length > 64) {
+    // Code points, matching the schema's `maxLength: 64` (JSON Schema counts
+    // code points), so the runtime is not stricter than its published contract.
+    if (!version || [...version].length > 64) {
       fail('invalid_manifest', 'manifest.version is required and must not exceed 64 characters');
     }
     if (protocolVersion !== SDK_PROTOCOL_VERSION) {
@@ -3161,6 +3178,17 @@
           && typeof config.pageExit.payload !== 'function'
         ) {
           fail('invalid_request', 'runtime pageExit.payload must be a function');
+        }
+        // `false` or an object, exactly as the .d.ts declares. A truthy
+        // non-object -- `heartbeat: 'disabled'`, `outputs: 'off'` -- used to fall
+        // through as "enabled with defaults", i.e. the author's intent inverted
+        // in silence, which is the one outcome a typo must never produce.
+        for (const key of ['heartbeat', 'outputs']) {
+          const value = config[key];
+          // `undefined` alone means absent: `0` and `null` take the `|| {}`
+          // fallback too, so they would also come out as enabled-with-defaults.
+          if (value === undefined || value === false || plainObject(value)) continue;
+          fail('invalid_request', `runtime ${key} must be false or an object`, { [key]: value });
         }
         const heartbeatInput = config.heartbeat === false ? null : (config.heartbeat || {});
         const outputsInput = config.outputs === false ? null : (config.outputs || {});

@@ -1121,6 +1121,46 @@ async function main() {
     `a superseded generation left the client running: ${mismatchGame.runtime.state}`);
   mismatchGame.dispose();
 
+  // `heartbeat`/`outputs` are `false | object` in the published .d.ts. A truthy
+  // non-object -- `heartbeat: 'disabled'`, `outputs: 'off'` -- used to fall
+  // through as "enabled with defaults": the author's intent inverted in silence,
+  // which is the one outcome a typo must never produce.
+  const monitoringEnvironment = createEnvironment();
+  const monitoringGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-monitoring-shape',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: { ...transport, logger: logger() },
+    windowImpl: monitoringEnvironment.windowImpl,
+    documentImpl: monitoringEnvironment.documentImpl,
+  });
+  // `0` and `null` are the same footgun as the strings, not "absent": today they
+  // all take the `|| {}` fallback and come out as "enabled with defaults", so an
+  // author writing `heartbeat: 0` to mean "off" gets it ON. Only `undefined`
+  // means absent.
+  for (const [key, badValue] of [
+    ['heartbeat', 'disabled'],
+    ['outputs', 'off'],
+    ['heartbeat', 0],
+    ['outputs', null],
+    ['outputs', true],
+  ]) {
+    let monitoringError = null;
+    try { monitoringGame.runtime.configure({ [key]: badValue, pageExit: false }); }
+    catch (error) { monitoringError = error; }
+    assert(monitoringError?.code === 'invalid_request',
+      `a non-object ${key} (${JSON.stringify(badValue)}) was silently treated as defaults`);
+  }
+  // Absent is still absent.
+  monitoringGame.runtime.configure({ pageExit: false });
+  // The declared shapes still work.
+  monitoringGame.runtime.configure({ heartbeat: false, outputs: false, pageExit: false });
+  monitoringGame.runtime.configure({
+    heartbeat: { intervalMs: 2500 }, outputs: { intervalMs: 700 }, pageExit: false,
+  });
+  monitoringGame.dispose();
+
   process.stdout.write('mini-game lifecycle runtime test passed\n');
 }
 
