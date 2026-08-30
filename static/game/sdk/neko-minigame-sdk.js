@@ -448,7 +448,13 @@
         }
       }
       const scoreField = String(rawDefinition.scoreField || 'score').trim();
-      if (!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(scoreField)) {
+      if (!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(scoreField)
+          || scoreField === 'prototype' || scoreField === 'constructor') {
+        // The clone every entry passes through forbids these property names, so
+        // a board declared on one connects fine and then rejects every
+        // submission; omitting the property instead yields a non-finite score.
+        // ('__proto__' cannot reach here -- the pattern requires a leading
+        // letter -- but the rule is stated in full so it reads as one set.)
         fail('invalid_manifest', `manifest.leaderboards.${boardId}.scoreField is invalid`);
       }
       const order = String(rawDefinition.order || 'descending').trim();
@@ -2114,6 +2120,18 @@
       return Math.max(MIN_RUNTIME_INTERVAL_MS, Math.min(Math.floor(numeric), maximum));
     }
 
+    function boundedRuntimeOutputLimit(value) {
+      // `Number()` on a truthy non-numeric gives NaN, and Math.min/Math.max
+      // preserve it. The non-finite limit then rides every poll payload, the
+      // trusted host's clone rejects it before /route/drain, and polling emits
+      // one error per tick while delivering no output and no control at all.
+      // Falls back rather than throwing, matching boundedRuntimeNumber, which
+      // the sibling intervalMs/timeoutMs fields already use.
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric) || numeric <= 0) return MAX_RUNTIME_OUTPUTS_PER_POLL;
+      return Math.max(1, Math.min(Math.floor(numeric), MAX_RUNTIME_OUTPUTS_PER_POLL));
+    }
+
     function requireBoundedRuntimeLifecyclePayload(payload, operation) {
       // Every other SDK egress path is bounded; the runtime lifecycle payload
       // was not, in the one dimension that costs anything. Same 256 KiB the
@@ -3052,10 +3070,7 @@
               outputsInput.timeoutMs,
               DEFAULT_OUTPUT_TIMEOUT_MS,
             ),
-            limit: Math.max(1, Math.min(
-              Math.floor(Number(outputsInput.limit || MAX_RUNTIME_OUTPUTS_PER_POLL)),
-              MAX_RUNTIME_OUTPUTS_PER_POLL,
-            )),
+            limit: boundedRuntimeOutputLimit(outputsInput.limit),
           }) : null,
           pageExit: pageExitInput ? Object.freeze({
             payload: typeof pageExitInput.payload === 'function' ? pageExitInput.payload : null,

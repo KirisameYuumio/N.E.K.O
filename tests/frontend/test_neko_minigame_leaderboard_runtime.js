@@ -199,6 +199,30 @@ async function main() {
   // per-entry size parks the trimmed state within the wrapper's overhead of the
   // cap therefore became permanently unlistable, for every user of that game,
   // because entry size is a property of the game and not of the run.
+  // The clone every entry passes through forbids `prototype`/`constructor` as
+  // property names, so a board declared on one used to connect fine and then
+  // reject every submission; omitting the property instead yields a non-finite
+  // score. Reject the board at manifest time instead of at every submit.
+  for (const reservedScoreField of ['prototype', 'constructor']) {
+    const reservedManifest = manifest(['leaderboard-local']);
+    reservedManifest.leaderboards = {
+      main: {
+        scoreField: reservedScoreField,
+        order: 'descending',
+        maxEntries: 3,
+        retention: 'recent',
+      },
+    };
+    let reservedError = null;
+    try {
+      await window.NekoMiniGame.connect(reservedManifest, {
+        transport: createTransport().transport,
+      });
+    } catch (error) { reservedError = error; }
+    assert(reservedError?.code === 'invalid_manifest',
+      `a board declared with scoreField "${reservedScoreField}" connected but can never accept a submission`);
+  }
+
   const bulkHost = createTransport();
   const bulkEntries = [];
   for (let index = 0; index < 64; index += 1) {

@@ -237,7 +237,11 @@ types are `runtime-state`, `runtime-inactive`, `runtime-error`,
 each event payload is bounded to 256 KiB, and each output poll accepts at most 50
 items. Runtime output handlers run sequentially in poll order. A handler that has
 not settled after 60 seconds is abandoned so output polling cannot stall
-permanently; the ordering guarantee is unchanged for handlers that settle.
+permanently. Abandoning is not cancelling: JavaScript promises cannot be
+cancelled, so a timed-out handler keeps running and may still complete and touch
+state after later handlers have started. The sequential ordering guarantee
+therefore covers handlers that settle within that budget; a handler that exceeds
+it forfeits its place in the order (and the SDK logs when that happens).
 
 Host-to-game runtime lifecycle events remain a fixed core list. Game-to-host
 events use the separate manifest-declared contract API above; they cannot add

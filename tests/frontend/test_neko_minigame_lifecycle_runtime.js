@@ -938,6 +938,23 @@ async function main() {
     windowImpl: stuckEnvironment.windowImpl,
     documentImpl: stuckEnvironment.documentImpl,
   });
+  // A truthy non-numeric limit used to survive as NaN: Number() produces it and
+  // Math.min/Math.max preserve it, so every poll payload carried a non-finite
+  // value that the trusted host's clone rejects before /route/drain -- one error
+  // per tick and no output or control ever delivered.
+  const malformedLimitConfig = stuckGame.runtime.configure({
+    heartbeat: false,
+    outputs: { intervalMs: 700, limit: 'fifty' },
+    pageExit: false,
+  });
+  assert(malformedLimitConfig.outputs.limit === 50,
+    'a malformed runtime output limit was stored instead of falling back');
+  assert(stuckGame.runtime.configure({
+    heartbeat: false, outputs: { intervalMs: 700, limit: 500 }, pageExit: false,
+  }).outputs.limit === 50, 'an over-large runtime output limit was not clamped');
+  assert(stuckGame.runtime.configure({
+    heartbeat: false, outputs: { intervalMs: 700, limit: 7 }, pageExit: false,
+  }).outputs.limit === 7, 'a valid runtime output limit was not honoured');
   stuckGame.runtime.configure({ heartbeat: false, outputs: { intervalMs: 700 }, pageExit: false });
   await stuckGame.runtime.start({ mode: 'stuck' });
   for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
