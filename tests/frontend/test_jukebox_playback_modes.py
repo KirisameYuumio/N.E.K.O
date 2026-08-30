@@ -1909,7 +1909,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 185,
+        "keyCount": 184,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -2962,7 +2962,7 @@ def test_jukebox_close_preserves_headless_runtime(mock_page: Page):
             hasStyle: document.head.contains(style),
             hasRuntimeHost: !!document.getElementById('neko-jukebox-runtime-host'),
             isRuntimeReady: J.State.isRuntimeReady,
-            playerHost: J.State.playerHost,
+            headlessRuntimeRequested: J.State.headlessRuntimeRequested,
             playerDestroyed: window.__lastAPlayer.destroyed === true,
             currentSong: J.State.currentSong && J.State.currentSong.id,
             songCount: J.State.songs.length,
@@ -2978,7 +2978,7 @@ def test_jukebox_close_preserves_headless_runtime(mock_page: Page):
         "hasStyle": False,
         "hasRuntimeHost": True,
         "isRuntimeReady": True,
-        "playerHost": "runtime",
+        "headlessRuntimeRequested": True,
         "playerDestroyed": False,
         "currentSong": "song1",
         "songCount": 4,
@@ -3301,18 +3301,25 @@ def test_jukebox_control_next_replays_the_only_song_instead_of_stopping(mock_pag
             currentSong: J.State.currentSong && J.State.currentSong.id
           };
 
-          window.__lastAPlayer.played = false;
-          const next = await J.executeControl({ action: 'next', headless: true });
-          const previous = await J.executeControl({ action: 'previous', headless: true });
+          // 逐条取样：next 停播之后 currentSong 会被清空，紧接着的 previous 又会
+          // 重新起播，只看终态两种实现都是「在放」，护栏会变哑。
+          const sample = async (action) => {
+            window.__lastAPlayer.played = false;
+            const outcome = await J.executeControl({ action, headless: true });
+            return {
+              ok: outcome.ok,
+              // ok:true 必须名副其实：音乐还在放，而不是被「同曲即停」分支停掉。
+              isPlaying: J.State.isPlaying,
+              currentSong: J.State.currentSong && J.State.currentSong.id,
+              replayed: window.__lastAPlayer.played === true
+            };
+          };
 
           return {
             afterPlay,
-            nextOk: next.ok,
-            previousOk: previous.ok,
-            // ok:true 必须名副其实：音乐还在放，而不是被「同曲即停」分支停掉。
-            stillPlaying: J.State.isPlaying,
-            currentSong: J.State.currentSong && J.State.currentSong.id,
-            replayed: window.__lastAPlayer.played === true
+            playbackMode: J.State.playbackMode,
+            afterNext: await sample('next'),
+            afterPrevious: await sample('previous')
           };
         }
         """ % _single_song_fetch_override()
@@ -3320,11 +3327,10 @@ def test_jukebox_control_next_replays_the_only_song_instead_of_stopping(mock_pag
 
     assert result == {
         "afterPlay": {"ok": True, "isPlaying": True, "currentSong": "only"},
-        "nextOk": True,
-        "previousOk": True,
-        "stillPlaying": True,
-        "currentSong": "only",
-        "replayed": True,
+        # 非随机模式才会走 getManualAdjacentSong，也就是评审描述的那个场景。
+        "playbackMode": "sequence",
+        "afterNext": {"ok": True, "isPlaying": True, "currentSong": "only", "replayed": True},
+        "afterPrevious": {"ok": True, "isPlaying": True, "currentSong": "only", "replayed": True},
     }
 
 
@@ -3524,7 +3530,7 @@ def test_jukebox_close_preserves_playback_when_panel_opened_first(mock_page: Pag
         async () => {
           const J = window.Jukebox;
 
-          // 先按「面板已打开」建出播放器：宿主是容器，playerHost === 'ui'。
+          // 先按「面板已打开」建出播放器：播放器节点落在面板容器里。
           const wrapper = document.createElement('div');
           wrapper.className = 'jukebox-wrapper';
           wrapper.innerHTML = '<div class="jukebox-container"></div>';
@@ -3532,7 +3538,6 @@ def test_jukebox_close_preserves_playback_when_panel_opened_first(mock_page: Pag
           J.State.container = wrapper;
           J.State.isOpen = true;
           J.initPlayer({ headless: false });
-          const uiHost = J.State.playerHost;
           const playerNode = document.getElementById('jukebox-player');
           const insideContainer = wrapper.contains(playerNode);
 
@@ -3547,7 +3552,6 @@ def test_jukebox_close_preserves_playback_when_panel_opened_first(mock_page: Pag
 
           const host = document.getElementById('neko-jukebox-runtime-host');
           return {
-            uiHost,
             insideContainer,
             stopped,
             // 播放器节点被移进无头宿主，而不是随容器一起被 remove。
@@ -3560,7 +3564,6 @@ def test_jukebox_close_preserves_playback_when_panel_opened_first(mock_page: Pag
     )
 
     assert result == {
-        "uiHost": "ui",
         "insideContainer": True,
         "stopped": 0,
         "adoptedIntoRuntimeHost": True,

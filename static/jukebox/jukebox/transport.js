@@ -63,8 +63,8 @@ Object.assign(window.Jukebox, {
   ensureRuntime: async function(options = {}) {
     const Jukebox = window.Jukebox || this;
     const headless = options.headless === true;
-    // 记在 State 上而不是靠 playerHost 反推：复用 music_ui 的共享播放器时根本
-    // 不会新建无头宿主，playerHost 会一直是 null。
+    // 无头运行时的唯一判据。不能靠「播放器建在哪个宿主里」反推：复用 music_ui
+    // 的共享播放器或面板播放器时根本不会新建无头宿主。
     if (headless) {
       Jukebox.State.headlessRuntimeRequested = true;
     }
@@ -1826,18 +1826,6 @@ Object.assign(window.Jukebox, {
     return Jukebox.State.player;
   },
 
-  // 播放器可能是新建的，也可能是复用 music_ui 的共享实例或已存在的 State.player。
-  // 后两条早返回路径原来完全不写 playerHost，于是无头播放的宿主一直是 null。
-  markPlayerHost: function(isHeadless) {
-    if (!isHeadless) {
-      Jukebox.State.playerHost = 'ui';
-      return;
-    }
-    if (!Jukebox.State.playerHost) {
-      Jukebox.State.playerHost = 'runtime';
-    }
-  },
-
   initPlayer: function(options = {}) {
     const Jukebox = window.Jukebox || this;
     const isHeadless = options.headless === true;
@@ -1845,14 +1833,12 @@ Object.assign(window.Jukebox, {
       const existingPlayer = window.music_ui.getMusicPlayerInstance();
       if (existingPlayer) {
         console.log('[Jukebox] 使用现有的音乐播放器');
-        Jukebox.markPlayerHost(isHeadless);
         return existingPlayer;
       }
       console.log('[Jukebox] music_ui 存在但播放器未初始化，创建新播放器');
     }
 
     if (Jukebox.State.player) {
-      Jukebox.markPlayerHost(isHeadless);
       return Jukebox.State.player;
     }
 
@@ -1890,8 +1876,6 @@ Object.assign(window.Jukebox, {
       volume: 1,
       audio: []
     });
-    Jukebox.markPlayerHost(isHeadless);
-
     console.log('[Jukebox] APlayer已创建，音量:', Jukebox.State.player.audio.volume);
     return Jukebox.State.player;
   },

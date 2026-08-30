@@ -121,7 +121,6 @@ Object.assign(window.Jukebox, {
     runtimeHost: null,
     runtimeInitPromise: null,
     isRuntimeReady: false,
-    playerHost: null,
     headlessRuntimeRequested: false,
     fuzzySearchWorker: null,
     fuzzySearchWorkerUrl: null,

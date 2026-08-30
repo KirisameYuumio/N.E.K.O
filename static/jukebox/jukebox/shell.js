@@ -248,7 +248,6 @@ Object.assign(window.Jukebox, {
     Jukebox.State.player = null;
     Jukebox.State.boundPlayer = null;
     Jukebox.State.audioElement = null;
-    Jukebox.State.playerHost = null;
   },
 
   closeBroadcastChannel: function() {
@@ -307,7 +306,6 @@ Object.assign(window.Jukebox, {
     if (!host.contains(playerContainer)) {
       host.appendChild(playerContainer);
     }
-    Jukebox.State.playerHost = 'runtime';
     return true;
   },
 
