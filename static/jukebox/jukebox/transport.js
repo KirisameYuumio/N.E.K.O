@@ -85,9 +85,16 @@ Object.assign(window.Jukebox, {
       return Jukebox.State.runtimeInitPromise;
     }
 
+    const epoch = Jukebox.State.teardownEpoch;
     Jukebox.State.runtimeInitPromise = (async () => {
       Jukebox.loadPlaybackPreferences();
       await Jukebox.loadSongData();
+      // 拉配置期间点歌台被整个拆掉了：绝不能再往下建隐藏宿主和播放器，否则用户
+      // 明确销毁之后又冒出来一个没人负责销毁的实例。留给调用方的 epoch 闸门去报
+      // jukebox_torn_down。
+      if (Jukebox.State.teardownEpoch !== epoch) {
+        return { songCount: Jukebox.State.songs.length, headless, tornDown: true };
+      }
       const player = Jukebox.initPlayer({ headless });
       if (!player && !Jukebox.getPlayer()) {
         throw new Error(window.t('Jukebox.playError', '音乐播放器未初始化'));
@@ -205,23 +212,33 @@ Object.assign(window.Jukebox, {
     return best <= maxDistance ? best : Infinity;
   },
 
+  // 曲库位置只能当「同档并列时谁排前面」的次序，不能直接从档分里减：档间距是
+  // 1000，而 index 没有上界，曲库超过 1000 首之后精确命中会掉进前缀档 —— 精确
+  // 命中落在 index=1001 得 8999，输给 index=0 的前缀命中 9000，用户报准歌名反而
+  // 播到别的歌。压成 [0,1) 的小数，档次序就跟曲库长度无关了。
+  getSongOrderPenalty: function(index) {
+    const position = Number.isFinite(index) && index > 0 ? index : 0;
+    return position / (position + 1);
+  },
+
   scoreSongForQuery: function(song, normalizedQuery, index, options = {}) {
     const allowFuzzy = options.fuzzy !== false;
+    const orderPenalty = Jukebox.getSongOrderPenalty(index);
     let bestScore = -Infinity;
     const values = Jukebox.getSongSearchValues(song);
 
     values.forEach((value) => {
       if (value === normalizedQuery) {
-        bestScore = Math.max(bestScore, 10000 - index);
+        bestScore = Math.max(bestScore, 10000 - orderPenalty);
         return;
       }
       if (value.startsWith(normalizedQuery)) {
-        bestScore = Math.max(bestScore, 9000 - (value.length - normalizedQuery.length) - index);
+        bestScore = Math.max(bestScore, 9000 - (value.length - normalizedQuery.length) - orderPenalty);
         return;
       }
       const includesIndex = value.indexOf(normalizedQuery);
       if (includesIndex >= 0) {
-        bestScore = Math.max(bestScore, 8000 - includesIndex - (value.length - normalizedQuery.length) - index);
+        bestScore = Math.max(bestScore, 8000 - includesIndex - (value.length - normalizedQuery.length) - orderPenalty);
         return;
       }
 
@@ -229,7 +246,7 @@ Object.assign(window.Jukebox, {
 
       const fuzzyDistance = Jukebox.getBestFuzzyDistance(normalizedQuery, value);
       if (Number.isFinite(fuzzyDistance)) {
-        bestScore = Math.max(bestScore, 7000 - fuzzyDistance * 100 - Math.abs(value.length - normalizedQuery.length) - index);
+        bestScore = Math.max(bestScore, 7000 - fuzzyDistance * 100 - Math.abs(value.length - normalizedQuery.length) - orderPenalty);
       }
     });
 
@@ -252,12 +269,16 @@ Object.assign(window.Jukebox, {
   buildFuzzySearchWorkerSource: function() {
     // Worker 里跑的就是这几个函数本体（toString 序列化），不另抄一份实现，
     // 免得主线程与 worker 的匹配规则各自漂移。
+    // 这几个函数是按名字序列化进 worker 的，漏一个就在 worker 里 ReferenceError，
+    // 而错误被 catch 成「搜索失败」，表面只是搜不到歌。改动它们的依赖时必须同步
+    // 这份清单，test_jukebox_fuzzy_worker_source_has_no_missing_dependency 会守住。
     const names = [
       'normalizeSongQuery',
       'getSongSearchValues',
       'getLevenshteinDistance',
       'getFuzzyDistanceBudget',
       'getBestFuzzyDistance',
+      'getSongOrderPenalty',
       'scoreSongForQuery',
       'findBestSongIndex'
     ];
@@ -390,8 +411,14 @@ Object.assign(window.Jukebox, {
     return index >= 0 ? songs[index] : null;
   },
 
+  isControlEpochCurrent: function(epoch) {
+    return epoch === Jukebox.State.teardownEpoch;
+  },
+
   executeControl: async function(command = {}) {
     const normalizedAction = String(command.action || '').trim().toLowerCase();
+    // 用户可能在这条指令的任何一个 await 里把点歌台整个拆掉。
+    const epoch = Jukebox.State.teardownEpoch;
 
     if (!Jukebox.supportedControlActions.includes(normalizedAction)) {
       return {
@@ -413,15 +440,18 @@ Object.assign(window.Jukebox, {
 
     if (normalizedAction === 'set_volume') {
       await Jukebox.ensureRuntime({ headless: command.headless !== false });
+      if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult(normalizedAction);
       return Jukebox.executeSetVolumeControl(command.value);
     }
 
     if (normalizedAction === 'adjust_volume') {
       await Jukebox.ensureRuntime({ headless: command.headless !== false });
+      if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult(normalizedAction);
       return Jukebox.executeAdjustVolumeControl(command.value);
     }
 
     await Jukebox.ensureRuntime({ headless: command.headless !== false });
+    if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult(normalizedAction);
 
     if (normalizedAction === 'next' || normalizedAction === 'previous') {
       const direction = normalizedAction === 'previous' ? -1 : 1;
@@ -447,11 +477,12 @@ Object.assign(window.Jukebox, {
       await Jukebox.loadSongData();
       song = await Jukebox.findSongForQuery(command.query || '');
     }
+    if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult('play');
     if (!song) {
       return { ok: false, action: 'play', message: 'song_not_found' };
     }
 
-    return Jukebox.executePlayControl('play', song);
+    return Jukebox.executePlayControl('play', song, { epoch });
   },
 
   // 0-1 和 0-100 两套量纲共存时，判据不能是「是否大于 1」：那样 value:1 会被
@@ -563,9 +594,15 @@ Object.assign(window.Jukebox, {
     return !Number.isInteger(requestId) || requestId === Jukebox.State.playRequestId;
   },
 
+  tornDownResult: function(action) {
+    return { ok: false, action, message: 'jukebox_torn_down' };
+  },
+
   executePlayControl: async function(action, song, playOptions = {}) {
+    const epoch = Number.isInteger(playOptions.epoch) ? playOptions.epoch : Jukebox.State.teardownEpoch;
     const requestId = ++Jukebox.State.playRequestId;
     const preflight = await Jukebox.preflightSongPlayback(song);
+    if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult(action);
     if (requestId !== Jukebox.State.playRequestId) {
       return {
         ok: false,
@@ -585,6 +622,7 @@ Object.assign(window.Jukebox, {
 
     const playedSong = await Jukebox.playSong(song.id, {
       ...playOptions,
+      epoch: undefined,
       actionAvailability: preflight.actionAvailability,
       // next / previous 在单曲曲库下会绕回当前这首，走进 playSong 的「同曲即停」
       // 分支：音乐停了，却因为拿到了 song 对象而报 ok:true，猫娘照样说「已切歌」。
@@ -593,6 +631,11 @@ Object.assign(window.Jukebox, {
       forceReplay: true,
       requestId
     });
+    if (!Jukebox.isControlEpochCurrent(epoch)) {
+      // 起播过程中点歌台被拆了：停掉刚起来的声音，别留下一个没人管的播放器。
+      Jukebox.stopPlayback();
+      return Jukebox.tornDownResult(action);
+    }
     if (!playedSong) {
       return {
         ok: false,
@@ -1067,10 +1110,23 @@ Object.assign(window.Jukebox, {
 
     try {
       await Jukebox.playAudio(song);
-      // 音频此刻已经在响了。isPlaying 必须立刻为真：stopAudio 的 player.pause()
+      // 音频此刻应该已经在响了。isPlaying 必须立刻为真：stopAudio 的 player.pause()
       // 挂在这个标志上，等到 playSong 末尾再置的话，动画加载期间来的 stop 会
       // 停不掉声音，还报成功。
       Jukebox.State.isPlaying = true;
+
+      // APlayer 的 play() 不返回 promise，自动播放被拦时它把 NotAllowedError
+      // 内部吞掉，await 照样立刻 resolve —— 于是没有声音却报成功。
+      //
+      // 决策：不等 play/playing 事件。那样必须配一个超时，而超时值在慢磁盘、
+      // 长音频、冷缓存上都可能把正常起播误判成失败，代价比它要防的问题更大。
+      // 这里只做一次「下一个 tick 回看播放器还停着吗」的判定：自动播放被拦时
+      // 浏览器是同步拒绝、微任务里回到 paused，这一拍足够看见；正常起播则早已
+      // paused === false。判不准时一律按成功放行，宁可漏报不要误报。
+      if (!(await Jukebox.confirmAudioStarted())) {
+        Jukebox.State.isPlaying = false;
+        throw new Error('autoplay_blocked');
+      }
 
       if (requestId !== Jukebox.State.playRequestId) {
         console.log('[Jukebox] 播放请求已被新请求取代，取消状态更新');
@@ -1129,6 +1185,15 @@ Object.assign(window.Jukebox, {
       Jukebox.showError(window.t('Jukebox.playFailed', '播放失败') + ': ' + error.message);
       return null;
     }
+  },
+
+  confirmAudioStarted: async function() {
+    const player = Jukebox.getPlayer();
+    const audio = player && player.audio;
+    // 拿不到 audio 元素就没法判断，按成功放行。
+    if (!audio) return true;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    return audio.paused !== true;
   },
 
   playAudio: async function(song) {

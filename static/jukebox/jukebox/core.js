@@ -122,6 +122,7 @@ Object.assign(window.Jukebox, {
     runtimeInitPromise: null,
     isRuntimeReady: false,
     headlessRuntimeRequested: false,
+    teardownEpoch: 0,
     fuzzySearchWorker: null,
     fuzzySearchWorkerUrl: null,
     fuzzySearchToken: 0,

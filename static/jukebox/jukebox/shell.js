@@ -278,6 +278,16 @@ Object.assign(window.Jukebox, {
 
   prepareForUnload: function() {
     Jukebox.cleanupUiRuntimeShell();
+    // 在途的指令必须先作废，再拆宿主。否则一条正卡在拉配置/预检里的指令恢复后
+    // 会重建隐藏宿主、在用户明确销毁之后起播，而随后的最终卸载只删全局变量，
+    // 那个复活的播放器就没人销毁了。
+    //
+    // 单靠推进 playRequestId 拦不住：executePlayControl 会在恢复后自己
+    // ++playRequestId 取一个更新的世代，比对照样通过。teardown 需要一个它抢不到
+    // 的独立计数器。
+    Jukebox.State.teardownEpoch += 1;
+    Jukebox.State.runtimeInitPromise = null;
+    Jukebox.State.playRequestId += 1;
     Jukebox.destroyPlayer();
     Jukebox.destroyRuntimeHost();
     Jukebox.State.headlessRuntimeRequested = false;

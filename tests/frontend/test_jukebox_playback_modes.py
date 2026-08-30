@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 184,
+        "keyCount": 188,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -4065,3 +4065,181 @@ def test_jukebox_stop_during_animation_load_actually_stops_audio(mock_page: Page
     # ok:true 必须名副其实：声音真的停了。
     assert result["pausedAfterStop"] is True
     assert result["isPlaying"] is False
+
+
+@pytest.mark.frontend
+def test_jukebox_fuzzy_worker_source_has_no_missing_dependency(mock_page: Page):
+    """The worker source is assembled from a hand-kept list of function names.
+
+    Missing one is silent in production: the worker throws a ReferenceError,
+    the error path reports "search failed", and the symptom is merely that a
+    song cannot be found.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        () => {
+          const J = window.Jukebox;
+          const source = J.buildFuzzySearchWorkerSource();
+          // worker 里唯一的全局对象就是这份 source 自己拼出来的 Jukebox。
+          const declared = new Set(
+            [...source.matchAll(/^const (\\w+) = /gm)].map(m => m[1])
+          );
+          const referenced = new Set(
+            [...source.matchAll(/Jukebox\\.(\\w+)/g)].map(m => m[1])
+          );
+          const missing = [...referenced].filter(name => !declared.has(name));
+
+          // 真跑一遍这份 source，语法/引用错误会直接抛出来。
+          let executed = null;
+          try {
+            const factory = new Function('self', source + '; return self.onmessage;');
+            const fakeSelf = { postMessage: (data) => { executed = data; } };
+            const onmessage = factory(fakeSelf);
+            onmessage({ data: { token: 7, query: 'song', songs: J.State.songs } });
+          } catch (error) {
+            return { missing, threw: String(error && error.message || error) };
+          }
+          return { missing, threw: null, executed };
+        }
+        """
+    )
+
+    assert result["missing"] == [], f"worker 源码缺少依赖: {result['missing']}"
+    assert result["threw"] is None
+    assert result["executed"]["token"] == 7
+    assert "error" not in result["executed"]
+
+
+@pytest.mark.frontend
+def test_jukebox_exact_match_wins_past_the_thousandth_song(mock_page: Page):
+    """Codex P2: tier scores must not be crossed by an unbounded playlist index.
+
+    Tiers are 1000 apart, so subtracting the raw index made an exact match at
+    index 1001 score below a prefix match at index 0.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          // index 0 是前缀命中（'alpha' 是 'alphabet' 的前缀），
+          // index 1001 才是精确命中。
+          const songs = [{ id: 'prefix', name: 'alphabet', artist: '', audio: '' }];
+          for (let i = 1; i <= 1000; i += 1) {
+            songs.push({ id: 'filler' + i, name: 'filler ' + i, artist: '', audio: '' });
+          }
+          songs.push({ id: 'exact', name: 'alpha', artist: '', audio: '' });
+          J.State.songs = songs;
+
+          const exactIndex = songs.findIndex(s => s.id === 'exact');
+          const found = await J.findSongForQuery('alpha');
+          return {
+            exactIndex,
+            foundId: found && found.id,
+            exactScore: J.scoreSongForQuery(songs[exactIndex], 'alpha', exactIndex),
+            prefixScore: J.scoreSongForQuery(songs[0], 'alpha', 0)
+          };
+        }
+        """
+    )
+
+    assert result["exactIndex"] == 1001
+    assert result["foundId"] == "exact"
+    # 档间距 1000，位置只在档内并列时起作用，永远不能把精确档压到前缀档以下。
+    assert result["exactScore"] > result["prefixScore"]
+    assert result["exactScore"] > 9000
+
+
+@pytest.mark.frontend
+def test_jukebox_full_teardown_cancels_a_pending_control(mock_page: Page):
+    """Codex P2: a command in flight must not resurrect the runtime after teardown."""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          let releaseConfig;
+          const originalLoad = J.loadSongData;
+          J.loadSongData = async function() {
+            await new Promise(resolve => { releaseConfig = resolve; });
+            return originalLoad.call(this);
+          };
+
+          // 第一条无头指令卡在拉配置里。
+          const pending = J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          while (typeof releaseConfig !== 'function') {
+            await new Promise(resolve => setTimeout(resolve, 0));
+          }
+
+          // 用户此时把点歌台整个拆掉。
+          J.prepareForUnload();
+          const hostAfterTeardown = !!document.getElementById('neko-jukebox-runtime-host');
+
+          releaseConfig();
+          const outcome = await pending.catch(error => ({ ok: false, message: String(error && error.message) }));
+          await new Promise(resolve => setTimeout(resolve, 30));
+
+          J.loadSongData = originalLoad;
+          return {
+            hostAfterTeardown,
+            ok: outcome.ok,
+            // 拆除之后不该有复活的宿主，也不该在放。
+            hostResurrected: !!document.getElementById('neko-jukebox-runtime-host'),
+            isPlaying: J.State.isPlaying,
+            runtimeInitPromise: J.State.runtimeInitPromise === null
+          };
+        }
+        """
+    )
+
+    assert result["hostAfterTeardown"] is False
+    assert result["ok"] is False
+    assert result["hostResurrected"] is False
+    assert result["isPlaying"] is False
+    assert result["runtimeInitPromise"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_reports_failure_when_autoplay_is_blocked(mock_page: Page):
+    """Codex P2: APlayer swallows NotAllowedError and play() returns no promise.
+
+    The control must not report success when nothing is audible.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          const player = J.getPlayer();
+
+          // 模拟自动播放被拦：play() 无返回值，音频回到 paused。
+          player.play = function() { this.audio.paused = true; };
+
+          const blocked = await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          const isPlayingAfterBlocked = J.State.isPlaying;
+
+          // 恢复正常起播行为再验一次，确认没有把正常情况误判成失败。
+          player.play = function() { this.audio.paused = false; this.played = true; };
+          const allowed = await J.executeControl({ action: 'play', query: 'Song 2', headless: true });
+
+          return {
+            blockedOk: blocked.ok,
+            blockedMessage: blocked.message || null,
+            isPlayingAfterBlocked,
+            allowedOk: allowed.ok,
+            current: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    assert result["blockedOk"] is False
+    assert result["isPlayingAfterBlocked"] is False
+    assert result["allowedOk"] is True
+    assert result["current"] == "song2"
