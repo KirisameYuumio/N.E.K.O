@@ -5098,11 +5098,19 @@ class _FakeGameRouteManager:
         self.spoken = []
         self.preloaded = []
         self.preload_render_languages = []
+        self.language_updates = []
+        self.user_language = ""
+        self._user_language_explicit = False
         self.statuses = []
         self.user_activity_count = 0
         self._takeover_active = False
         self._takeover_input_dispatcher = None
         self.render_language_at_mirror = []
+
+    def set_user_language(self, language):
+        self.language_updates.append(language)
+        self.user_language = language
+        self._user_language_explicit = True
 
     async def mirror_user_input(self, text, **kwargs):
         self.mirrored.append((text, kwargs))
@@ -7230,6 +7238,7 @@ async def test_project_speech_preload_is_silent_and_deduplicates_lines(monkeypat
             "lines": ["  开球了  ", "开球了", "看我的"],
             "session_id": "match_1",
             "render_language": "ja",
+            "i18n_language": "ja",
         }),
     )
 
@@ -7241,11 +7250,48 @@ async def test_project_speech_preload_is_silent_and_deduplicates_lines(monkeypat
     # lock, and the audio cache identity is derived from that field, so any
     # concurrent writer would invalidate audio this batch already synthesized.
     assert mgr.preload_render_languages == ["ja"]
+    # And the healing write reaches the shared session only once the batch is
+    # actually about to run -- every refusal above it (unavailable / superseded /
+    # busy) must leave the character's language alone.
+    assert mgr.language_updates == ["ja"]
     # Observed from inside the batch: the shared field is still unwritten.
     assert mgr.render_language_at_mirror == [None]
     assert getattr(mgr, "_conversation_render_language", None) is None
     assert mgr.spoken == []
     assert mgr.assistant_mirrored == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speech_preload_absorbs_language_on_the_route_locked_path(monkeypatch):
+    """The route-locked branch has its own absorb, and it is the one that can be refused.
+
+    With an active route the preload takes the locked branch, where
+    `route_superseded` and `preload_busy` are still ahead of it. The healing
+    write must land there too -- and only there -- or the branch either never
+    heals or heals on a refusal.
+    """
+    mgr = _FakeGameRouteManager()
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+    _gr_patch_all(monkeypatch, "_get_current_character_info", lambda: {"lanlan_name": "Lan"})
+
+    with reset_game_route_state():
+        gr_runtime._activate_game_route("soccer", "match_1", "Lan")
+        result = await gr_runtime.game_project_speech_preload(
+            "soccer",
+            _FakeRequest({
+                "lines": ["开球了"],
+                "session_id": "match_1",
+                "lanlan_name": "Lan",
+                "render_language": "ja",
+                "i18n_language": "ja",
+            }),
+        )
+
+    assert result["ok"] is True
+    assert mgr.preloaded == [["开球了"]]
+    assert mgr.preload_render_languages == ["ja"]
+    assert mgr.language_updates == ["ja"]
 
 
 @pytest.mark.unit
@@ -7839,6 +7885,74 @@ async def test_project_speak_pre_route_rejects_output_while_another_game_owns_th
         # The counter this endpoint increments before its try/finally must not
         # leak, or four rejections wedge the character on ``busy`` forever.
         assert getattr(mgr, "_sdk_game_speech_pending_count", 0) == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_refused_output_requests_do_not_move_the_character_language(monkeypatch):
+    """A request that gets refused must not have moved the shared session first.
+
+    ``_absorb_request_language`` writes ``mgr.user_language``, and it used to run
+    before the ownership fence on every output endpoint. A pre-route line from a
+    game that does not own the character therefore switched the character's
+    language on its way to being refused -- and the winning route then rendered
+    in it. Same shape as the stale ``/route/start`` and the silent preload.
+    """
+    for endpoint, payload_extra in (
+        (gr_runtime.game_project_speak, {}),
+        (gr_runtime.game_project_mirror_assistant, {}),
+    ):
+        with reset_game_route_state():
+            mgr = _LocaleTrackingManager(language="en")
+            _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+            gr_runtime._activate_game_route("badminton", "owner-session", "Lan")
+
+            result = await endpoint(
+                "soccer",
+                _FakeRequest({
+                    "line": "开球了",
+                    "lanlan_name": "Lan",
+                    "i18n_language": "ja",
+                    **payload_extra,
+                }),
+            )
+
+            assert result["reason"] == "route_owned_by_other_game"
+            assert mgr.language_updates == [], endpoint.__name__
+            assert mgr.user_language == "en", endpoint.__name__
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_admitted_output_requests_still_absorb_the_character_language(monkeypatch):
+    """The healing side effect must survive on the path it exists for."""
+    class _SpeakingLocaleManager(_FakeGameRouteManager):
+        def __init__(self):
+            super().__init__()
+            self.user_language = "en"
+            self._user_language_explicit = False
+            self.language_updates = []
+
+        def set_user_language(self, language):
+            self.language_updates.append(language)
+            self.user_language = language
+            self._user_language_explicit = True
+
+    with reset_game_route_state():
+        mgr = _SpeakingLocaleManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({
+                "line": "开球了",
+                "lanlan_name": "Lan",
+                "i18n_language": "ja",
+            }),
+        )
+
+        assert result["ok"] is True
+        assert mgr.language_updates == ["ja"]
 
 
 @pytest.mark.unit

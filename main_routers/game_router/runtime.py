@@ -2892,11 +2892,13 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
             "lanlan_name": lanlan_name,
             "method": "project_text_mirror",
         }
-    _absorb_request_language(data, lanlan_name)
+    # Absorbed under the route lock below, after the ownership fence: this
+    # request can still be refused as route_superseded or
+    # route_owned_by_other_game, and writing mgr.user_language before that lets
+    # a refused pre-route mirror switch the character's language.
     mgr = get_session_manager().get(lanlan_name)
     if not mgr:
         return {"ok": False, "reason": "no_session_manager", "lanlan_name": lanlan_name}
-    _apply_request_render_language(data, mgr)
     event = _attach_game_memory_flag_to_event(
         data.get("event") if isinstance(data.get("event"), dict) else {},
         state,
@@ -2943,6 +2945,9 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
                 "lanlan_name": lanlan_name,
                 "method": "project_text_mirror",
             }
+        # Admitted: this request owns the character's output right now.
+        _absorb_request_language(data, lanlan_name)
+        _apply_request_render_language(data, mgr)
         try:
             result = await asyncio.wait_for(
                 _mirror_game_assistant_text(
@@ -3057,7 +3062,13 @@ async def game_project_speak(game_type: str, request: Request):
             details={"reason": result.get("reason"), "method": "project_tts"},
         )
         return result
-    _absorb_request_language(data, lanlan_name)
+    # NOT absorbed here either: _absorb_request_language() writes
+    # mgr.user_language, and this request can still be rejected below as `busy`,
+    # `route_superseded`, `route_owned_by_other_game` or `stale_session`. A
+    # pre-route line from a game that does not own the character would otherwise
+    # switch the character's language on its way to being refused. Absorbed
+    # under the lock, next to the render-language application, once this request
+    # has actually won the speech slot.
     mgr = get_session_manager().get(lanlan_name)
     if not mgr:
         return {"ok": False, "reason": "no_session_manager", "lanlan_name": lanlan_name}
@@ -3144,6 +3155,7 @@ async def game_project_speak(game_type: str, request: Request):
                 else:
                     # This request now owns the speech slot, so its locale can
                     # no longer be read by another request's synthesis.
+                    _absorb_request_language(data, lanlan_name)
                     _apply_request_render_language(data, mgr)
                     speech_correlation_id = str(
                         data.get("sdk_speech_correlation_id") or ""
@@ -3382,7 +3394,10 @@ async def game_project_speech_preload(game_type: str, request: Request):
             "method": "project_tts_preload",
         }
 
-    _absorb_request_language(data, lanlan_name)
+    # Absorbed just before the batch is created, below: this request can still
+    # be refused as project_tts_preload_unavailable, route_superseded or
+    # preload_busy, and writing mgr.user_language before that lets a refused
+    # preload switch the character's language.
     mgr = get_session_manager().get(lanlan_name)
     if not mgr:
         return {"ok": False, "reason": "no_session_manager", "lanlan_name": lanlan_name}
@@ -3437,12 +3452,14 @@ async def game_project_speech_preload(game_type: str, request: Request):
                     "method": "project_tts_preload",
                     "results": [],
                 }
+            _absorb_request_language(data, lanlan_name)
             preload_task = asyncio.create_task(
                 preload(lines, render_language=preload_render_language)
             )
             raw_route_tasks.add(preload_task)
             route_preload_tasks = raw_route_tasks
     else:
+        _absorb_request_language(data, lanlan_name)
         preload_task = asyncio.create_task(
             preload(lines, render_language=preload_render_language)
         )

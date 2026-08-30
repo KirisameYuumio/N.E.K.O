@@ -867,6 +867,59 @@ async function main() {
   assert(hostProtocolError?.code === 'incompatible_version',
     'an incompatible host-selected protocol was not rejected');
 
+  // Placed last: these connect extra clients, and every assertion above counts
+  // handshakes and protocol messages on the shared transport.
+
+  // The published schema declares minimum/maximum as numbers. `Number()`
+  // coercion accepted a numeric-looking string, and turned `minimum: null` --
+  // an author writing "no minimum" -- into a hard floor of 0, invisible until a
+  // payload was rejected against a bound nobody declared.
+  for (const badLimit of ['5', null, true, []]) {
+    let badLimitError = null;
+    try {
+      await window.NekoMiniGame.connect({
+        id: 'limit-type-test',
+        version: '1.0.0',
+        requiredCapabilities: ['runtime', 'logging'],
+        contracts: {
+          events: {
+            'round-count': {
+              type: 'object',
+              properties: { round: { type: 'integer', minimum: badLimit } },
+              required: ['round'],
+            },
+          },
+        },
+      }, { transport });
+    } catch (error) { badLimitError = error; }
+    assert(badLimitError?.code === 'invalid_manifest',
+      `a non-number minimum (${JSON.stringify(badLimit)}) was coerced instead of rejected`);
+  }
+
+  // Declared property names are bounded at 64 in the published schema, where
+  // JSON Schema counts CODE POINTS. `name.length` charged two per astral
+  // character, so the runtime was stricter than its own published contract.
+  const astralName = 'gg' + '🎮'.repeat(32);
+  assert(astralName.length > 64 && [...astralName].length <= 64,
+    'the astral fixture no longer straddles the UTF-16 and code-point bounds');
+  const astralGame = await window.NekoMiniGame.connect({
+    id: 'astral-name-test',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+    contracts: {
+      events: {
+        'astral-event': {
+          type: 'object',
+          properties: { [astralName]: { type: 'integer' } },
+          required: [astralName],
+        },
+      },
+    },
+  }, { transport });
+  assert(astralGame.manifest.contracts.events['astral-event'].properties[astralName],
+    'a 34-code-point property name was rejected by a 64-code-point bound');
+  astralGame.dispose();
+
   process.stdout.write('mini-game SDK runtime test passed\n');
 }
 

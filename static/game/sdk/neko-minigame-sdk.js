@@ -298,17 +298,22 @@
       schema.enum = Object.freeze(values);
     }
     if (type === 'number' || type === 'integer') {
+      // `typeof`, not `Number()`: the published schema declares these as
+      // numbers, and coercing meant `minimum: '5'` was silently accepted while
+      // `minimum: null` became a hard floor of 0 -- the opposite of what an
+      // author writing "no minimum" meant, and invisible until a payload was
+      // rejected against a bound nobody declared.
       if (input.minimum !== undefined) {
-        if (!Number.isFinite(Number(input.minimum))) {
-          fail('invalid_manifest', `${fieldName}.minimum must be finite`);
+        if (typeof input.minimum !== 'number' || !Number.isFinite(input.minimum)) {
+          fail('invalid_manifest', `${fieldName}.minimum must be a finite number`);
         }
-        schema.minimum = Number(input.minimum);
+        schema.minimum = input.minimum;
       }
       if (input.maximum !== undefined) {
-        if (!Number.isFinite(Number(input.maximum))) {
-          fail('invalid_manifest', `${fieldName}.maximum must be finite`);
+        if (typeof input.maximum !== 'number' || !Number.isFinite(input.maximum)) {
+          fail('invalid_manifest', `${fieldName}.maximum must be a finite number`);
         }
-        schema.maximum = Number(input.maximum);
+        schema.maximum = input.maximum;
       }
       if (schema.minimum !== undefined && schema.maximum !== undefined && schema.minimum > schema.maximum) {
         fail('invalid_manifest', `${fieldName}.minimum must not exceed maximum`);
@@ -341,8 +346,11 @@
       }
       const properties = {};
       for (const [name, child] of entries) {
+        // Code points, matching the published schema's `maxLength` (JSON Schema
+        // counts code points) -- `name.length` charged two per astral character,
+        // so the runtime was stricter than the contract it publishes.
         if (
-          !name || name.length > 64
+          !name || [...name].length > 64
           || name === '__proto__' || name === 'prototype' || name === 'constructor'
         ) {
           fail('invalid_manifest', `${fieldName}.properties contains an invalid field`, { name });
@@ -2178,10 +2186,25 @@
       return payload == null ? {} : payload;
     }
 
+    function runtimeRouteInstanceEntropy() {
+      // Without this the fallback is `${Date.now()}-${sequence}`, and every SDK
+      // client starts its sequence at 1: two windows opening in the same
+      // millisecond mint the SAME generation, and the server cannot tell them
+      // apart -- one route silently supersedes or answers for the other.
+      const cryptoImpl = windowImpl.crypto || globalThis.crypto;
+      const values = cryptoImpl?.getRandomValues?.(new Uint32Array(2));
+      if (values) return `${values[0].toString(36)}${values[1].toString(36)}`;
+      return `${Math.floor(Math.random() * 0xffffffff).toString(36)}`
+        + `${Math.floor(Math.random() * 0xffffffff).toString(36)}`;
+    }
+
     function nextRuntimeRouteInstanceId() {
       runtimeRouteInstanceSequence = (runtimeRouteInstanceSequence % Number.MAX_SAFE_INTEGER) + 1;
       const randomId = windowImpl.crypto?.randomUUID?.();
-      return String(randomId || `${Date.now().toString(36)}-${runtimeRouteInstanceSequence.toString(36)}`);
+      return String(randomId || (
+        `${Date.now().toString(36)}-${runtimeRouteInstanceSequence.toString(36)}`
+        + `-${runtimeRouteInstanceEntropy()}`
+      ));
     }
 
     function rememberRuntimeRouteInstanceId(routeInstanceId) {

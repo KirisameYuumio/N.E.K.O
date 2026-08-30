@@ -1001,6 +1001,55 @@ async function main() {
   )).length === 2, 'a handler that settled normally was reported as exceeding the budget');
   stuckGame.dispose();
 
+  // Without crypto.randomUUID the generation id falls back to
+  // `${Date.now()}-${sequence}`, and every SDK client starts its sequence at 1.
+  // Two windows opening in the same millisecond therefore minted the SAME
+  // generation, and the server cannot tell them apart -- one route silently
+  // supersedes or answers for the other.
+  const realDateNow = Date.now;
+  const collisionStarts = [];
+  const collisionTransport = {
+    ...transport,
+    logger: logger(),
+    resetRuntime() { return { sessionId: 'collision-session', characterName: '' }; },
+    getRuntimeState() { return { sessionId: 'collision-session', characterName: '' }; },
+    applyRuntimeState() { return { sessionId: 'collision-session', characterName: '' }; },
+    async start(payload) {
+      collisionStarts.push(payload.sdk_route_instance_id);
+      return { ok: true, state: { game_route_active: true, lanlan_name: 'Yui' }, payload };
+    },
+    async heartbeat() { return { ok: true, active: true }; },
+    async drain() { return { ok: true, outputs: [] }; },
+    async end() { return { ok: true }; },
+    dispose() {},
+  };
+  try {
+    // Same millisecond for every client, and no randomUUID anywhere.
+    Date.now = () => 1700000000000;
+    for (let client = 0; client < 4; client += 1) {
+      const collisionEnvironment = createEnvironment();
+      const collisionGame = await window.NekoMiniGame.connect({
+        id: 'lifecycle-generation-collision',
+        version: '1.0.0',
+        requiredCapabilities: ['runtime', 'logging'],
+      }, {
+        transport: collisionTransport,
+        windowImpl: collisionEnvironment.windowImpl,
+        documentImpl: collisionEnvironment.documentImpl,
+      });
+      collisionGame.runtime.configure({ heartbeat: false, outputs: false, pageExit: false });
+      await collisionGame.runtime.start({ client });
+      await collisionGame.runtime.end({ reason: 'collision-probe' });
+      collisionGame.dispose();
+    }
+  } finally {
+    Date.now = realDateNow;
+  }
+  assert(collisionStarts.length === 4 && collisionStarts.every(Boolean),
+    'the generation collision probe did not mint four ids');
+  assert(new Set(collisionStarts).size === 4,
+    `separate SDK clients minted colliding route generations: ${JSON.stringify(collisionStarts)}`);
+
   process.stdout.write('mini-game lifecycle runtime test passed\n');
 }
 
