@@ -4395,3 +4395,42 @@ def test_jukebox_loader_discovers_and_forwards_to_the_owner(mock_page: Page):
     assert result["forwarded"] == {"ok": True, "action": "next", "via": "owner"}
     assert result["afterGone"] is False
     assert result["partsLoaded"] is False
+
+
+@pytest.mark.frontend
+def test_jukebox_standalone_bootstrap_starts_the_control_owner_service(mock_page: Page):
+    """#4 call site: owning the player is worthless if nobody announces it.
+
+    The service itself is covered elsewhere; this pins that
+    jukebox-standalone.js actually starts it, and only in the standalone window.
+    """
+    standalone_source = (REPO_ROOT / "static" / "jukebox" / "jukebox-standalone.js").read_text(
+        encoding="utf-8"
+    )
+
+    result = mock_page.evaluate(
+        """
+        (source) => {
+          const run = (isStandalone) => {
+            const calls = [];
+            window.__NEKO_JUKEBOX_STANDALONE__ = isStandalone;
+            window.Jukebox = {
+              startControlOwnerService: () => { calls.push('started'); return true; }
+            };
+            try {
+              new Function(source)();
+            } catch (error) {
+              return { calls, error: String(error && error.message || error) };
+            }
+            return { calls, error: null };
+          };
+          return { standalone: run(true), embedded: run(false) };
+        }
+        """,
+        standalone_source,
+    )
+
+    assert result["standalone"]["error"] is None
+    assert result["standalone"]["calls"] == ["started"]
+    # 嵌在角色窗口里的点歌台不是拥有者，绝不能去抢这个身份。
+    assert result["embedded"]["calls"] == []
