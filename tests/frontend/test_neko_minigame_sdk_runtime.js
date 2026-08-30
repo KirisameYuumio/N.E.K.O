@@ -1043,6 +1043,22 @@ async function main() {
   assert(coercedMaxEntriesError?.code === 'invalid_manifest',
     'a coerced leaderboard maxEntries was accepted instead of rejected');
 
+  // The schema applies its capability pattern to the string the manifest
+  // actually declares, so `' logging '` is schema-invalid -- while trimming
+  // first silently rewrote it into a real permission request.
+  for (const padded of [' logging', 'logging ', ' runtime ']) {
+    let paddedCapabilityError = null;
+    try {
+      await window.NekoMiniGame.connect({
+        id: 'padded-capability-test',
+        version: '1.0.0',
+        requiredCapabilities: [padded],
+      }, { transport });
+    } catch (error) { paddedCapabilityError = error; }
+    assert(paddedCapabilityError?.code === 'invalid_manifest',
+      `a whitespace-padded capability (${JSON.stringify(padded)}) was trimmed into a real one`);
+  }
+
   // `required` entries are property NAMES and the schema types them as strings;
   // String(1) matched a property literally named "1".
   let numericRequiredError = null;

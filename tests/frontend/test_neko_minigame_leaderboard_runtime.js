@@ -30,6 +30,7 @@ function createTransport({ server = false, shared = null } = {}) {
   const serverCalls = [];
   let storagePending = false;
   let storagePendingOperation = '';
+  let storageGetFailure = null;
   let lockPending = false;
   let runtimeState = { sessionId: 'leaderboard-session', characterName: 'Yui' };
 
@@ -69,6 +70,10 @@ function createTransport({ server = false, shared = null } = {}) {
     requestGameStorage(operation, payload, options = {}) {
       if (storagePending || storagePendingOperation === operation) return pendingRequest(options);
       if (operation === 'get') {
+        // A transport that reports failure by RETURNING a non-OK response
+        // instead of throwing -- indistinguishable from "no board yet" unless
+        // the reader looks at ok/status.
+        if (storageGetFailure) return Promise.resolve(storageGetFailure);
         return Promise.resolve(values.has(payload.key)
           ? { ok: true, found: true, value: values.get(payload.key) }
           : { ok: true, found: false });
@@ -135,6 +140,7 @@ function createTransport({ server = false, shared = null } = {}) {
     serverCalls,
     setStoragePending(value) { storagePending = value; },
     setStoragePendingOperation(value) { storagePendingOperation = String(value || ''); },
+    setStorageGetFailure(value) { storageGetFailure = value; },
     setLockPending(value) { lockPending = value; },
   };
 }
@@ -221,6 +227,73 @@ async function main() {
     } catch (error) { reservedError = error; }
     assert(reservedError?.code === 'invalid_manifest',
       `a board declared with scoreField "${reservedScoreField}" connected but can never accept a submission`);
+  }
+
+  // The declared score field must BE a number: Number(null)/Number(false)/
+  // Number('') are all 0, so malformed entries used to be persisted and ranked
+  // as legitimate zeroes.
+  for (const badScore of [null, false, '', '10', undefined]) {
+    let badScoreError = null;
+    try { await game.leaderboard.local.submit('main', { score: badScore, mode: 'duel' }); }
+    catch (error) { badScoreError = error; }
+    assert(badScoreError !== null,
+      `a non-numeric score (${JSON.stringify(badScore)}) was coerced instead of rejected`);
+    assert(['invalid_request', 'invalid_contract'].includes(badScoreError.code),
+      `a non-numeric score (${JSON.stringify(badScore)}) failed with an unexpected code: ${badScoreError.code}`);
+  }
+  const ranksAfterBadScores = await game.leaderboard.local.list('main', { sort: 'rank', limit: 10 });
+  assert(ranksAfterBadScores.data.entries.map((entry) => entry.score).join(',') === '40,30,20',
+    'a rejected entry still reached the board');
+
+  // `order` / `retention` default only when ABSENT: `|| 'descending'` also
+  // swallowed an explicit null/''/false, so a schema-invalid manifest ran with
+  // configuration its author never declared.
+  for (const [field, badValue] of [
+    ['order', null], ['order', ''], ['retention', false], ['retention', 0],
+  ]) {
+    const badManifest = manifest(['leaderboard-local']);
+    badManifest.leaderboards = {
+      main: { scoreField: 'score', order: 'descending', maxEntries: 3, retention: 'recent' },
+    };
+    badManifest.leaderboards.main[field] = badValue;
+    let badModeError = null;
+    try {
+      await window.NekoMiniGame.connect(badManifest, { transport: createTransport().transport });
+    } catch (error) { badModeError = error; }
+    assert(badModeError?.code === 'invalid_manifest',
+      `an explicitly falsey ${field} (${JSON.stringify(badValue)}) was replaced by the default`);
+  }
+
+  // A failed read is not an empty board. Treating it as one meant a subsequent
+  // submit wrote a replacement holding ONLY the new entry -- one transient read
+  // failure erased the whole leaderboard.
+  for (const failureShape of [{ ok: false, error: 'storage_unavailable' }, { ok: true, error: 'x' }]) {
+    const failHost = createTransport();
+    const failGame = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+      transport: failHost.transport,
+    });
+    await failGame.leaderboard.local.submit('main', { score: 42, mode: 'duel' });
+    const storedBefore = JSON.stringify(failHost.values.get('leaderboards/main'));
+    assert(storedBefore && storedBefore.includes('42'),
+      'the read-failure probe did not seed a board first');
+    // `{ok:true, error}` is the control: it is NOT a failure, so it must behave
+    // exactly as today and is what keeps the assertion below from passing for
+    // the wrong reason.
+    failHost.setStorageGetFailure(failureShape);
+    let readFailureError = null;
+    try { await failGame.leaderboard.local.submit('main', { score: 7, mode: 'duel' }); }
+    catch (error) { readFailureError = error; }
+    if (failureShape.ok === false) {
+      assert(readFailureError !== null,
+        'a failed leaderboard read was treated as an empty board');
+      assert(JSON.stringify(failHost.values.get('leaderboards/main')) === storedBefore,
+        'a failed leaderboard read let a submit overwrite the existing board');
+    } else {
+      assert(readFailureError === null,
+        'a successful read carrying an unrelated error field was rejected');
+    }
+    failHost.setStorageGetFailure(null);
+    failGame.dispose();
   }
 
   const bulkHost = createTransport();

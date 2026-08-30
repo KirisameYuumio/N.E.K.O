@@ -226,7 +226,10 @@
       if (typeof item !== 'string') {
         fail('invalid_manifest', `${fieldName} entries must be strings`, { entry: item });
       }
-      const capability = item.trim();
+      // The ORIGINAL string, untrimmed: the schema applies its pattern to what
+      // the manifest actually declares, so `' logging '` is schema-invalid --
+      // while trimming first silently rewrote it into a real permission request.
+      const capability = item;
       if (!CAPABILITY_PATTERN.test(capability)) {
         fail('invalid_manifest', `Invalid capability in ${fieldName}`, { capability });
       }
@@ -493,11 +496,19 @@
         // letter -- but the rule is stated in full so it reads as one set.)
         fail('invalid_manifest', `manifest.leaderboards.${boardId}.scoreField is invalid`);
       }
-      const order = String(rawDefinition.order || 'descending').trim();
+      // Default only an ABSENT value. `|| 'descending'` also swallowed an
+      // explicit `null` / `''` / `false`, so a manifest the schema rejects (it
+      // allows only the named enum strings) ran with configuration its author
+      // never declared.
+      const order = rawDefinition.order === undefined
+        ? 'descending'
+        : String(rawDefinition.order).trim();
       if (!['ascending', 'descending'].includes(order)) {
         fail('invalid_manifest', `manifest.leaderboards.${boardId}.order is unsupported`);
       }
-      const retention = String(rawDefinition.retention || 'recent').trim();
+      const retention = rawDefinition.retention === undefined
+        ? 'recent'
+        : String(rawDefinition.retention).trim();
       if (!['best', 'recent'].includes(retention)) {
         fail('invalid_manifest', `manifest.leaderboards.${boardId}.retention is unsupported`);
       }
@@ -928,7 +939,12 @@
   function normalizeLeaderboardEntryData(value, definition, fieldName = 'leaderboard entry') {
     if (!plainObject(value)) fail('invalid_request', `${fieldName} must be an object`);
     const data = normalizeBoundedJson(value, fieldName, MAX_LEADERBOARD_ENTRY_BYTES);
-    const score = Number(data[definition.scoreField]);
+    // The declared score field must BE a number. `Number(null)`, `Number(false)`
+    // and `Number('')` are all 0, so a malformed entry used to be persisted and
+    // ranked as a legitimate zero instead of rejected -- and the server facade
+    // forwards the original non-numeric value on past this same check.
+    const rawScore = data[definition.scoreField];
+    const score = typeof rawScore === 'number' ? rawScore : Number.NaN;
     if (!Number.isFinite(score) || Math.abs(score) > 1e12) {
       fail('invalid_request', `${fieldName}.${definition.scoreField} must be a finite score`);
     }
@@ -3658,6 +3674,18 @@
 
     async function readLocalLeaderboard(boardId, definition, requestOptions = {}) {
       const response = await requestLocalLeaderboardStorage('get', boardId, {}, requestOptions);
+      // A transport that reports failure by RETURNING a non-OK response instead
+      // of throwing used to look identical to "no board yet": `found` is simply
+      // absent either way. The caller then wrote a replacement holding only the
+      // new entry, so one transient read failure erased the whole board. A read
+      // that did not succeed is not an empty board.
+      if (response.ok === false || response.data?.ok === false) {
+        fail('request_failed', 'The local leaderboard could not be read', {
+          operation: 'leaderboard.local.read',
+          boardId,
+          status: response.status,
+        });
+      }
       const value = response.data?.found === true ? response.data.value : null;
       return normalizeStoredLeaderboardState(value, definition);
     }
