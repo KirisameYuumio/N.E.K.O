@@ -21,6 +21,10 @@ def _volume_argument_error(action: str, value: Any) -> str | None:
     """
     if value is None or value == "":
         return f"INVALID_ARGUMENT: {action} requires a numeric value"
+    # bool 是 int 的子类，float(True) == 1.0 会一路放行，前端的 Number(true) 又把它
+    # 读成 1，于是 set_volume=true 悄悄变成 1%。显式挡掉。
+    if isinstance(value, bool):
+        return f"INVALID_ARGUMENT: {action} value must be a number, not a boolean"
     try:
         number = float(value)
     except (TypeError, ValueError):

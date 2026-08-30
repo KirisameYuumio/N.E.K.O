@@ -390,6 +390,10 @@ def test_jukebox_plugin_rejects_incomplete_action_arguments():
         ("set_volume", {"value": "loud"}),
         ("set_volume", {"value": 140}),
         ("set_volume", {"value": -1}),
+        # bool 是 int 的子类：float(True) == 1.0 会骗过纯数值校验。
+        ("set_volume", {"value": True}),
+        ("set_volume", {"value": False}),
+        ("adjust_volume", {"value": True}),
         ("adjust_volume", {}),
         ("adjust_volume", {"value": None}),
         ("adjust_volume", {"value": -140}),
