@@ -515,7 +515,13 @@
           && typeof rawDefinition.scoreField !== 'string') {
         fail('invalid_manifest', `manifest.leaderboards.${boardId}.scoreField must be a string`);
       }
-      const scoreField = String(rawDefinition.scoreField || 'score').trim();
+      // Only an ABSENT value defaults, and the declared name is checked as
+      // written: `''` is schema-invalid yet silently became the default board
+      // field, and `' score '` was trimmed into a real field the manifest never
+      // declared. Same rule as the other pattern-constrained fields.
+      const scoreField = rawDefinition.scoreField === undefined
+        ? 'score'
+        : rawDefinition.scoreField;
       if (!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(scoreField)
           || scoreField === 'prototype' || scoreField === 'constructor') {
         // The clone every entry passes through forbids these property names, so
@@ -969,7 +975,14 @@
 
   function leaderboardDefinition(manifest, boardIdInput, operation) {
     const boardId = String(boardIdInput || '').trim();
-    const definition = manifest.leaderboards[boardId];
+    // Own properties only: `manifest.leaderboards` is a plain object, so a
+    // board id of `constructor` (or `toString`, ...) resolved to the inherited
+    // Object.prototype member -- truthy, so an undeclared board passed this
+    // check and every field read off that "definition" was nonsense.
+    const declared = Object.prototype.hasOwnProperty.call(
+      manifest.leaderboards, boardId,
+    );
+    const definition = declared ? manifest.leaderboards[boardId] : undefined;
     if (!definition) {
       fail('invalid_request', 'Leaderboard board is not declared by the game manifest', {
         operation,

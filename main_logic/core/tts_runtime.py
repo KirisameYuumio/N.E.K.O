@@ -541,7 +541,16 @@ class TtsRuntimeMixin:
 
     @staticmethod
     def _normalize_game_speech_preload_text(clean_text: str, *, normalize_spaces: bool) -> str:
-        text = replace_blank(clean_text) if normalize_spaces else clean_text
+        # Gated on contains_chinese exactly like normalize_text() below, which
+        # is what the real speak path runs. replace_blank drops every ASCII
+        # space whose neighbour is non-ASCII, so applying it unconditionally
+        # glued Korean/Cyrillic/Thai words together -- and produced cached audio
+        # that differs from what the same line would sound like when spoken.
+        text = (
+            replace_blank(clean_text)
+            if normalize_spaces and contains_chinese(clean_text)
+            else clean_text
+        )
         markdown = TtsMarkdownStripper()
         bracket = TtsBracketStripper()
         markdown_output = markdown.feed(text) + markdown.flush()

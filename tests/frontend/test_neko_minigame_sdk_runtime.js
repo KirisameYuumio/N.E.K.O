@@ -1157,7 +1157,7 @@ async function main() {
     contracts: { events: { 'no-fields': { type: 'object' } } },
   }, { transport });
   assert(!!absentFieldClient, 'absent contract properties/required stopped connecting');
-  await absentFieldClient.disconnect?.();
+  absentFieldClient.dispose();
 
   // The schema bounds enum SHORTHAND items at maxLength 4096; the expanded
   // `enum` form carries no such bound, so converting first dropped it.

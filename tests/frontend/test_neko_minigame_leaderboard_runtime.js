@@ -349,6 +349,53 @@ async function main() {
       `a padded ${field} (${JSON.stringify(padded)}) was trimmed into a real mode`);
   }
 
+  // scoreField followed the same `|| default` + trim shape one line above the
+  // modes: `''` is schema-invalid yet became the default field, and
+  // `' score '` was trimmed into a field the manifest never declared.
+  for (const badScoreField of ['', ' score ', 'score ']) {
+    const scoreFieldManifest = manifest(['leaderboard-local']);
+    scoreFieldManifest.leaderboards = {
+      main: {
+        scoreField: badScoreField, order: 'descending', maxEntries: 3, retention: 'recent',
+      },
+    };
+    let scoreFieldError = null;
+    try {
+      await window.NekoMiniGame.connect(scoreFieldManifest, {
+        transport: createTransport().transport,
+      });
+    } catch (error) { scoreFieldError = error; }
+    assert(scoreFieldError?.code === 'invalid_manifest',
+      `a rewritten scoreField (${JSON.stringify(badScoreField)}) was accepted`);
+  }
+  // Control: ABSENT still defaults to 'score', otherwise the three assertions
+  // above are satisfied by an implementation that dropped the default entirely.
+  const defaultScoreFieldManifest = manifest(['leaderboard-local']);
+  defaultScoreFieldManifest.leaderboards = {
+    main: { order: 'descending', maxEntries: 3, retention: 'recent' },
+  };
+  const defaultScoreFieldGame = await window.NekoMiniGame.connect(
+    defaultScoreFieldManifest, { transport: createTransport().transport },
+  );
+  const defaultScoreFieldResult = await defaultScoreFieldGame.leaderboard.local.submit(
+    'main', { score: 11, mode: 'duel' },
+  );
+  assert(defaultScoreFieldResult.ok, 'an absent scoreField stopped defaulting to score');
+  defaultScoreFieldGame.dispose();
+
+  // `manifest.leaderboards` is a plain object, so an undeclared board named
+  // after an Object.prototype member resolved to the INHERITED value -- truthy,
+  // so the "declared by the manifest" check passed and every field was then
+  // read off Object.prototype.constructor.
+  for (const inheritedBoardId of ['constructor', 'toString', 'valueOf']) {
+    let inheritedBoardError = null;
+    try {
+      await game.leaderboard.local.list(inheritedBoardId, { sort: 'rank', limit: 1 });
+    } catch (error) { inheritedBoardError = error; }
+    assert(inheritedBoardError?.code === 'invalid_request',
+      `an inherited property (${inheritedBoardId}) passed as a declared board`);
+  }
+
   // The dual of the read guard: a failed WRITE reported by return value used to
   // resolve, and submit() then built its success result from the in-memory
   // state -- telling the game its entry was retained and ranked while nothing

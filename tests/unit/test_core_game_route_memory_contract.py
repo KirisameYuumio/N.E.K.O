@@ -4363,3 +4363,32 @@ async def test_focus_pulse_is_cleared_when_its_own_send_is_cancelled(monkeypatch
     session.stream_text.assert_not_awaited()
     # 关键：亮起之后必须有一次熄灭，否则气泡一直卡着。
     assert pulses == [True, False]
+
+
+@pytest.mark.unit
+def test_game_speech_preload_glues_spaces_only_for_chinese_text():
+    """The preload path must normalize spaces the way the speak path does.
+
+    ``replace_blank`` drops every ASCII space whose neighbour is non-ASCII, so
+    running it unconditionally glued Korean/Cyrillic/Thai words together --
+    scripts that separate words WITH those spaces. ``normalize_text``, which is
+    what the real speak path runs, gates it on ``contains_chinese``; preload has
+    to match or the cached audio differs from the spoken line.
+    """
+
+    normalize = core_module.LLMSessionManager._normalize_game_speech_preload_text
+
+    # Scripts that are non-ASCII but space-delimited keep their word boundaries.
+    assert normalize("안녕하세요 여러분", normalize_spaces=True) == (
+        "안녕하세요 여러분"
+    )
+    assert normalize("Привет мир", normalize_spaces=True) == (
+        "Привет мир"
+    )
+
+    # The artifact this normalization exists for is still removed, so the guard
+    # above cannot be satisfied by simply dropping the normalization.
+    assert normalize("你 好 世 界", normalize_spaces=True) == "你好世界"
+
+    # And the ws_bistream providers still opt out of it entirely.
+    assert normalize("你 好", normalize_spaces=False) == "你 好"
