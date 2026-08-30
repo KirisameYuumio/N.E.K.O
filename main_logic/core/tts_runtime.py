@@ -1689,6 +1689,11 @@ class TtsRuntimeMixin:
             audio_sent = bool(chunks)
             async with self._ensure_audio_frame_send_lock():
                 for tts_audio in chunks:
+                    if websocket is not self.websocket:
+                        logger.warning(
+                            f"⚠️ send_cached_speech_batch aborted: websocket replaced mid-batch, speech_id={speech_id}"
+                        )
+                        return False, False
                     header = self._audio_chunk_header(speech_id)
                     await self._write_audio_frame(websocket, header, tts_audio)
                     self._speech_output_total += 1
@@ -1701,6 +1706,11 @@ class TtsRuntimeMixin:
                 correlation_id = self._game_speech_correlation_for(speech_id)
                 if correlation_id:
                     done_message["sdk_speech_correlation_id"] = correlation_id
+                if websocket is not self.websocket:
+                    logger.warning(
+                        f"⚠️ send_cached_speech_batch terminal signal skipped: websocket replaced, speech_id={speech_id}"
+                    )
+                    return audio_sent, False
                 await websocket.send_json(done_message)
             return audio_sent, True
         except WebSocketDisconnect:
@@ -1727,6 +1737,16 @@ class TtsRuntimeMixin:
                 effective_speech_id = speech_id if speech_id is not None else self.current_speech_id
                 header = self._audio_chunk_header(effective_speech_id)
                 async with self._ensure_audio_frame_send_lock():
+                    if websocket is not self.websocket:
+                        # Reconnect/teardown landed while this call was queued for
+                        # the frame lock. The pin above keeps the frame whole; it
+                        # cannot make a retired socket the right destination.
+                        # Writing it there delivers to nobody and hides the loss
+                        # from the caller, so report it instead.
+                        logger.warning(
+                            f"⚠️ send_speech skipped: websocket replaced while waiting for the frame lock, speech_id={effective_speech_id}"
+                        )
+                        return False
                     await self._write_audio_frame(websocket, header, tts_audio)
                 logger.debug(f"🔊 send_speech OK: {len(tts_audio)} bytes, speech_id={effective_speech_id}")
                 self._speech_output_total += 1
@@ -1776,6 +1796,11 @@ class TtsRuntimeMixin:
                 if correlation_id:
                     message["sdk_speech_correlation_id"] = correlation_id
                 async with self._ensure_audio_frame_send_lock():
+                    if websocket is not self.websocket:
+                        logger.warning(
+                            f"⚠️ send_audio_done skipped: websocket replaced while waiting for the frame lock, speech_id={speech_id}"
+                        )
+                        return False
                     await websocket.send_json(message)
                 logger.debug(f"🔚 send_audio_done OK: speech_id={speech_id}")
                 return True

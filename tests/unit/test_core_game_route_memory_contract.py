@@ -4568,3 +4568,66 @@ async def test_cached_replay_is_not_interleaved_by_a_concurrent_stream():
     # The concurrent frame really did go out, so the assertion above cannot be
     # satisfied by a probe where nothing competed with the batch.
     assert labels.count("live") == 2, labels
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_reconnect_while_queued_for_the_frame_lock_drops_the_frame():
+    """Pinning keeps a frame whole; it cannot make a retired socket the right one.
+
+    The existing sibling test covers a swap that lands AFTER ``send_json`` has
+    already started. This one covers the other window: a call that pinned the
+    live socket, then waited for the frame lock while reconnect replaced it.
+    Writing there delivers to nobody and would hide the loss from the caller.
+    """
+
+    class _ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    class _RecordingWebsocket:
+        client_state = _ConnectedState()
+
+        def __init__(self, name, before_first_send=None):
+            self.name = name
+            self.received: list[str] = []
+            self._before_first_send = before_first_send
+
+        async def send_json(self, payload):
+            hook, self._before_first_send = self._before_first_send, None
+            if hook is not None:
+                # Yield BEFORE swapping so the queued caller has already pinned
+                # this socket; the swap then happens while it waits for the lock.
+                await asyncio.sleep(0)
+                hook()
+            self.received.append(f"header:{payload.get('speech_id')}")
+
+        async def send_bytes(self, data):
+            self.received.append(f"payload:{data.decode()}")
+
+    mgr = _make_manager()
+    replacement = _RecordingWebsocket("replacement")
+    live = _RecordingWebsocket(
+        "live", before_first_send=lambda: setattr(mgr, "websocket", replacement),
+    )
+    mgr.websocket = live
+    mgr._game_speech_correlation_for = lambda _speech_id: ""
+    mgr.speech_playback_gain = lambda _speech_id: 1.0
+    mgr._speech_output_total = 0
+    mgr._last_speech_output_time = 0.0
+    mgr._last_speech_output_bytes = 0
+
+    holder, queued = await asyncio.gather(
+        core_module.LLMSessionManager.send_speech(mgr, b"first", speech_id="first"),
+        core_module.LLMSessionManager.send_speech(mgr, b"second", speech_id="second"),
+    )
+
+    assert holder is True
+    assert queued is False, "a frame was written to a socket that had been replaced"
+    assert live.received == ["header:first", "payload:first"], live.received
+    assert replacement.received == [], replacement.received
+    # The swap really happened and the second call really did pin the old socket,
+    # so the assertion above cannot pass by the probe never racing at all.
+    assert mgr.websocket is replacement
