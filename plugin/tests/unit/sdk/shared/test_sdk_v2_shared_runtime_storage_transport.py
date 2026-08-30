@@ -8,14 +8,14 @@ from pathlib import Path
 import pytest
 
 from plugin.sdk.shared import runtime, storage, transport
+from plugin.sdk.shared.models import Ok
+from plugin.sdk.shared.models.exceptions import TransportError
 from plugin.sdk.shared.runtime import call_chain
-from plugin.sdk.shared.runtime import memory as runtime_memory
 from plugin.sdk.shared.runtime import system_info
 from plugin.sdk.shared.storage import database
 from plugin.sdk.shared.storage import state
 from plugin.sdk.shared.storage import store
 from plugin.sdk.shared.transport import message_plane
-from plugin.sdk.shared.models.exceptions import InvalidArgumentError, TransportError
 
 
 class _Ctx:
@@ -99,7 +99,6 @@ def test_storage_extended_types_contains_supported_types() -> None:
 
 
 def test_runtime_contract_inits_construct() -> None:
-    assert runtime_memory.MemoryClient(plugin_ctx=object()) is not None
     assert system_info.SystemInfo(plugin_ctx=object()) is not None
     assert message_plane.MessagePlaneTransport() is not None
 
@@ -155,10 +154,6 @@ async def test_async_call_chain_isolated_per_task() -> None:
     assert seen["p2:after_yield"] == ["p2.entry:run"]
     assert (await async_chain.get_current_chain()).unwrap() == []
 
-    mem = runtime_memory.MemoryClient(object())
-    assert (await mem.query("bucket", "q")).is_err()
-    assert (await mem.get("bucket")).is_err()
-
     sys_info_client = system_info.SystemInfo(object())
     assert (await sys_info_client.get_system_config()).is_err()
     assert (await sys_info_client.get_python_env()).is_ok()
@@ -169,6 +164,83 @@ async def test_async_call_chain_isolated_per_task() -> None:
     assert (await plane.publish("topic", {})).is_ok()
     assert (await plane.subscribe("topic", handler=lambda payload: payload)).is_ok()
     assert (await plane.unsubscribe("topic")).is_ok()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_reason", "expected_reason"),
+    [
+        ("backpressure", "backpressure"),
+        ({"private": "must-not-propagate"}, "transport_error"),
+    ],
+)
+async def test_message_plane_transport_propagates_local_submission_rejection(
+    raw_reason: object,
+    expected_reason: str,
+) -> None:
+    class _RejectedContext:
+        def push_message(self, **_kwargs: object) -> dict[str, object]:
+            return {"submitted": False, "reason": raw_reason}
+
+    seen: list[dict[str, object]] = []
+
+    async def _handler(payload: dict[str, object]) -> object:
+        seen.append(payload)
+        return Ok(None)
+
+    plane = message_plane.MessagePlaneTransport(
+        plugin_ctx=_RejectedContext(),  # type: ignore[arg-type]
+    )
+    assert (await plane.subscribe("topic", _handler)).is_ok()
+
+    result = await plane.publish("topic", {"value": 1})
+
+    assert result.is_err()
+    error = result.err()
+    assert isinstance(error, TransportError)
+    assert error.code == "message_submission_failed"
+    assert error.context["reason"] == expected_reason
+    assert "must-not-propagate" not in str(error)
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_message_plane_transport_runs_handlers_after_local_submission() -> None:
+    class _SubmittedContext:
+        def push_message(self, **_kwargs: object) -> dict[str, object]:
+            return {"submitted": True}
+
+    seen: list[dict[str, object]] = []
+
+    async def _handler(payload: dict[str, object]) -> object:
+        seen.append(payload)
+        return Ok(None)
+
+    plane = message_plane.MessagePlaneTransport(
+        plugin_ctx=_SubmittedContext(),  # type: ignore[arg-type]
+    )
+    assert (await plane.subscribe("topic", _handler)).is_ok()
+
+    result = await plane.notify("topic", {"value": 1})
+
+    assert result.is_ok()
+    assert seen == [{"value": 1}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_result", [None, {"ok": True}])
+async def test_message_plane_transport_preserves_legacy_unconfirmed_success(
+    legacy_result: object,
+) -> None:
+    class _LegacyContext:
+        def push_message(self, **_kwargs: object) -> object:
+            return legacy_result
+
+    plane = message_plane.MessagePlaneTransport(
+        plugin_ctx=_LegacyContext(),  # type: ignore[arg-type]
+    )
+
+    assert (await plane.publish("topic", {})).is_ok()
 
 
 def test_runtime_contract_placeholder_classes() -> None:
@@ -269,14 +341,6 @@ async def test_shared_facade_validation_paths(tmp_path) -> None:
     assert (await db.kv.set("", 1)).is_err()
     assert (await db.kv.delete("",)).is_err()
 
-    mem = runtime_memory.MemoryClient(object())
-    assert (await mem.query("", "q")).is_err()
-    assert (await mem.query("bucket", "", timeout=1)).is_err()
-    assert (await mem.query("bucket", "q", timeout=0)).is_err()
-    assert (await mem.get("", limit=1)).is_err()
-    assert (await mem.get("bucket", limit=0)).is_err()
-    assert (await mem.get("bucket", timeout=0)).is_err()
-
     sys_client = system_info.SystemInfo(object())
     assert (await sys_client.get_system_config(timeout=0)).is_err()
 
@@ -335,40 +399,3 @@ async def test_plugin_database_configure_database_name_preserves_active_sessions
     assert (await db.kv.set("k", "new")).is_ok()
     assert (await db.kv.get("k")).unwrap() == "new"
     assert (plugin_dir / "new.db").exists()
-
-
-@pytest.mark.asyncio
-async def test_shared_memory_timeout_bool_and_impl_error_normalization() -> None:
-    mem = runtime_memory.MemoryClient(object())
-    timeout_error = await mem.query("bucket", "q", timeout=True)  # type: ignore[arg-type]
-    assert timeout_error.is_err()
-    assert isinstance(timeout_error.error, InvalidArgumentError)
-
-    class _CustomSdkError(InvalidArgumentError):
-        pass
-
-    class _BoomCtx:
-        plugin_id = "demo"
-        _host_ctx = None
-
-        async def query_memory(self, *args, **kwargs):
-            raise _CustomSdkError("boom")
-
-        class bus:
-            class memory:
-                @staticmethod
-                async def get(*args, **kwargs):
-                    raise _CustomSdkError("boom")
-
-    _BoomCtx._host_ctx = _BoomCtx()  # type: ignore[attr-defined]
-    mem_err = runtime_memory.MemoryClient(_BoomCtx())
-
-    query_error = await mem_err.query("bucket", "q")
-    assert query_error.is_err()
-    assert isinstance(query_error.error, TransportError)
-    assert query_error.error.context["op_name"] == "memory.query"
-
-    get_error = await mem_err.get("bucket")
-    assert get_error.is_err()
-    assert isinstance(get_error.error, TransportError)
-    assert get_error.error.context["op_name"] == "memory.get"

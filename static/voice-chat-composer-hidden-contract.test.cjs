@@ -5,8 +5,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { readJsParts } = require('./app-part-test-utils.cjs');
 
-const source = fs.readFileSync(path.join(__dirname, 'app/app-interpage.js'), 'utf8');
+const appInterpageDirectory = path.join(__dirname, 'app/app-interpage');
+const source = readJsParts(appInterpageDirectory);
+const runtimeSource = readJsParts(appInterpageDirectory, { contractView: false });
 
 function createEventTarget() {
     const listeners = new Map();
@@ -35,6 +38,8 @@ function loadHarness() {
     const windowTarget = createEventTarget();
     const documentTarget = createEventTarget();
     let composerHidden = null;
+    let goodbyeComposerHidden = null;
+    const catSnapshots = [];
     const localStorageData = new Map();
     const document = Object.assign(documentTarget, {
         hidden: false,
@@ -75,6 +80,9 @@ function loadHarness() {
             setComposerHidden(hidden) {
                 composerHidden = !!hidden;
             },
+            setGoodbyeComposerHidden(hidden) {
+                goodbyeComposerHidden = !!hidden;
+            },
         },
         YuiGuideCommon: {
             createScopedTutorialResources() {
@@ -112,6 +120,9 @@ function loadHarness() {
         getComputedStyle() { return {}; },
     });
     window.window = window;
+    window.addEventListener('neko:cat-local-chat-state', (event) => {
+        catSnapshots.push(event.detail);
+    });
     const context = {
         window,
         document,
@@ -134,12 +145,16 @@ function loadHarness() {
         localStorage: window.localStorage,
         sessionStorage: window.sessionStorage,
     };
-    vm.runInNewContext(source, context, { filename: 'app/app-interpage.js' });
+    vm.runInNewContext(runtimeSource, context, { filename: 'app/app-interpage' });
     return {
         window,
         get composerHidden() {
             return composerHidden;
         },
+        get goodbyeComposerHidden() {
+            return goodbyeComposerHidden;
+        },
+        catSnapshots,
     };
 }
 
@@ -204,4 +219,36 @@ test('voice chat composer helper applies active state through the shared effecti
     harness.window.appInterpage.applyVoiceComposerHiddenFromActive(false);
     assert.equal(harness.composerHidden, false);
     assert.equal(harness.window.appState.voiceChatActive, false);
+});
+
+test('goodbye cat snapshot waits for matching config instead of being dropped', () => {
+    const harness = loadHarness();
+    const message = {
+        action: 'goodbye_chat_composer_hidden',
+        hidden: true,
+        lanlan_name: 'A',
+        cat_active: true,
+        cat_tier: 'cat1',
+        cat_entered_at: 1000,
+        cat_items: [],
+        timestamp: Date.now(),
+    };
+
+    assert.equal(
+        harness.window.appInterpage.handleGoodbyeChatComposerHiddenMessage(message, 'test'),
+        true,
+    );
+    assert.equal(harness.goodbyeComposerHidden, null);
+    assert.equal(harness.catSnapshots.length, 0);
+
+    harness.window.appState.lanlan_name = 'A';
+    harness.window.lanlan_config = { lanlan_name: 'A' };
+    harness.window.dispatchEvent(new harness.window.CustomEvent('neko:config-injected', {
+        detail: { lanlan_name: 'A' },
+    }));
+
+    assert.equal(harness.goodbyeComposerHidden, true);
+    assert.equal(harness.catSnapshots.length, 1);
+    assert.equal(harness.catSnapshots[0].active, true);
+    assert.equal(harness.catSnapshots[0].enteredAt, 1000);
 });

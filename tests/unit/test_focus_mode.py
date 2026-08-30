@@ -547,6 +547,28 @@ def test_focus_extra_body_provider_dialects():
     assert focus_extra_body("glm-5.2") == {"thinking": {"type": "enabled"}}
 
 
+def test_official_deepseek_v4_registers_the_thinking_type_dialect():
+    """Official DeepSeek V4 defaults to thinking-on, so it belongs in the map.
+
+    Asserting the VALUE alone would not be enough: swapping in a fresh constant
+    with identical contents (a separate ``EXTRA_BODY_DEEPSEEK``) keeps the value
+    assertions green, yet ``_THINKING_ENABLE_FORM`` pairs by ``id()`` — a new
+    identity silently drops the focus dual. So pin the constant identity too.
+    """
+    from config.providers import (
+        EXTRA_BODY_CLAUDE, MODELS_EXTRA_BODY_MAP, focus_extra_body, get_extra_body,
+    )
+
+    for model in ("deepseek-v4-flash", "deepseek-v4-pro"):
+        assert MODELS_EXTRA_BODY_MAP[model] is EXTRA_BODY_CLAUDE
+        assert get_extra_body(model) == {"thinking": {"type": "disabled"}}
+        # 凝神对偶由派生表自动获得，不需要单独登记。
+        assert focus_extra_body(model) == {"thinking": {"type": "enabled"}}
+
+    # 转售同款的网关是另外的键名，各走各的方言，不被官方那两行波及。
+    assert get_extra_body("deepseek-ai/DeepSeek-V4-Flash") == {"enable_thinking": False}
+
+
 async def test_focus_override_threads_through_visible_stream():
     """The override returned above must reach ``llm.astream`` unchanged through
     the real production path (``_astream_visible_with_tools`` → tool-leak filter
@@ -651,6 +673,10 @@ async def test_inline_focus_is_privacy_independent(monkeypatch):
     # weight tweak can't silently break it — to isolate that wiring from the bar.
     keyword_full = config.FOCUS_SIGNAL_WEIGHTS["keyword"]
     _patch_charge(monkeypatch, enter=max(0.0, keyword_full - 0.1))
+    # Per-user 凝神 switch defaults on when unset — stub it so this test doesn't
+    # read the dev machine's real user_preferences.json (where the user may have
+    # focusCognitionEnabled off, which would gate the inline path before scoring).
+    _stub_user_focus_setting(monkeypatch, enabled=None)
     mgr = _bare_mgr()
     assert await mgr._focus_inline_decision("好累，一个人，没意思，撑不住了") is True
     assert mgr.state.mode is CognitionMode.FOCUS
@@ -660,6 +686,10 @@ async def test_idle_thinking_is_read_only(monkeypatch):
     # _focus_idle_thinking reports whether we're in Focus WITHOUT mutating the
     # charge — the decay is deferred to the post-turn cooldown.
     _patch_charge(monkeypatch, enter=1.0)
+    # Per-user 凝神 switch defaults on when unset — stub it so this test doesn't
+    # read the dev machine's real user_preferences.json (focusCognitionEnabled
+    # off there would force the idle read to return False before checking mode).
+    _stub_user_focus_setting(monkeypatch, enabled=None)
     mgr = _bare_mgr()
     await mgr.state.update_focus(1.0)  # FOCUS
     charge_before = mgr.state.snapshot()["focus_charge"]
@@ -749,7 +779,8 @@ async def test_inline_gate_user_setting_off_blocks_and_clears(monkeypatch):
 
 async def test_inline_gate_user_setting_default_on_allows(monkeypatch):
     # Setting absent ⇒ defaults to on, so the global flag alone governs entry.
-    _patch_charge(monkeypatch, enter=1.0)
+    keyword_full = config.FOCUS_SIGNAL_WEIGHTS["keyword"]
+    _patch_charge(monkeypatch, enter=max(0.0, keyword_full - 0.1))
     monkeypatch.setattr(config, "FOCUS_MODE_ENABLED", True)
     _stub_user_focus_setting(monkeypatch, enabled=None)  # key absent
     mgr = _bare_mgr()

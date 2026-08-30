@@ -12,7 +12,7 @@
             <el-tag size="small" effect="plain" :type="typeTagType">{{ typeLabel }}</el-tag>
             <h3 class="plugin-list-row-card__name">{{ displayText.name }}</h3>
             <StatusIndicator :status="plugin.status || 'stopped'" />
-            <el-tag v-if="plugin.autoStart === false && plugin.type !== 'extension'" size="small" type="warning">
+            <el-tag v-if="plugin.autoStart === false" size="small" type="warning">
               {{ t('plugins.manualStart') }}
             </el-tag>
             <SourceTag
@@ -20,6 +20,16 @@
               :has-update="hasUpdate"
             />
           </div>
+          <el-button
+            v-if="availableUiAction"
+            data-testid="plugin-open-ui"
+            size="small"
+            type="primary"
+            plain
+            @click.stop="$emit('open-ui', availableUiAction)"
+          >
+            {{ t('plugins.ui.open') }}
+          </el-button>
         </div>
 
         <p class="plugin-list-row-card__description">
@@ -52,12 +62,6 @@
           <span class="plugin-list-row-card__meta-label">{{ t('plugins.entryPoint') }}</span>
           <span class="plugin-list-row-card__meta-value">{{ entryCount }}</span>
         </div>
-        <div v-if="plugin.type === 'extension' && plugin.host_plugin_id" class="plugin-list-row-card__meta-item">
-          <span class="plugin-list-row-card__meta-label">Host</span>
-          <span class="plugin-list-row-card__meta-value plugin-list-row-card__meta-value--code">
-            {{ plugin.host_plugin_id }}
-          </span>
-        </div>
       </div>
     </div>
   </el-card>
@@ -73,24 +77,28 @@ import SourceDetailRow from '@/components/plugin/SourceDetailRow.vue'
 import { useMarketVersionsStore } from '@/stores/marketVersions'
 import { hasNewerVersion } from '@/utils/version'
 import { resolvePluginDisplayText } from '@/utils/pluginDisplay'
-import type { PluginMeta, PluginInstallSourceDetailMarket } from '@/types/api'
+import { isOpenUiNavigationAction } from '@/utils/pluginListActions'
+import type { PluginListAction, PluginMeta, PluginInstallSourceDetailMarket } from '@/types/api'
 
 interface Props {
-  plugin: PluginMeta & { status?: string; enabled?: boolean; autoStart?: boolean; type?: string; host_plugin_id?: string }
+  plugin: PluginMeta & { status?: string; enabled?: boolean; autoStart?: boolean; type?: string }
   isSelected?: boolean
   showMetrics?: boolean
   showSourceDetail?: boolean
+  enableUiAction?: boolean
 }
 
 const props = withDefaults(defineProps<Props>(), {
   isSelected: false,
   showMetrics: false,
   showSourceDetail: false,
+  enableUiAction: false,
 })
 
 defineEmits<{
   click: []
   contextmenu: [event: MouseEvent]
+  'open-ui': [action: PluginListAction]
 }>()
 
 const { t, locale } = useI18n()
@@ -98,6 +106,13 @@ const marketVersions = useMarketVersionsStore()
 
 const entryCount = computed(() => props.plugin.entries?.length || 0)
 const displayText = computed(() => resolvePluginDisplayText(props.plugin, locale.value))
+const availableUiAction = computed(() => {
+  if (!props.enableUiAction) return null
+  return props.plugin.list_actions?.find((action) => {
+    if (!isOpenUiNavigationAction(action) || action.disabled) return false
+    return !action.requires_running || props.plugin.status === 'running'
+  }) || null
+})
 
 const latestVersion = computed<string | null>(() => {
   const src = props.plugin.install_source
@@ -116,13 +131,11 @@ const hasUpdate = computed<boolean>(() => {
 
 const typeLabel = computed(() => {
   if (props.plugin.type === 'adapter') return t('plugins.typeAdapter')
-  if (props.plugin.type === 'extension') return t('plugins.typeExtension')
   return t('plugins.typePlugin')
 })
 
 const typeTagType = computed<'primary' | 'success' | 'warning'>(() => {
   if (props.plugin.type === 'adapter') return 'success'
-  if (props.plugin.type === 'extension') return 'warning'
   return 'primary'
 })
 </script>

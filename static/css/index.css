@@ -102,9 +102,14 @@ body {
     opacity: 1;
     filter: brightness(0) invert(1);
     /* 将emoji变成纯白色，移除阴影 */
-    animation: pawBounce 1.5s ease-in-out infinite;
     z-index: 1;
     /* 确保猫爪在遮罩层之上 */
+}
+
+/* 弹跳动画只在 toast 可见时运行：默认态 toast 以 opacity:0 隐藏（非 display:none），
+   若动画挂在基础态上会在两个窗口里以显示器刷新率永久空转（合成器无法休眠）。 */
+#status-toast.show::before {
+    animation: pawBounce 1.5s ease-in-out infinite;
 }
 
 /* 小猫爪爪弹跳动画 */
@@ -494,7 +499,7 @@ button * {
      1) 静态容器：avatar 三家（live2d/vrm/mmd）+ chat 主面板 + 字幕条 +
         React chat 浮窗 + avatar preview 弹窗 + status toast。
         #sidebar 自带 inline display:none 不需要再列。
-     2) 动态浮动 UI：avatar-ui-buttons.js 用 `{prefix}-floating-buttons` /
+     2) 动态浮动 UI：avatar-ui-buttons parts 用 `{prefix}-floating-buttons` /
         `{prefix}-return-button-container` / `{prefix}-lock-icon` 三组 ID
         命名约定（live2d / vrm / mmd 各一份）注入到 body，靠属性后缀
         匹配统一收掉，避免漏一个 prefix 留个浮动按钮挡鼠标。 */
@@ -505,6 +510,12 @@ button * {
     display: flex;
     flex-direction: column;
     gap: 12px;
+}
+
+body.neko-live2d-peek #live2d-floating-buttons,
+body.neko-live2d-peek #live2d-lock-icon {
+    display: none !important;
+    pointer-events: none !important;
 }
 
 body.neko-game-active #live2d-container,
@@ -554,6 +565,157 @@ body.neko-game-active [id$="-lock-icon"] {
 
 .neko-idle-return-button-container.is-cat1-dropping-from-compact-top-edge > .neko-idle-return-btn {
     animation: nekoIdleCat1CompactDrop 360ms cubic-bezier(0.22, 0.72, 0.2, 1) both;
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-top-edge-dropping > .neko-idle-return-btn {
+    animation: nekoIdleCat1DesktopWindowTopEdgeDrop 360ms cubic-bezier(0.22, 0.72, 0.2, 1) both;
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peeking {
+    pointer-events: none;
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peeking > .neko-idle-return-btn {
+    pointer-events: auto;
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-edge-peek-left {
+    --neko-desktop-window-edge-peek-clip: polygon(-100% -100%, 50% -100%, 50% 200%, -100% 200%);
+    --neko-desktop-window-edge-peek-cycle-clip: polygon(-100% -100%, 58% -100%, 58% 200%, -100% 200%);
+    --neko-desktop-window-edge-peek-cycle-shift: translate3d(-8%, 0, 0);
+    clip-path: var(--neko-desktop-window-edge-peek-clip);
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-edge-peek-right {
+    --neko-desktop-window-edge-peek-clip: polygon(50% -100%, 200% -100%, 200% 200%, 50% 200%);
+    --neko-desktop-window-edge-peek-cycle-clip: polygon(42% -100%, 200% -100%, 200% 200%, 42% 200%);
+    --neko-desktop-window-edge-peek-cycle-shift: translate3d(8%, 0, 0);
+    clip-path: var(--neko-desktop-window-edge-peek-clip);
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-edge-peek-bottom {
+    --neko-desktop-window-edge-peek-clip: polygon(-100% 56%, 200% 56%, 200% 200%, -100% 200%);
+    --neko-desktop-window-edge-peek-cycle-clip: polygon(-100% 48%, 200% 48%, 200% 200%, -100% 200%);
+    --neko-desktop-window-edge-peek-cycle-shift: translate3d(0, 8%, 0);
+    clip-path: var(--neko-desktop-window-edge-peek-clip);
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-edge-peek-left > .neko-idle-return-art {
+    --neko-idle-return-edge-transform: rotate(-60deg);
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-edge-peek-right > .neko-idle-return-art {
+    --neko-idle-return-edge-transform: rotate(60deg);
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-edge-peek-bottom > .neko-idle-return-art {
+    --neko-idle-return-edge-transform: rotate(180deg);
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-cycle-active > .neko-idle-return-btn {
+    animation: nekoIdleCat1DesktopWindowEdgePeekCycle
+        var(--neko-desktop-window-edge-peek-cycle-duration, 850ms)
+        cubic-bezier(0.45, 0, 0.25, 1) both;
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-edge-peek-facing-right > .neko-idle-return-art {
+    --neko-idle-return-facing-transform: scaleX(-1);
+}
+
+.neko-idle-return-btn.is-cat1-facing-right.is-cat1-desktop-window-edge-peek-walking:not(.is-cat1-desktop-window-edge-peek-facing-right) > .neko-idle-return-art {
+    --neko-idle-return-facing-transform: scaleX(1);
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-leaving > .neko-idle-return-btn {
+    animation: nekoIdleCat1DesktopWindowEdgePeekLeave 360ms cubic-bezier(0.22, 0.72, 0.2, 1) both;
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-cue-active::after {
+    content: "";
+    position: absolute;
+    width: 18px;
+    height: 3px;
+    border-radius: 999px;
+    background: rgba(255, 190, 86, 0.95);
+    box-shadow:
+        5px 8px 0 rgba(255, 190, 86, 0.82),
+        -1px 16px 0 rgba(255, 190, 86, 0.68);
+    filter: drop-shadow(0 1px 1px rgba(73, 43, 18, 0.28));
+    pointer-events: none;
+    z-index: 4;
+    animation: nekoIdleCat1DesktopWindowEdgePeekCue 700ms ease-out both;
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-door-clipped {
+    clip-path: var(--neko-desktop-window-door-clip, inset(0));
+}
+
+.neko-desktop-window-door-layer {
+    display: contents;
+    pointer-events: none;
+}
+
+.neko-desktop-window-door-opening,
+.neko-desktop-window-door-frame {
+    position: fixed;
+    pointer-events: none;
+}
+
+.neko-desktop-window-door-opening {
+    z-index: 99998;
+    background: radial-gradient(ellipse at center, rgba(72, 61, 102, 0.9), rgba(17, 15, 25, 0.98));
+}
+
+.neko-desktop-window-door-frame {
+    z-index: 100000;
+    box-sizing: border-box;
+    border: 4px solid rgba(237, 204, 139, 0.98);
+    box-shadow:
+        inset 0 0 0 2px rgba(102, 65, 54, 0.82),
+        0 0 0 1px rgba(57, 38, 44, 0.8),
+        0 5px 5px rgba(24, 19, 33, 0.35);
+}
+
+.neko-desktop-window-door.is-left .neko-desktop-window-door-frame {
+    border-left-width: 7px;
+    border-right-width: 2px;
+    border-radius: 12px 3px 3px 12px;
+}
+
+.neko-desktop-window-door.is-right .neko-desktop-window-door-frame {
+    border-left-width: 2px;
+    border-right-width: 7px;
+    border-radius: 3px 12px 12px 3px;
+}
+
+.neko-desktop-window-door.is-top .neko-desktop-window-door-frame {
+    border-top-width: 7px;
+    border-bottom-width: 2px;
+    border-radius: 12px 12px 3px 3px;
+}
+
+.neko-desktop-window-door.is-bottom .neko-desktop-window-door-frame {
+    border-top-width: 2px;
+    border-bottom-width: 7px;
+    border-radius: 3px 3px 12px 12px;
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-left::after {
+    left: -8px;
+    top: 20%;
+    transform: rotate(-18deg);
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-right::after {
+    right: -8px;
+    top: 20%;
+    transform: rotate(198deg);
+}
+
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-bottom::after {
+    left: 52%;
+    bottom: -4px;
+    transform: rotate(90deg);
 }
 
 .neko-idle-return-button-container.is-cat1-compact-mirror-active {
@@ -698,6 +860,44 @@ body.neko-game-active [id$="-lock-icon"] {
     --neko-idle-return-facing-transform: scaleX(-1);
 }
 
+/*
+ * Settled desktop-window peeks own their edge composition. The generic walk
+ * facing class may legitimately remain on the button, but it must not mirror
+ * the already-rotated peek back into the sensed window.
+ */
+.neko-idle-return-btn.is-cat1-facing-right.is-cat1-desktop-window-edge-peek-left > .neko-idle-return-art,
+.neko-idle-return-btn.is-cat1-facing-right.is-cat1-desktop-window-edge-peek-right > .neko-idle-return-art,
+.neko-idle-return-btn.is-cat1-facing-right.is-cat1-desktop-window-edge-peek-bottom > .neko-idle-return-art {
+    --neko-idle-return-facing-transform: scaleX(1);
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-top-edge-active > .neko-idle-return-art {
+    --neko-idle-return-facing-transform: scaleX(1);
+}
+
+.neko-idle-return-btn.is-cat1-desktop-window-top-edge-active.is-cat1-desktop-window-top-edge-facing-right > .neko-idle-return-art {
+    --neko-idle-return-facing-transform: scaleX(-1);
+}
+
+/*
+ * 只校准 GNOME 原生 58px 毛球路径。左侧接近的终点已经在 JS 中前移 34px；
+ * 右侧的跨窗口视觉位置少 33px，因此待机和侧身素材都要补上这段距离。
+ * 待机规则使用独立站位侧，而不是会在动作完成后重置的 facingRight，避免误伤左侧待机。
+ */
+.neko-idle-return-btn[data-neko-cat1-native-yarn-visual-anchor="true"][data-neko-cat1-native-yarn-side="right"][data-neko-cat1-substate="idle"]:not(.is-cat1-playing):not(.is-cat1-eating):not(.is-cat1-stretching):not(.is-drag-action) > .neko-idle-return-art {
+    left: 33px;
+}
+
+.neko-idle-return-btn[data-neko-cat1-native-yarn-visual-anchor="true"].is-cat1-walking:not(.is-cat1-facing-right) > .neko-idle-return-art,
+.neko-idle-return-btn[data-neko-cat1-native-yarn-visual-anchor="true"].is-cat1-stretching:not(.is-cat1-facing-right) > .neko-idle-return-art {
+    left: calc(12.3046875% + 33px);
+}
+
+.neko-idle-return-btn[data-neko-cat1-native-yarn-visual-anchor="true"].is-cat1-walking.is-cat1-facing-right > .neko-idle-return-art,
+.neko-idle-return-btn[data-neko-cat1-native-yarn-visual-anchor="true"].is-cat1-stretching.is-cat1-facing-right > .neko-idle-return-art {
+    left: -17.96875%;
+}
+
 .neko-idle-return-btn.is-cat1-edge-peek-left > .neko-idle-return-art {
     --neko-idle-return-edge-transform: rotate(60deg);
 }
@@ -728,6 +928,20 @@ body.neko-game-active [id$="-lock-icon"] {
 
 .neko-idle-return-btn.is-cat1-edge-peek-bottom-right > .neko-idle-return-art {
     --neko-idle-return-edge-transform: rotate(-60deg);
+}
+
+[data-neko-live2d-peek-anchor$="left"] .neko-idle-return-art {
+    --neko-idle-return-facing-transform: scaleX(-1);
+}
+
+[data-neko-live2d-peek-anchor$="right"] .neko-idle-return-art {
+    --neko-idle-return-facing-transform: scaleX(1);
+}
+
+[data-neko-live2d-peek-anchor] .neko-idle-return-art {
+    /* The transferred Live2D anchor controls placement only. Cat edge-peek
+       rotation is reserved for a drag performed after entering cat form. */
+    --neko-idle-return-edge-transform: rotate(0deg);
 }
 
 .neko-idle-thought-bubble {
@@ -827,6 +1041,9 @@ body.neko-game-active [id$="-lock-icon"] {
 .neko-idle-return-btn.is-drag-action-pending .neko-idle-thought-bubble,
 .neko-idle-return-btn.is-drag-action .neko-idle-thought-bubble,
 .neko-idle-return-btn.is-cat1-walking .neko-idle-thought-bubble,
+.neko-idle-return-btn.is-cat1-desktop-window-top-edge-walking .neko-idle-thought-bubble,
+.neko-idle-return-btn.is-cat1-desktop-window-edge-peek-walking .neko-idle-thought-bubble,
+.neko-idle-return-button-container.is-cat1-desktop-window-edge-peeking .neko-idle-thought-bubble,
 .neko-idle-return-btn.is-cat1-stretching .neko-idle-thought-bubble,
 .neko-idle-return-btn.is-cat1-playing .neko-idle-thought-bubble,
 .neko-idle-return-btn.is-cat1-eating:not(.is-thought-bubble-popping) .neko-idle-thought-bubble,
@@ -897,10 +1114,64 @@ body.neko-game-active [id$="-lock-icon"] {
     }
 }
 
+@keyframes nekoIdleCat1DesktopWindowTopEdgeDrop {
+    0% {
+        transform: translate3d(0, -52px, 0) rotate(0deg);
+    }
+    70% {
+        transform: translate3d(0, 3px, 0) rotate(-2deg);
+    }
+    100% {
+        transform: translate3d(0, 0, 0) rotate(0deg);
+    }
+}
+
+@keyframes nekoIdleCat1DesktopWindowEdgePeekLeave {
+    0% {
+        transform: translate3d(0, -52px, 0) rotate(0deg);
+    }
+    70% {
+        transform: translate3d(0, 3px, 0) rotate(2deg);
+    }
+    100% {
+        transform: translate3d(0, 0, 0) rotate(0deg);
+    }
+}
+
+@keyframes nekoIdleCat1DesktopWindowEdgePeekCue {
+    0% {
+        opacity: 0;
+    }
+    28% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0;
+    }
+}
+
+@keyframes nekoIdleCat1DesktopWindowEdgePeekCycle {
+    0%, 100% {
+        transform: translate3d(0, 0, 0);
+        clip-path: var(--neko-desktop-window-edge-peek-clip);
+    }
+    46% {
+        transform: var(--neko-desktop-window-edge-peek-cycle-shift);
+        clip-path: var(--neko-desktop-window-edge-peek-cycle-clip);
+    }
+}
+
 @media (prefers-reduced-motion: reduce) {
     .neko-idle-return-btn.is-tier-transitioning > .neko-idle-return-art,
     .neko-idle-return-btn.is-tier-transitioning > .neko-idle-return-art-next,
-    .neko-idle-return-button-container.is-cat1-dropping-from-compact-top-edge > .neko-idle-return-btn {
+    .neko-idle-return-button-container.is-cat1-dropping-from-compact-top-edge > .neko-idle-return-btn,
+    .neko-idle-return-button-container.is-cat1-desktop-window-top-edge-dropping > .neko-idle-return-btn,
+    .neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-leaving > .neko-idle-return-btn,
+    .neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-cue-active::after {
+        animation: none;
+    }
+
+    .neko-idle-return-button-container.is-cat1-desktop-window-edge-peek-cycle-active > .neko-idle-return-btn {
         animation: none;
     }
 }
@@ -1422,6 +1693,13 @@ body.subtitle-web-host #react-chat-window-shell.is-dragging {
     -webkit-mask-size: 300% 100%; mask-size: 300% 100%;
     -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
 }
+.compact-chat-surface-shell.neko-compact-collapsing > .compact-chat-surface-frame,
+.compact-chat-surface-shell.neko-compact-expanding > .compact-chat-surface-frame {
+    /* Electron/Chromium 在 mask 动画首帧可能把 backdrop-filter 合成为矩形纹理；
+       仅在擦除期间强制胶囊裁剪，稳态移除 class 后外阴影仍可正常越界绘制。 */
+    -webkit-clip-path: inset(0 round 999px);
+    clip-path: inset(0 round 999px);
+}
 .compact-chat-surface-shell.neko-compact-collapsing {
     animation: neko-compact-collapse-wipe 280ms ease forwards;
 }
@@ -1644,9 +1922,7 @@ body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"
 body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) [data-compact-geometry-owner="surface"],
 body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) [data-compact-geometry-owner="surface"] *,
 body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #reactChatWindowMinimizeButton,
-body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #reactChatWindowMinimizeButton *,
-body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-input-tool-fan[data-compact-input-tool-fan-open="true"],
-body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] * {
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #reactChatWindowMinimizeButton * {
     pointer-events: auto;
 }
 
@@ -1670,21 +1946,6 @@ body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"
 body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-export-history-scroll-content,
 body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-export-history-message {
     pointer-events: none;
-}
-
-/* 主动分享表情包 overlay 的图片区域保持点击穿透；关闭叉是唯一可交互 hit region。
-   它注册了 data-compact-geometry-owner="surface"，会被上面那条把 surface 子树重新开成 auto 的通用规则命中；
-   这里用同优先级、靠后定义的规则把透明包装和图片区压回 none，再单独保留关闭按钮 auto。
-   React styles.css 那条单 class 规则赢不了 host 的 ID 选择器。 */
-body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-meme-overlay,
-body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-meme-overlay img,
-body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-meme-overlay-frame,
-body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-meme-overlay-close-icon {
-    pointer-events: none;
-}
-
-body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-meme-overlay-close {
-    pointer-events: auto;
 }
 
 body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) .compact-export-history-bubble,
@@ -1778,6 +2039,29 @@ body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"
     overflow: visible !important;
     clip-path: none !important;
     z-index: 100003 !important;
+}
+
+/* 轮盘容器本身是透明的；保留按钮和圆形旋转区的交互，其余区域（特别是与紧凑播放器
+   重叠的左上控制带）必须点击穿透。这里覆盖上面的宿主通用 pointer-events 规则。 */
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] {
+    pointer-events: none !important;
+}
+
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-fan-hit-region,
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-item:not([data-compact-tool-wheel-slot="hidden"]):not([data-compact-tool-wheel-slot="hidden-forward"]):not([data-compact-tool-wheel-slot="hidden-backward"]),
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .avatar-tool-quickbar,
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .avatar-tool-quickbar * {
+    pointer-events: auto !important;
+}
+
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-item[data-compact-tool-wheel-slot="hidden"],
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-item[data-compact-tool-wheel-slot="hidden-forward"],
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-item[data-compact-tool-wheel-slot="hidden-backward"] {
+    pointer-events: none !important;
+}
+
+body.subtitle-web-host #react-chat-window-shell[data-chat-surface-mode="compact"]:not(.is-minimized):not(.is-collapsing):not(.is-expanding) #react-chat-window-root .app-shell:has(> #music-player-mount.compact-music-player-mount > .music-player-bar:not([hidden])) .compact-input-tool-fan[data-compact-input-tool-fan-open="true"] .compact-input-tool-fan-hit-region {
+    clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%, 0 var(--compact-tool-wheel-music-control-cutout-height), var(--compact-tool-wheel-music-control-cutout-width) var(--compact-tool-wheel-music-control-cutout-height), var(--compact-tool-wheel-music-control-cutout-width) 0);
 }
 
 #react-chat-window-root {
@@ -3047,6 +3331,20 @@ body.react-chat-window-dragging {
 .crop-tool-confirm { color: #34c759; }
 .crop-tool-confirm:hover { background: rgba(52, 199, 89, 0.16); color: #4cd964; }
 .crop-tool-confirm.is-active { background: rgba(52, 199, 89, 0.16); color: #34c759; }
+
+.crop-tool-pin {
+    width: auto;
+    min-width: 48px;
+    padding: 0 10px;
+    color: #8bd8ff;
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+.crop-tool-pin:hover {
+    background: rgba(68, 183, 254, 0.18);
+    color: #b9e9ff;
+}
 
 .crop-tool-cancel { color: #ff6b7a; }
 .crop-tool-cancel:hover { background: rgba(220, 53, 69, 0.18); color: #ff8a97; }

@@ -7,19 +7,26 @@ from plugin.sdk.plugin import (
     # 基类
     NekoPluginBase, PluginMeta,
     # 装饰器
-    neko_plugin, plugin_entry, lifecycle, timer_interval, message, on_event,
-    custom_event, hook, before_entry, after_entry, around_entry, replace_entry,
+    EntryKind, neko_plugin, plugin_entry, lifecycle, timer_interval, message,
+    on_event, custom_event, hook, before_entry, after_entry, around_entry,
+    replace_entry, quick_action, plugin, ui,
+    # LLM 工具与系统活动
+    llm_tool, LlmToolMeta, OsActivitySnapshot, get_os_activity_snapshot,
+    # 插件本地 i18n 与设置
+    PluginI18n, tr, PluginSettings, SettingsField,
     # Result 类型
     Ok, Err, Result, unwrap, unwrap_or,
     # 运行时辅助工具
     Plugins, PluginRouter, PluginConfig, PluginStore,
-    SystemInfo, MemoryClient,
+    SystemInfo,
     # 错误
     SdkError, TransportError,
     # 日志
     get_plugin_logger,
 )
 ```
+
+`plugin.sdk.plugin` 是受支持的开发者导入面。根包 `plugin.sdk` 有意只暴露保守的共享子集；不要假定插件专用 helper 都会从根包再次导出。
 
 ## NekoPluginBase
 
@@ -38,11 +45,13 @@ class MyPlugin(NekoPluginBase):
 |------|------|------|
 | `self.ctx` | `PluginContext` | 运行时上下文（由宿主注入） |
 | `self.plugin_id` | `str` | 本插件的唯一标识符 |
-| `self.config_dir` | `Path` | 包含 `plugin.toml` 的目录 |
+| `self.plugin_dir` | `Path` | 包含代码、Manifest 和静态资源的插件安装目录 |
+| `self.config_dir` | `Path` | `self.plugin_dir` 的兼容别名 |
+| `self.storage_dir` | `Path` | 分配给插件的用户存储根目录 |
+| `self.runtime_config_path` | `Path` | 外部运行配置文件路径 |
 | `self.metadata` | `dict` | 来自 `plugin.toml` 的插件元数据 |
-| `self.bus` | `Bus` | 用于发布/订阅的事件总线 |
+| `self.bus` | `SdkBusContext` | 宿主状态的 read/watch 门面；没有 publish/emit API |
 | `self.plugins` | `Plugins` | 跨插件调用辅助工具 |
-| `self.memory` | `MemoryClient` | 访问宿主内存系统 |
 | `self.system_info` | `SystemInfo` | 宿主系统元数据 |
 
 ### 方法
@@ -59,26 +68,48 @@ self.report_status({
 })
 ```
 
-#### `push_message(**kwargs) -> object`
+#### `push_message(**kwargs) -> PushMessageResult`
 
-向宿主系统推送消息。
+使用 v2 schema 向宿主系统推送消息。
 
 ```python
-self.push_message(
+result = self.push_message(
     source="my_feature",
-    message_type="text",        # "text" | "url" | "binary" | "binary_url"
-    description="Task complete",
-    priority=5,                 # 0-10（0=低，10=紧急）
-    content="Result text",
+    visibility=["chat"],       # []、["chat"]、["hud"] 或二者
+    ai_behavior="blind",       # "respond"、"read"、"blind"
+    parts=[{"type": "text", "text": "任务已完成"}],
+    priority=5,
 )
+
+if not result["submitted"]:
+    # 保留本地状态；重试和去重仍由插件自行决定。
+    self.logger.warning("消息提交失败：%s", result["reason"])
 ```
+
+`submitted=True` 只表示 SDK 的权威本地提交路径已接收 payload，并由 SDK 接管后续
+提交责任；它不表示宿主已经消费、模型已经生成或音频已经播放。
+拒绝结果使用稳定的 `backpressure`、`transport_error` 或
+`transport_unavailable` reason，且不会包含消息正文或原始异常文本。拒绝结果还会携带
+兼容旧调用方的 `ok=False`；新代码应以 `submitted` 为正式判据。
+
+v1 字段（`message_type`、`content`、`delivery`、`reply` 及其他旧别名）已经弃用，但当前源码仍会转换。请立即迁移；本文档不保证确切移除版本。参见[迁移指南](./migration-v0.9#push-message-v2)。
 
 #### `data_path(*parts) -> Path`
 
 获取插件 `data/` 目录下的路径。
 
 ```python
-db_path = self.data_path("cache.db")  # → <plugin_dir>/data/cache.db
+db_path = self.data_path("records.db")
+# → <storage-root>/plugins/<plugin_id>/data/records.db
+```
+
+#### `cache_path(*parts) -> Path`
+
+获取插件可清理缓存目录下的路径。
+
+```python
+preview_path = self.cache_path("preview.png")
+# → <storage-root>/plugins/<plugin_id>/cache/preview.png
 ```
 
 #### `register_dynamic_entry(entry_id, handler, ...) -> bool`
@@ -116,7 +147,17 @@ self.register_static_ui("static")  # 提供 <plugin_dir>/static/index.html 服�
 
 #### `include_router(router, *, prefix) -> None`
 
-挂载一个 `PluginRouter`（用于扩展）。
+挂载一个 `PluginRouter`，用于组织大型或按功能拆分的普通 Plugin。
+
+相关方法还有 `exclude_router(router_or_name) -> bool`、`get_router(name)` 和 `list_routers()`。Router 不能作为 manifest 的 `[plugin].entry`，而且这条挂载路径不会自动调用 `on_mount` / `on_unmount`。
+
+#### Hosted/静态 UI 与列表操作
+
+Hosted TSX 使用导出的 `ui` namespace 和 manifest surface，详见 [Hosted UI](./hosted-ui)。旧式静态 UI 使用 `register_static_ui(...)`。列表行操作使用 `set_list_actions(...)`、`register_list_action(...)`、`clear_list_actions()` 和 `get_list_actions()` 管理。
+
+#### LLM 工具方法
+
+`register_llm_tool(...)`、`unregister_llm_tool(name)` 和 `list_llm_tools()` 是 `@llm_tool` 的命令式对应接口。它们注册对话期工具，不是用户插件 Agent 入口。详见 [LLM Tool Calling](./tool-calling)。
 
 #### `run_update(**kwargs) -> object`（异步）
 
@@ -234,17 +275,6 @@ value = unwrap_or(await self.store.get("key"), None)  # → {"count": 42}
 
 ---
 
-## MemoryClient
-
-通过 `self.memory` 访问。
-
-```python
-result = await self.memory.query("default", "keyword")  # 在指定 bucket 中检索
-result = await self.memory.get("default", limit=20)      # 列出该 bucket 中的最近记录
-```
-
----
-
 ## SystemInfo
 
 通过 `self.system_info` 访问。这些方法都返回 `Result`，需用 `unwrap_or(...)` 解包。
@@ -266,17 +296,23 @@ python_env = unwrap_or(await self.system_info.get_python_env(), {})
 | `ctx.plugin_id` | `str` | 插件标识符 |
 | `ctx.config_path` | `Path` | `plugin.toml` 的路径 |
 | `ctx.logger` | `Logger` | 日志记录器实例 |
-| `ctx.bus` | `Bus` | 事件总线 |
+| `ctx.bus` | `SdkBusContext` | 宿主状态的 read/watch 门面 |
 | `ctx.metadata` | `dict` | 插件元数据 |
 
-### 消息类型
+### Bus 与 Memory
 
-| 类型 | 使用场景 |
-|------|----------|
-| `text` | 纯文本消息 |
-| `url` | URL 链接 |
-| `binary` | 小型二进制数据（直接传输） |
-| `binary_url` | 大文件（通过 URL 引用） |
+在异步入口中，先 `await get()`，再使用本地列表操作：
+
+```python
+events = await self.bus.events.get(plugin_id=self.plugin_id, max_count=50)
+recent = events.filter(priority_min=1).sort(by="timestamp", reverse=True).limit(20)
+
+records = await self.bus.memory.get(bucket_id="default", limit=20)
+```
+
+列表接口为 `filter` / `where`、`sort`、`limit`、`watch`。可调用形式 `filter(predicate)`、`where(predicate)` 和 `sort(key=...)` 仅处理本地快照；可重放的 watcher 链必须使用结构化 `filter(field=value, ...)` 与 `sort(by=...)`。只有 `messages`、`events`、`lifecycle` 支持 `watch()`；`conversations` 与 `memory` 是只读快照。watcher 仅接受 `add`、`del`、`change`。
+
+`bus.memory` 保存的是有容量上限、只驻留内存的近期用户话语事件（TTL 为一小时），与角色持久化的事实、反思和人格相互独立。`ctx.query_memory(...)` 只为兼容而保留，它调用已弃用的占位端点，不执行语义召回。
 
 ### 优先级等级
 

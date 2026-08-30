@@ -10,10 +10,25 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
+import main_logic.omni_realtime_client as _realtime_package
+import main_logic.omni_realtime_client._gemini_support as _gemini_support
 from main_logic.omni_realtime_client import OmniRealtimeClient, TurnDetectionMode
 
 # Dummy WAV header + silence for testing audio streaming
 DUMMY_AUDIO_CHUNK = b'\x00' * 1024
+
+
+def test_realtime_package_state_reexports_follow_canonical_owner(monkeypatch):
+    sentinel_genai = object()
+    sentinel_types = object()
+
+    monkeypatch.setattr(_realtime_package, "GEMINI_AVAILABLE", False)
+    monkeypatch.setattr(_realtime_package, "genai", sentinel_genai)
+    monkeypatch.setattr(_gemini_support, "types", sentinel_types)
+
+    assert _gemini_support.GEMINI_AVAILABLE is False
+    assert _gemini_support.genai is sentinel_genai
+    assert _realtime_package.types is sentinel_types
 
 
 @pytest.mark.unit
@@ -46,13 +61,18 @@ async def test_gemini_create_response_propagates_send_failure(monkeypatch):
     client._is_gemini = True
     client._gemini_session = object()
 
-    async def fail_send_user_turn(_text):
+    observed_turn_starts: list[bool] = []
+
+    async def fail_send_user_turn(_text, *, starts_user_turn=True):
+        observed_turn_starts.append(starts_user_turn)
         raise RuntimeError("gemini send failed")
 
     monkeypatch.setattr(client, "_gemini_send_user_turn", fail_send_user_turn)
 
     with pytest.raises(RuntimeError, match="gemini send failed"):
         await OmniRealtimeClient.create_response(client, "postgame context")
+
+    assert observed_turn_starts == [True]
 
 
 @pytest.mark.unit
@@ -63,7 +83,10 @@ async def test_gemini_create_response_skipped_failure_restores_skip_state(monkey
     client._gemini_session = object()
     client._skip_until_next_response = False
 
-    async def fail_send_user_turn(_text):
+    observed_turn_starts: list[bool] = []
+
+    async def fail_send_user_turn(_text, *, starts_user_turn=True):
+        observed_turn_starts.append(starts_user_turn)
         raise RuntimeError("gemini send failed")
 
     monkeypatch.setattr(client, "_gemini_send_user_turn", fail_send_user_turn)
@@ -72,6 +95,7 @@ async def test_gemini_create_response_skipped_failure_restores_skip_state(monkey
         await OmniRealtimeClient.create_response(client, "postgame context", skipped=True)
 
     assert client._skip_until_next_response is False
+    assert observed_turn_starts == [True]
 
 
 @pytest.mark.unit
@@ -82,7 +106,10 @@ async def test_gemini_prime_context_skipped_failure_restores_skip_state(monkeypa
     client._gemini_session = object()
     client._skip_until_next_response = False
 
-    async def fail_send_user_turn(_text):
+    observed_turn_starts: list[bool] = []
+
+    async def fail_send_user_turn(_text, *, starts_user_turn=True):
+        observed_turn_starts.append(starts_user_turn)
         raise RuntimeError("gemini send failed")
 
     monkeypatch.setattr(client, "_gemini_send_user_turn", fail_send_user_turn)
@@ -91,6 +118,8 @@ async def test_gemini_prime_context_skipped_failure_restores_skip_state(monkeypa
         await OmniRealtimeClient.prime_context(client, "assistant: context", skipped=True)
 
     assert client._skip_until_next_response is False
+    # A task-result report is not the user's turn -- it must not retire tools.
+    assert observed_turn_starts == [False]
 
 
 @pytest.mark.unit
@@ -225,7 +254,6 @@ async def test_stream_audio(realtime_client):
             # Length might chance due to downsampling in audio_processor if it was 48k -> 16k
             # But DUMMY_AUDIO_CHUNK is 1024 bytes (512 samples @ 16bit).
             # If default sample rate assumed 16k, it passes through.
-            pass 
             
     assert audio_append_found, "input_audio_buffer.append event not found"
     
@@ -307,6 +335,235 @@ async def test_receive_text_delta(realtime_client):
     
     # Verify response.done was processed
     assert response_done_mock.called
+
+
+@pytest.mark.unit
+async def test_cancelled_response_done_is_forwarded_to_response_arbiter(
+    realtime_client,
+):
+    realtime_client.ws = AsyncMock()
+    realtime_client.ws.__aiter__.return_value = [
+        json.dumps({
+            "type": "response.done",
+            "response": {"id": "resp_cancelled", "status": "cancelled"},
+        }),
+    ]
+    realtime_client._response_arbiter.notify_response_terminal = MagicMock()
+    realtime_client.on_response_done = AsyncMock()
+
+    await realtime_client.handle_messages()
+
+    realtime_client._response_arbiter.notify_response_terminal.assert_called_once_with(
+        {
+            "type": "response.done",
+            "response": {"id": "resp_cancelled", "status": "cancelled"},
+        }
+    )
+
+
+@pytest.mark.unit
+async def test_late_delta_from_cancelled_response_is_not_forwarded_after_new_response():
+    client = _make_manual_client(model="gpt-4o-realtime-preview", api_type="openai")
+    events = [
+        json.dumps({"type": "response.created", "response": {"id": "resp_old"}}),
+        json.dumps({"type": "response.created", "response": {"id": "resp_new"}}),
+        json.dumps(
+            {
+                "type": "response.text.delta",
+                "response_id": "resp_old",
+                "delta": "stale",
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response.audio.delta",
+                "response_id": "resp_old",
+                "delta": base64.b64encode(b"stale-audio").decode("ascii"),
+            }
+        ),
+        json.dumps({"type": "response.done", "response": {"id": "resp_old"}}),
+        json.dumps(
+            {
+                "type": "response.text.delta",
+                "response_id": "resp_new",
+                "delta": "fresh",
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response.audio.delta",
+                "response_id": "resp_new",
+                "delta": base64.b64encode(b"fresh-audio").decode("ascii"),
+            }
+        ),
+        json.dumps({"type": "response.done", "response": {"id": "resp_new"}}),
+    ]
+    client.ws = AsyncMock()
+    client.ws.__aiter__.return_value = events
+    client.on_text_delta = AsyncMock()
+    client.on_audio_delta = AsyncMock()
+
+    await client.handle_messages()
+
+    client.on_text_delta.assert_awaited_once_with("fresh", True)
+    client.on_audio_delta.assert_awaited_once_with(b"fresh-audio")
+
+
+async def test_id_bearing_events_are_dropped_without_an_active_response():
+    client = _make_manual_client(model="gpt-4o-realtime-preview", api_type="openai")
+    client.ws = AsyncMock()
+    client.ws.__aiter__.return_value = [
+        json.dumps({"type": "response.created", "response": {"id": "resp-old"}}),
+        json.dumps({"type": "response.done", "response": {"id": "resp-old"}}),
+        json.dumps(
+            {
+                "type": "response.text.delta",
+                "response_id": "resp-old",
+                "delta": "late",
+            }
+        ),
+        json.dumps(
+            {
+                "type": "response.function_call_arguments.done",
+                "response_id": "resp-old",
+                "call_id": "call-old",
+                "name": "late_tool",
+                "arguments": "{}",
+            }
+        ),
+    ]
+    client.on_text_delta = AsyncMock()
+    client.on_tool_call = AsyncMock()
+
+    await client.handle_messages()
+
+    client.on_text_delta.assert_not_awaited()
+    client.on_tool_call.assert_not_awaited()
+
+
+class _ScriptedWs:
+    """Async-iterable ws stub driven by an async generator.
+
+    Unlike ``AsyncMock.__aiter__.return_value``, an async generator lets a
+    test capture arbiter state between events, before the end-of-stream
+    path calls ``arbiter.shutdown`` and wipes the tracked response ids.
+    """
+
+    def __init__(self, agen):
+        self._agen = agen
+
+    def __aiter__(self):
+        return self._agen
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.unit
+async def test_crossed_response_done_releases_arbiter_tracked_id_immediately():
+    """A stale ``response.done`` must still reach the response arbiter.
+
+    When a server-initiated response and a newer response cross so both
+    ``response.created`` events are observed, the earlier response's
+    ``response.done`` hits the transport's stale-event filter. Its terminal
+    must be forwarded to the arbiter anyway: otherwise the tracked id keeps
+    the lane closed until the staleness timer (60s) instead of releasing
+    immediately.
+    """
+    client = _make_manual_client(model="gpt-4o-realtime-preview", api_type="openai")
+    arbiter = client._response_arbiter
+    state = {}
+
+    async def events():
+        yield json.dumps({"type": "response.created", "response": {"id": "resp_a"}})
+        yield json.dumps({"type": "response.created", "response": {"id": "resp_b"}})
+        state["before_done"] = set(arbiter._server_response_ids)
+        yield json.dumps({"type": "response.done", "response": {"id": "resp_a"}})
+        # Captured right after the stale done was processed, before the
+        # end-of-stream shutdown wipes the arbiter state.
+        state["after_done"] = set(arbiter._server_response_ids)
+        state["busy_after_done"] = arbiter.is_busy
+
+    client.ws = _ScriptedWs(events())
+    await client.handle_messages()
+
+    assert state["before_done"] == {"resp_a", "resp_b"}
+    # Negative validation: before the fix the stale filter swallowed
+    # resp_a's terminal, so its id stayed tracked (and held the lane)
+    # until the staleness timer expired.
+    assert state["after_done"] == {"resp_b"}
+    # The later response is still live and must keep holding the lane.
+    assert state["busy_after_done"] is True
+
+
+@pytest.mark.unit
+async def test_crossed_response_done_keeps_stale_content_filtered_and_frees_lane():
+    """The stale terminal releases the arbiter without leaking content.
+
+    The earlier response's ``response.done`` reaches the arbiter, but its
+    content (text deltas) and content-side completion semantics
+    (``on_response_done``) stay filtered; once the current response also
+    finishes, the lane opens immediately.
+    """
+    client = _make_manual_client(model="gpt-4o-realtime-preview", api_type="openai")
+    arbiter = client._response_arbiter
+    state = {}
+
+    async def events():
+        yield json.dumps({"type": "response.created", "response": {"id": "resp_a"}})
+        yield json.dumps({"type": "response.created", "response": {"id": "resp_b"}})
+        yield json.dumps(
+            {"type": "response.text.delta", "response_id": "resp_a", "delta": "stale"}
+        )
+        yield json.dumps({"type": "response.done", "response": {"id": "resp_a"}})
+        state["done_calls_after_stale_done"] = client.on_response_done.await_count
+        yield json.dumps(
+            {"type": "response.text.delta", "response_id": "resp_b", "delta": "fresh"}
+        )
+        yield json.dumps({"type": "response.done", "response": {"id": "resp_b"}})
+        state["ids_after_both_done"] = set(arbiter._server_response_ids)
+        state["busy_after_both_done"] = arbiter.is_busy
+
+    client.on_text_delta = AsyncMock()
+    client.on_response_done = AsyncMock()
+    client.ws = _ScriptedWs(events())
+    await client.handle_messages()
+
+    # Stale content is still filtered; only the current response renders.
+    client.on_text_delta.assert_awaited_once_with("fresh", True)
+    # The stale response.done must not run content-side completion.
+    assert state["done_calls_after_stale_done"] == 0
+    assert client.on_response_done.await_count == 1
+    # Both terminals delivered: the lane opens immediately, no timer wait.
+    assert state["ids_after_both_done"] == set()
+    assert state["busy_after_both_done"] is False
+
+
+@pytest.mark.unit
+async def test_single_response_done_flow_releases_arbiter_lane():
+    """Normal single-response flow is unchanged by the stale-terminal fix."""
+    client = _make_manual_client(model="gpt-4o-realtime-preview", api_type="openai")
+    arbiter = client._response_arbiter
+    state = {}
+
+    async def events():
+        yield json.dumps({"type": "response.created", "response": {"id": "resp_a"}})
+        yield json.dumps(
+            {"type": "response.text.delta", "response_id": "resp_a", "delta": "hello"}
+        )
+        yield json.dumps({"type": "response.done", "response": {"id": "resp_a"}})
+        state["ids_after_done"] = set(arbiter._server_response_ids)
+        state["busy_after_done"] = arbiter.is_busy
+
+    client.on_text_delta = AsyncMock()
+    client.on_response_done = AsyncMock()
+    client.ws = _ScriptedWs(events())
+    await client.handle_messages()
+
+    client.on_text_delta.assert_awaited_once_with("hello", True)
+    client.on_response_done.assert_awaited_once()
+    assert state["ids_after_done"] == set()
+    assert state["busy_after_done"] is False
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -426,8 +683,8 @@ async def test_connect_step_manual_vad_sends_null_turn_detection():
 @pytest.mark.parametrize(
     "proxy_url",
     [
-        "wss://lanlan.tech/realtime",  # StepFun proxy
-        "wss://lanlan.app/realtime",   # Vertex Gemini proxy
+        "wss://www.lanlan.tech/realtime",  # StepFun proxy
+        "wss://www.lanlan.app/realtime",   # Vertex Gemini proxy
     ],
 )
 async def test_connect_free_proxy_routes_manual_vad_per_backend(proxy_url):
@@ -473,7 +730,7 @@ async def test_connect_gemini_manual_vad_disables_automatic_activity_detection()
     fake_genai_client = MagicMock()
     fake_genai_client.aio.live.connect = MagicMock(side_effect=fake_live_connect)
 
-    with patch("main_logic.omni_realtime_client.genai") as mock_genai_module:
+    with patch("main_logic.omni_realtime_client._gemini_support.genai") as mock_genai_module:
         mock_genai_module.Client = MagicMock(return_value=fake_genai_client)
         await client.connect(instructions="You are helpful.", native_audio=True)
 
@@ -538,7 +795,7 @@ async def test_signal_user_activity_end_gemini_manual_sends_activity_end():
     fake_genai_client = MagicMock()
     fake_genai_client.aio.live.connect = MagicMock(return_value=fake_ctx)
 
-    with patch("main_logic.omni_realtime_client.genai") as mock_genai_module:
+    with patch("main_logic.omni_realtime_client._gemini_support.genai") as mock_genai_module:
         mock_genai_module.Client = MagicMock(return_value=fake_genai_client)
         await client.connect(instructions="hi", native_audio=True)
 
@@ -587,7 +844,7 @@ async def test_signal_user_activity_end_gemini_server_vad_is_noop():
     fake_genai_client = MagicMock()
     fake_genai_client.aio.live.connect = MagicMock(return_value=fake_ctx)
 
-    with patch("main_logic.omni_realtime_client.genai") as mock_genai_module:
+    with patch("main_logic.omni_realtime_client._gemini_support.genai") as mock_genai_module:
         mock_genai_module.Client = MagicMock(return_value=fake_genai_client)
         await client.connect(instructions="hi", native_audio=True)
 
@@ -618,7 +875,7 @@ async def test_gemini_connect_uses_supplied_native_voice():
     fake_genai_client = MagicMock()
     fake_genai_client.aio.live.connect = MagicMock(return_value=fake_ctx)
 
-    with patch("main_logic.omni_realtime_client.genai") as mock_genai_module:
+    with patch("main_logic.omni_realtime_client._gemini_support.genai") as mock_genai_module:
         mock_genai_module.Client = MagicMock(return_value=fake_genai_client)
         await client.connect(instructions="hi", native_audio=True)
 
@@ -726,11 +983,11 @@ _VAD_PROVIDER_MATRIX = [
     ("glm", "glm-realtime", "wss://example.test/realtime", "glm", True),
     ("step", "step-1o-audio", "wss://example.test/realtime", "step", True),
     # lanlan.tech (China free, StepFun proxy) — has server VAD by default
-    ("free_stepfun", "free-model", "wss://lanlan.tech/realtime", "free", True),
+    ("free_stepfun", "free-model", "wss://www.lanlan.tech/realtime", "free", True),
     # lanlan.app (international free, Vertex Gemini proxy) — __init__ already
     # treats this as client-VAD only (False), so MANUAL has nothing to flip.
     # Included to verify we don't accidentally re-enable server VAD.
-    ("free_vertex", "free-model", "wss://lanlan.app/realtime", "free", False),
+    ("free_vertex", "free-model", "wss://www.lanlan.app/realtime", "free", False),
 ]
 
 
@@ -806,7 +1063,7 @@ async def test_connect_gemini_manual_mode_keeps_has_server_vad_false():
     fake_genai_client = MagicMock()
     fake_genai_client.aio.live.connect = MagicMock(return_value=fake_ctx)
 
-    with patch("main_logic.omni_realtime_client.genai") as mock_genai_module:
+    with patch("main_logic.omni_realtime_client._gemini_support.genai") as mock_genai_module:
         mock_genai_module.Client = MagicMock(return_value=fake_genai_client)
         await client.connect(instructions="hi", native_audio=True)
 
@@ -894,6 +1151,97 @@ async def test_connect_websocket_invalid_turn_detection_mode_raises_before_webso
             await client.connect(instructions="hi", native_audio=True)
 
         mock_ws_connect.assert_not_called()
+
+
+@pytest.mark.unit
+async def test_failed_websocket_connect_does_not_reset_response_arbiter():
+    client = _make_manual_client(
+        model="qwen-omni-turbo-realtime",
+        api_type="qwen",
+    )
+    client._response_arbiter.reset_connection_state = MagicMock()
+
+    with patch(
+        "websockets.connect",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("connect failed"),
+    ):
+        with pytest.raises(RuntimeError, match="connect failed"):
+            await client.connect(instructions="hi", native_audio=True)
+
+    client._response_arbiter.reset_connection_state.assert_not_called()
+    await client.close()
+
+
+@pytest.mark.unit
+async def test_successful_websocket_connect_resets_arbiter_after_socket_is_ready():
+    client = _make_manual_client(
+        model="qwen-omni-turbo-realtime",
+        api_type="qwen",
+    )
+    ws = AsyncMock()
+
+    def assert_socket_ready() -> None:
+        assert client.ws is ws
+
+    client._response_arbiter.reset_connection_state = MagicMock(
+        side_effect=assert_socket_ready
+    )
+    with patch("websockets.connect", new_callable=AsyncMock, return_value=ws):
+        await client.connect(instructions="hi", native_audio=True)
+
+    client._response_arbiter.reset_connection_state.assert_called_once_with()
+    await client.close()
+
+
+@pytest.mark.unit
+async def test_close_detaches_socket_before_awaiting_arbiter_shutdown():
+    client = _make_manual_client(
+        model="qwen-omni-turbo-realtime",
+        api_type="qwen",
+    )
+    ws = AsyncMock()
+    client.ws = ws
+    client._close_audio_processor = AsyncMock()
+
+    async def assert_socket_detached(_reason: str) -> None:
+        assert client.ws is None
+
+    client._response_arbiter.shutdown = AsyncMock(
+        side_effect=assert_socket_detached
+    )
+
+    await client.close()
+
+    client._response_arbiter.shutdown.assert_awaited_once_with(
+        "realtime client closed"
+    )
+    ws.close.assert_awaited_once_with()
+
+
+@pytest.mark.unit
+async def test_failed_transport_detaches_socket_before_arbiter_shutdown():
+    client = _make_manual_client(
+        model="qwen-omni-turbo-realtime",
+        api_type="qwen",
+    )
+    ws = AsyncMock()
+    client.ws = ws
+
+    async def assert_socket_detached(_reason: str) -> None:
+        assert client.ws is None
+
+    client._response_arbiter.shutdown = AsyncMock(
+        side_effect=assert_socket_detached
+    )
+
+    await client._close_failed_transport("transport failed")
+
+    assert client._fatal_error_occurred is True
+    client._response_arbiter.shutdown.assert_awaited_once_with(
+        "transport failed"
+    )
+    ws.close.assert_awaited_once_with()
 
 
 # ──────────────────────────────────────────────────────────────────────

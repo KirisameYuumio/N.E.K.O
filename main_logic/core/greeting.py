@@ -21,21 +21,57 @@ Method-only mixin: every instance attribute is assigned in
 import asyncio
 import time
 from main_logic.omni_realtime_client import OmniRealtimeClient
-from main_logic.omni_offline_client import OmniOfflineClient
+from main_logic.omni_offline_client import OmniOfflineClient, _strip_nonverbal_directives
 from main_logic.session_state import SessionEvent
+from main_logic.startup_greeting_policy import (
+    _STARTUP_GREETING_BURST_SECONDS,
+    _STARTUP_GREETING_EARLIER_SAMPLES,
+    _STARTUP_GREETING_MIN_GAP_SECONDS,
+    _STARTUP_GREETING_RECALL_SECONDS,
+    _STARTUP_GREETING_STRICT_SAMPLES,
+    _STARTUP_GREETING_VARIANT_MEMORY,
+    _select_startup_followup,
+    _select_startup_greeting_variant,
+    _startup_greeting_burst_age,
+    split_startup_history_windows,
+)
+from memory.anti_repeat import get_anti_repeat_corpus
+from memory.startup_greeting_history import get_startup_greeting_history
+from config.prompts.avatar_interaction_contract import (
+    normalize_avatar_interaction_payload,
+)
 from config.prompts.prompts_avatar_interaction import (
-    _normalize_avatar_interaction_payload,
     _build_avatar_interaction_instruction,
     _build_avatar_interaction_memory_meta,
+    _sanitize_avatar_interaction_text_context,
 )
 from utils.config_manager import get_config_manager
-from utils.language_utils import normalize_language_code, get_global_language
+from utils.avatar_tool_store import (
+    AvatarToolStoreError,
+    get_avatar_tool_store,
+    is_local_avatar_tool_id,
+)
+from utils.cloudsave_runtime import MaintenanceModeError
+from utils.language_utils import normalize_language_code, get_global_language_full
 from uuid import uuid4
-from ._shared import logger, _proactive_expected_sid
+from ._shared import (
+    logger,
+    _proactive_expected_sid,
+    _proactive_published_text_chunks,
+)
 
 
 class GreetingMixin:
     """Greeting and avatar-interaction methods (see module docstring)."""
+
+    @staticmethod
+    def _greeting_locale_keys(language: str | None) -> tuple[str, str]:
+        """Return the short prompt locale and full regional holiday locale."""
+        selected_language = language or get_global_language_full()
+        return (
+            normalize_language_code(selected_language, format='short'),
+            normalize_language_code(selected_language, format='full'),
+        )
 
     def _remember_avatar_interaction_id(self, interaction_id: str) -> None:
         if interaction_id in self._recent_avatar_interaction_id_set:
@@ -46,30 +82,204 @@ class GreetingMixin:
         self._recent_avatar_interaction_ids.append(interaction_id)
         self._recent_avatar_interaction_id_set.add(interaction_id)
 
+    @staticmethod
+    def _avatar_interaction_ingress_time(payload: dict) -> float:
+        captured_at = payload.get("_user_input_ingress_time")
+        if isinstance(captured_at, (int, float)):
+            return float(captured_at)
+        return time.time()
+
+    @staticmethod
+    def _avatar_interaction_contract_payload(payload: dict) -> dict:
+        """Hide server transport metadata from the strict public contract."""
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            key: value
+            for key, value in payload.items()
+            if key not in {
+                "_user_input_ingress_time",
+                "_avatar_interaction_ingress_reserved",
+            }
+        }
+
+    @staticmethod
+    def _resolve_local_avatar_tool_prompt_record(raw: dict, record: dict) -> dict:
+        change_items = record.get("imageChange", {}).get("items")
+        change_index = raw.get("change_index")
+        if (
+            not isinstance(change_items, list)
+            or isinstance(change_index, bool)
+            or not isinstance(change_index, int)
+            or change_index < 0
+            or change_index >= len(change_items)
+        ):
+            raise ValueError("invalid local change index")
+        special = record.get("interaction", {}).get("special")
+        has_special_fact = "special_triggered" in raw
+        if bool(special) != has_special_fact:
+            raise ValueError("local special fact does not match record")
+        return {
+            "name": record["name"],
+            "meaning": (
+                special["meaning"]
+                if special and raw["special_triggered"] is True
+                else change_items[change_index]["meaning"]
+            ),
+        }
+
+    def note_avatar_interaction_ingress(self, payload: dict) -> bool:
+        """Expose validated avatar engagement before background dispatch."""
+        raw = normalize_avatar_interaction_payload(
+            self._avatar_interaction_contract_payload(payload),
+            sanitize_text_context=_sanitize_avatar_interaction_text_context,
+        )
+        if not raw:
+            return False
+        interaction_id = raw["interaction_id"]
+        if interaction_id in self._recent_avatar_interaction_id_set:
+            return False
+        # The WebSocket dispatch loop calls this synchronously. Reserve before
+        # scheduling the handler so a second frame with the same ID is already
+        # a duplicate even when the first task has not started yet.
+        self.note_user_engagement(
+            at=self._avatar_interaction_ingress_time(payload)
+        )
+        self._remember_avatar_interaction_id(interaction_id)
+        return True
+
     async def handle_avatar_interaction(self, payload: dict) -> dict:
         raw_interaction_id = str(payload.get("interaction_id") or payload.get("interactionId") or "").strip() if isinstance(payload, dict) else ""
-        raw = _normalize_avatar_interaction_payload(payload)
+        raw = normalize_avatar_interaction_payload(
+            self._avatar_interaction_contract_payload(payload),
+            sanitize_text_context=_sanitize_avatar_interaction_text_context,
+        )
         if not raw:
             logger.debug("[%s] handle_avatar_interaction: ignored invalid payload", self.lanlan_name)
             await self.send_avatar_interaction_ack(raw_interaction_id, False, "invalid_payload")
             return {"accepted": False, "reason": "invalid_payload"}
 
-        interaction_id = raw["interaction_id"]
-        now_ms = int(time.time() * 1000)
+        local_record = None
+        local_prompt_record = None
+        local_store = None
+        if is_local_avatar_tool_id(raw["tool_id"]):
+            local_store = get_avatar_tool_store(self._config_manager)
+            try:
+                local_record = await asyncio.to_thread(
+                    local_store.read_record,
+                    raw["tool_id"],
+                    verify_resources=False,
+                )
+            except (AvatarToolStoreError, MaintenanceModeError, OSError):
+                logger.debug(
+                    "[%s] handle_avatar_interaction: missing or invalid local tool=%s",
+                    self.lanlan_name,
+                    raw["tool_id"],
+                )
+                await self.send_avatar_interaction_ack(
+                    raw_interaction_id, False, "invalid_payload"
+                )
+                return {"accepted": False, "reason": "invalid_payload"}
+            if raw["tool_revision"] != local_store.record_revision(local_record):
+                logger.debug(
+                    "[%s] handle_avatar_interaction: stale local tool revision=%s",
+                    self.lanlan_name,
+                    raw["tool_id"],
+                )
+                await self.send_avatar_interaction_ack(
+                    raw_interaction_id, False, "stale_tool_revision"
+                )
+                return {"accepted": False, "reason": "stale_tool_revision"}
+            try:
+                local_prompt_record = self._resolve_local_avatar_tool_prompt_record(
+                    raw, local_record
+                )
+            except (KeyError, TypeError, ValueError):
+                await self.send_avatar_interaction_ack(
+                    raw_interaction_id, False, "invalid_payload"
+                )
+                return {"accepted": False, "reason": "invalid_payload"}
 
-        if interaction_id in self._recent_avatar_interaction_id_set:
+        interaction_id = raw["interaction_id"]
+        ingress_reserved = (
+            payload.get("_avatar_interaction_ingress_reserved") is True
+        )
+
+        if (
+            interaction_id in self._recent_avatar_interaction_id_set
+            and not ingress_reserved
+        ):
             logger.debug("[%s] handle_avatar_interaction: duplicate interaction_id=%s", self.lanlan_name, interaction_id)
             await self.send_avatar_interaction_ack(interaction_id, False, "duplicate")
             return {"accepted": False, "reason": "duplicate", "interaction_id": interaction_id}
 
-        if now_ms - self._last_avatar_interaction_at < self.avatar_interaction_cooldown_ms:
+        if not ingress_reserved:
+            self.note_user_engagement(
+                at=self._avatar_interaction_ingress_time(payload)
+            )
+
+        # Serialize the cooldown decision with strict local-resource
+        # verification and cooldown commit. A failed verification releases the
+        # gate without consuming the next valid interaction's cooldown slot.
+        #
+        # 冷却命中是连击时的高频分支，它的 ack 走 WebSocket。早先把这次 await
+        # 留在闸门里，一旦下行有背压，后面每一次互动都要排队等它发完 —— 包括
+        # 冷却窗口结束后第一个本该被接受的互动。判定与去重登记留在锁内保持原子，
+        # ack 挪到锁外发。
+        cooldown_hit = False
+        gate_rejection: tuple[str, str] | None = None
+        async with self._avatar_interaction_gate_lock:
+            now_ms = int(time.time() * 1000)
+            if now_ms - self._last_avatar_interaction_at < self.avatar_interaction_cooldown_ms:
+                self._remember_avatar_interaction_id(interaction_id)
+                cooldown_hit = True
+
+            # Only an event that can pass the duplicate/cooldown gates pays the
+            # full resource-digest cost. Re-read and resolve from the verified
+            # record so prompt data never comes from the lightweight first read.
+            if not cooldown_hit and local_store is not None:
+                try:
+                    local_record = await asyncio.to_thread(
+                        local_store.read_record,
+                        raw["tool_id"],
+                        verify_resources=True,
+                    )
+                    if raw["tool_revision"] != local_store.record_revision(local_record):
+                        gate_rejection = (raw_interaction_id, "stale_tool_revision")
+                    else:
+                        local_prompt_record = self._resolve_local_avatar_tool_prompt_record(
+                            raw, local_record
+                        )
+                except (
+                    AvatarToolStoreError,
+                    MaintenanceModeError,
+                    OSError,
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
+                    logger.debug(
+                        "[%s] handle_avatar_interaction: local tool changed or failed resource verification=%s",
+                        self.lanlan_name,
+                        raw["tool_id"],
+                    )
+                    gate_rejection = (raw_interaction_id, "invalid_payload")
+
+            if not cooldown_hit and gate_rejection is None:
+                self._remember_avatar_interaction_id(interaction_id)
+                self._last_avatar_interaction_at = now_ms
+
+        # 闸门里不留任何 await：拒绝的 ack 走 WebSocket，下行一有背压就会把后面
+        # 每一次互动堵在锁上。判定与去重登记在锁内保持原子，回执一律出锁再发。
+        if gate_rejection is not None:
+            rejected_id, reason = gate_rejection
+            await self.send_avatar_interaction_ack(rejected_id, False, reason)
+            return {"accepted": False, "reason": reason}
+
+        if cooldown_hit:
             logger.debug("[%s] handle_avatar_interaction: cooldown skip interaction_id=%s", self.lanlan_name, interaction_id)
-            self._remember_avatar_interaction_id(interaction_id)
             await self.send_avatar_interaction_ack(interaction_id, False, "cooldown")
             return {"accepted": False, "reason": "cooldown", "interaction_id": interaction_id}
-
-        self._remember_avatar_interaction_id(interaction_id)
-        self._last_avatar_interaction_at = now_ms
 
         if self.is_active and isinstance(self.session, OmniRealtimeClient):
             logger.debug("[%s] handle_avatar_interaction: voice session active, skipping", self.lanlan_name)
@@ -99,11 +309,13 @@ class GreetingMixin:
             self.lanlan_name,
             self.master_name,
             raw,
+            local_prompt_record,
         )
         memory_meta = _build_avatar_interaction_memory_meta(
             getattr(self, "user_language", None),
             raw,
             self.master_name,
+            local_prompt_record,
         )
         memory_note = memory_meta["memory_note"]
         delivered = False
@@ -194,13 +406,24 @@ class GreetingMixin:
             self._pending_turn_meta = None
 
         if accepted:
-            logger.info(
-                "[%s] handle_avatar_interaction: delivered interaction_id=%s tool=%s action=%s",
-                self.lanlan_name,
-                interaction_id,
-                raw["tool_id"],
-                raw["action_id"],
-            )
+            if "action_id" in raw:
+                logger.info(
+                    "[%s] handle_avatar_interaction: delivered interaction_id=%s tool=%s action=%s",
+                    self.lanlan_name,
+                    interaction_id,
+                    raw["tool_id"],
+                    raw["action_id"],
+                )
+            else:
+                logger.info(
+                    "[%s] handle_avatar_interaction: delivered interaction_id=%s tool=%s round=%s/%s result=%s",
+                    self.lanlan_name,
+                    interaction_id,
+                    raw["tool_id"],
+                    raw["user_gesture"],
+                    raw["avatar_gesture"],
+                    raw["round_result"],
+                )
             return {"accepted": True, "interaction_id": interaction_id}
 
         logger.debug(
@@ -209,11 +432,13 @@ class GreetingMixin:
         )
         return {"accepted": False, "reason": ack_reason, "interaction_id": interaction_id}
 
-    async def trigger_greeting(self) -> None:
+    async def trigger_greeting(self, *, render_language: str | None = None) -> None:
         """On first connect or character switch, trigger a proactive greeting based on the gap since the last conversation.
 
         Flow: query memory_server for the gap → build the guiding prompt → proactively start a text session → deliver.
         """
+        greeting_name = self.lanlan_name
+        greeting_memory_server_port = self.memory_server_port
         if self.is_goodbye_silent():
             logger.info("[%s] trigger_greeting: goodbye silent, skipping", self.lanlan_name)
             return
@@ -235,7 +460,7 @@ class GreetingMixin:
             from utils.internal_http_client import get_internal_http_client
             _mem_client = get_internal_http_client()
             resp = await _mem_client.get(
-                f"http://127.0.0.1:{self.memory_server_port}/last_conversation_gap/{self.lanlan_name}",
+                f"http://127.0.0.1:{greeting_memory_server_port}/last_conversation_gap/{greeting_name}",
                 timeout=2.0,
             )
             if not resp.is_success:
@@ -246,8 +471,55 @@ class GreetingMixin:
             logger.warning("[%s] trigger_greeting: failed to query gap: %s", self.lanlan_name, e)
             return
 
-        if gap_seconds < 900:  # < 15分钟，不触发
+        if gap_seconds < _STARTUP_GREETING_MIN_GAP_SECONDS:  # < 15分钟，不触发
             logger.debug("[%s] trigger_greeting: gap %.0fs < 15min, skipping", self.lanlan_name, gap_seconds)
+            return
+
+        # 普通 anti-repeat 的前景 TTL 是 10 分钟，而 greeting 的硬门槛是 15 分钟，
+        # 所以它天然无法承担同日开屏轮换。这里预热专用的已提交历史；只有真正送达
+        # 的文本才会在下方 callback 中写入。一次读满 3 天召回窗，随后就地切成
+        # 1 天强约束层 + 1~3 天弱约束层，避免为两级窗口读两次盘。
+        greeting_history = get_startup_greeting_history()
+        anti_repeat_corpus = get_anti_repeat_corpus()
+        observed_at = time.time()
+        try:
+            await asyncio.gather(
+                greeting_history.apreload(greeting_name),
+                anti_repeat_corpus.apreload(greeting_name),
+            )
+            recall_greetings = greeting_history.recent(
+                greeting_name,
+                now=observed_at,
+                max_age_seconds=_STARTUP_GREETING_RECALL_SECONDS,
+            )
+        except Exception as e:
+            logger.debug(
+                "[%s] trigger_greeting: startup history unavailable: %s",
+                self.lanlan_name,
+                e,
+            )
+            recall_greetings = []
+        recent_greetings, earlier_greetings = split_startup_history_windows(
+            recall_greetings,
+            observed_at=observed_at,
+        )
+
+        # 同一个逻辑启动 burst 最多说一次。15 分钟内原 gap gate 已覆盖，这里保守
+        # 补齐 15~30 分钟的反复启动/多窗口重连。投递前的原子 reservation 会再
+        # 校验一次已提交历史，避免两个错峰启动任务都拿到同一份空快照。
+        burst_age = _startup_greeting_burst_age(
+            recall_greetings,
+            observed_at=observed_at,
+            last_user_engagement_at=getattr(
+                self, "last_user_engagement_time", None
+            ),
+        )
+        if burst_age is not None:
+            logger.info(
+                "[%s] trigger_greeting: startup burst suppressed (age=%.0fs)",
+                self.lanlan_name,
+                burst_age,
+            )
             return
 
         # ── await 归来后再检查一次：memory 查询期间用户可能已点了麦克风 ──
@@ -255,11 +527,18 @@ class GreetingMixin:
             logger.info("[%s] trigger_greeting: voice session appeared during gap query, skipping", self.lanlan_name)
             return
 
-        _lang = normalize_language_code(self.user_language, format='short')
+        _lang, _holiday_lang = self._greeting_locale_keys(
+            self.user_language or render_language
+        )
         from config.prompts.prompts_proactive import get_greeting_prompt, get_time_of_day_hint
+        from config.prompts.prompts_proactive import get_startup_greeting_guidance
         from utils.time_format import format_elapsed as _format_elapsed
         from utils.holiday_cache import preview_holiday_or_weekend_hint, commit_holiday_or_weekend_hint
-        template = get_greeting_prompt(gap_seconds, _lang)
+        # Keep the region for startup prompt selection so Traditional Chinese
+        # reaches the dedicated zh-TW templates. Formatting helpers that only
+        # support short codes continue to use ``_lang``.
+        _prompt_lang = _holiday_lang
+        template = get_greeting_prompt(gap_seconds, _prompt_lang)
         if not template:
             return
 
@@ -288,24 +567,204 @@ class GreetingMixin:
             logger.warning("[%s] trigger_greeting: session is not text mode after start, aborting", self.lanlan_name)
             return
 
+        # Reflection endpoint is read-only: selection does not start synthesis and
+        # does not consume cooldown.  We mark one candidate surfaced only from the
+        # committed-text callback below.  Topic keys are held off for the whole
+        # 3-day recall window — re-raising the same remembered topic reads as far
+        # more repetitive than reusing a generic opening shape, which only rotates
+        # against the 1-day strict layer.
+        recently_used_topic_keys = {
+            record.topic_key for record in recall_greetings if record.topic_key
+        }
+        startup_followup = None
+        memory_variant_available = all(
+            record.variant_key != _STARTUP_GREETING_VARIANT_MEMORY
+            for record in recent_greetings
+        )
+        if memory_variant_available:
+            try:
+                followup_resp = await _mem_client.get(
+                    f"http://127.0.0.1:{greeting_memory_server_port}/followup_topics/{greeting_name}",
+                    timeout=5.0,
+                )
+                if followup_resp.is_success:
+                    startup_followup = _select_startup_followup(
+                        followup_resp.json().get("topics", []),
+                        recently_used_topic_keys=recently_used_topic_keys,
+                    )
+                else:
+                    logger.debug(
+                        "[%s] trigger_greeting: followup topics returned %s",
+                        greeting_name,
+                        followup_resp.status_code,
+                    )
+            except Exception as e:
+                # Memory enrichment is optional; a transient reflection failure must
+                # never suppress a safe ordinary greeting.
+                logger.debug(
+                    "[%s] trigger_greeting: followup topics unavailable: %s",
+                    greeting_name,
+                    e,
+                )
+
+        startup_variant = _select_startup_greeting_variant(
+            recent_greetings,
+            has_followup=startup_followup is not None,
+        )
+        if startup_variant != _STARTUP_GREETING_VARIANT_MEMORY:
+            startup_followup = None
+        surfaced_topic_key = startup_followup[0] if startup_followup else None
+        startup_memory_cue = startup_followup[1] if startup_followup else ""
+
         # 投递通道已就绪，构建 instruction（节日预算仅 preview，不消费）
         elapsed = _format_elapsed(_lang, gap_seconds)
-        time_hint = get_time_of_day_hint(_lang).format(master=self.master_name)
+        time_hint = get_time_of_day_hint(_prompt_lang).format(master=self.master_name)
 
         _holiday_token = None
         try:
-            holiday_hint_text, _holiday_token = await preview_holiday_or_weekend_hint(_lang, self.lanlan_name)
+            holiday_hint_text, _holiday_token = await preview_holiday_or_weekend_hint(
+                _holiday_lang,
+                self.lanlan_name,
+            )
         except Exception as e:
             logger.debug("[%s] trigger_greeting: holiday hint failed: %s", self.lanlan_name, e)
             holiday_hint_text = None
         holiday_hint = (holiday_hint_text + '\n') if holiday_hint_text else ''
 
         instruction = template.format(
-            elapsed=elapsed, name=self.lanlan_name, master=self.master_name,
+            elapsed=elapsed, name=greeting_name, master=self.master_name,
             time_hint=time_hint, holiday_hint=holiday_hint,
         )
-        print(f"[trigger_greeting] instruction:\n{instruction}")
-        logger.info("[%s] trigger_greeting: gap=%.0fs elapsed=%s, delivering", self.lanlan_name, gap_seconds, elapsed)
+        instruction += "\n" + get_startup_greeting_guidance(
+            gap_seconds,
+            _prompt_lang,
+            variant_key=startup_variant,
+            master=self.master_name,
+            memory_cue=startup_memory_cue,
+            recent_openings=tuple(
+                record.text
+                for record in recent_greetings[:_STARTUP_GREETING_STRICT_SAMPLES]
+            ),
+            earlier_openings=tuple(
+                record.text
+                for record in earlier_greetings[:_STARTUP_GREETING_EARLIER_SAMPLES]
+            ),
+        )
+
+        async def _record_committed_side_effects() -> None:
+            if surfaced_topic_key:
+                try:
+                    surfaced_resp = await _mem_client.post(
+                        f"http://127.0.0.1:{greeting_memory_server_port}/record_surfaced/{greeting_name}",
+                        json={"reflection_ids": [surfaced_topic_key]},
+                        timeout=5.0,
+                    )
+                    if not surfaced_resp.is_success:
+                        logger.debug(
+                            "[%s] trigger_greeting: record_surfaced returned %s",
+                            self.lanlan_name,
+                            surfaced_resp.status_code,
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "[%s] trigger_greeting: record_surfaced failed: %s",
+                        self.lanlan_name,
+                        e,
+                    )
+            if _holiday_token is not None:
+                try:
+                    await asyncio.to_thread(
+                        commit_holiday_or_weekend_hint,
+                        greeting_name,
+                        _holiday_token,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "[%s] trigger_greeting: holiday commit failed: %s",
+                        self.lanlan_name,
+                        e,
+                    )
+
+        greeting_commit_seen = False
+        greeting_reservation_token = None
+        greeting_published_text_chunks: list[str] = []
+
+        def _on_greeting_committed(committed_text: str) -> None:
+            nonlocal greeting_commit_seen
+            if greeting_commit_seen:
+                return
+            published_text = _strip_nonverbal_directives(
+                "".join(greeting_published_text_chunks)
+            ).strip()
+            # prompt_ephemeral can still build a local assistant_message after a
+            # user turn has stolen the speech id; the transport drops those deltas.
+            # A prefix recorded at send_lanlan_response's sync-queue boundary is
+            # irrevocable commit evidence even if the final sid was preempted.
+            if (
+                greeting_reservation_token is None
+                or (
+                    not published_text
+                    and (
+                        self.state.is_proactive_preempted()
+                        or self.current_speech_id != proactive_sid
+                    )
+                )
+            ):
+                logger.info(
+                    "[%s] trigger_greeting: committed-text bookkeeping rejected "
+                    "after sid preemption",
+                    self.lanlan_name,
+                )
+                return
+            greeting_commit_seen = True
+            bookkeeping_text = published_text or committed_text
+
+            # Both in-memory stages happen before prompt_ephemeral emits its
+            # terminal callback.  Disk writes are detached so a cancellation after
+            # visible text cannot make the greeting eligible again.
+            try:
+                staged_greeting = greeting_history.stage_committed(
+                    greeting_name,
+                    bookkeeping_text,
+                    variant_key=startup_variant,
+                    topic_key=surfaced_topic_key,
+                    reservation_token=greeting_reservation_token,
+                )
+                greeting_history.flush_staged_detached(staged_greeting)
+            except Exception as e:
+                logger.debug(
+                    "[%s] trigger_greeting: startup history commit skipped: %s",
+                    self.lanlan_name,
+                    e,
+                )
+            try:
+                staged_anti_repeat = anti_repeat_corpus.stage_output(
+                    greeting_name,
+                    bookkeeping_text,
+                    is_proactive=True,
+                )
+                anti_repeat_corpus.flush_staged_detached(staged_anti_repeat)
+            except Exception as e:
+                logger.debug(
+                    "[%s] trigger_greeting: anti-repeat commit skipped: %s",
+                    self.lanlan_name,
+                    e,
+                )
+
+            if surfaced_topic_key or _holiday_token is not None:
+                self._fire_task(_record_committed_side_effects())
+
+        logger.debug(
+            "[%s] trigger_greeting: instruction built "
+            "(len=%d variant=%s has_memory_cue=%s strict=%d earlier=%d)",
+            greeting_name,
+            len(instruction),
+            startup_variant,
+            bool(startup_memory_cue),
+            min(len(recent_greetings), _STARTUP_GREETING_STRICT_SAMPLES),
+            min(len(earlier_greetings), _STARTUP_GREETING_EARLIER_SAMPLES),
+        )
+        logger.info("[%s] trigger_greeting: gap=%.0fs elapsed=%s, delivering", greeting_name, gap_seconds, elapsed)
 
         # ── 投递前最终检查：构建 instruction 期间（holiday hint 等 await）语音可能已接管 ──
         if self._is_voice_session_active_or_starting():
@@ -340,7 +799,19 @@ class GreetingMixin:
                     proactive_sid = self.current_speech_id
                 await self.state.fire(SessionEvent.PROACTIVE_CLAIM, sid=proactive_sid)
                 await self.state.fire(SessionEvent.PROACTIVE_PHASE2)
+                if (
+                    self.state.is_proactive_preempted()
+                    or self.current_speech_id != proactive_sid
+                ):
+                    logger.info(
+                        "[%s] trigger_greeting: preempted after phase claim, skipping",
+                        self.lanlan_name,
+                    )
+                    return
                 _sid_token = _proactive_expected_sid.set(proactive_sid)
+                _published_text_token = _proactive_published_text_chunks.set(
+                    greeting_published_text_chunks
+                )
                 try:
                     # 防御 stale session: 4429 start_session 之后到这里又过了
                     # 多次 await（holiday hint / try_start_proactive /
@@ -361,26 +832,58 @@ class GreetingMixin:
                             self.lanlan_name, type(session_ref).__name__,
                         )
                         return
-                    delivered = await session_ref.prompt_ephemeral(instruction)
+                    greeting_reservation_token = greeting_history.try_reserve(
+                        greeting_name,
+                        now=time.time(),
+                        burst_seconds=_STARTUP_GREETING_BURST_SECONDS,
+                        last_user_engagement_at=getattr(
+                            self, "last_user_engagement_time", None
+                        ),
+                    )
+                    if greeting_reservation_token is None:
+                        logger.info(
+                            "[%s] trigger_greeting: startup reservation denied",
+                            self.lanlan_name,
+                        )
+                        return
+                    try:
+                        delivered = await session_ref.prompt_ephemeral(
+                            instruction,
+                            on_committed_text=_on_greeting_committed,
+                        )
+                    finally:
+                        greeting_history.release_reservation(
+                            greeting_name, greeting_reservation_token
+                        )
                 finally:
+                    _proactive_published_text_chunks.reset(_published_text_token)
                     _proactive_expected_sid.reset(_sid_token)
                 logger.info("[%s] trigger_greeting: delivered=%s", self.lanlan_name, delivered)
-                # 投递成功后才真正消费节日/周末预算
-                # commit 内部会 atomic_write_json 消费预算文件，offload 以免阻塞事件循环
-                if delivered and _holiday_token is not None:
-                    await asyncio.to_thread(commit_holiday_or_weekend_hint, self.lanlan_name, _holiday_token)
         finally:
             await self.state.fire(SessionEvent.PROACTIVE_DONE)
 
-    async def trigger_cat_greeting(self, duration_seconds: float, tier: str, was_auto: bool) -> None:
+    async def trigger_cat_greeting(
+        self,
+        duration_seconds: float,
+        tier: str,
+        was_auto: bool,
+        episode: dict | None = None,
+        *,
+        render_language: str | None = None,
+    ) -> None:
         """When transforming back from cat form to catgirl (asking her back), trigger one dedicated greeting based on "behavior (tier) × time spent as a cat".
 
         Dual of trigger_greeting, but with independent timing: it doesn't query
-        last_conversation_gap, instead using the cat-dwell duration measured and
-        passed in by the frontend (the datetime gap is "since the last
+        last_conversation_gap, instead using the server-observed cat-dwell
+        duration passed in by the websocket router (the datetime gap is "since the last
         conversation", this is "how long she stayed a cat" — two clocks that don't
-        interfere). Flow: pick the behavior/duration tier → build the guiding
-        prompt → proactively start a text session → deliver.
+        interfere). A valid episode has already passed the router enum
+        allowlist and remains request-local; it becomes the factual cat-form
+        scene for this one prompt without altering guards or persistent state.
+        Cat Mind activity may enrich a return after the normal dwell threshold,
+        but it never shortens or bypasses that threshold.
+        Flow: pick the behavior/duration tier → build the guiding prompt →
+        proactively start a text session → deliver.
         """
         if self.is_goodbye_silent():
             logger.info("[%s] trigger_cat_greeting: goodbye silent, skipping", self.lanlan_name)
@@ -396,13 +899,35 @@ class GreetingMixin:
         # tier → 行为：cat1=清醒 / cat2=打盹 / cat3=熟睡。
         behavior = {"cat1": "awake", "cat2": "nap", "cat3": "sleep"}.get(str(tier or "").strip().lower(), "awake")
 
-        _lang = normalize_language_code(self.user_language, format='short')
         from config.prompts.prompts_proactive import (
-            get_cat_greeting_prompt, get_cat_greeting_reason_hint, get_time_of_day_hint,
+            CAT_GREETING_SILENT_BELOW_SECONDS,
+            get_cat_greeting_episode_prompt, get_cat_greeting_episode_scene,
+            get_cat_greeting_prompt,
+            get_cat_greeting_reason_hint,
+            normalize_proactive_prompt_locale,
+        )
+        # 猫咪问候的四张表都在 prompts_proactive（有 zh-TW 行）；短码会把 zh-TW
+        # 折成 zh，那些行永远取不到（issue #2500）。
+        _lang = normalize_proactive_prompt_locale(
+            self.user_language or render_language or get_global_language_full()
         )
         from utils.time_format import format_elapsed as _format_elapsed
-        # < 3min 静默由 get_cat_greeting_prompt 内部判定，返回 None 时不触发。
-        template = get_cat_greeting_prompt(behavior, duration_seconds, _lang)
+        episode_scene = get_cat_greeting_episode_scene(episode, _lang)
+        if duration_seconds < CAT_GREETING_SILENT_BELOW_SECONDS:
+            logger.debug(
+                "[%s] trigger_cat_greeting: duration %.0fs below unified threshold, skipping",
+                self.lanlan_name,
+                duration_seconds,
+            )
+            return
+        if episode_scene:
+            template = get_cat_greeting_episode_prompt(
+                behavior,
+                duration_seconds,
+                _lang,
+            )
+        else:
+            template = get_cat_greeting_prompt(behavior, duration_seconds, _lang)
         if not template:
             logger.debug("[%s] trigger_cat_greeting: duration %.0fs below threshold, skipping", self.lanlan_name, duration_seconds)
             return
@@ -429,18 +954,40 @@ class GreetingMixin:
             logger.warning("[%s] trigger_cat_greeting: session is not text mode after start, aborting", self.lanlan_name)
             return
 
-        # 与 time_hint 一样，reason_hint 先 format 好 {master} 再注入主模板。
+        # reason_hint 先 format 好 {master} 再注入猫形态 return 模板。
         reason_hint = get_cat_greeting_reason_hint(was_auto, _lang).format(master=self.master_name)
         elapsed = _format_elapsed(_lang, duration_seconds)
-        time_hint = get_time_of_day_hint(_lang).format(master=self.master_name)
+        # Cat return is a closed experience prompt. Do not import the general
+        # proactive time-of-day hint here: its meal/late-night suggestions can
+        # replace the actual cat-form episode with an unrelated greeting.
+        # Legacy cat templates still accept this placeholder for compatibility,
+        # but it is deliberately empty on this path.
+        time_hint = ""
 
         instruction = template.format(
             reason_hint=reason_hint, elapsed=elapsed, name=self.lanlan_name,
             master=self.master_name, time_hint=time_hint,
+            cat_form_scene=episode_scene,
         )
         print(f"[trigger_cat_greeting] instruction:\n{instruction}")
-        logger.info("[%s] trigger_cat_greeting: behavior=%s duration=%.0fs was_auto=%s elapsed=%s, delivering",
-                    self.lanlan_name, behavior, duration_seconds, was_auto, elapsed)
+        episode_marker = "-"
+        if isinstance(episode, dict):
+            episode_kind = episode.get("kind")
+            episode_highlight = episode.get("highlight")
+            if episode_kind in ("activity", "rest_after_activity", "rested"):
+                episode_marker = str(episode_kind)
+                if episode_highlight in ("played_yarn", "ate_snack", "small_move", "social_ping"):
+                    episode_marker += ":" + str(episode_highlight)
+        logger.info(
+            "[%s] trigger_cat_greeting: behavior=%s duration=%.0fs was_auto=%s "
+            "elapsed=%s episode=%s, delivering",
+            self.lanlan_name,
+            behavior,
+            duration_seconds,
+            was_auto,
+            elapsed,
+            episode_marker,
+        )
 
         # ── 投递前最终检查：构建 instruction 期间语音可能已接管 ──
         if self._is_voice_session_active_or_starting():
@@ -488,8 +1035,15 @@ class GreetingMixin:
         finally:
             await self.state.fire(SessionEvent.PROACTIVE_DONE)
 
-    async def trigger_new_character_greeting(self) -> None:
-        from config.prompts.prompts_proactive import get_new_character_greeting_prompt
+    async def trigger_new_character_greeting(
+        self,
+        *,
+        render_language: str | None = None,
+    ) -> None:
+        from config.prompts.prompts_proactive import (
+            get_new_character_greeting_prompt,
+            normalize_proactive_prompt_locale,
+        )
         from utils.new_character_greeting_state import has_pending, remove_pending
 
         config_manager = get_config_manager()
@@ -505,7 +1059,13 @@ class GreetingMixin:
             logger.info("[%s] trigger_new_character_greeting: voice session active/starting, skipping", self.lanlan_name)
             return
 
-        _lang = normalize_language_code(getattr(self, 'user_language', '') or '', format='short') or get_global_language()
+        # 同 trigger_cat_greeting：破冰问候模板也在 prompts_proactive，要 prompt
+        # key 才留得住 zh-TW。空 user_language 才回落全局语言（issue #2500）。
+        _lang = normalize_proactive_prompt_locale(
+            getattr(self, 'user_language', '')
+            or render_language
+            or get_global_language_full()
+        )
         template = get_new_character_greeting_prompt(_lang)
 
         if self._is_voice_session_active_or_starting():

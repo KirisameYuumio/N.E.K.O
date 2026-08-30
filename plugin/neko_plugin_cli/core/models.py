@@ -6,12 +6,16 @@ import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, computed_field, model_validator
+from plugin._types.plugin_types import (
+    SUPPORTED_PLUGIN_TYPES,
+    format_plugin_type_choice_error,
+)
 
 # Keep low-level validation helpers module-local so the public models stay small
 # and consistent across CLI/API/service usage.
 _PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_PACKAGE_TYPES = {"plugin", "bundle", "extension", "adapter"}
+_PACKAGE_TYPES = SUPPORTED_PLUGIN_TYPES | {"bundle"}
 _PACKAGE_SUFFIXES = {".neko-plugin", ".neko-bundle"}
 
 
@@ -58,7 +62,7 @@ def _normalize_required_string(value: str, *, field_name: str) -> str:
 def _normalize_package_type(value: str) -> str:
     normalized = str(value).strip().lower()
     if normalized not in _PACKAGE_TYPES:
-        raise ValueError("package_type must be one of: plugin, bundle, extension, adapter")
+        raise ValueError(format_plugin_type_choice_error("package_type", allowed=_PACKAGE_TYPES))
     return normalized
 
 
@@ -147,17 +151,20 @@ class PluginSource:
     plugin_dir: Path
     plugin_toml_path: Path
     pyproject_toml_path: Path | None = None
+    config_example_path: Path | None = None
     plugin_id: str = ""
     name: str = ""
     version: str = ""
     package_type: str = "plugin"
     plugin_toml: dict[str, object] = field(default_factory=dict)
     pyproject_toml: dict[str, object] | None = None
+    config_example_toml: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         self.plugin_dir = _normalize_path(self.plugin_dir)
         self.plugin_toml_path = _normalize_path(self.plugin_toml_path)
         self.pyproject_toml_path = _normalize_optional_path(self.pyproject_toml_path)
+        self.config_example_path = _normalize_optional_path(self.config_example_path)
         self.plugin_id = _normalize_plugin_id(self.plugin_id)
         self.name = _normalize_required_string(self.name, field_name="name")
         self.version = _normalize_required_string(self.version, field_name="version")
@@ -166,6 +173,8 @@ class PluginSource:
             raise TypeError("plugin_toml must be a dict")
         if self.pyproject_toml is not None and not isinstance(self.pyproject_toml, dict):
             raise TypeError("pyproject_toml must be a dict or None")
+        if self.config_example_toml is not None and not isinstance(self.config_example_toml, dict):
+            raise TypeError("config_example_toml must be a dict or None")
 
     @property
     def has_pyproject(self) -> bool:
@@ -175,6 +184,12 @@ class PluginSource:
     def plugin_table(self) -> dict[str, object]:
         value = self.plugin_toml.get("plugin")
         return value if isinstance(value, dict) else {}
+
+    @property
+    def runtime_config_defaults(self) -> dict[str, object]:
+        if self.config_example_toml is not None:
+            return self.config_example_toml
+        return self.plugin_toml
 
     @property
     def description(self) -> str:
@@ -444,10 +459,11 @@ class InstallResult(_BaseModel):
     profiles_root: OptionalResolvedPath = None
     installed_plugins: list[InstalledPlugin] = Field(default_factory=list)
     profile_dir: OptionalResolvedPath = None
+    profile_reused: bool = False
     metadata_found: bool = False
     payload_hash: OptionalPayloadHashValue = ""
     payload_hash_verified: bool | None = None
-    conflict_strategy: ConflictStrategyValue = "rename"
+    conflict_strategy: ConflictStrategyValue = "fail"
 
     @model_validator(mode="after")
     def _validate_layout(self) -> InstallResult:

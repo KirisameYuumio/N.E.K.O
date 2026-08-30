@@ -14,6 +14,7 @@
     <script src="/static/i18n-i18next.js?v={{ static_asset_version }}"></script>
     <script src="/static/common_dialogs.js?v={{ static_asset_version }}"></script>
     <link rel="stylesheet" href="/static/css/index.css?v={{ static_asset_version }}">
+    <link rel="stylesheet" href="/static/css/music_ui.css?v={{ static_asset_version }}">
     <link rel="stylesheet" href="/static/css/subtitle.css?v={{ static_asset_version }}">
     <link rel="stylesheet" href="/static/css/dark-mode.css?v={{ static_asset_version }}">
     <script>window.__NEKO_REACT_CHAT_ASSET_VERSION__={{ react_chat_asset_version | tojson }};</script>
@@ -465,7 +466,7 @@
     })();</script>
 
     <div id="status-toast"></div>
-    <!-- 空壳 DOM：防止 app-ui.js / app-websocket.js 中 getElementById 返回 null -->
+    <!-- 空壳 DOM：防止 app-ui / app-websocket.js 中 getElementById 返回 null -->
     <div id="live2d-container" style="display:none;"><canvas id="live2d-canvas"></canvas></div>
     <div id="vrm-container" style="display:none;"><canvas id="vrm-canvas"></canvas></div>
     <div id="subtitle-display" class="hidden" style="display:none;"><span id="subtitle-text"></span></div>
@@ -529,7 +530,7 @@
     <!-- React Chat（与 index.html 完全相同的 DOM 结构）-->
     <!-- overlay 默认 hidden（与 index.html 一致）：在 React 挂载完成、shell 已带
          data-chat-surface-mode="compact" 之前不渲染任何东西，避免先闪一帧 full 形态。
-         app-react-chat-window.js 的 openWindow() 会在 mountWindow() 之后置 hidden=false。 -->
+         app-react-chat-window 的 openWindow() 会在 mountWindow() 之后置 hidden=false。 -->
     <div id="react-chat-window-overlay" hidden>
         <div id="react-chat-window-backdrop"></div>
         <div id="react-chat-window-shell" role="dialog" aria-modal="true" aria-labelledby="react-chat-window-title">
@@ -630,14 +631,23 @@
     <script src="/static/ogg-opus-decoder-wrapper.js?v={{ static_asset_version }}"></script>
 
     <!-- app 模块（与 index.html 完全相同的加载顺序）-->
+    <script src="/static/app/desktop-capture-provider.js?v={{ static_asset_version }}"></script>
     <script src="/static/subtitle/subtitle-shared.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-prompt-shared.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-state.js?v={{ static_asset_version }}"></script>
-    <script src="/static/app/app-ui.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-cat-mind.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-cat-mind-debug.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-ui/bootstrap-goodbye-and-toasts.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-ui/model-display.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-ui/return-transitions.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-ui/return-window-drag.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-ui/surface-floating-controls.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-ui/wrapup-final-guards.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-chat-text-utils.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-chat.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-chat-avatar.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-audio-playback.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-widget-interaction.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-spatial-audio.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-audio-capture.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-screen.js?v={{ static_asset_version }}"></script>
@@ -652,25 +662,40 @@
     <script src="/static/tutorial/core/timeline-engine.js?v={{ static_asset_version }}"></script>
     <script src="/static/tutorial/core/visual-runtime.js?v={{ static_asset_version }}"></script>
     <script src="/static/tutorial/yui-guide/common.js?v={{ static_asset_version }}"></script>
-    <script src="/static/app/app-interpage.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-interpage/bootstrap-resources-and-model-reload.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-interpage/composer-voice-sync.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-interpage/cross-window-broadcast-and-bridge.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-interpage/guide-message-relay.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-interpage/guide-overlay.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-interpage/guide-targets.js?v={{ static_asset_version }}"></script>
+    <script src="/static/app/app-interpage/listeners-and-api.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-proactive.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-settings.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-agent.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-character.js?v={{ static_asset_version }}"></script>
+    <!-- Match index.html: install the adapter before app.js opens the WebSocket. -->
+    <script src="/static/app/app-chat-adapter.js?v={{ react_chat_asset_version }}"></script>
     <script src="/static/app/app-websocket.js?v={{ static_asset_version }}"></script>
+    <script src="/static/vrm/motion/bridge.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-telemetry.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app-buttons.js?v={{ react_chat_asset_version }}"></script>
+    <script src="/static/avatar/avatar-drop-parser.js?v={{ static_asset_version }}"></script>
     <script src="/static/app/app.js?v={{ static_asset_version }}"></script>
     <script src="/static/subtitle/subtitle.js?v={{ static_asset_version }}"></script>
 
     <!-- React Chat（与 index.html 相同的 bundle + 初始化器）-->
     <!-- Local-mutation CSRF helper：mini-game invite respond endpoint 等本地
          mutation 共用 window.nekoLocalMutationSecurity 拿 X-CSRF-Token；必须
-         在 app-react-chat-window.js 之前加载，与 index.html 同序。 -->
+         在 app-react-chat-window 之前加载，与 index.html 同序。 -->
     <script src="/static/game/system/game-audio-system.js?v={{ static_asset_version }}"></script>
     <script src="/static/react/neko-chat/neko-chat-window.iife.js?v={{ react_chat_asset_version }}"></script>
-    <script src="/static/app/app-react-chat-window.js?v={{ react_chat_asset_version }}"></script>
-    <script src="/static/app/app-chat-adapter.js?v={{ react_chat_asset_version }}"></script>
+    <script src="/static/app/app-react-chat-window/bootstrap-state-and-geometry.js?v={{ react_chat_asset_version }}"></script>
+    <script src="/static/app/app-react-chat-window/geometry-and-messages.js?v={{ react_chat_asset_version }}"></script>
+    <script src="/static/app/app-react-chat-window/message-bundle-actions-and-prompts.js?v={{ react_chat_asset_version }}"></script>
+    <script src="/static/app/app-react-chat-window/minimize-and-idle-dock.js?v={{ react_chat_asset_version }}"></script>
+    <script src="/static/app/app-react-chat-window/cat-local-chat-lexicon.js?v={{ react_chat_asset_version }}"></script>
+    <script src="/static/app/app-react-chat-window/cat-local-chat.js?v={{ react_chat_asset_version }}"></script>
+    <script src="/static/app/app-react-chat-window/resize-drag-and-api.js?v={{ react_chat_asset_version }}"></script>
     <script src="/static/app/app-chat-export.js?v={{ static_asset_version }}"></script>
 
     <script>
@@ -692,6 +717,9 @@
 
         // BALL: 折叠态毛线球窗口总尺寸（CSS .minimized 51px 内容 + 32px Electron 窗口边框/透明余量）
         var BALL = 83;
+        // NEKO-PC full 折叠由主进程落成 88×88；保留 2px DWM/缩放取整容差。
+        // 不能复用 BALL + 4（87），否则页面重载时会把真实 88px 球误判为展开窗口并撑高。
+        var ELECTRON_COLLAPSED_MAX_SIZE = 90;
         var MIN_W = 300;
         var MIN_H_BASE = 200;
         // GalGame 模式开启时输入框需要额外 ~110px 容纳 A/B/C 选项 + 间距，
@@ -742,13 +770,13 @@
                 W.getBounds().then(function(b) {
                     if (!b) return;
                     if (isReactElectronCollapsed()) return;
-                    if (b.width <= BALL + 4 && b.height <= BALL + 4) return;
+                    if (b.width <= ELECTRON_COLLAPSED_MAX_SIZE && b.height <= ELECTRON_COLLAPSED_MAX_SIZE) return;
                     if (b.height >= minH) return;
                     W.setBounds(b.x, b.y, b.width, minH);
                 });
             } catch (_) {}
         }
-        // body class 由 app-react-chat-window.js 在 toggle 时刷新；这里订阅
+        // body class 由 app-react-chat-window 在 toggle 时刷新；这里订阅
         // 主动同步事件，避免轮询 / MutationObserver 的重绘开销。
         window.addEventListener('react-chat-window:galgame-mode-change', syncWindowToMinH);
         // 附件 0↔N 切换走对称事件；setComposerAttachments 在 dedupe 后只在
@@ -1261,17 +1289,38 @@
                 setTimeout(syncGameWindowStateOnInit, 100);
                 return;
             }
+            // Bootstrap snapshot vs. live socket: this fetch can start while route
+            // A is active and resolve after A's `closed` event has already been
+            // handled, and the dispatch below would then re-open a dead route on
+            // this page. Every close path advances the route state revision, so
+            // compare it across the request the same way the reconnect
+            // reconciliation in app-websocket.js does.
+            var routeRevisionAtBootstrap = -1;
+            try {
+                if (window.appState) {
+                    routeRevisionAtBootstrap = Number(window.appState.gameRouteStateRevision) || 0;
+                }
+            } catch (_) {}
             fetch('/api/game/route/active?lanlan_name=' + encodeURIComponent(lan))
                 .then(function(resp) { return resp && resp.ok ? resp.json() : null; })
                 .then(function(data) {
                     if (!data || !data.active) return;
+                    try {
+                        if (routeRevisionAtBootstrap >= 0 && window.appState
+                            && (Number(window.appState.gameRouteStateRevision) || 0)
+                                !== routeRevisionAtBootstrap) {
+                            console.log('[GameWindow] 忽略晚到的启动路由快照');
+                            return;
+                        }
+                    } catch (_) {}
                     try {
                         window.dispatchEvent(new CustomEvent('neko-game-window-state-change', {
                             detail: {
                                 action: 'opened',
                                 lanlanName: data.lanlan_name || lan,
                                 gameType: data.game_type || '',
-                                sessionId: data.session_id || ''
+                                sessionId: data.session_id || '',
+                                routeInstanceId: data.sdk_route_instance_id || ''
                             }
                         }));
                     } catch (_) {}
@@ -1367,6 +1416,18 @@
         window.addEventListener('neko:screenshot-result', function(e) {
             var result = e.detail;
             if (result && result.dataUrl) {
+                if (window.appButtons && typeof window.appButtons.enqueueCapturedScreenshotResult === 'function') {
+                    window.appButtons.enqueueCapturedScreenshotResult(result).catch(function(error) {
+                        console.warn('[Screenshot] proxy result queue failed:', error);
+                        if (typeof window.showStatusToast === 'function') {
+                            window.showStatusToast(
+                                typeof window.t === 'function' ? window.t('app.screenshotFailed') : '\u622A\u56FE\u5931\u8D25',
+                                5000
+                            );
+                        }
+                    });
+                    return;
+                }
                 // 优先写入旧版 pending list DOM，再由 syncPendingComposerAttachments
                 // 自动同步到 React Chat，确保 legacy sendTextPayloadInternal 和 React 都读到同一套数据。
                 if (typeof window.addScreenshotToList === 'function') {

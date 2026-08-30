@@ -1,8 +1,10 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { hasOrderedDirectorScripts, readDirectorSource } = require('./yui-guide-director-test-parts.cjs');
 const test = require('node:test');
 const vm = require('node:vm');
+const { jsPartPaths, readJsParts } = require('./app-part-test-utils.cjs');
 
 const guideHelpers = require('./tutorial/core/guide-helpers.js');
 const scopedResources = require('./tutorial/core/scoped-resources.js');
@@ -25,6 +27,23 @@ const dayGuideFiles = [
     'tutorial/yui-guide/days/day5-personalization-guide.js',
     'tutorial/yui-guide/days/day6-agent-guide.js'
 ];
+
+function getBalancedBlockFrom(source, startIndex) {
+    const openBraceIndex = source.indexOf('{', startIndex);
+    assert.notEqual(openBraceIndex, -1, 'expected block opening brace');
+    let depth = 0;
+    for (let index = openBraceIndex; index < source.length; index += 1) {
+        if (source[index] === '{') {
+            depth += 1;
+        } else if (source[index] === '}') {
+            depth -= 1;
+            if (depth === 0) {
+                return source.slice(startIndex, index + 1);
+            }
+        }
+    }
+    assert.fail('expected balanced block closing brace');
+}
 
 test('common guide helpers freeze config, register guides, and create locale audio maps', () => {
     const win = {};
@@ -343,8 +362,8 @@ test('common helper creates a PC overlay run id before tutorial lifecycle start'
 
 test('tutorial start activates PC lifecycle before hiding the system cursor', () => {
     const managerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/universal-manager.js'), 'utf8');
-    const emitBlock = managerSource.split('    emitTutorialStarted(page = this.currentPage, source = this.currentTutorialStartSource) {')[1].split(
-        '    logPromptFlow',
+    const emitBlock = managerSource.split('    emitTutorialStarted(page = this.currentPage, source = this.currentTutorialStartSource, options = {}) {')[1].split(
+        '    logTutorialFlow',
         1
     )[0];
 
@@ -836,7 +855,7 @@ test('target geometry registry and chat window adapter expose phase two boundari
 });
 
 test('app interpage recognizes explicit Yui guide dedup bypass messages', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const source = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
 
     assert.match(source, /function shouldBypassYuiGuideMessageDedup\(action,\s*message\)/);
     assert.match(source, /message\s*&&\s*message\.bypassDedup === true/);
@@ -848,7 +867,7 @@ test('app interpage recognizes explicit Yui guide dedup bypass messages', () => 
 });
 
 test('app interpage sends external chat pet reports through the command bus', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const source = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const bridgeDataBlock = source.split('    function handleYuiGuideChatBridgeData(data) {')[1].split(
         '    function drainPendingYuiGuideChatBridgeQueue',
         1
@@ -911,7 +930,7 @@ test('app interpage sends external chat pet reports through the command bus', ()
 });
 
 test('app interpage routes non-guide broadcasts through a shared interpage sender', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const source = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const senderBlock = source.split('    function postInterpageMessage(message, options) {')[1].split(
         '    function stopIdleChatCompactSurfaceHeartbeat',
         1
@@ -950,7 +969,7 @@ test('app interpage routes non-guide broadcasts through a shared interpage sende
 });
 
 test('app interpage routes Yui guide timers and local listeners through scoped resources', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const source = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const helperBlock = source.split('    function createAppInterpageScopedResources() {')[1].split(
         '    /**\n     * Returns true if this action+timestamp was already processed',
         1
@@ -1064,7 +1083,7 @@ test('full tutorial pages load common helpers before the director', () => {
         const targetRegistryIndex = source.indexOf('/static/tutorial/core/target-geometry-registry.js');
         const chatAdapterIndex = source.indexOf('/static/tutorial/core/chat-window-adapter.js');
         const commonIndex = source.indexOf('/static/tutorial/yui-guide/common.js');
-        const directorIndex = source.indexOf('/static/tutorial/yui-guide/director.js');
+        const directorIndex = source.indexOf('/static/tutorial/yui-guide/director/bootstrap.js');
 
         assert.notEqual(guideHelpersIndex, -1, templatePath + ' should load tutorial/core/guide-helpers.js');
         assert.notEqual(scopedResourcesIndex, -1, templatePath + ' should load tutorial/core/scoped-resources.js');
@@ -1072,7 +1091,8 @@ test('full tutorial pages load common helpers before the director', () => {
         assert.notEqual(targetRegistryIndex, -1, templatePath + ' should load tutorial/core/target-geometry-registry.js');
         assert.notEqual(chatAdapterIndex, -1, templatePath + ' should load tutorial/core/chat-window-adapter.js');
         assert.notEqual(commonIndex, -1, templatePath + ' should load tutorial/yui-guide/common.js');
-        assert.notEqual(directorIndex, -1, templatePath + ' should load tutorial/yui-guide/director.js');
+        assert.ok(hasOrderedDirectorScripts(source), templatePath + ' should load all director parts in dependency order');
+        assert.notEqual(directorIndex, -1, templatePath + ' should load tutorial/yui-guide/director parts');
         assert.ok(guideHelpersIndex < commonIndex, templatePath + ' should load guide helpers before common helpers');
         assert.ok(scopedResourcesIndex < commonIndex, templatePath + ' should load scoped resources before common helpers');
         assert.ok(bridgeCommandBusIndex < commonIndex, templatePath + ' should load bridge command bus before common helpers');
@@ -1082,24 +1102,23 @@ test('full tutorial pages load common helpers before the director', () => {
     }
 });
 
-test('lifecycle state store module is loaded before prompt and manager scripts', () => {
+test('lifecycle state store module is loaded before runtime and manager scripts', () => {
     const lifecyclePath = path.join(__dirname, 'tutorial/core/lifecycle-state-store.js');
     assert.ok(fs.existsSync(lifecyclePath), 'tutorial/core/lifecycle-state-store.js should exist');
     const source = fs.readFileSync(lifecyclePath, 'utf8');
     const stores = require('./tutorial/core/lifecycle-state-store.js');
 
-    for (const exportName of [
-        'TutorialLifecycleStateStore',
-        'HomeTutorialPromptLifecycleStateStore'
-    ]) {
+    for (const exportName of ['TutorialLifecycleStateStore']) {
         assert.equal(typeof stores[exportName], 'function', exportName + ' should be exported');
         assert.match(source, new RegExp('class ' + exportName));
     }
     assert.match(source, /root\.TutorialLifecycleStores = api/);
 
     const orderedScripts = [
-        ['templates/index.html', '/static/tutorial/core/app-prompt.js'],
+        ['templates/index.html', '/static/tutorial/core/home-tutorial-runtime.js'],
         ['templates/index.html', '/static/tutorial/core/universal-manager.js'],
+        ['templates/index.html', '/static/tutorial/avatar/floating-guide-reset.js'],
+        ['templates/index.html', '/static/tutorial/icebreaker/new-user-icebreaker.js'],
         ['templates/api_key_settings.html', '/static/tutorial/core/universal-manager.js'],
         ['templates/memory_browser.html', '/static/tutorial/core/universal-manager.js']
     ];
@@ -1112,6 +1131,27 @@ test('lifecycle state store module is loaded before prompt and manager scripts',
         assert.notEqual(lifecycleIndex, -1, templatePath + ' should load tutorial/core/lifecycle-state-store.js');
         assert.notEqual(consumerIndex, -1, templatePath + ' should load ' + consumerScript);
         assert.ok(lifecycleIndex < consumerIndex, templatePath + ' should load lifecycle stores before ' + consumerScript);
+    }
+});
+
+test('seven-day tutorial state loads before every runtime consumer', () => {
+    const orderedScripts = [
+        ['templates/index.html', '/static/tutorial/core/avatar-floating-boot-predictor.js'],
+        ['templates/index.html', '/static/tutorial/core/home-tutorial-runtime.js'],
+        ['templates/index.html', '/static/tutorial/core/universal-manager.js'],
+        ['templates/api_key_settings.html', '/static/tutorial/core/universal-manager.js'],
+        ['templates/memory_browser.html', '/static/tutorial/core/universal-manager.js'],
+        ['templates/memory_browser.html', '/static/tutorial/avatar/floating-guide-reset.js']
+    ];
+
+    for (const [templatePath, consumerScript] of orderedScripts) {
+        const templateSource = fs.readFileSync(path.join(repoRoot, templatePath), 'utf8');
+        const stateIndex = templateSource.indexOf('/static/tutorial/core/seven-day-state.js');
+        const consumerIndex = templateSource.indexOf(consumerScript);
+
+        assert.notEqual(stateIndex, -1, templatePath + ' should load seven-day tutorial state');
+        assert.notEqual(consumerIndex, -1, templatePath + ' should load ' + consumerScript);
+        assert.ok(stateIndex < consumerIndex, templatePath + ' should load seven-day state before ' + consumerScript);
     }
 });
 
@@ -1139,10 +1179,10 @@ test('resistance controller support module is loaded before the director', () =>
     ]) {
         const templateSource = fs.readFileSync(path.join(repoRoot, templatePath), 'utf8');
         const controllerIndex = templateSource.indexOf('/static/tutorial/visual/resistance-controllers.js');
-        const directorIndex = templateSource.indexOf('/static/tutorial/yui-guide/director.js');
+        const directorIndex = templateSource.indexOf('/static/tutorial/yui-guide/director/bootstrap.js');
 
         assert.notEqual(controllerIndex, -1, templatePath + ' should load tutorial/visual/resistance-controllers.js');
-        assert.notEqual(directorIndex, -1, templatePath + ' should load tutorial/yui-guide/director.js');
+        assert.notEqual(directorIndex, -1, templatePath + ' should load tutorial/yui-guide/director parts');
         assert.ok(controllerIndex < directorIndex, templatePath + ' should load resistance controllers before director');
     }
 });
@@ -1150,7 +1190,10 @@ test('resistance controller support module is loaded before the director', () =>
 test('interpage consumes common tutorial geometry before chat bridge scripts run', () => {
     const indexTemplate = fs.readFileSync(path.join(repoRoot, 'templates', 'index.html'), 'utf8');
     const chatTemplate = fs.readFileSync(path.join(repoRoot, 'templates', 'chat.html'), 'utf8');
-    const appInterpageSource = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const appInterpageDirectory = path.join(repoRoot, 'static', 'app/app-interpage');
+    const appInterpageSource = readJsParts(appInterpageDirectory);
+    const interpageAssetPaths = jsPartPaths(appInterpageDirectory)
+        .map((partPath) => '/static/app/app-interpage/' + path.basename(partPath));
 
     assert.notEqual(indexTemplate.indexOf('/static/tutorial/core/bridge-command-bus.js'), -1);
     assert.notEqual(chatTemplate.indexOf('/static/tutorial/core/bridge-command-bus.js'), -1);
@@ -1166,8 +1209,10 @@ test('interpage consumes common tutorial geometry before chat bridge scripts run
     assert.notEqual(chatTemplate.indexOf('/static/tutorial/core/timeline-engine.js'), -1);
     assert.notEqual(indexTemplate.indexOf('/static/tutorial/core/visual-runtime.js'), -1);
     assert.notEqual(chatTemplate.indexOf('/static/tutorial/core/visual-runtime.js'), -1);
-    assert.match(indexTemplate, /\/static\/app\/app-interpage\.js\?v=\{\{\s*static_asset_version\s*\}\}/);
-    assert.match(chatTemplate, /\/static\/app\/app-interpage\.js\?v=\{\{\s*static_asset_version\s*\}\}/);
+    for (const assetPath of interpageAssetPaths) {
+        assert.ok(indexTemplate.includes(assetPath + '?v={{ static_asset_version }}'));
+        assert.ok(chatTemplate.includes(assetPath + '?v={{ static_asset_version }}'));
+    }
     assert.ok(
         indexTemplate.indexOf('/static/tutorial/core/guide-helpers.js') >= 0
             && indexTemplate.indexOf('/static/tutorial/core/guide-helpers.js') < indexTemplate.indexOf('/static/tutorial/yui-guide/common.js')
@@ -1179,8 +1224,8 @@ test('interpage consumes common tutorial geometry before chat bridge scripts run
             && indexTemplate.indexOf('/static/tutorial/core/script-normalizer.js') < indexTemplate.indexOf('/static/tutorial/yui-guide/common.js')
             && indexTemplate.indexOf('/static/tutorial/core/timeline-engine.js') < indexTemplate.indexOf('/static/tutorial/yui-guide/common.js')
             && indexTemplate.indexOf('/static/tutorial/core/visual-runtime.js') < indexTemplate.indexOf('/static/tutorial/yui-guide/common.js')
-            && indexTemplate.indexOf('/static/tutorial/yui-guide/common.js') < indexTemplate.indexOf('/static/app/app-interpage.js'),
-        'index.html should load scoped resources and common helpers before app-interpage.js'
+            && indexTemplate.indexOf('/static/tutorial/yui-guide/common.js') < indexTemplate.indexOf('/static/app/app-interpage'),
+        'index.html should load scoped resources and common helpers before app-interpage'
     );
     assert.ok(
         chatTemplate.indexOf('/static/tutorial/core/guide-helpers.js') >= 0
@@ -1193,18 +1238,18 @@ test('interpage consumes common tutorial geometry before chat bridge scripts run
             && chatTemplate.indexOf('/static/tutorial/core/script-normalizer.js') < chatTemplate.indexOf('/static/tutorial/yui-guide/common.js')
             && chatTemplate.indexOf('/static/tutorial/core/timeline-engine.js') < chatTemplate.indexOf('/static/tutorial/yui-guide/common.js')
             && chatTemplate.indexOf('/static/tutorial/core/visual-runtime.js') < chatTemplate.indexOf('/static/tutorial/yui-guide/common.js')
-            && chatTemplate.indexOf('/static/tutorial/yui-guide/common.js') < chatTemplate.indexOf('/static/app/app-interpage.js'),
-        'chat.html should load scoped resources and common helpers before app-interpage.js'
+            && chatTemplate.indexOf('/static/tutorial/yui-guide/common.js') < chatTemplate.indexOf('/static/app/app-interpage'),
+        'chat.html should load scoped resources and common helpers before app-interpage'
     );
     assert.ok(
         indexTemplate.indexOf('/static/tutorial/yui-guide/common.js') >= 0
-            && indexTemplate.indexOf('/static/tutorial/yui-guide/common.js') < indexTemplate.indexOf('/static/app/app-interpage.js'),
-        'index.html should load tutorial/yui-guide/common.js before app-interpage.js'
+            && indexTemplate.indexOf('/static/tutorial/yui-guide/common.js') < indexTemplate.indexOf('/static/app/app-interpage'),
+        'index.html should load tutorial/yui-guide/common.js before app-interpage'
     );
     assert.ok(
         chatTemplate.indexOf('/static/tutorial/yui-guide/common.js') >= 0
-            && chatTemplate.indexOf('/static/tutorial/yui-guide/common.js') < chatTemplate.indexOf('/static/app/app-interpage.js'),
-        'chat.html should load tutorial/yui-guide/common.js before app-interpage.js'
+            && chatTemplate.indexOf('/static/tutorial/yui-guide/common.js') < chatTemplate.indexOf('/static/app/app-interpage'),
+        'chat.html should load tutorial/yui-guide/common.js before app-interpage'
     );
     assert.match(appInterpageSource, /createYuiGuideTargetGeometryRegistry\(\)/);
     assert.match(appInterpageSource, /function getYuiGuideChatSpotlightElement\(createIfMissing\) \{[\s\S]*document\.createElement\('div'\)[\s\S]*spotlight\.id = 'yui-guide-chat-spotlight'/);
@@ -1212,12 +1257,24 @@ test('interpage consumes common tutorial geometry before chat bridge scripts run
     assert.match(appInterpageSource, /entry\.localSelectors\.some\(function \(selector\)/);
     assert.match(appInterpageSource, /getYuiGuideChatTargetShape\(kind\)/);
     assert.match(appInterpageSource, /getYuiGuideChatTargetShape\(kind\) === 'circle'/);
-    assert.match(appInterpageSource, /function shouldAlignYuiGuideChatSpotlightToCapsuleText\(kind, variant\)/);
-    // 修改原因：胶囊输入框定位走 registry 的 capsuleBody，不新增 capsule-input 的 plain-capsule 特例。
-    assert.match(appInterpageSource, /function shouldAlignYuiGuideChatSpotlightToCapsuleText\(kind, variant\) \{\s*return kind === 'input' && variant === 'plain-capsule';\s*\}/);
-    assert.match(appInterpageSource, /function getYuiGuideChatSpotlightSourceRect\(kind, variant, rect\)/);
-    assert.match(appInterpageSource, /anchorOffsetX \* YUI_GUIDE_CHAT_CAPSULE_TEXT_ALIGNMENT_RATIO/);
-    assert.match(appInterpageSource, /return \{ rect: sourceRect \};/);
+    const shouldAlignFunctionStart = appInterpageSource.indexOf(
+        'function shouldAlignYuiGuideChatSpotlightToCapsuleText(kind, variant, metrics)'
+    );
+    const sourceRectFunctionStart = appInterpageSource.indexOf(
+        'function getYuiGuideChatSpotlightSourceRect(kind, variant, rect, metrics)'
+    );
+    assert.notEqual(shouldAlignFunctionStart, -1);
+    assert.notEqual(sourceRectFunctionStart, -1);
+    const shouldAlignFunction = getBalancedBlockFrom(appInterpageSource, shouldAlignFunctionStart);
+    const sourceRectFunction = getBalancedBlockFrom(appInterpageSource, sourceRectFunctionStart);
+    // 修改原因：Niri 的 capsuleBody 使用已提交布局坐标，不再叠加文字起点平移；
+    // 标准 Wayland 和普通 input + plain-capsule 保留既有视觉契约。
+    assert.match(shouldAlignFunction, /metrics\.waylandWorkAreaCarrier === true/);
+    assert.match(shouldAlignFunction, /metrics\.niriWaylandRuntime !== true/);
+    assert.match(sourceRectFunction, /anchorOffsetX \* YUI_GUIDE_CHAT_CAPSULE_TEXT_ALIGNMENT_RATIO/);
+    assert.match(sourceRectFunction, /width:\s*rect\.width/);
+    assert.doesNotMatch(sourceRectFunction, /sourceRect\.width = Math\.max\(1, rect\.left \+ rect\.width - sourceRect\.left\)/);
+    assert.match(sourceRectFunction, /return \{ rect: sourceRect \};/);
 });
 
 test('daily guide files consume common helpers instead of redeclaring shared helpers', () => {
@@ -1254,7 +1311,7 @@ test('Day3 guide ships every referenced audio file', () => {
 });
 
 test('director delegates external chat bridge messages to the command bus', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const constructorBlock = source.split('    class YuiGuideDirector {')[1].split(
         '            const capabilityApi = window.homeTutorialPlatformCapabilities;',
         1
@@ -1272,7 +1329,7 @@ test('director delegates external chat bridge messages to the command bus', () =
 });
 
 test('director streams guide chat text over voice duration without an empty placeholder', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const appendBlock = source.split('        appendGuideChatMessage(text, options) {')[1].split(
         '        focusAndHighlightChatInput',
         1
@@ -1339,7 +1396,7 @@ test('interaction takeover delegates external chat commands to the command bus b
 });
 
 test('standalone chat guide lock uses a transparent shield instead of per-input locks', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const source = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const lockBlock = source.split('    function applyYuiGuideChatLockState(disabled) {')[1].split(
         '    function getReactChatWindowHost() {',
         1
@@ -1384,7 +1441,7 @@ test('interaction takeover preserves external chat spotlight clears during resis
 });
 
 test('externalized chat spotlight ownership stops home overlay spotlight tracking', () => {
-    const directorSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const directorSource = readDirectorSource(path.join(repoRoot, 'static'));
     const overlaySource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/overlay.js'), 'utf8');
     const sceneOrchestratorSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/scene-orchestrator.js'), 'utf8');
     const visualRuntimeSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/visual-runtime.js'), 'utf8');
@@ -1458,7 +1515,7 @@ test('new user icebreaker exports state used by greeting gating', () => {
 });
 
 test('director exposes phase one guard and timing helpers for complex sequences', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const directorSource = source.split('    class YuiGuideDirector {')[1];
     const helperBlock = directorSource.split('        isStopping() {')[1].split(
         '        setTutorialTakingOver(active) {',
@@ -1497,7 +1554,7 @@ test('director exposes phase one guard and timing helpers for complex sequences'
 });
 
 test('director routes resistance interrupts through ResistanceController boundary', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const resistanceSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/visual/resistance-controllers.js'), 'utf8');
     const cssSource = fs.readFileSync(path.join(repoRoot, 'static', 'css/yui-guide.css'), 'utf8');
     const pluginRuntimeSource = fs.readFileSync(path.join(repoRoot, 'frontend', 'plugin-manager/src/yui-guide-runtime.ts'), 'utf8');
@@ -1662,7 +1719,7 @@ test('director routes resistance interrupts through ResistanceController boundar
 });
 
 test('director wraps round-level look-at lifecycle with withLookAt helper', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const orchestratorSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/scene-orchestrator.js'), 'utf8');
     const directorSource = source.split('    class YuiGuideDirector {')[1];
     const helperBlock = directorSource.split('        isStopping() {')[1].split(
@@ -1684,7 +1741,7 @@ test('director wraps round-level look-at lifecycle with withLookAt helper', () =
 });
 
 test('settings tour flow owns migrated settings tour concrete scene bodies', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const settingsTourFlowSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/settings-tour-flow.js'), 'utf8');
     const day4GuideSource = fs.readFileSync(
         path.join(repoRoot, 'static', 'tutorial/yui-guide/days/day4-companion-guide.js'),
@@ -1791,7 +1848,7 @@ test('settings tour flow owns migrated settings tour concrete scene bodies', () 
     assert.match(day4IntroSceneBlock, /target:\s*'chat-capsule-input'/);
     assert.match(
         settingsTourFlowSource,
-        /runPanelNarrationEllipse[\s\S]*director\.setHomePcCursorOutputSuppressedForExternalizedChat\(false\);[\s\S]*director\.cursor\.runPauseAwareEllipse/
+        /runPanelNarrationEllipse[\s\S]*director\.releaseExternalizedChatCursorToHome\(\);[\s\S]*director\.cursor\.runPauseAwareEllipse/
     );
     assert.match(
         settingsTourFlowSource,
@@ -1803,11 +1860,11 @@ test('settings tour flow owns migrated settings tour concrete scene bodies', () 
     );
     assert.match(
         source,
-        /async moveCursorToElement\(element,\s*durationMs,\s*options\) \{[\s\S]*this\.setHomePcCursorOutputSuppressedForExternalizedChat\(false\);[\s\S]*this\.cursor\.moveToRect/
+        /async moveCursorToElement\(element,\s*durationMs,\s*options\) \{[\s\S]*this\.releaseExternalizedChatCursorToHome\(\);[\s\S]*this\.cursor\.moveToRect/
     );
     assert.match(
         source,
-        /async moveCursorToTrackedElement\(element,\s*durationMs,\s*options\) \{[\s\S]*this\.setHomePcCursorOutputSuppressedForExternalizedChat\(false\);[\s\S]*this\.cursor\.moveToPoint/
+        /async moveCursorToTrackedElement\(element,\s*durationMs,\s*options\) \{[\s\S]*this\.releaseExternalizedChatCursorToHome\(\);[\s\S]*this\.cursor\.moveToPoint/
     );
     assert.match(flowChatBlock, /return this\.playPanelTourScene\(scene,\s*context,\s*this\.getPanelTourSchema\(scene\)\);/);
     assert.match(flowModelBlock, /return this\.playPanelTourScene\(scene,\s*context,\s*this\.getPanelTourSchema\(scene\)\);/);
@@ -1848,7 +1905,7 @@ test('settings tour flow owns migrated settings tour concrete scene bodies', () 
 });
 
 test('Day1 activation uses the shared first-daily input cursor handoff', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const orchestratorSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/scene-orchestrator.js'), 'utf8');
     const inputIntroSceneBlock = source.split('        isAvatarFloatingInputIntroScene(scene) {')[1].split(
         '        getAvatarFloatingIntroSpotlightTarget(scene) {',
@@ -1869,7 +1926,7 @@ test('Day1 activation uses the shared first-daily input cursor handoff', () => {
 });
 
 test('director routes cursor anchor persistence through CursorAnchorStore', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const orchestratorSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/scene-orchestrator.js'), 'utf8');
     const constructorBlock = source.split('    class YuiGuideDirector {')[1].split(
         '            this.keydownHandler = this.onKeyDown.bind(this);',
@@ -1907,7 +1964,7 @@ test('director routes cursor anchor persistence through CursorAnchorStore', () =
 });
 
 test('director delegates avatar floating scene operations through OperationRegistry facade', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const operationRegistrySource = fs.readFileSync(
         path.join(repoRoot, 'static', 'tutorial/core/operation-registry.js'),
         'utf8'
@@ -1999,10 +2056,10 @@ test('director delegates avatar floating scene operations through OperationRegis
 });
 
 test('day2 Galgame guide drag follows the compact tool wheel arc and holds the target after day swap', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const overlaySource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/overlay.js'), 'utf8');
     const day2GuideSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/days/day2-screen-voice-guide.js'), 'utf8');
-    const appInterpageSource = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const appInterpageSource = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const sceneOrchestratorSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/scene-orchestrator.js'), 'utf8');
     const operationRegistrySource = fs.readFileSync(
         path.join(repoRoot, 'static', 'tutorial/core/operation-registry.js'),
@@ -2168,9 +2225,9 @@ test('templates and frontend harness load OperationRegistry before Director', ()
     for (const templatePath of templatePaths) {
         const templateSource = fs.readFileSync(templatePath, 'utf8');
         const registryIndex = templateSource.indexOf('/static/tutorial/core/operation-registry.js');
-        const directorIndex = templateSource.indexOf('/static/tutorial/yui-guide/director.js');
+        const directorIndex = templateSource.indexOf('/static/tutorial/yui-guide/director/bootstrap.js');
         assert.notStrictEqual(registryIndex, -1, `${templatePath} should load tutorial/core/operation-registry.js`);
-        assert.notStrictEqual(directorIndex, -1, `${templatePath} should load tutorial/yui-guide/director.js`);
+        assert.notStrictEqual(directorIndex, -1, `${templatePath} should load tutorial/yui-guide/director parts`);
         assert.ok(registryIndex < directorIndex, `${templatePath} should load OperationRegistry before Director`);
     }
 
@@ -2183,7 +2240,7 @@ test('templates and frontend harness load OperationRegistry before Director', ()
 });
 
 test('director routes final teardown through performFullCleanup helper', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const directorSource = source.split('    class YuiGuideDirector {')[1];
     const destroyBlock = directorSource.split('        destroy() {')[1].split(
         '        onKeyDown(event) {',
@@ -2218,7 +2275,7 @@ test('tutorial teardown removes DOM overlay residue and blocks late overlay recr
 });
 
 test('director routes scene and chat stream timers through scoped resources', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const constructorBlock = source.split('    class YuiGuideDirector {')[1].split(
         '            this.keydownHandler = this.onKeyDown.bind(this);',
         1
@@ -2255,7 +2312,7 @@ test('director routes scene and chat stream timers through scoped resources', ()
 
 test('manager keeps Yui-only lifecycle resources and excludes legacy driver tutorial code', () => {
     const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/universal-manager.js'), 'utf8');
-    const constructorBlock = source.split('class UniversalTutorialManager {')[1].split('    logPromptFlow(', 1)[0];
+    const constructorBlock = source.split('class UniversalTutorialManager {')[1].split('    logTutorialFlow(', 1)[0];
     const destroyBlock = source.split("    async destroy(reason = 'destroy') {")[1].split(
         '    broadcastYuiGuideTerminationRequest',
         1
@@ -2265,7 +2322,7 @@ test('manager keeps Yui-only lifecycle resources and excludes legacy driver tuto
         1
     )[0];
     const clearViewportWatcherBlock = source.split('    clearTutorialLive2dViewportPlacementWatcher() {')[1].split(
-        '    beginTutorialAvatarOverride() {',
+        '    beginTutorialAvatarOverride(options = {}) {',
         1
     )[0];
     const scrollBlock = source.split('    blockTutorialScroll() {')[1].split(
@@ -2308,7 +2365,7 @@ test('manager keeps Yui-only lifecycle resources and excludes legacy driver tuto
 
     assert.match(source, /getHomeAvatarFloatingGuideStartRound\(options = \{\}\) \{/);
     assert.match(source, /candidates\.push\(state\.pendingRound, state\.manualResetRound, 1\);/);
-    assert.match(startBlock, /const round = this\.getHomeAvatarFloatingGuideStartRound\(\);/);
+    assert.match(startBlock, /const round = this\.getHomeAvatarFloatingGuideLaunchRound\(\);/);
     assert.match(startBlock, /this\.startAvatarFloatingGuideRound\(round, \{/);
     assert.doesNotMatch(source, /startYuiGuideSceneSequence|getDirectYuiGuideSceneIdsForCurrentPage|getPendingYuiGuideResumeScene/);
     assert.doesNotMatch(source, /callYuiGuideDirector|notifyYuiGuideStepEnter|notifyYuiGuideStepLeave/);
@@ -2318,7 +2375,7 @@ test('manager keeps Yui-only lifecycle resources and excludes legacy driver tuto
 });
 
 test('director uses SpotlightController facade for guide highlight operations', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const visualControllerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/visual/controllers.js'), 'utf8');
     const spotlightControllerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/visual/spotlight-controller.js'), 'utf8');
     const resistanceControllerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/visual/resistance-controllers.js'), 'utf8');
@@ -2386,7 +2443,7 @@ test('director uses SpotlightController facade for guide highlight operations', 
 });
 
 test('director registers settings side panels as pause tokens', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const resistanceControllerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/visual/resistance-controllers.js'), 'utf8');
     const directorSource = source.split('    class YuiGuideDirector {')[1];
     const sidebarControllerBlock = resistanceControllerSource.split('    class SidebarPauseController {')[1].split(
@@ -2433,7 +2490,7 @@ test('director registers settings side panels as pause tokens', () => {
 });
 
 test('director routes termination requests through TutorialTerminationRouter', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const resistanceControllerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/visual/resistance-controllers.js'), 'utf8');
     const directorSource = source.split('    class YuiGuideDirector {')[1];
     const routerBlock = resistanceControllerSource.split('    class TutorialTerminationRouter {')[1];
@@ -2615,7 +2672,11 @@ test('tutorial skip button reuses the manager tutorial end lifecycle', () => {
     assert.match(managerSource, /modelType === 'live3d'/);
     assert.match(managerSource, /live3d_sub_type/);
     assert.match(teardownBlock, /this\.restoreAvatarFloatingModelInteractionState\('teardown-early'\);/);
-    assert.match(teardownBlock, /\.then\(\(\) => this\.restoreAvatarFloatingModelInteractionState\('tutorial-avatar-restored'\)\)/);
+    // 最终恢复必须先判断猫咪业务形态，不能把旧 DOM 的穿透样式直接应用到重载后的模型。
+    assert.match(teardownBlock, /\.then\(\(\) => this\.restoreAvatarFloatingModelStateAfterTutorial\(\)\)/);
+    assert.match(managerSource, /goodbyeActive:/);
+    assert.match(avatarInteractionRestoreBlock, /window\.dispatchEvent\(new CustomEvent\('live2d-goodbye-click'/);
+    assert.match(avatarInteractionRestoreBlock, /this\._avatarFloatingModelLockSnapshot = null;/);
     assert.doesNotMatch(routerBlock, /requestAvatarFloatingGuideCooperativeEnd\(finalReason\)/);
     assert.match(routerBlock, /return director\.tutorialManager\.requestTutorialEnd\(finalReason\);/);
     assert.match(routerBlock, /return director\.tutorialManager\.requestTutorialDestroy\(finalReason\);/);
@@ -2683,8 +2744,7 @@ test('avatar floating auto-start rechecks current due round before delayed launc
     assert.match(pendingCheckBlock, /const state = loadAvatarFloatingGuideState\(\);/);
     assert.match(pendingCheckBlock, /if \(state\.manualResetRound\) \{[\s\S]*?return state\.manualResetRound === round;[\s\S]*?\}/);
     assert.match(pendingCheckBlock, /return this\.getNextAvatarFloatingGuideAutoRound\(\) === round;/);
-    assert.match(pendingCheckBlock, /state\.completedRounds\.includes\(round\)/);
-    assert.match(pendingCheckBlock, /state\.skippedRounds\.includes\(round\)/);
+    assert.match(pendingCheckBlock, /getSevenDayTutorialStateApi\(\)\.isRoundSettled\(state, round\)/);
     assert.doesNotMatch(pendingCheckBlock, /state\.pendingRound\s*\|\|/);
     assert.doesNotMatch(pendingCheckBlock, /state\.pendingRound === round/);
     assert.doesNotMatch(pendingCheckBlock, /state\.lastAutoShownRound === round/);
@@ -2703,20 +2763,27 @@ test('avatar floating auto-start reserves the round before long playback can be 
     assert.notEqual(autoReservationIndex, -1, 'auto round starts should reserve same-day playback before long narration');
     assert.notEqual(setCurrentIndex, -1, 'round starts should still persist current round state');
     assert.ok(autoReservationIndex < setCurrentIndex, 'auto reservation should be written before pending/current round state');
-    assert.match(startRoundBlock, /if \(source === 'auto'\) \{[\s\S]*?this\.markAvatarFloatingGuideRoundAutoShown\(round\);[\s\S]*?\}/);
+    assert.match(startRoundBlock, /if \(source === 'auto'\) \{[\s\S]*?this\.markAvatarFloatingGuideRoundAutoShown\(round, autoReservationId\);[\s\S]*?\}/);
+    assert.match(startRoundBlock, /this\.rollbackAvatarFloatingGuideRoundAutoShown\(round, autoReservationId\)/);
 });
 
 test('avatar floating auto due calculation ignores runtime pending round after refresh', () => {
     const managerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/universal-manager.js'), 'utf8');
+    const stateSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/seven-day-state.js'), 'utf8');
     const nextAutoBlock = managerSource.split('    getNextAvatarFloatingGuideAutoRound() {')[1].split(
         '    getHomeAvatarFloatingGuideStartRound(options = {}) {',
         1
     )[0];
+    const sharedCalculationBlock = stateSource.split('    function getNextAutoRound(stateValue, todayValue) {')[1].split(
+        '    function markRoundOutcome(roundValue, outcome, options) {',
+        1
+    )[0];
 
-    assert.match(nextAutoBlock, /const pendingManualRound = state\.manualResetRound;/);
-    assert.doesNotMatch(nextAutoBlock, /state\.pendingRound\s*\|\|\s*state\.manualResetRound/);
+    assert.match(nextAutoBlock, /getSevenDayTutorialStateApi\(\)\.getNextAutoRound\(state\)/);
+    assert.match(sharedCalculationBlock, /if \(state\.manualResetRound\) \{[\s\S]*?return state\.manualResetRound;/);
+    assert.doesNotMatch(sharedCalculationBlock, /state\.pendingRound/);
     assert.ok(
-        nextAutoBlock.indexOf('if (pendingManualRound)') < nextAutoBlock.indexOf('if (state.lastAutoShownDate === today)'),
+        sharedCalculationBlock.indexOf('if (state.manualResetRound)') < sharedCalculationBlock.indexOf('if (state.lastAutoShownDate === today)'),
         'manual resets should still override same-day auto reservation'
     );
 });
@@ -2777,7 +2844,7 @@ test('PC global overlay cleanup clears the stored run id before the next tutoria
 
 test('PC global overlay cleanup notifies external chat windows to stop overlay relays', () => {
     const managerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/universal-manager.js'), 'utf8');
-    const appInterpageSource = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const appInterpageSource = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const clearOverlayBlock = managerSource.split('    clearPcTutorialGlobalOverlay(reason = ')[1].split(
         '    requestTutorialEnd(reason = ',
         1
@@ -2796,6 +2863,7 @@ test('PC global overlay cleanup notifies external chat windows to stop overlay r
     assert.match(lifecycleMessageBlock, /tutorialRunId:\s*tutorialRunId/);
     assert.match(appInterpageSource, /if \(message\.tutorialRunId && message\.action !== 'yui_guide_tutorial_lifecycle_ended'\) \{/);
     assert.match(appInterpageSource, /function getYuiGuideScreenCoordinateBounds\(metrics\) \{/);
+    assert.match(appInterpageSource, /metrics\.coordinateSpace === 'screen-dip'[\s\S]*metrics\.renderBounds/);
     assert.match(appInterpageSource, /return metrics && \(metrics\.bounds \|\| metrics\.contentBounds\) \|\| \{ x: 0, y: 0 \};/);
     assert.match(externalCleanupBlock, /yuiGuidePcOverlayActive = false;/);
     assert.match(externalCleanupBlock, /yuiGuidePcOverlayReady = false;/);
@@ -2826,7 +2894,7 @@ test('PC global overlay cleanup notifies external chat windows to stop overlay r
 });
 
 test('external chat ignores stale guide commands after lifecycle ended', () => {
-    const appInterpageSource = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const appInterpageSource = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const relayHandlerBlock = appInterpageSource.split('    function handleYuiGuideRelayedMessage(message) {')[1].split(
         '    function postInterpageMessage',
         1
@@ -2927,7 +2995,7 @@ test('external chat ignores stale guide commands after lifecycle ended', () => {
 });
 
 test('external chat reuses tutorial PC overlay run id for capsule spotlight and cursor patches', () => {
-    const appInterpageSource = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const appInterpageSource = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const normalizeBridgeBlock = appInterpageSource.split('    function normalizeYuiGuideBridgeMessage(action, payload) {')[1].split(
         '    function postYuiGuideMessageToChat',
         1
@@ -2993,7 +3061,7 @@ test('external chat reuses tutorial PC overlay run id for capsule spotlight and 
 });
 
 test('PC overlay bridges rotate stale run ids and replay current state', () => {
-    const appInterpageSource = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const appInterpageSource = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
     const overlaySource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/overlay.js'), 'utf8');
     const externalBridgeBlock = appInterpageSource.split('    function resetYuiGuidePcOverlayRunForRetry() {')[1].split(
         '    function createYuiGuideTargetGeometryRegistry() {',
@@ -3045,7 +3113,7 @@ test('PC overlay bridges rotate stale run ids and replay current state', () => {
 });
 
 test('director wraps the legacy ghost cursor with GhostCursorController facade', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const visualControllerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/visual/controllers.js'), 'utf8');
     const ghostCursorControllerSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/visual/ghost-cursor-controller.js'), 'utf8');
     const constructorBlock = source.split('    class YuiGuideDirector {')[1].split(
@@ -3089,7 +3157,7 @@ test('spotlight facade exposes pause and resume hooks for pause coordination', (
 });
 
 test('director consumes phase two target registry and chat adapter boundaries', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
+    const source = readDirectorSource(path.join(repoRoot, 'static'));
     const constructorBlock = source.split('    class YuiGuideDirector {')[1].split(
         '            this.latestExternalizedChatCursorMoveSceneId =',
         1
@@ -3354,8 +3422,8 @@ test('day6 chat cursor handoff clears external ownership without hiding the PC c
     const day6Source = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/days/day6-agent-guide.js'), 'utf8');
     const sceneOrchestratorSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/scene-orchestrator.js'), 'utf8');
     const takeoverSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/core/interaction-takeover.js'), 'utf8');
-    const directorSource = fs.readFileSync(path.join(repoRoot, 'static', 'tutorial/yui-guide/director.js'), 'utf8');
-    const appInterpageSource = fs.readFileSync(path.join(repoRoot, 'static', 'app/app-interpage.js'), 'utf8');
+    const directorSource = readDirectorSource(path.join(repoRoot, 'static'));
+    const appInterpageSource = readJsParts(path.join(repoRoot, 'static', 'app/app-interpage'));
 
     const day6StatusSceneBlock = day6Source.split("id: 'day6_agent_status_master'")[1].split(
         "id: 'day6_plugin_side_panel'",

@@ -18,11 +18,11 @@ def _make_engine(facts_on_disk: list[dict]):
     fact_store.aload_facts_full = AsyncMock(return_value=facts_on_disk)
     cm = MagicMock()
     cm.memory_dir = "/tmp/dummy"
-    # Patch 必须 target `memory.reflection.get_config_manager` —— 因为
+    # Patch the manager submodule because it consumes get_config_manager.
     # reflection.py 用 `from utils.config_manager import get_config_manager`
     # 把名字 bind 到本模块 namespace，patch source module 对已 bind 的
     # 局部引用无效（CodeRabbit minor #1392）。
-    with patch("memory.reflection.get_config_manager", return_value=cm):
+    with patch("memory.reflection.manager.get_config_manager", return_value=cm):
         engine = ReflectionEngine(fact_store=fact_store, persona_manager=MagicMock())
     return engine
 
@@ -109,6 +109,28 @@ async def test_happy_path_renders_watermarked_block():
 
 
 @pytest.mark.asyncio
+async def test_happy_path_localizes_traditional_context_instruction():
+    engine = _make_engine([
+        {"id": "f1", "text": "已吸收事實", "absorbed": True, "importance": 7},
+    ])
+    mock_reranker = MagicMock()
+    mock_reranker.aretrieve_per_query_topk = AsyncMock(return_value=[
+        {"id": "f1", "text": "已吸收事實", "importance": 7},
+    ])
+    with patch("memory.embeddings.get_embedding_service", return_value=_enabled_service()), \
+         patch("memory.embeddings.is_cached_embedding_valid", return_value=True), \
+         patch("memory.recall.MemoryRecallReranker", return_value=mock_reranker):
+        block = await engine._build_related_context_block(
+            "小天",
+            [{"id": "f2", "text": "新事實"}],
+            prompt_lang="zh-TW",
+        )
+
+    assert "僅供參考，本輪不要為它們單獨產出 reflection" in block
+    assert "仅供参考" not in block
+
+
+@pytest.mark.asyncio
 async def test_returns_empty_when_all_absorbed_facts_lack_valid_embedding():
     """Codex P2 #1392：fact 没 valid embedding 时 reranker 会 fallback 到
     evidence_score 排序，fact 又没 score 字段 → 注入近随机的历史 fact 当
@@ -122,6 +144,27 @@ async def test_returns_empty_when_all_absorbed_facts_lack_valid_embedding():
             "小天", [{"id": "f2", "text": "query"}]
         )
     assert block == ""
+
+
+@pytest.mark.asyncio
+async def test_arbitration_archived_fact_stays_out_of_related_context():
+    engine = _make_engine([
+        {
+            "id": "loser", "text": "rejected", "absorbed": True,
+            "importance": 7, "arbitration_archived_at": "2026-08-01T00:00:00",
+        },
+        {"id": "valid", "text": "valid", "absorbed": True, "importance": 5},
+    ])
+    reranker = MagicMock()
+    reranker.aretrieve_per_query_topk = AsyncMock(return_value=[])
+    with patch("memory.embeddings.get_embedding_service", return_value=_enabled_service()), \
+         patch("memory.embeddings.is_cached_embedding_valid", return_value=True), \
+         patch("memory.recall.MemoryRecallReranker", return_value=reranker):
+        assert await engine._build_related_context_block(
+            "小天", [{"id": "fresh", "text": "query"}],
+        ) == ""
+    candidates = reranker.aretrieve_per_query_topk.await_args.args[0]
+    assert [row["id"] for row in candidates] == ["valid"]
 
 
 @pytest.mark.asyncio

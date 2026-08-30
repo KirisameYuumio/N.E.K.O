@@ -103,6 +103,7 @@ class TestKeybookSaveLoad:
                        'ASSIST_API_KEY_DEEPSEEK',
                        'ASSIST_API_KEY_DOUBAO', 'ASSIST_API_KEY_DOUBAO_TTS', 'ASSIST_API_KEY_GROK',
                        'ASSIST_API_KEY_CLAUDE', 'ASSIST_API_KEY_OPENROUTER',
+                       'ASSIST_API_KEY_ORCAROUTER',
                        'ASSIST_API_KEY_QWEN_INTL',
                        'ASSIST_API_KEY_MINIMAX', 'ASSIST_API_KEY_MINIMAX_INTL',
                        'ASSIST_API_KEY_MIMO']:
@@ -553,9 +554,8 @@ class TestAssistFollowsCore:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_get_core_config_api_returns_kimi_code_key(self, monkeypatch):
-        """GET must echo back assistApiKeyKimiCode; otherwise the frontend reads
-        an empty value and a re-save overwrites the stored secret."""
+    async def test_get_core_config_api_returns_kimi_code_key_placeholder(self, monkeypatch):
+        """GET reports that the Kimi Code key is configured without exposing it."""
         from main_routers.config_router import core_config as config_router
 
         async def fake_read_json_async(_path):
@@ -580,7 +580,10 @@ class TestAssistFollowsCore:
 
         assert response['success'] is True
         assert response['assistApi'] == 'kimi_code'
-        assert response['assistApiKeyKimiCode'] == 'sk-kimi-code-stored'
+        assert (
+            response['assistApiKeyKimiCode']
+            == config_router.CORE_CONFIG_SECRET_SENTINEL
+        )
 
     @pytest.mark.unit
     def test_free_core_defaults_assist_to_free_when_key_missing(self, config_manager):
@@ -796,6 +799,7 @@ class TestProviderExclusion:
             'grok',
             'claude',
             'openrouter',
+            'orcarouter',
             'elevenlabs',
             'qwen_intl',
             'minimax_intl',
@@ -1274,6 +1278,23 @@ class TestVoiceCloneKeyResolution:
         existing = config_manager.find_cosyvoice_voice_by_audio_md5('cosyvoice_intl', audio_md5, 'en')
         assert existing is not None
         assert existing[0] == 'voice-old-intl'
+
+    @pytest.mark.unit
+    async def test_async_voice_save_is_available_through_config_manager_facade(self, config_manager):
+        voice_data = {
+            'voice_id': 'voice-design-async',
+            'provider': 'cosyvoice',
+            'source': 'design',
+        }
+
+        await config_manager.asave_voice_for_api_key(
+            '__VOICE_DESIGN_TEST__',
+            'voice-design-async',
+            voice_data,
+        )
+
+        stored = config_manager.load_voice_storage()
+        assert stored['__VOICE_DESIGN_TEST__']['voice-design-async'] == voice_data
 
 
 # ---------------------------------------------------------------------------
@@ -1915,7 +1936,7 @@ class TestGptsovitsEnabledSaveMigration:
         config_manager,
     ):
         import asyncio
-        from main_routers import config_router
+        from main_routers.config_router import core_config as config_router
 
         _write_core_config(config_manager, {
             'coreApi': 'qwen',
@@ -1932,12 +1953,12 @@ class TestGptsovitsEnabledSaveMigration:
         assert resp['assistApiKeyDoubaoTts'] == ''
 
     @pytest.mark.unit
-    def test_get_core_config_api_doubao_tts_display_uses_owned_shared_key(
+    def test_get_core_config_api_doubao_tts_redacts_owned_shared_key(
         self,
         config_manager,
     ):
         import asyncio
-        from main_routers import config_router
+        from main_routers.config_router import core_config as config_router
 
         _write_core_config(config_manager, {
             'coreApi': 'qwen',
@@ -1951,7 +1972,118 @@ class TestGptsovitsEnabledSaveMigration:
         resp = asyncio.run(config_router.get_core_config_api())
 
         assert resp['success'] is True
-        assert resp['assistApiKeyDoubaoTts'] == 'ark-doubao-speech-key'
+        assert (
+            resp['assistApiKeyDoubaoTts']
+            == config_router.CORE_CONFIG_SECRET_SENTINEL
+        )
+
+    @pytest.mark.unit
+    def test_update_core_config_doubao_tts_masked_noop_preserves_owned_shared_key(
+        self,
+        config_manager,
+        monkeypatch,
+    ):
+        config_router, asyncio = self._neutralize_side_effects(monkeypatch)
+        stored_key = 'ark-doubao-legacy-shared-key'
+        _write_core_config(config_manager, {
+            'coreApi': 'qwen',
+            'assistApi': 'qwen',
+            'enableCustomApi': True,
+            'ttsModelProvider': 'doubao_tts',
+            'ttsModelApiKey': stored_key,
+            'assistApiKeyDoubaoTts': '',
+        })
+
+        loaded = asyncio.run(config_router.get_core_config_api())
+        assert loaded['ttsModelApiKey'] == config_router.CORE_CONFIG_SECRET_SENTINEL
+        assert (
+            loaded['assistApiKeyDoubaoTts']
+            == config_router.CORE_CONFIG_SECRET_SENTINEL
+        )
+
+        resp = asyncio.run(config_router.update_core_config(self._FakeRequest({
+            'enableCustomApi': True,
+            'coreApi': 'qwen',
+            'assistApi': 'qwen',
+            'ttsModelProvider': 'doubao_tts',
+            'ttsModelApiKey': loaded['ttsModelApiKey'],
+            'assistApiKeyDoubaoTts': loaded['assistApiKeyDoubaoTts'],
+        })))
+        assert resp.get('success') is True
+
+        saved = config_manager.load_json_config('core_config.json', {})
+        assert saved['ttsModelApiKey'] == stored_key
+        assert saved['assistApiKeyDoubaoTts'] == ''
+        assert config_router.CORE_CONFIG_SECRET_SENTINEL not in json.dumps(saved)
+
+    @pytest.mark.unit
+    def test_update_core_config_doubao_tts_explicit_clear_removes_owned_shared_key(
+        self,
+        config_manager,
+        monkeypatch,
+    ):
+        config_router, asyncio = self._neutralize_side_effects(monkeypatch)
+        _write_core_config(config_manager, {
+            'coreApi': 'qwen',
+            'assistApi': 'qwen',
+            'enableCustomApi': True,
+            'ttsModelProvider': 'doubao_tts',
+            'ttsModelApiKey': 'ark-doubao-legacy-shared-key',
+            'assistApiKeyDoubaoTts': '',
+        })
+
+        resp = asyncio.run(config_router.update_core_config(self._FakeRequest({
+            'enableCustomApi': True,
+            'coreApi': 'qwen',
+            'assistApi': 'qwen',
+            'ttsModelProvider': 'doubao_tts',
+            'ttsModelApiKey': config_router.CORE_CONFIG_SECRET_SENTINEL,
+            'assistApiKeyDoubaoTts': '',
+        })))
+        assert resp.get('success') is True
+
+        saved = config_manager.load_json_config('core_config.json', {})
+        assert saved['ttsModelApiKey'] == ''
+        assert saved['assistApiKeyDoubaoTts'] == ''
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ('stored_provider', 'submitted_key'),
+        (
+            ('vllm_omni', 'ark-doubao-explicit-model-key'),
+            ('doubao_tts', ''),
+        ),
+    )
+    def test_update_core_config_doubao_tts_respects_explicit_model_key_update(
+        self,
+        config_manager,
+        monkeypatch,
+        stored_provider,
+        submitted_key,
+    ):
+        config_router, asyncio = self._neutralize_side_effects(monkeypatch)
+        _write_core_config(config_manager, {
+            'coreApi': 'qwen',
+            'assistApi': 'qwen',
+            'enableCustomApi': True,
+            'ttsModelProvider': stored_provider,
+            'ttsModelApiKey': 'previous-shared-key',
+            'assistApiKeyDoubaoTts': '',
+        })
+
+        resp = asyncio.run(config_router.update_core_config(self._FakeRequest({
+            'enableCustomApi': True,
+            'coreApi': 'qwen',
+            'assistApi': 'qwen',
+            'ttsModelProvider': 'doubao_tts',
+            'ttsModelApiKey': submitted_key,
+            'assistApiKeyDoubaoTts': config_router.CORE_CONFIG_SECRET_SENTINEL,
+        })))
+        assert resp.get('success') is True
+
+        saved = config_manager.load_json_config('core_config.json', {})
+        assert saved['ttsModelApiKey'] == submitted_key
+        assert saved['assistApiKeyDoubaoTts'] == ''
 
     @pytest.mark.unit
     def test_get_model_api_config_returns_kimi_code_provider_type(self, config_manager):

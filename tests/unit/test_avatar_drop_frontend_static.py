@@ -13,8 +13,8 @@ CORE_PACKAGE_PATH = REPO_ROOT / "main_logic" / "core"
 CROSS_SERVER_PATH = REPO_ROOT / "main_logic" / "cross_server.py"
 INDEX_TEMPLATE_PATH = REPO_ROOT / "templates" / "index.html"
 INTAKE_PATH = REPO_ROOT / "static" / "avatar" / "avatar-drop-intake.js"
-MAIN_SERVER_PATH = REPO_ROOT / "app" / "main_server.py"
-OMNI_OFFLINE_PATH = REPO_ROOT / "main_logic" / "omni_offline_client.py"
+MAIN_SERVER_PATH = REPO_ROOT / "app" / "main_server" / "web_app.py"
+OMNI_OFFLINE_PATH = REPO_ROOT / "main_logic" / "omni_offline_client"
 PARSER_PATH = REPO_ROOT / "static" / "avatar" / "avatar-drop-parser.js"
 WEBSOCKET_ROUTER_PATH = REPO_ROOT / "main_routers" / "websocket_router.py"
 
@@ -41,8 +41,31 @@ def _js_function_block(source: str, function_name: str) -> str:
     depth = 0
     quote: str | None = None
     escaped = False
+    # Comment-aware, like the sibling extractor in
+    # test_voice_start_failure_static.py. Without this an apostrophe inside a
+    # `//` comment -- "the server's auto_close_mic" -- opens a string state that
+    # never closes, the brace counter never returns to zero, and the failure
+    # surfaces as "unterminated JS function" in a test that has nothing to do
+    # with the comment that was edited.
+    line_comment = False
+    block_comment = False
     for index in range(brace, len(source)):
         char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+            continue
+        if not quote and char == "/" and next_char == "/":
+            line_comment = True
+            continue
+        if not quote and char == "/" and next_char == "*":
+            block_comment = True
+            continue
         if quote:
             if escaped:
                 escaped = False
@@ -156,6 +179,7 @@ def test_avatar_drop_payload_sends_full_prompt_but_records_memory_summary_only()
     wait_teardown = _js_function_block(source, "waitForAvatarDropVoiceTeardown")
     prepare_text_mode = _js_function_block(source, "prepareAvatarDropTextMode")
     send_payload = _js_function_block(source, "sendAvatarDropPayload")
+    send_text_internal = _js_function_block(source, "sendTextPayloadInternal")
     audio_capture_source = _read(APP_AUDIO_CAPTURE_PATH)
     stop_recording = _js_function_block(audio_capture_source, "stopRecording")
     app_websocket_source = _read(APP_WEBSOCKET_PATH)
@@ -186,6 +210,14 @@ def test_avatar_drop_payload_sends_full_prompt_but_records_memory_summary_only()
     assert "memoryText: displayText" in send_payload
     assert "memoryText: prompt" not in send_payload
     assert "extraImageDataUrls: imageDataUrls" in send_payload
+    normalize_extra_images = (
+        "extraImageDataUrls = await Promise.all(extraImageDataUrls.map(function (dataUrl)"
+    )
+    assert normalize_extra_images in send_text_internal
+    assert "return mod.normalizeImageDataUrlForPendingList(dataUrl);" in send_text_internal
+    assert send_text_internal.index(normalize_extra_images) < send_text_internal.index(
+        "var optimisticImageUrls"
+    )
     assert "input_type: 'avatar_drop_image',\n                                request_id: requestId" in source
     assert "var messageSource = typeof options.source === 'string' ? options.source.trim() : '';" in source
     assert "extraMessage.source = messageSource" in source
@@ -224,7 +256,7 @@ def test_avatar_drop_scripts_and_backend_routes_are_wired():
 def test_avatar_drop_image_and_memory_override_are_routed_as_text_session_inputs():
     core_source = _read_package(CORE_PACKAGE_PATH)
     cross_server_source = _read(CROSS_SERVER_PATH)
-    offline_source = _read(OMNI_OFFLINE_PATH)
+    offline_source = _read_package(OMNI_OFFLINE_PATH)
     websocket_source = _read(WEBSOCKET_ROUTER_PATH)
 
     assert '_TEXT_SESSION_INPUT_TYPES = frozenset({"text", "avatar_drop_image", "user_image"})' in core_source
@@ -239,7 +271,7 @@ def test_avatar_drop_image_and_memory_override_are_routed_as_text_session_inputs
     assert "memory_override_text" not in core_source
     assert "record_transcript_text = transcript_text" in core_source
     assert '"text": record_transcript_text' in core_source
-    assert "msg_input_type in _TEXT_SESSION_INPUT_TYPES" in core_source
+    assert 'msg_input_type == "text"' in core_source
     assert "input_type in _IMAGE_INPUT_TYPES" in core_source
     assert '_USER_IMAGE_INPUT_TYPES = frozenset({"screen", "camera", "avatar_drop_image", "user_image"})' in cross_server_source
     assert "input_type in _USER_IMAGE_INPUT_TYPES" in cross_server_source

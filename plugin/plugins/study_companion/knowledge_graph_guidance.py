@@ -37,6 +37,13 @@ GENERIC_QUERY_TERMS = {
     "\u5982\u4f55",
     "\u5b66\u4e60",
     "\u4ec0\u4e48",
+    "\u7406\u89e3",
+    "\u5206\u6790",
+    "\u8bf4\u660e",
+    "\u89e3\u91ca",
+    "\u8bb2\u89e3",
+    "\u89e3\u7b54",
+    "\u8c08\u8c08",
     "\u533a\u522b",
     "\u5173\u7cfb",
     "\u4e3a\u4ec0\u4e48",
@@ -45,6 +52,16 @@ GENERIC_QUERY_TERMS = {
     "\u4e0d\u4e00\u5b9a",
 }
 SUBJECT_QUERY_HINTS = {
+    "math": {
+        "\u6570\u5b66",
+        "\u51fd\u6570",
+        "\u65b9\u7a0b",
+        "\u51e0\u4f55",
+        "\u6982\u7387",
+        "\u4ee3\u6570",
+        "math",
+        "mathematics",
+    },
     "physics": {
         "\u725b\u987f",
         "\u53d7\u529b",
@@ -86,6 +103,54 @@ SUBJECT_QUERY_HINTS = {
         "bfs",
         "dfs",
         "\u904d\u5386",
+    },
+    "politics": {
+        "\u653f\u6cbb",
+        "\u6cd5\u6cbb",
+        "\u516c\u6c11",
+        "\u6c11\u4e3b",
+        "\u54f2\u5b66",
+        "politics",
+        "civics",
+        "government",
+    },
+    "chinese": {
+        "\u8bed\u6587",
+        "\u4e2d\u6587",
+        "\u9605\u8bfb",
+        "\u4f5c\u6587",
+        "\u6587\u8a00\u6587",
+        "\u8bd7\u6b4c",
+        "chinese",
+        "literature",
+    },
+    "history": {
+        "\u5386\u53f2",
+        "\u671d\u4ee3",
+        "\u9769\u547d",
+        "\u6218\u4e89",
+        "\u6587\u660e",
+        "history",
+        "historical",
+    },
+    "geography": {
+        "\u5730\u7406",
+        "\u6c14\u5019",
+        "\u5730\u5f62",
+        "\u7ecf\u7eac\u5ea6",
+        "\u533a\u57df",
+        "geography",
+        "climate",
+    },
+    "economics": {
+        "\u7ecf\u6d4e",
+        "\u4f9b\u7ed9",
+        "\u9700\u6c42",
+        "\u5e02\u573a",
+        "\u901a\u8d27\u81a8\u80c0",
+        "economics",
+        "economy",
+        "market",
     },
 }
 RELATION_GROUP_TITLES = {
@@ -234,13 +299,26 @@ def build_topic_edges(topics: list[dict[str, Any]]) -> list[dict[str, Any]]:
             related_id = _ref_id(ref)
             if not related_id:
                 continue
+            relation = _edge_relation("related", ref)
+            if relation == "prerequisite":
+                edges.append(
+                    _edge_payload(
+                        source=by_id.get(related_id),
+                        target=topic,
+                        source_id=related_id,
+                        target_id=target_id,
+                        relation=relation,
+                        ref=ref,
+                    )
+                )
+                continue
             edges.append(
                 _edge_payload(
                     source=topic,
                     target=by_id.get(related_id),
                     source_id=target_id,
                     target_id=related_id,
-                    relation=_edge_relation("related", ref),
+                    relation=relation,
                     ref=ref,
                 )
             )
@@ -311,6 +389,7 @@ def match_topics(
     *,
     topic_id: str = "",
     query: str = "",
+    subject: str = "",
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     by_id = {_topic_id(topic): topic for topic in topics if _topic_id(topic)}
@@ -320,6 +399,7 @@ def match_topics(
             {
                 "id": topic_key,
                 "label": _topic_label(by_id[topic_key], topic_key),
+                "subject": _text(by_id[topic_key].get("subject")),
                 "score": 100,
                 "match": "topic_id",
             }
@@ -329,10 +409,16 @@ def match_topics(
     subject_hints = _subject_hints(query_text)
     if not terms:
         return []
+    subject_scope = _text(subject).lower()
+    if subject_scope == "unknown":
+        return []
     scored: list[dict[str, Any]] = []
     for topic in topics:
         current_id = _topic_id(topic)
         if not current_id:
+            continue
+        topic_subject = _text(topic.get("subject"))
+        if subject_scope and topic_subject.lower() != subject_scope:
             continue
         label = _topic_label(topic, current_id)
         label_lower = label.lower()
@@ -371,19 +457,17 @@ def match_topics(
             else:
                 continue
             matched_terms.append(term)
-        subject = _text(topic.get("subject"))
         if score and subject_hints:
-            if subject in subject_hints:
+            if topic_subject in subject_hints:
                 score += 18
-            elif subject:
+            elif topic_subject:
                 score -= 10
-        if score and subject == "math":
-            score += 2
         if score:
             scored.append(
                 {
                     "id": current_id,
                     "label": label,
+                    "subject": topic_subject,
                     "score": score,
                     "match": "query",
                     "matched_terms": list(dict.fromkeys(matched_terms))[:6],
@@ -563,6 +647,10 @@ def _build_diagnosis_questions(
                 )
             )
             continue
+        if len(
+            [item for item in questions if item["kind"] == "prerequisite_probe"]
+        ) >= 3:
+            continue
         add(
             _question_payload(
                 kind="prerequisite_probe",
@@ -575,8 +663,6 @@ def _build_diagnosis_questions(
                 edge=edge,
             )
         )
-        if len([item for item in questions if item["kind"] == "prerequisite_probe"]) >= 3:
-            break
 
     for edge in confusions:
         topic_id, topic_label = _other_topic_for_edge(edge, selected_id)
@@ -674,6 +760,7 @@ def build_knowledge_guidance_payload(
     topics: list[dict[str, Any]],
     topic_id: str = "",
     query: str = "",
+    response_mode: str = "problem_solving",
     max_depth: int = 3,
     match_limit: int = 5,
 ) -> dict[str, Any]:
@@ -686,9 +773,15 @@ def build_knowledge_guidance_payload(
     )
     graph_index = KnowledgeGraphIndex(topic_items)
 
+    normalized_response_mode = _text(response_mode).lower() or "problem_solving"
     subgraph_budget = SubgraphBudget(
         focus_topics=max(1, min(3, int(match_limit or 3))),
-        max_depth=max(1, min(2, int(max_depth or 2))),
+        max_depth=(
+            1
+            if normalized_response_mode == "general_discussion"
+            else max(1, min(2, int(max_depth or 2)))
+        ),
+        max_nodes=24,
     )
     relevant_subgraph = build_relevant_subgraph(
         graph_index,
@@ -696,7 +789,51 @@ def build_knowledge_guidance_payload(
         query=query,
         budget=subgraph_budget,
     )
+    allowed_relations = {
+        "general_explanation": {
+            "prerequisite", "application", "supports", "extends", "confusable"
+        },
+        "general_discussion": {"application", "supports", "extends", "co_occurs"},
+        "unknown": {
+            "prerequisite", "application", "supports", "extends", "confusable"
+        },
+    }.get(normalized_response_mode)
+    if allowed_relations is not None:
+        relevant_subgraph = dict(relevant_subgraph)
+        relation_groups = relevant_subgraph.get("relation_groups")
+        relation_groups = relation_groups if isinstance(relation_groups, dict) else {}
+        filtered_groups = {
+            relation: group
+            for relation, group in relation_groups.items()
+            if relation in allowed_relations
+        }
+        edges = [
+            edge for edge in list(relevant_subgraph.get("edges") or [])
+            if isinstance(edge, dict)
+            and _normalized_relation(edge.get("relation")) in allowed_relations
+        ]
+        referenced_ids = set()
+        for edge in edges:
+            referenced_ids.update({_text(edge.get("from")), _text(edge.get("to"))})
+        focus_ids = {
+            _text(topic.get("id"))
+            for topic in list(relevant_subgraph.get("focus_topics") or [])
+            if isinstance(topic, dict)
+        }
+        relevant_subgraph["relation_groups"] = filtered_groups
+        relevant_subgraph["edges"] = edges
+        relevant_subgraph["nodes"] = [
+            node for node in list(relevant_subgraph.get("nodes") or [])
+            if isinstance(node, dict)
+            and _text(node.get("id")) in referenced_ids.union(focus_ids)
+        ]
+        summary = dict(relevant_subgraph.get("summary") or {})
+        summary["node_count"] = len(relevant_subgraph["nodes"])
+        summary["edge_count"] = len(edges)
+        relevant_subgraph["summary"] = summary
     model_context = compress_subgraph_payload(relevant_subgraph, mode="guidance")
+    if normalized_response_mode != "problem_solving":
+        model_context["practice_suggestions"] = []
     by_id = graph_index.by_id
     edges = graph_index.edges
     incoming = graph_index.incoming_edges
@@ -759,6 +896,12 @@ def build_knowledge_guidance_payload(
         for edge in outgoing_edges
         if _normalized_relation(edge.get("relation")) in NEXT_PRACTICE_RELATIONS
     ]
+    if normalized_response_mode == "general_explanation":
+        next_practice = []
+    elif normalized_response_mode == "general_discussion":
+        learning_path = []
+        confusions = []
+        next_practice = []
     diagnosis_questions = _build_diagnosis_questions(
         selected_id=selected_id,
         selected_label=_topic_label(selected_topic, selected_id),
@@ -766,6 +909,8 @@ def build_knowledge_guidance_payload(
         confusions=confusions,
         next_practice=next_practice,
     )
+    if normalized_response_mode != "problem_solving":
+        diagnosis_questions = []
     relation_groups = _build_relation_groups(
         learning_path=learning_path,
         applications=applications,

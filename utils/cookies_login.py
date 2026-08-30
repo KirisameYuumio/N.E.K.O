@@ -27,6 +27,8 @@ Fetches and saves authentication cookies for each platform, with system-level pr
 import json
 import os
 import sys
+import threading
+from dataclasses import dataclass
 from typing import Dict, Any, Optional
 from pathlib import Path
 import logging
@@ -44,12 +46,18 @@ if not logger.handlers:
 CONFIG_DIR = Path("config")
 COOKIE_FILES = {
     'netease': CONFIG_DIR / 'netease_cookies.json',
+    'qqmusic': CONFIG_DIR / 'qqmusic_cookies.json',
     'bilibili': CONFIG_DIR / 'bilibili_cookies.json',
+    'xhh': CONFIG_DIR / 'xhh_cookies.json',
     "douyin": CONFIG_DIR / 'douyin_cookies.json',
     "kuaishou": CONFIG_DIR / 'kuaishou_cookies.json', 
     'weibo': CONFIG_DIR / 'weibo_cookies.json',
     'reddit': CONFIG_DIR / 'reddit_cookies.json',
-    'twitter': CONFIG_DIR / 'twitter_cookies.json'
+    'twitter': CONFIG_DIR / 'twitter_cookies.json',
+    'youtube': CONFIG_DIR / 'youtube_cookies.json',
+    # Twitch stores OAuth credentials here, not browser cookies.  Reuse the
+    # existing encrypted, permission-restricted credential store.
+    'twitch': CONFIG_DIR / 'twitch_credentials.json',
 }
 
 class LoginStatus:
@@ -70,9 +78,24 @@ def mask_string(s: str) -> str:
 
 def validate_cookies(platform: str, cookies: Dict[str, str]) -> bool:
     """Core credential integrity check, preventing incomplete cookies from causing account anomalies or risk control"""
+    if platform == 'youtube':
+        if not cookies.get('SAPISID'):
+            logger.warning("⚠️ 安全拦截：YouTube Cookie 缺少 SAPISID！")
+            return False
+        return True
+
+    if platform == 'twitch':
+        required = ('access_token', 'refresh_token', 'client_id')
+        if not all(cookies.get(key) for key in required):
+            logger.warning("⚠️ 安全拦截：Twitch OAuth 凭证缺少必要字段！")
+            return False
+        return True
+
     required_keys = {
         'netease': ['MUSIC_U'],
+        'qqmusic': ['uin', 'qqmusic_key'],
         'bilibili': ['SESSDATA'],
+        'xhh': ['user_heybox_id', 'user_pkey'],
         "douyin": ['sessionid', 'ttwid'],
         "kuaishou": ['kuaishou.server.web_st', 'userId'], 
         'weibo': ['SUB'],
@@ -87,7 +110,32 @@ def validate_cookies(platform: str, cookies: Dict[str, str]) -> bool:
                 return False
     return True
 
-def save_cookies_to_file(platform: str, cookies: Dict[str, Any], encrypt: bool = True) -> bool:
+
+def get_cookie_key_file(platform: str) -> Path:
+    return CONFIG_DIR / f"{platform}_key.key"
+
+
+def get_legacy_cookie_files(platform: str) -> list[Path]:
+    """Return plaintext compatibility paths supported by older releases."""
+    filename = f"{platform}_cookies.json"
+    return [
+        Path(os.path.expanduser("~")) / filename,
+        Path("config") / filename,
+        Path(".") / filename,
+    ]
+
+
+def _read_encryption_key(platform: str, key_file: Path) -> bytes:
+    return key_file.read_bytes()
+
+
+def _write_encryption_key(platform: str, key_file: Path, key: bytes) -> None:
+    key_file.write_bytes(key)
+
+    if sys.platform != 'win32':
+        os.chmod(key_file, 0o600)
+
+def _save_cookies_to_file_uncached(platform: str, cookies: Dict[str, Any], encrypt: bool = True) -> bool:
     """Save cookies, with normalization checks and encryption logic"""
     try:
         if platform not in COOKIE_FILES:
@@ -113,20 +161,22 @@ def save_cookies_to_file(platform: str, cookies: Dict[str, Any], encrypt: bool =
             from cryptography.fernet import Fernet
             
             # 生成或加载加密密钥
-            key_file = CONFIG_DIR / f"{platform}_key.key"
+            key_file = get_cookie_key_file(platform)
             if key_file.exists():
-                with open(key_file, 'rb') as f:
-                    key = f.read()
+                key = _read_encryption_key(platform, key_file)
+                try:
+                    fernet = Fernet(key)
+                except (TypeError, ValueError):
+                    logger.warning("%s 加密密钥损坏，将在保存时重新生成", platform)
+                    key = Fernet.generate_key()
+                    _write_encryption_key(platform, key_file, key)
+                    fernet = Fernet(key)
             else:
                 key = Fernet.generate_key()
-                with open(key_file, 'wb') as f:
-                    f.write(key)
-                # 设置密钥文件权限
-                if sys.platform != 'win32':
-                    os.chmod(key_file, 0o600)
+                _write_encryption_key(platform, key_file, key)
+                fernet = Fernet(key)
             
             # 加密Cookie数据
-            fernet = Fernet(key)
             cookie_json = json.dumps(cookies, ensure_ascii=False)
             encrypted_data = fernet.encrypt(cookie_json.encode('utf-8'))
             
@@ -149,9 +199,12 @@ def save_cookies_to_file(platform: str, cookies: Dict[str, Any], encrypt: bool =
             
             logger.info(f"✅ 已明文保存 {platform} 凭证到: {cookie_file}")
         
-        logger.info(f"🔐 【{platform.capitalize()} 凭证摘要】:")
-        for k, v in list(cookies.items())[:3]: # 仅展示前三个键
-            logger.info(f"   - {k}: {mask_string(v)}")
+        # OAuth bearer material must never enter logs, even in partially masked
+        # form. Cookie-based platforms retain the existing diagnostic summary.
+        if platform != 'twitch':
+            logger.info(f"🔐 【{platform.capitalize()} 凭证摘要】:")
+            for k, v in list(cookies.items())[:3]: # 仅展示前三个键
+                logger.info(f"   - {k}: {mask_string(v)}")
         return True
         
     except Exception as e:
@@ -183,7 +236,7 @@ def _normalize_cookies(cookies: Dict[str, Any], platform: str) -> Dict[str, str]
     
     return valid_cookies
 
-def load_cookies_from_file(platform: str) -> Dict[str, str]:
+def _load_cookies_from_file_uncached(platform: str) -> Dict[str, str]:
     """Load cookies from file, auto-detecting whether they are encrypted"""
     try:
         if platform not in COOKIE_FILES:
@@ -198,10 +251,9 @@ def load_cookies_from_file(platform: str) -> Dict[str, str]:
             from cryptography.fernet import Fernet
             
             # 加载加密密钥
-            key_file = CONFIG_DIR / f"{platform}_key.key"
+            key_file = get_cookie_key_file(platform)
             if key_file.exists():
-                with open(key_file, 'rb') as f:
-                    key = f.read()
+                key = _read_encryption_key(platform, key_file)
                 
                 # 解密Cookie数据
                 with open(cookie_file, 'rb') as f:
@@ -268,6 +320,313 @@ def load_cookies_from_file(platform: str) -> Dict[str, str]:
         logger.error(f"❌ 加载 {platform} Cookie 失败: {e}")
         return {}
 
+
+def _credential_file_candidates(platform: str) -> tuple[Path, ...]:
+    """Return configured and compatibility paths in fixed priority order."""
+    cookie_file = COOKIE_FILES.get(platform)
+    if cookie_file is None:
+        return ()
+    candidates = [cookie_file, *get_legacy_cookie_files(platform)]
+    return tuple(dict.fromkeys(path.absolute() for path in candidates))
+
+
+def _path_exists(path: Path) -> bool:
+    """Check a credential artifact without following a symlink."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _load_plaintext_cookie_file(
+    platform: str,
+    cookie_file: Path,
+    *,
+    log_success: bool = True,
+) -> Dict[str, str]:
+    """Load one legacy plaintext credential file."""
+    try:
+        cookie_data = json.loads(cookie_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("读取 %s 旧版凭证失败: %s", platform, type(exc).__name__)
+        return {}
+
+    if isinstance(cookie_data, list):
+        cookies = {
+            str(item.get("name")): str(item.get("value"))
+            for item in cookie_data
+            if isinstance(item, dict) and item.get("name") and item.get("value")
+        }
+    elif isinstance(cookie_data, dict):
+        cookies = cookie_data
+    else:
+        return {}
+
+    normalized = _normalize_cookies(cookies, platform)
+    if not normalized or not validate_cookies(platform, normalized):
+        return {}
+    if log_success:
+        logger.info("✅ 已从兼容路径加载 %s 凭证", platform)
+    return normalized
+
+
+def _load_credential_sources_uncached(
+    platform: str,
+) -> tuple[Dict[str, str], Path | None, bool]:
+    """Read configured then legacy sources for the first process-local lookup."""
+    candidates = _credential_file_candidates(platform)
+    if not candidates:
+        return {}, None, False
+
+    configured_file = candidates[0]
+    artifact_exists = _path_exists(configured_file)
+    if artifact_exists and not configured_file.is_symlink():
+        credentials = _load_cookies_from_file_uncached(platform)
+        if credentials:
+            return credentials, configured_file, True
+
+    for legacy_file in candidates[1:]:
+        if not _path_exists(legacy_file):
+            continue
+        if legacy_file.is_symlink():
+            continue
+        credentials = _load_plaintext_cookie_file(platform, legacy_file)
+        if credentials:
+            return credentials, legacy_file, True
+
+    return {}, None, artifact_exists
+
+
+@dataclass(frozen=True)
+class CredentialSnapshot:
+    """Defensive view of one platform's process-cached credential state."""
+
+    state: str
+    credentials: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _CredentialEntry:
+    state: str
+    credentials: dict[str, str]
+    source_path: str | None = None
+
+
+class CredentialManager:
+    """Thread-safe process-lifetime cache for decrypted platform credentials."""
+
+    READY = "ready"
+    MISSING = "missing"
+    INVALID = "invalid"
+    AUTH_REJECTED = "auth_rejected"
+
+    def __init__(self) -> None:
+        self._cache: dict[str, _CredentialEntry] = {}
+        self._cache_lock = threading.RLock()
+        self._platform_locks: dict[str, threading.RLock] = {}
+
+    def _platform_lock(self, platform: str) -> threading.RLock:
+        with self._cache_lock:
+            return self._platform_locks.setdefault(platform, threading.RLock())
+
+    def _cached(self, platform: str) -> _CredentialEntry | None:
+        with self._cache_lock:
+            return self._cache.get(platform)
+
+    def _store(
+        self,
+        platform: str,
+        state: str,
+        credentials: Dict[str, str] | None = None,
+        source_path: Path | None = None,
+    ) -> _CredentialEntry:
+        entry = _CredentialEntry(
+            state=state,
+            credentials=dict(credentials or {}),
+            source_path=str(source_path) if source_path is not None else None,
+        )
+        with self._cache_lock:
+            self._cache[platform] = entry
+        return entry
+
+    @staticmethod
+    def _copy(entry: _CredentialEntry) -> Dict[str, str]:
+        if entry.state != CredentialManager.READY:
+            return {}
+        return dict(entry.credentials)
+
+    def _load_entry(self, platform: str) -> _CredentialEntry:
+        cached = self._cached(platform)
+        if cached is not None:
+            return cached
+
+        with self._platform_lock(platform):
+            cached = self._cached(platform)
+            if cached is not None:
+                return cached
+
+            credentials, source_path, artifact_exists = (
+                _load_credential_sources_uncached(platform)
+            )
+            if credentials:
+                state = self.READY
+            elif artifact_exists:
+                state = self.INVALID
+            else:
+                state = self.MISSING
+            return self._store(platform, state, credentials, source_path)
+
+    def load(self, platform: str) -> Dict[str, str]:
+        return self._copy(self._load_entry(platform))
+
+    def snapshot(self, platform: str) -> CredentialSnapshot:
+        entry = self._load_entry(platform)
+        return CredentialSnapshot(entry.state, self._copy(entry))
+
+    def save(
+        self,
+        platform: str,
+        cookies: Dict[str, Any],
+        encrypt: bool = True,
+        *,
+        expected_credentials: Dict[str, Any] | None = None,
+    ) -> bool:
+        normalized = _normalize_cookies(cookies, platform)
+        if not normalized:
+            return False
+        expected = None
+        if expected_credentials is not None:
+            expected = _normalize_cookies(expected_credentials, platform)
+            if not expected:
+                return False
+
+        with self._platform_lock(platform):
+            if expected is not None:
+                entry = self._cached(platform)
+                if (
+                    entry is None
+                    or entry.state != self.READY
+                    or entry.credentials != expected
+                ):
+                    return False
+            if not _save_cookies_to_file_uncached(
+                platform,
+                normalized,
+                encrypt=encrypt,
+            ):
+                return False
+            self._store(
+                platform,
+                self.READY,
+                normalized,
+                COOKIE_FILES[platform].absolute(),
+            )
+            return True
+
+    def delete(self, platform: str) -> bool:
+        """Delete credential payloads while retaining stable encryption material."""
+        with self._platform_lock(platform):
+            artifact_existed = False
+            entry = self._cached(platform)
+            source_path = entry.source_path if entry is not None else None
+            for index, stored_file in enumerate(_credential_file_candidates(platform)):
+                try:
+                    stored_file.lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    with self._cache_lock:
+                        self._cache.pop(platform, None)
+                    raise
+
+                if index > 0:
+                    if stored_file.is_symlink():
+                        continue
+                    known_source = source_path == str(stored_file)
+                    if not known_source and not _load_plaintext_cookie_file(
+                        platform,
+                        stored_file,
+                        log_success=False,
+                    ):
+                        continue
+
+                try:
+                    stored_file.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    with self._cache_lock:
+                        self._cache.pop(platform, None)
+                    raise
+                artifact_existed = True
+
+            self._store(platform, self.MISSING)
+            return artifact_existed
+
+    def mark_auth_rejected(
+        self,
+        platform: str,
+        expected_credentials: Dict[str, Any],
+    ) -> bool:
+        expected = _normalize_cookies(expected_credentials, platform)
+        if not expected:
+            return False
+
+        with self._platform_lock(platform):
+            entry = self._cached(platform)
+            if entry is None or entry.state != self.READY:
+                return False
+            if entry.credentials != expected:
+                return False
+            source_path = Path(entry.source_path) if entry.source_path else None
+            self._store(
+                platform,
+                self.AUTH_REJECTED,
+                entry.credentials,
+                source_path,
+            )
+            return True
+
+    def status(self, platform: str) -> dict[str, Any]:
+        snapshot = self.snapshot(platform)
+        stored = snapshot.state in {self.READY, self.INVALID, self.AUTH_REJECTED}
+        return {
+            "has_cookies": snapshot.state == self.READY and bool(snapshot.credentials),
+            "has_stored_credentials": stored,
+            "cookies_count": (
+                len(snapshot.credentials) if snapshot.state == self.READY else 0
+            ),
+            "credential_state": snapshot.state,
+        }
+
+    def status_all(self, platforms) -> dict[str, dict[str, Any]]:
+        return {platform: self.status(platform) for platform in platforms}
+
+    def clear(self) -> None:
+        """Drop cached secrets during process teardown and tests."""
+        with self._cache_lock:
+            self._cache.clear()
+
+
+credential_manager = CredentialManager()
+
+
+def save_cookies_to_file(
+    platform: str,
+    cookies: Dict[str, Any],
+    encrypt: bool = True,
+) -> bool:
+    """Compatibility wrapper backed by the process-wide credential manager."""
+    return credential_manager.save(platform, cookies, encrypt=encrypt)
+
+
+def load_cookies_from_file(platform: str) -> Dict[str, str]:
+    """Return a defensive copy of process-cached credentials."""
+    return credential_manager.load(platform)
+
 def parse_cookie_string(cookie_string: str) -> Dict[str, str]:
     """Parse plaintext cookies"""
     cookies = {}
@@ -289,6 +648,17 @@ def get_bilibili_cookies(_method: str = "manual") -> Optional[Dict[str, str]]:
     cookies = parse_cookie_string(cookie_string)
     if cookies:
         save_cookies_to_file('bilibili', cookies)  # noqa: ASYNC_BLOCK — CLI-only path; outer fn already blocks on input()
+    return cookies
+
+
+def get_xhh_cookies(_method: str = "manual") -> Optional[Dict[str, str]]:
+    print("\n" + "-" * 40)
+    print("【小黑盒手动导入】(需包含 user_heybox_id 和 user_pkey 字段)")
+    cookie_string = input("👉 请粘贴 Cookie: ").strip()
+    print("\033[F\033[K" + "👉 请粘贴 Cookie: [已接收，已脱敏掩码]")
+    cookies = parse_cookie_string(cookie_string)
+    if cookies:
+        save_cookies_to_file('xhh', cookies)
     return cookies
 
 # ==========================================
@@ -344,6 +714,16 @@ def get_twitter_cookies(_method: str = "manual") -> Optional[Dict[str, str]]:
         save_cookies_to_file('twitter', cookies)  # noqa: ASYNC_BLOCK — CLI-only path; outer fn already blocks on input()
     return cookies
 
+def get_youtube_cookies(_method: str = "manual") -> Optional[Dict[str, str]]:
+    print("\n" + "-" * 40)
+    print("【YouTube 手动导入】(必须包含 SAPISID 字段)")
+    cookie_string = input("👉 请粘贴 Cookie: ").strip()
+    print("\033[F\033[K" + "👉 请粘贴 Cookie: [已接收，已脱敏掩码]")
+    cookies = parse_cookie_string(cookie_string)
+    if cookies:
+        save_cookies_to_file('youtube', cookies)
+    return cookies
+
 def get_netease_cookies(_method: str = "manual") -> Optional[Dict[str, str]]:
     print("\n" + "-" * 40)
     print("【网易云音乐手动导入】(需包含 MUSIC_U 字段)")
@@ -354,6 +734,17 @@ def get_netease_cookies(_method: str = "manual") -> Optional[Dict[str, str]]:
         save_cookies_to_file('netease', cookies)  # noqa: ASYNC_BLOCK — CLI-only path; outer fn already blocks on input()
     return cookies
 
+
+def get_qqmusic_cookies(_method: str = "manual") -> Optional[Dict[str, str]]:
+    print("\n" + "-" * 40)
+    print("【QQ音乐手动导入】(需包含 uin 和 qqmusic_key 字段)")
+    cookie_string = input("👉 请粘贴 Cookie: ").strip()
+    print("\033[F\033[K" + "👉 请粘贴 Cookie: [已接收，已脱敏掩码]")
+    cookies = parse_cookie_string(cookie_string)
+    if cookies:
+        save_cookies_to_file('qqmusic', cookies)  # noqa: ASYNC_BLOCK — CLI-only path; outer fn already blocks on input()
+    return cookies
+
 # ==========================================
 # 交互式终端 UI 引擎
 # ==========================================
@@ -361,18 +752,36 @@ class PlatformLoginManager:
     def __init__(self):
         self.platforms = {
             'netease': {'name': '网易云音乐', 'methods': ['manual'], 'func': get_netease_cookies},
+            'qqmusic': {'name': 'QQ音乐', 'methods': ['manual'], 'func': get_qqmusic_cookies},
             'bilibili': {'name': 'Bilibili', 'methods': ['manual'], 'func': get_bilibili_cookies},
+            'xhh': {'name': '小黑盒', 'methods': ['manual'], 'func': get_xhh_cookies},
             "douyin": {'name': '抖音', 'methods': ['manual'], 'func': get_douyin_cookies},
             "kuaishou": {'name': '快手', 'methods': ['manual'], 'func': get_kuaishou_cookies},
             'weibo': {'name': '微博', 'methods': ['manual'], 'func': get_weibo_cookies},
             'reddit': {'name': 'Reddit', 'methods': ['manual'], 'func': get_reddit_cookies},
-            'twitter': {'name': 'Twitter/X', 'methods': ['manual'], 'func': get_twitter_cookies}
+            'twitter': {'name': 'Twitter/X', 'methods': ['manual'], 'func': get_twitter_cookies},
+            'youtube': {'name': 'YouTube', 'methods': ['manual'], 'func': get_youtube_cookies},
+            'twitch': {'name': 'Twitch', 'methods': ['device_code'], 'func': lambda _method: None},
         }
     
     def login_platform(self, platform: str, method: str) -> Optional[Dict[str, str]]:
         if platform in self.platforms:
             return self.platforms[platform]['func'](method)
         return None
+
+    def build_request_params(
+        self,
+        platform: str,
+        path: str,
+        *,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Build platform-specific request parameters through one login entry point."""
+        if platform == 'xhh':
+            from utils.web_scraper.platform_helpers import build_xhh_request_params
+
+            return build_xhh_request_params(path, extra=extra)
+        return dict(extra or {})
     
     def get_supported_platforms(self) -> Dict[str, Dict[str, Any]]:
         """Get supported platforms and their login methods"""

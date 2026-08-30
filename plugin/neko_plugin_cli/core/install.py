@@ -2,20 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import shutil
 import zipfile
 
+from .inspect import PackageInspector
 from .models import InstalledPlugin, InstallResult
-from .archive_utils import (
-    collect_plugin_folders,
-    compute_archive_payload_hash,
-    read_manifest,
-    read_metadata,
-    safe_archive_path,
-    validate_dependency_layout,
-    validate_package_type,
-    validate_plugin_layout,
-    verify_payload_hash,
-)
+from .archive_utils import read_metadata, safe_archive_path
 
 _SAFE_PACKAGE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -29,7 +21,7 @@ class PackageInstaller:
         *,
         plugins_root: str | Path,
         profiles_root: str | Path,
-        on_conflict: str = "rename",
+        on_conflict: str = "fail",
     ) -> InstallResult:
         package_path = Path(package_path).expanduser().resolve()
         plugins_root_path = Path(plugins_root).expanduser().resolve()
@@ -39,30 +31,31 @@ class PackageInstaller:
         on_conflict = self.normalize_conflict_strategy(on_conflict)
 
         with zipfile.ZipFile(package_path) as archive:
-            manifest = read_manifest(archive)
-            package_type = self.require_string(manifest, "package_type")
-            package_id = self.validate_package_id(self.require_string(manifest, "id"))
-            metadata = read_metadata(archive)
-            plugin_folders = collect_plugin_folders(archive)
-            validate_package_type(package_type, plugin_folders)
-            validate_plugin_layout(archive, plugin_folders)
-            validate_dependency_layout(archive, plugin_folders)
-            payload_hash = compute_archive_payload_hash(archive)
-            payload_hash_verified = verify_payload_hash(metadata, payload_hash)
-            if payload_hash_verified is False:
-                meta_payload = metadata.get("payload", {}) if metadata else {}
-                expected = meta_payload.get("hash", "<unknown>") if isinstance(meta_payload, dict) else "<unknown>"
-                raise ValueError(
-                    f"payload hash mismatch: the archive content does not match the hash "
-                    f"recorded in metadata.toml.\n"
-                    f"  expected (metadata.toml): {expected}\n"
-                    f"  computed (archive):       {payload_hash}\n"
-                    f"This usually means the package was built on a different platform "
-                    f"(e.g. Windows vs Linux) with an older version of neko_plugin_cli "
-                    f"that had cross-platform sorting issues, or the archive was modified "
-                    f"after packaging. Try re-building the plugin with the latest "
-                    f"neko_plugin_cli."
+            inspected = PackageInspector().inspect_archive(
+                archive,
+                package_path=package_path,
+            )
+            if inspected.payload_hash_verified is False:
+                metadata = read_metadata(archive)
+                payload_table = metadata.get("payload", {}) if metadata else {}
+                expected = (
+                    payload_table.get("hash", "<unknown>")
+                    if isinstance(payload_table, dict)
+                    else "<unknown>"
                 )
+                raise ValueError(
+                    "payload hash mismatch: the archive content does not match the hash "
+                    "recorded in metadata.toml.\n"
+                    f"  expected (metadata.toml): {expected}\n"
+                    f"  computed (archive):       {inspected.payload_hash}\n"
+                    "This usually means the package was built on a different platform "
+                    "(e.g. Windows vs Linux) with an older version of neko_plugin_cli "
+                    "that had cross-platform sorting issues, or the archive was modified "
+                    "after packaging. Try re-building the plugin with the latest "
+                    "neko_plugin_cli."
+                )
+            package_id = self.validate_package_id(inspected.package_id)
+            plugin_folders = [item.plugin_id for item in inspected.plugins]
             folder_mapping = self.plan_plugin_targets(
                 plugin_folders,
                 plugins_root_path,
@@ -87,7 +80,7 @@ class PackageInstaller:
 
         return InstallResult(
             package_path=package_path,
-            package_type=package_type,
+            package_type=inspected.package_type,
             package_id=package_id,
             plugins_root=plugins_root_path,
             profiles_root=profiles_root_path,
@@ -101,9 +94,9 @@ class PackageInstaller:
                 for source_folder, target_dir in sorted(folder_mapping.items())
             ],
             profile_dir=profile_dir,
-            metadata_found=(metadata is not None),
-            payload_hash=payload_hash,
-            payload_hash_verified=payload_hash_verified,
+            metadata_found=inspected.metadata_found,
+            payload_hash=inspected.payload_hash,
+            payload_hash_verified=inspected.payload_hash_verified,
             conflict_strategy=on_conflict,
         )
 
@@ -117,14 +110,23 @@ class PackageInstaller:
         mapping: dict[str, Path] = {}
         reserved_names: set[str] = set()
         for folder in plugin_folders:
-            target_dir = self.resolve_target_dir(
+            target_dir = self.resolve_plugin_target_dir(
                 plugins_root / folder,
-                on_conflict=on_conflict,
                 reserved_names=reserved_names,
             )
             mapping[folder] = target_dir
             reserved_names.add(target_dir.name)
         return mapping
+
+    @staticmethod
+    def resolve_plugin_target_dir(
+        target_dir: Path,
+        *,
+        reserved_names: set[str] | None = None,
+    ) -> Path:
+        if target_dir.exists() or (reserved_names is not None and target_dir.name in reserved_names):
+            raise FileExistsError(f"plugin target already exists: {target_dir.name}")
+        return target_dir.resolve()
 
     def extract_plugins(self, archive: zipfile.ZipFile, folder_mapping: dict[str, Path]) -> None:
         for name in archive.namelist():
@@ -192,7 +194,7 @@ class PackageInstaller:
             return
         target_path.parent.mkdir(parents=True, exist_ok=True)
         with archive.open(info) as src, target_path.open("wb") as dst:
-            dst.write(src.read())
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
 
     def resolve_target_dir(
         self,
@@ -219,16 +221,6 @@ class PackageInstaller:
             if candidate.name not in reserved_names and not candidate.exists():
                 return candidate.resolve()
             counter += 1
-
-    def require_string(self, data: dict[str, object], key: str) -> str:
-        value = data.get(key)
-        if not isinstance(value, str) or not value.strip():
-            actual = repr(value) if value is not None else "<missing>"
-            raise ValueError(
-                f"manifest.toml field '{key}' must be a non-empty string, got {actual}. "
-                f"The package manifest may be malformed or was created by an incompatible tool."
-            )
-        return value.strip()
 
     def validate_package_id(self, package_id: str) -> str:
         if (
@@ -260,7 +252,7 @@ def install_package(
     *,
     plugins_root: str | Path,
     profiles_root: str | Path,
-    on_conflict: str = "rename",
+    on_conflict: str = "fail",
 ) -> InstallResult:
     """Public convenience wrapper for archive extraction into runtime directories."""
 

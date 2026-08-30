@@ -397,7 +397,7 @@
         // 通道各到一份。BC 先到的话 handleCatgirlSwitch 跑完 lanlan_name 已是 newCatgirl，
         // 接踵而至的 WS 事件参数还是 (newCatgirl, 上一次的 oldCatgirl)，原本只 newCatgirl
         // !== oldCatgirl 的 dedupe 拦不住，会重新清 chat / 关 socket / 重连 / 重加载模型。
-        // app-interpage.js 的 BC handler 已加同样守护作为外层防御，这里在源头再加一道，
+        // app-interpage 的 BC handler 已加同样守护作为外层防御，这里在源头再加一道，
         // 让所有调用方（不光 BC/WS handler）自动受益。
         if (window.lanlan_config && window.lanlan_config.lanlan_name === newCatgirl) {
             console.log('[猫娘切换] 已经是当前角色', newCatgirl, '，跳过重复事件（BC + WS 双通道收到同一切换）');
@@ -566,8 +566,11 @@
                 window.live2dManager.pixi_app.ticker.stop();
             }
 
-            // 停止 VRM 渲染循环
-            if (window.vrmManager && window.vrmManager._animationFrameId) {
+            // 停止 VRM 渲染循环（走 pauseRendering：空闲低频模式下 rAF id 为
+            // null，裸字段取消管不到 interval，会让旧模型在后台永久渲染）
+            if (window.vrmManager && typeof window.vrmManager.pauseRendering === 'function') {
+                window.vrmManager.pauseRendering();
+            } else if (window.vrmManager && window.vrmManager._animationFrameId) {
                 cancelAnimationFrame(window.vrmManager._animationFrameId);
                 window.vrmManager._animationFrameId = null;
             }
@@ -667,8 +670,10 @@
                 }
 
                 if (window.vrmManager) {
-                    // 1. 停止动画循环
-                    if (window.vrmManager._animationFrameId) {
+                    // 1. 停止动画循环（走 pauseRendering，理由同上：兼容空闲低频模式）
+                    if (typeof window.vrmManager.pauseRendering === 'function') {
+                        window.vrmManager.pauseRendering();
+                    } else if (window.vrmManager._animationFrameId) {
                         cancelAnimationFrame(window.vrmManager._animationFrameId);
                         window.vrmManager._animationFrameId = null;
                     }
@@ -1215,10 +1220,15 @@
                 console.log('[猫娘切换] VRM模型加载完成');
                 resetAvatarLockForCharacterSwitch('vrm');
 
-                // 【关键修复】确保VRM渲染循环已启动（loadModel内部会调用startAnimation，但为了保险再次确认）
+                // 【关键修复】确保VRM渲染循环已启动。历史上这里调用的
+                // startAnimation() 在 VRMManager 上并不存在（typeof 守卫下静默
+                // no-op）；真正的恢复 API 是 resumeRendering()——空闲低频模式引入
+                // pauseRendering 停链后，这条兜底必须真的能把循环拉起来。
                 if (!window.vrmManager._animationFrameId) {
                     console.log('[猫娘切换] VRM渲染循环未启动，手动启动');
-                    if (typeof window.vrmManager.startAnimation === 'function') {
+                    if (typeof window.vrmManager.resumeRendering === 'function') {
+                        window.vrmManager.resumeRendering();
+                    } else if (typeof window.vrmManager.startAnimation === 'function') {
                         window.vrmManager.startAnimation();
                     }
                 } else {
@@ -1637,7 +1647,7 @@
                 const modelResponse = await fetch(`/api/characters/current_live2d_model?catgirl_name=${encodeURIComponent(newCatgirl)}`);
                 throwIfStale();
                 if (!modelResponse.ok) {
-                    // 原本失败也走成功路径：configRes.ok 失败时跳进 fallback yui-origin，
+                    // 原本失败也走成功路径：configRes.ok 失败时跳进 fallback yui-lolita，
                     // 但 modelResponse 本身失败时 modelData.success/model_info 缺失，下面
                     // `if (modelData.success && modelData.model_info)` 直接跳过整个加载块，
                     // 用户看到的是空白容器但弹"已切换到 xxx"——配合本 PR 入口 dedupe，
@@ -1713,9 +1723,9 @@
                         }
                     } else {
                         // 模型配置获取失败（可能因 CFA/反勒索防护导致路径不可用），回退到默认模型
-                        console.warn(`[猫娘切换] 模型配置获取失败 (HTTP ${modelConfigRes.status}: ${modelData.model_info.path}), 回退到默认模型 yui-origin`);
+                        console.warn(`[猫娘切换] 模型配置获取失败 (HTTP ${modelConfigRes.status}: ${modelData.model_info.path}), 回退到默认模型 yui-lolita`);
                         try {
-                            const defaultPath = '/static/yui-origin/yui-origin.model3.json';
+                            const defaultPath = '/static/yui-lolita/yui-lolita.model3.json';
                             const defaultRes = await fetch(defaultPath);
                             throwIfStale();
                             if (defaultRes.ok) {
@@ -1735,7 +1745,7 @@
                                 if (window.live2dManager?.pixi_app?.ticker && !window.live2dManager.pixi_app.ticker.started) {
                                     window.live2dManager.pixi_app.ticker.start();
                                 }
-                                console.log('[猫娘切换] 已回退加载默认模型 yui-origin');
+                                console.log('[猫娘切换] 已回退加载默认模型 yui-lolita');
                             } else {
                                 // throw 而非只 log：原本静默继续会让 showLive2d() + "已切换到 xxx"
                                 // toast 都跑，但实际模型没载起来。配合 dedupe 让用户看空白点不动。
@@ -1966,10 +1976,15 @@
                     if (ticker && !ticker.started) ticker.start();
                 } catch (_e) { /* ignore */ }
                 try {
-                    if (window.vrmManager
-                        && !window.vrmManager._animationFrameId
-                        && typeof window.vrmManager.startAnimation === 'function') {
-                        window.vrmManager.startAnimation();
+                    // rollback 恢复：startAnimation 在 VRMManager 上不存在（历史
+                    // 遗留 no-op），切换失败后旧 VRM 会被 pauseRendering 冻住——
+                    // 改用真实的 resumeRendering() 恢复渲染循环
+                    if (window.vrmManager && !window.vrmManager._animationFrameId) {
+                        if (typeof window.vrmManager.resumeRendering === 'function') {
+                            window.vrmManager.resumeRendering();
+                        } else if (typeof window.vrmManager.startAnimation === 'function') {
+                            window.vrmManager.startAnimation();
+                        }
                     }
                 } catch (_e) { /* ignore */ }
                 // MMD rollback 恢复：清理阶段为防 MMD→非 MMD 切换中途失败让模型区空白，

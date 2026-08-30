@@ -29,6 +29,7 @@ HOSTED_SURFACE_ACTION_IDS = [
     "study_goal_delete",
     "study_goals",
     "study_knowledge_map",
+    "study_review_knowledge_candidate",
     "study_memory_create_deck",
     "study_memory_delete_deck",
     "study_memory_due_reviews",
@@ -57,9 +58,15 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 
-from plugin.core.ui_manifest import normalize_plugin_ui_manifest
+from tests.fake_clock import patch_module_clock
+
+from plugin.core.ui_manifest import (
+    normalize_plugin_ui_manifest,
+    resolve_localized_surface_entry_path,
+)
 from plugin.plugins import study_companion as study_companion_module
 from plugin.plugins.study_companion import StudyCompanionPlugin
+from plugin.plugins.study_companion._event_bus import StudyEvent
 from plugin.plugins.study_companion.awareness_buffer import ActivityBuffer
 from plugin.plugins.study_companion.llm_prompts import (
     _compact_prompt_value,
@@ -81,6 +88,22 @@ from plugin.plugins.study_companion.knowledge_quality import (
     KnowledgeCandidateType,
     KnowledgeEvidenceType,
     KnowledgeQualityStore,
+)
+from plugin.plugins.study_companion.knowledge_graph_guidance import (
+    build_knowledge_guidance_payload,
+    match_topics,
+)
+from plugin.plugins.study_companion.knowledge_graph_index import (
+    KnowledgeGraphIndex,
+    SubgraphBudget,
+    build_relevant_subgraph,
+    compress_subgraph_payload,
+)
+from plugin.plugins.study_companion.knowledge_retrieval_eval import (
+    evaluate_knowledge_retrieval_queries,
+)
+from plugin.plugins.study_companion.knowledge_seed_validator import (
+    validate_knowledge_seed_manifest,
 )
 from plugin.plugins.study_companion.knowledge_contribution import (
     PublicGraphContributionBuilder,
@@ -122,7 +145,10 @@ from plugin.plugins.study_companion.ui_api import (
     build_knowledge_map_payload,
     build_open_ui_payload,
 )
-from plugin.server.application.plugins.ui_query_service import _build_surfaces_sync
+from plugin.server.application.plugins.ui_query_service import (
+    _build_plugin_list_actions_from_meta,
+    _build_surfaces_sync,
+)
 from plugin.sdk.plugin import Err, Ok, OsActivitySnapshot
 from plugin.sdk.shared.constants import EVENT_META_ATTR
 
@@ -295,17 +321,17 @@ async def test_awareness_disabled_does_not_start_loop_on_startup(
 
 
 @pytest.mark.asyncio
-async def test_study_plugin_startup_auto_opens_panel_page(
+async def test_study_plugin_startup_ignores_legacy_auto_open_ui(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     opened: list[str] = []
     monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
-    monkeypatch.setenv("NEKO_USER_PLUGIN_SERVER_PORT", "49888")
-    monkeypatch.delenv("NEKO_STUDY_COMPANION_PANEL_URL", raising=False)
-    monkeypatch.delenv("NEKO_PLUGIN_MANAGER_URL", raising=False)
-    monkeypatch.delenv("NEKO_PLUGIN_MANAGER_BASE_URL", raising=False)
-    monkeypatch.delenv("NEKO_PLUGIN_MANAGER_PORT", raising=False)
-    monkeypatch.setattr(study_companion_module, "_open_url_in_browser", opened.append)
+    monkeypatch.setattr(
+        study_companion_module,
+        "_open_url_in_browser",
+        opened.append,
+        raising=False,
+    )
     ctx = _Ctx(
         tmp_path,
         {
@@ -319,9 +345,7 @@ async def test_study_plugin_startup_auto_opens_panel_page(
 
     try:
         assert isinstance(result, Ok)
-        assert opened == [
-            "http://127.0.0.1:49888/plugin/study_companion/ui/"
-        ]
+        assert opened == []
         assert plugin.get_list_actions()[0]["target"] == (
             "/plugin/study_companion/ui/"
         )
@@ -330,40 +354,10 @@ async def test_study_plugin_startup_auto_opens_panel_page(
 
 
 @pytest.mark.asyncio
-async def test_study_plugin_startup_auto_open_can_be_disabled_by_config(
+async def test_study_open_ui_entry_and_list_action_remain_available(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    opened: list[str] = []
     monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
-    monkeypatch.setenv("NEKO_USER_PLUGIN_SERVER_PORT", "49888")
-    monkeypatch.delenv("NEKO_STUDY_COMPANION_DISABLE_AUTO_OPEN_UI", raising=False)
-    monkeypatch.setattr(study_companion_module, "_open_url_in_browser", opened.append)
-    ctx = _Ctx(
-        tmp_path,
-        {
-            "study": {"language": "en", "auto_open_ui": False},
-            "study_companion": {"communication": {"enabled": False}},
-        },
-    )
-    plugin = StudyCompanionPlugin(ctx)
-
-    result = await plugin.startup()
-
-    try:
-        assert isinstance(result, Ok)
-        assert opened == []
-    finally:
-        await plugin.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_study_plugin_startup_auto_open_uses_configured_panel_url(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    opened: list[str] = []
-    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
-    monkeypatch.setenv("NEKO_STUDY_COMPANION_PANEL_URL", "http://127.0.0.1:48916/ui")
-    monkeypatch.setattr(study_companion_module, "_open_url_in_browser", opened.append)
     ctx = _Ctx(
         tmp_path,
         {
@@ -377,140 +371,23 @@ async def test_study_plugin_startup_auto_open_uses_configured_panel_url(
 
     try:
         assert isinstance(result, Ok)
-        assert opened == [
-            "http://127.0.0.1:48916/plugin/study_companion/ui/"
+        monkeypatch.setattr(plugin, "get_static_ui_config", lambda: {"enabled": True})
+        open_result = await plugin.study_open_ui()
+        assert isinstance(open_result, Ok)
+        assert open_result.value == {
+            "available": True,
+            "path": "/plugin/study_companion/ui/",
+            "message_key": "ui.open.available",
+        }
+        assert plugin.get_list_actions() == [
+            {
+                "id": "open_ui",
+                "kind": "ui",
+                "target": "/plugin/study_companion/ui/",
+                "open_in": "new_tab",
+            }
         ]
     finally:
-        await plugin.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_study_plugin_startup_auto_open_can_be_disabled_by_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    opened: list[str] = []
-    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
-    monkeypatch.setenv("NEKO_STUDY_COMPANION_DISABLE_AUTO_OPEN_UI", "true")
-    monkeypatch.setattr(study_companion_module, "_open_url_in_browser", opened.append)
-    ctx = _Ctx(
-        tmp_path,
-        {
-            "study": {"language": "en", "auto_open_ui": True},
-            "study_companion": {"communication": {"enabled": False}},
-        },
-    )
-    plugin = StudyCompanionPlugin(ctx)
-
-    result = await plugin.startup()
-
-    try:
-        assert isinstance(result, Ok)
-        assert opened == []
-    finally:
-        await plugin.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_study_plugin_startup_auto_open_falls_back_for_invalid_manager_port(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    opened: list[str] = []
-    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
-    monkeypatch.delenv("NEKO_STUDY_COMPANION_PANEL_URL", raising=False)
-    monkeypatch.delenv("NEKO_PLUGIN_MANAGER_URL", raising=False)
-    monkeypatch.delenv("NEKO_PLUGIN_MANAGER_BASE_URL", raising=False)
-    monkeypatch.setenv("NEKO_USER_PLUGIN_SERVER_PORT", "70000")
-    monkeypatch.setenv("NEKO_PLUGIN_MANAGER_PORT", "5173")
-    monkeypatch.setattr(study_companion_module, "_open_url_in_browser", opened.append)
-    ctx = _Ctx(
-        tmp_path,
-        {
-            "study": {"language": "en", "auto_open_ui": True},
-            "study_companion": {"communication": {"enabled": False}},
-        },
-    )
-    plugin = StudyCompanionPlugin(ctx)
-
-    result = await plugin.startup()
-
-    try:
-        assert isinstance(result, Ok)
-        assert opened == [
-            "http://127.0.0.1:48916/plugin/study_companion/ui/"
-        ]
-    finally:
-        await plugin.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_study_plugin_auto_open_failure_does_not_block_startup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def _fail_open(_url: str) -> None:
-        raise RuntimeError("browser unavailable")
-
-    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
-    monkeypatch.setattr(study_companion_module, "_open_url_in_browser", _fail_open)
-    ctx = _Ctx(
-        tmp_path,
-        {
-            "study": {"language": "en", "auto_open_ui": True},
-            "study_companion": {"communication": {"enabled": False}},
-        },
-    )
-    plugin = StudyCompanionPlugin(ctx)
-    plugin.logger = ctx.logger
-
-    result = await plugin.startup()
-
-    try:
-        assert isinstance(result, Ok)
-        assert any(
-            warning[0][0] == "study auto-open UI failed: {}"
-            for warning in ctx.logger.warnings
-        )
-    finally:
-        await plugin.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_study_plugin_auto_open_timeout_does_not_block_startup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    unblock = threading.Event()
-    opened: list[str] = []
-
-    def _hang_open(url: str) -> None:
-        opened.append(url)
-        unblock.wait(timeout=1.0)
-
-    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
-    monkeypatch.setattr(study_companion_module, "_open_url_in_browser", _hang_open)
-    monkeypatch.setattr(
-        study_companion_module,
-        "_AUTO_OPEN_UI_TASK_TIMEOUT_SECONDS",
-        0.01,
-    )
-    ctx = _Ctx(
-        tmp_path,
-        {
-            "study": {"language": "en", "auto_open_ui": True},
-            "study_companion": {"communication": {"enabled": False}},
-        },
-    )
-    plugin = StudyCompanionPlugin(ctx)
-    plugin.logger = ctx.logger
-
-    try:
-        result = await plugin.startup()
-
-        assert isinstance(result, Ok)
-        assert any(
-            warning[0][0] == "study auto-open UI failed: {}"
-            for warning in ctx.logger.warnings
-        )
-    finally:
-        unblock.set()
         await plugin.shutdown()
 
 
@@ -589,7 +466,9 @@ async def test_start_awareness_loop_primes_first_push_before_uptime_interval(
         )
     )
     plugin._ocr_pipeline = object()
-    monkeypatch.setattr(study_companion_module.time, "monotonic", lambda: 10.0)
+    # start_awareness_loop() 和 _should_push_context() 都在 study_companion 包的
+    # __init__ 里读 time.monotonic()，所以假时钟打在这个模块上。
+    patch_module_clock(monkeypatch, study_companion_module, monotonic=lambda: 10.0)
 
     plugin.start_awareness_loop()
     try:
@@ -831,6 +710,9 @@ class _FakeStudyOcrPipeline:
 class _FakeTutorAgent:
     def __init__(self) -> None:
         self.inputs: list[tuple[str, dict[str, object], str]] = []
+        self.semantic_routing_result: str | Exception | None = None
+        self.semantic_routing_calls: list[tuple[list[dict[str, object]], str]] = []
+        self.semantic_routing_deadlines: list[float] = []
         self.evaluations: list[tuple[str, str, str, dict[str, object], str]] = []
         self.summaries: list[
             tuple[list[dict[str, object]], dict[str, object], str]
@@ -838,6 +720,42 @@ class _FakeTutorAgent:
 
     def update_config(self, config: StudyConfig) -> None:
         self._config = config
+
+    async def _call_model(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        operation: str = "concept_explain",
+        deadline: float | None = None,
+    ) -> str:
+        self.semantic_routing_calls.append((messages, operation))
+        if deadline is not None:
+            self.semantic_routing_deadlines.append(deadline)
+        if isinstance(self.semantic_routing_result, Exception):
+            raise self.semantic_routing_result
+        if self.semantic_routing_result is None:
+            raise RuntimeError("semantic routing unavailable")
+        return self.semantic_routing_result
+
+    def _new_operation_deadline(
+        self, operation: str, messages: list[dict[str, object]]
+    ) -> float:
+        return time.monotonic() + 30.0
+
+    def _attach_vision_image(
+        self, messages: list[dict[str, object]], image: str
+    ) -> list[dict[str, object]]:
+        self.semantic_routing_calls.append((messages, f"image:{image}"))
+        attached = [dict(message) for message in messages]
+        for message in reversed(attached):
+            if message.get("role") != "user":
+                continue
+            message["content"] = [
+                {"type": "text", "text": str(message.get("content") or "")},
+                {"type": "image_url", "image_url": {"url": image, "detail": "auto"}},
+            ]
+            break
+        return attached
 
     async def concept_explain(
         self,
@@ -976,14 +894,14 @@ def test_study_store_round_trip_and_export(tmp_path: Path) -> None:
             context={"index": index},
         )
 
-    assert store.load_config(StudyConfig()).language == "en"
+    assert store.load_config(StudyConfig(language="zh-TW")).language == "zh-TW"
     assert store.load_state(build_initial_state()).last_ocr_text == "photosynthesis"
     assert [item["input_text"] for item in store.list_interactions(limit=10)] == [
         "e",
         "c",
     ]
     exported = store.export_json()
-    assert exported["config"]["language"] == "en"
+    assert "language" not in exported["config"]
     assert exported["sessions"][0]["id"] == "session-1"
     assert [
         item["question"]["question"] for item in store.list_qa_records(limit=2)
@@ -996,6 +914,278 @@ def test_study_store_round_trip_and_export(tmp_path: Path) -> None:
     assert exported["review_log"][0]["topic_id"] == "photosynthesis_topic"
     assert exported["knowledge_evidence"][0]["item_id"] == candidate["id"]
     store.close()
+
+
+def test_study_store_ignores_legacy_persisted_language(tmp_path: Path) -> None:
+    store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
+    store.open()
+    try:
+        store.set_raw("config", {"language": "en", "history_limit": 7})
+
+        loaded = store.load_config(StudyConfig(language="zh-CN", history_limit=50))
+
+        assert loaded.language == "zh-CN"
+        assert loaded.history_limit == 7
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_study_status_uses_plugin_page_locale_without_persisting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    plugin = StudyCompanionPlugin(
+        _Ctx(
+            tmp_path,
+            {
+                "study": {
+                    "language": "en",
+                    "default_mode": MODE_COMPANION,
+                    "auto_open_ui": False,
+                }
+            },
+        )
+    )
+    assert isinstance(await plugin.startup(), Ok)
+
+    try:
+        result = await plugin.study_status(locale="zh-TW")
+
+        assert isinstance(result, Ok)
+        assert result.value["config"]["language"] == "en"
+        assert plugin._cfg.language == "en"
+        assert plugin._agent is not None
+        assert plugin._agent._config is plugin._cfg
+        assert "language" not in (plugin._store.get_raw("config") or {})
+    finally:
+        await plugin.shutdown()
+
+
+def test_study_companion_pages_forward_current_locale_to_plugin_entries() -> None:
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
+    hosted_source = (plugin_dir / "surfaces" / "study_panel.tsx").read_text(
+        encoding="utf-8"
+    )
+    static_source = (plugin_dir / "static" / "main.js").read_text(encoding="utf-8")
+
+    assert "locale: PluginSurfaceProps['locale']" in hosted_source
+    assert "{ ...args, locale: String(locale || '').trim() }" in hosted_source
+    assert hosted_source.count("props.locale,") == 13
+    assert "}, [props.locale]);" in hosted_source
+    assert "typeof window.I18n.lang === 'function'" in static_source
+    assert "createRun(entryId, { ...args, locale }, deadline, signal)" in static_source
+
+
+def test_reviewed_entry_context_contracts_remain_session_local() -> None:
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
+    status = (plugin_dir / "entry_status_entries.py").read_text(encoding="utf-8")
+    explain = (plugin_dir / "entry_tutor_explain_entries.py").read_text(encoding="utf-8")
+    events = (plugin_dir / "entry_communication_tutor_events.py").read_text(encoding="utf-8")
+    answer = " ".join(
+        (plugin_dir / "entry_tutor_answer_entries.py")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    questions = (plugin_dir / "entry_tutor_question_entries.py").read_text(encoding="utf-8")
+
+    assert "self._cfg.language = page_locale" not in status
+    assert "target_lanlan = self._resolve_study_target_lanlan" in explain
+    assert 'payload["target_lanlan"] = normalized_target' in events
+    assert "supplied_question_id and state_question_id" in answer
+    assert "supplied_attempt_id and state_attempt_id" in answer
+    assert "scope.subject or None" in questions
+    assert "scope.stage or None" in questions
+    assert "course_family=scope.course_family or None" in questions
+    assert 'code="PRACTICE_SCOPE_INVALIDATED"' in questions
+
+
+def test_scoped_question_candidates_are_filtered_before_limits() -> None:
+    eligible = {"inside-topic"}
+
+    class _ScopedStore:
+        def __init__(self) -> None:
+            self.requested_topic_ids: list[set[str] | None] = []
+
+        def list_topics(self, *_args, **_kwargs):
+            return [{"id": "inside-topic", "name": "Inside"}]
+
+        def list_latest_mastery_for_topics(self, _topic_ids):
+            return []
+
+        def list_wrong_questions(self, *, topic_ids=None, **_kwargs):
+            requested = set(topic_ids) if topic_ids is not None else None
+            self.requested_topic_ids.append(requested)
+            return [{"id": "wrong-inside", "topic_id": "inside-topic"}]
+
+        def get_topic(self, topic_id):
+            return {"id": topic_id, "name": "Inside"}
+
+    class _ScopedTracker:
+        def __init__(self) -> None:
+            self.store = _ScopedStore()
+            self.preview_options: dict[str, Any] = {}
+
+        def preview_next_question_params(self, topic_id, **kwargs):
+            self.preview_options = dict(kwargs)
+            return {
+                "target_topic_id": topic_id,
+                "due_reviews": [{"topic_id": "inside-topic"}],
+                "weak_topics": [{"topic_id": "inside-topic", "mastery": 0.2}],
+            }
+
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    tracker = _ScopedTracker()
+    plugin._knowledge_tracker = tracker
+
+    params = plugin._scoped_question_params(
+        SimpleNamespace(
+            eligible_topic_ids=list(eligible),
+            subject="math",
+            stage="high_school",
+            chapter="",
+            unit="",
+            course_family="",
+            topic_id="",
+            mode="explicit_scope",
+        )
+    )
+
+    assert tracker.store.requested_topic_ids == [eligible]
+    assert tracker.preview_options["candidate_topic_ids"] == eligible
+    assert tracker.preview_options["candidate_limit"] == 5000
+    assert tracker.preview_options["candidate_topics_by_id"] == {
+        "inside-topic": {"id": "inside-topic", "name": "Inside"}
+    }
+    assert params["retry_wrong_questions"][0]["topic_id"] == "inside-topic"
+    assert params["due_reviews"][0]["topic_id"] == "inside-topic"
+    assert params["weak_topics"][0]["topic_id"] == "inside-topic"
+
+
+def test_explicit_topic_question_selection_loads_topic_by_id_before_scope_cap() -> None:
+    topic = {
+        "id": "late-topic",
+        "name": "Late topic",
+        "stage": "high_school",
+        "subject": "math",
+        "course_family": "",
+        "chapter": "Algebra",
+        "unit": "Functions",
+    }
+
+    class _ScopedStore:
+        def list_topics(self, *_args, **_kwargs):
+            return []
+
+        def get_topic(self, topic_id):
+            return dict(topic) if topic_id == "late-topic" else None
+
+        def list_latest_mastery_for_topics(self, _topic_ids):
+            return []
+
+        def list_wrong_questions(self, **_kwargs):
+            return []
+
+    class _ScopedTracker:
+        def __init__(self) -> None:
+            self.store = _ScopedStore()
+            self.preview_options: dict[str, Any] = {}
+
+        def preview_next_question_params(self, topic_id, **kwargs):
+            self.preview_options = dict(kwargs)
+            return {"target_topic_id": topic_id, "target_topic": dict(topic)}
+
+    scope_fields = {
+        "mode": "explicit_topic",
+        "stage": "high_school",
+        "subject": "math",
+        "course_family": "",
+        "chapter": "Algebra",
+        "unit": "Functions",
+        "topic_id": "late-topic",
+    }
+    scope = SimpleNamespace(
+        **scope_fields,
+        eligible_topic_ids=["late-topic"],
+        to_public_dict=lambda: dict(scope_fields),
+    )
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    tracker = _ScopedTracker()
+    plugin._knowledge_tracker = tracker
+
+    params = plugin._scoped_question_params(scope)
+
+    assert params["target_topic_id"] == "late-topic"
+    assert tracker.preview_options["candidate_topics_by_id"] == {
+        "late-topic": topic
+    }
+
+
+def test_focused_scoped_preview_keeps_candidate_queries_scoped() -> None:
+    eligible = {"inside-topic"}
+
+    class _ScopedStore:
+        def list_topics(self, *_args, **_kwargs):
+            return [{"id": "inside-topic", "name": "Inside"}]
+
+        def list_latest_mastery_for_topics(self, _topic_ids):
+            return []
+
+        def list_wrong_questions(self, **_kwargs):
+            return []
+
+        def get_topic(self, topic_id):
+            return {"id": topic_id, "name": "Inside"}
+
+    class _ScopedTracker:
+        def __init__(self) -> None:
+            self.store = _ScopedStore()
+            self.preview_options: list[dict[str, Any]] = []
+
+        def preview_next_question_params(self, topic_id, **kwargs):
+            self.preview_options.append(dict(kwargs))
+            return {
+                "target_topic_id": topic_id,
+                "target_topic": {"id": topic_id, "name": "Inside"},
+                "retry_wrong_question": {},
+                "due_reviews": [
+                    {
+                        "topic_id": "inside-topic",
+                        "topic": {"id": "inside-topic", "name": "Inside"},
+                    }
+                ],
+                "weak_topics": [],
+                "candidate_evidence": [],
+                "suggested_difficulty": 2,
+            }
+
+    scope = SimpleNamespace(
+        eligible_topic_ids=list(eligible),
+        subject="math",
+        stage="high_school",
+        chapter="",
+        unit="",
+        course_family="",
+        topic_id="",
+        mode="explicit_scope",
+        scope_key="scope-key",
+        scope_revision=1,
+        to_public_dict=lambda: {"scope_key": "scope-key"},
+    )
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    tracker = _ScopedTracker()
+    plugin._knowledge_tracker = tracker
+    plugin._resolve_active_practice_scope = lambda: scope  # type: ignore[method-assign]
+
+    context = plugin._build_targeted_question_context()
+
+    assert context["selected_topic_id"] == "inside-topic"
+    assert len(tracker.preview_options) == 2
+    assert tracker.preview_options[1]["candidate_topic_ids"] == eligible
+    assert tracker.preview_options[1]["candidate_limit"] == 5000
+    assert tracker.preview_options[1]["candidate_topics_by_id"] == {
+        "inside-topic": {"id": "inside-topic", "name": "Inside"}
+    }
 
 
 @pytest.mark.asyncio
@@ -1060,6 +1250,155 @@ async def test_study_settings_entry_persists_and_updates_runtime(
         await plugin.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_study_doc_export_settings_payload_preserves_missing_fields_and_syncs_dynamic_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from plugin.core.registry import _extract_entries_preview
+
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    expected_disabled = {
+        "enabled": False,
+        "pdf_backend": "reportlab",
+        "default_style": "compact",
+        "xmind_enabled": False,
+    }
+    preview_ids = {
+        entry["id"]
+        for entry in _extract_entries_preview(
+            "study_companion", StudyCompanionPlugin, conf={}, pdata={}
+        )
+    }
+    assert "study_export_notes" in preview_ids
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "en", "auto_open_ui": False},
+            "doc_export": expected_disabled,
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    startup = await plugin.startup()
+    assert isinstance(startup, Ok)
+
+    try:
+        loaded = await plugin.study_get_settings_config()
+        assert isinstance(loaded, Ok)
+        assert loaded.value["config"]["doc_export"] == expected_disabled
+        disabled_entries = plugin.collect_entries()
+        assert "study_export_notes" in disabled_entries
+        disabled_export = await disabled_entries["study_export_notes"].handler(
+            fmt="markdown", preview_only=True
+        )
+        assert isinstance(disabled_export, Err)
+
+        without_doc_export = await plugin.study_update_settings_config(
+            config={"study": {"default_mode": MODE_INTERACTIVE}}
+        )
+        assert isinstance(without_doc_export, Ok)
+        assert without_doc_export.value["config"]["doc_export"] == expected_disabled
+
+        enabled = await plugin.study_update_settings_config(
+            config={"doc_export": {"enabled": True}}
+        )
+        expected_enabled = {**expected_disabled, "enabled": True}
+        assert isinstance(enabled, Ok)
+        assert enabled.value["config"]["doc_export"] == expected_enabled
+        assert plugin._cfg.doc_export.to_dict() == expected_enabled
+        enabled_entries = plugin.collect_entries()
+        assert "study_export_notes" in enabled_entries
+        enabled_schema = enabled_entries["study_export_notes"].meta.input_schema[
+            "properties"
+        ]
+        assert enabled_schema["fmt"]["enum"] == [
+            "markdown",
+            "pdf",
+            "docx",
+            "xmind",
+        ]
+        assert "default" not in enabled_schema["style"]
+        hot_enabled_export = await enabled_entries["study_export_notes"].handler(
+            fmt="markdown", preview_only=True, title="Hot Enabled Notes"
+        )
+        assert isinstance(hot_enabled_export, Ok)
+        assert hot_enabled_export.value["format"] == "markdown"
+
+        with_xmind = await plugin.study_update_settings_config(
+            config={"doc_export": {"xmind_enabled": True}}
+        )
+        assert isinstance(with_xmind, Ok)
+        assert with_xmind.value["config"]["doc_export"] == expected_enabled
+        xmind_schema = plugin.collect_entries()[
+            "study_export_notes"
+        ].meta.input_schema["properties"]
+        assert xmind_schema["fmt"]["enum"] == [
+            "markdown",
+            "pdf",
+            "docx",
+            "xmind",
+        ]
+
+        disabled = await plugin.study_update_settings_config(
+            config={"doc_export": {"enabled": False}}
+        )
+        expected_final = {**expected_enabled, "enabled": False}
+        assert isinstance(disabled, Ok)
+        assert disabled.value["config"]["doc_export"] == expected_final
+        assert plugin._cfg.doc_export.to_dict() == expected_final
+        final_entries = plugin.collect_entries()
+        assert "study_export_notes" in final_entries
+        disabled_again = await final_entries["study_export_notes"].handler(
+            fmt="markdown", preview_only=True
+        )
+        assert isinstance(disabled_again, Err)
+        assert (
+            plugin._store.load_config(StudyConfig()).doc_export.to_dict()
+            == expected_final
+        )
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_study_doc_export_settings_update_rolls_back_config_and_dynamic_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "en", "auto_open_ui": False},
+            "doc_export": {"enabled": False, "xmind_enabled": False},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    startup = await plugin.startup()
+    assert isinstance(startup, Ok)
+    original_persist_state = plugin._persist_state
+    persisted_runtime_values: list[bool] = []
+
+    async def _fail_first_persist() -> None:
+        persisted_runtime_values.append(plugin._cfg.doc_export.enabled)
+        if len(persisted_runtime_values) == 1:
+            raise RuntimeError("settings persistence failed")
+        await original_persist_state()
+
+    monkeypatch.setattr(plugin, "_persist_state", _fail_first_persist)
+
+    try:
+        result = await plugin.study_update_settings_config(
+            config={"doc_export": {"enabled": True}}
+        )
+
+        assert isinstance(result, Err)
+        assert persisted_runtime_values == [True, False]
+        assert plugin._cfg.doc_export.enabled is False
+        assert "study_export_notes" in plugin.collect_entries()
+        assert plugin._store.load_config(StudyConfig()).doc_export.enabled is False
+    finally:
+        await plugin.shutdown()
+
+
 def test_study_store_seed_topic_upsert_preserves_seed_metadata(tmp_path: Path) -> None:
     store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
     store.open()
@@ -1070,6 +1409,11 @@ def test_study_store_seed_topic_upsert_preserves_seed_metadata(tmp_path: Path) -
                 "name": "Seed Topic",
                 "subject": "math",
                 "chapter": "Seed Chapter",
+                "stage": "junior_high",
+                "unit": "Seed Unit",
+                "skills": ["seed skill"],
+                "question_types": ["seed question type"],
+                "examples": [{"prompt": "seed example", "answer_outline": ["seed step"]}],
                 "depth": 2,
                 "difficulty": 0.7,
                 "prerequisites": [{"id": "pre_seed", "required_mastery": 0.5}],
@@ -1084,6 +1428,11 @@ def test_study_store_seed_topic_upsert_preserves_seed_metadata(tmp_path: Path) -
                 "name": "Runtime Topic",
                 "subject": "science",
                 "chapter": "Runtime Chapter",
+                "stage": "college",
+                "unit": "Runtime Unit",
+                "skills": ["runtime skill"],
+                "question_types": ["runtime question type"],
+                "examples": [{"prompt": "runtime example"}],
                 "depth": 5,
                 "difficulty": 0.2,
                 "prerequisites": [{"id": "pre_runtime", "required_mastery": 0.9}],
@@ -1098,6 +1447,11 @@ def test_study_store_seed_topic_upsert_preserves_seed_metadata(tmp_path: Path) -
         assert topic["name"] == "Seed Topic"
         assert topic["subject"] == "math"
         assert topic["chapter"] == "Seed Chapter"
+        assert topic["stage"] == "junior_high"
+        assert topic["unit"] == "Seed Unit"
+        assert topic["skills"] == ["seed skill"]
+        assert topic["question_types"] == ["seed question type"]
+        assert topic["examples"] == [{"prompt": "seed example", "answer_outline": ["seed step"]}]
         assert topic["depth"] == 2
         assert topic["difficulty"] == 0.7
         assert topic["prerequisites"] == [{"id": "pre_seed", "required_mastery": 0.5}]
@@ -1106,6 +1460,1145 @@ def test_study_store_seed_topic_upsert_preserves_seed_metadata(tmp_path: Path) -
         assert topic["source"] == "seed"
     finally:
         store.close()
+
+
+def test_study_store_seed_topic_upsert_refreshes_seed_metadata(tmp_path: Path) -> None:
+    store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
+    store.open()
+    try:
+        store.upsert_topic(
+            {
+                "id": "seed_topic",
+                "name": "Old Seed Topic",
+                "subject": "math",
+                "chapter": "Old Chapter",
+                "prerequisites": [{"id": "old_pre"}],
+                "related": [{"id": "old_related", "relation": "next"}],
+                "source": "seed",
+            }
+        )
+        store.upsert_topic(
+            {
+                "id": "seed_topic",
+                "name": "New Seed Topic",
+                "subject": "math",
+                "chapter": "New Chapter",
+                "prerequisites": [{"id": "new_pre"}],
+                "related": [{"id": "new_related", "relation": "application"}],
+                "source": "seed",
+            }
+        )
+
+        topic = store.get_topic("seed_topic")
+        assert topic is not None
+        assert topic["name"] == "New Seed Topic"
+        assert topic["chapter"] == "New Chapter"
+        assert topic["prerequisites"] == [{"id": "new_pre"}]
+        assert topic["related"] == [
+            {"id": "new_related", "relation": "application"}
+        ]
+        assert topic["source"] == "seed"
+    finally:
+        store.close()
+
+
+def test_study_store_knowledge_seed_inherits_top_level_stage(
+    tmp_path: Path,
+) -> None:
+    knowledge_seed = tmp_path / "knowledge_seed.json"
+    knowledge_seed.write_text(
+        json.dumps(
+            {
+                "subject": "math",
+                "grade_level": "junior_high",
+                "topics": [
+                    {
+                        "id": "linear_equation",
+                        "name": "一元一次方程",
+                        "chapter": "方程与不等式",
+                        "unit": "一元方程",
+                        "skills": ["识别一元一次方程", "求解一元一次方程"],
+                        "question_types": ["解方程", "应用题"],
+                        "examples": [
+                            {
+                                "prompt": "解方程 2x + 3 = 9。",
+                                "answer_outline": ["移项", "合并同类项", "求出 x = 3"],
+                            }
+                        ],
+                    },
+                    {
+                        "id": "calculus_intro",
+                        "name": "微积分入门",
+                        "chapter": "高等数学",
+                        "stage": "college",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    store = StudyStore(
+        tmp_path / "study.db",
+        tmp_path / "seed.json",
+        _Logger(),
+        knowledge_seed,
+    )
+    store.open()
+    try:
+        inherited = store.get_topic("linear_equation")
+        explicit = store.get_topic("calculus_intro")
+
+        assert inherited is not None
+        assert inherited["stage"] == "junior_high"
+        assert inherited["unit"] == "一元方程"
+        assert inherited["skills"] == ["识别一元一次方程", "求解一元一次方程"]
+        assert inherited["question_types"] == ["解方程", "应用题"]
+        assert inherited["examples"] == [
+            {
+                "prompt": "解方程 2x + 3 = 9。",
+                "answer_outline": ["移项", "合并同类项", "求出 x = 3"],
+            }
+        ]
+        assert explicit is not None
+        assert explicit["stage"] == "college"
+        assert [item["id"] for item in store.list_topics(stage="junior_high")] == [
+            "linear_equation"
+        ]
+    finally:
+        store.close()
+
+
+def test_study_store_knowledge_seed_repairs_empty_seed_stage(
+    tmp_path: Path,
+) -> None:
+    knowledge_seed = tmp_path / "knowledge_seed.json"
+    knowledge_seed.write_text(
+        json.dumps(
+            {
+                "subject": "math",
+                "grade_level": "junior_high",
+                "topics": [
+                    {
+                        "id": "absolute_value",
+                        "name": "绝对值",
+                        "chapter": "实数与代数式",
+                        "unit": "Seed Unit",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
+    store.open()
+    try:
+        store.upsert_topic(
+            {
+                "id": "absolute_value",
+                "name": "绝对值",
+                "subject": "math",
+                "chapter": "实数与代数式",
+                "stage": "",
+                "source": "seed",
+            }
+        )
+
+        assert store.get_topic("absolute_value")["stage"] == ""
+        assert store.load_knowledge_seed(knowledge_seed) == 1
+        repaired = store.get_topic("absolute_value")
+        assert repaired["stage"] == "junior_high"
+        assert repaired["unit"] == "Seed Unit"
+    finally:
+        store.close()
+
+
+def test_study_store_knowledge_seed_manifest_loads_multiple_files(
+    tmp_path: Path,
+) -> None:
+    seed_dir = tmp_path / "knowledge_seeds"
+    seed_dir.mkdir()
+    (seed_dir / "math.json").write_text(
+        json.dumps(
+            {
+                "subject": "math",
+                "grade_level": "junior_high",
+                "topics": [
+                    {
+                        "id": "manifest_math_topic",
+                        "name": "Manifest Math Topic",
+                        "chapter": "Manifest Math",
+                        "unit": "Manifest Unit",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (seed_dir / "english.json").write_text(
+        json.dumps(
+            {
+                "subject": "english",
+                "stage": "senior_high",
+                "topics": [
+                    {
+                        "id": "manifest_english_topic",
+                        "name": "Manifest English Topic",
+                        "chapter": "Manifest English",
+                        "unit": "Manifest Unit",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "knowledge_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "type": "knowledge_seed_manifest",
+                "files": [
+                    {"path": "knowledge_seeds/math.json"},
+                    {"path": "knowledge_seeds/english.json"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
+    store.open()
+    try:
+        assert store.load_knowledge_seed(manifest_path) == 2
+        assert store.get_topic("manifest_math_topic")["subject"] == "math"
+        assert store.get_topic("manifest_math_topic")["stage"] == "junior_high"
+        assert store.get_topic("manifest_english_topic")["subject"] == "english"
+        assert store.get_topic("manifest_english_topic")["stage"] == "senior_high"
+    finally:
+        store.close()
+
+
+def test_study_store_schema_includes_standard_knowledge_fields(tmp_path: Path) -> None:
+    store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
+    store.open()
+    try:
+        columns = {
+            str(row["name"])
+            for row in store._require_conn().execute("PRAGMA table_info(topics)")
+        }
+        assert {"unit", "skills", "question_types", "examples"}.issubset(columns)
+    finally:
+        store.close()
+
+
+def _read_static_knowledge_seed_payload() -> dict[str, object]:
+    seed_path = (
+        Path(__file__).resolve().parents[3]
+        / "plugins"
+        / "study_companion"
+        / "static"
+        / "knowledge_graph_seed.json"
+    )
+    payload = json.loads(seed_path.read_text(encoding="utf-8"))
+    topics = payload.get("topics")
+    if isinstance(topics, list):
+        return payload
+    files = payload.get("files")
+    if not isinstance(files, list):
+        return {**payload, "topics": []}
+    merged_topics: list[dict[str, object]] = []
+    for item in files:
+        raw_path = item.get("path") if isinstance(item, dict) else item
+        if not raw_path:
+            continue
+        child_payload = json.loads(
+            (seed_path.parent / str(raw_path)).read_text(encoding="utf-8")
+        )
+        child_topics = child_payload.get("topics")
+        if isinstance(child_topics, list):
+            default_subject = str(child_payload.get("subject") or "")
+            default_stage = str(
+                child_payload.get("stage")
+                or child_payload.get("grade_level")
+                or child_payload.get("education_level")
+                or child_payload.get("course_level")
+                or ""
+            )
+            for topic in child_topics:
+                if not isinstance(topic, dict):
+                    continue
+                merged = dict(topic)
+                merged.setdefault("subject", default_subject)
+                merged.setdefault("stage", default_stage)
+                merged_topics.append(merged)
+    return {**payload, "topics": merged_topics}
+
+
+def _static_subject_component_counts() -> dict[str, int]:
+    payload = _read_static_knowledge_seed_payload()
+    topics = [
+        topic
+        for topic in payload.get("topics", [])
+        if isinstance(topic, dict) and topic.get("id") and topic.get("subject")
+    ]
+    by_id = {str(topic["id"]): topic for topic in topics}
+    by_subject: dict[str, set[str]] = {}
+    adjacency: dict[str, dict[str, set[str]]] = {}
+    for topic in topics:
+        subject = str(topic["subject"])
+        topic_id = str(topic["id"])
+        by_subject.setdefault(subject, set()).add(topic_id)
+        adjacency.setdefault(subject, {}).setdefault(topic_id, set())
+    for topic in topics:
+        source_id = str(topic["id"])
+        source_subject = str(topic["subject"])
+        for bucket in ("prerequisites", "related"):
+            edges = topic.get(bucket)
+            if not isinstance(edges, list):
+                continue
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                target_id = str(edge.get("id") or "")
+                target = by_id.get(target_id)
+                if not target or str(target.get("subject")) != source_subject:
+                    continue
+                adjacency[source_subject].setdefault(source_id, set()).add(target_id)
+                adjacency[source_subject].setdefault(target_id, set()).add(source_id)
+
+    counts: dict[str, int] = {}
+    for subject, subject_ids in by_subject.items():
+        seen: set[str] = set()
+        components = 0
+        for topic_id in sorted(subject_ids):
+            if topic_id in seen:
+                continue
+            components += 1
+            stack = [topic_id]
+            seen.add(topic_id)
+            while stack:
+                current = stack.pop()
+                for neighbor in adjacency.get(subject, {}).get(current, set()):
+                    if neighbor not in seen:
+                        seen.add(neighbor)
+                        stack.append(neighbor)
+        counts[subject] = components
+    return counts
+
+
+def _static_cross_subject_bridge_counts() -> dict[tuple[str, str], int]:
+    payload = _read_static_knowledge_seed_payload()
+    topics = [
+        topic
+        for topic in payload.get("topics", [])
+        if isinstance(topic, dict) and topic.get("id") and topic.get("subject")
+    ]
+    by_id = {str(topic["id"]): topic for topic in topics}
+    counts: dict[tuple[str, str], int] = {}
+    for topic in topics:
+        source_subject = str(topic["subject"])
+        for bucket in ("prerequisites", "related"):
+            edges = topic.get(bucket)
+            if not isinstance(edges, list):
+                continue
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                target = by_id.get(str(edge.get("id") or ""))
+                if not target:
+                    continue
+                target_subject = str(target.get("subject") or "")
+                if source_subject == target_subject:
+                    continue
+                pair = (source_subject, target_subject)
+                counts[pair] = counts.get(pair, 0) + 1
+    return counts
+
+
+def test_study_static_knowledge_seed_contains_standard_base_library_fields() -> None:
+    payload = _read_static_knowledge_seed_payload()
+    topics = payload["topics"]
+
+    topic_ids = {str(topic.get("id") or "") for topic in topics}
+    stages = {
+        str(topic.get("stage") or payload.get("grade_level") or "")
+        for topic in topics
+    }
+    subjects = {
+        str(topic.get("subject") or payload.get("subject") or "")
+        for topic in topics
+    }
+    college_subject_counts = {
+        subject: sum(
+            1
+            for topic in topics
+            if topic.get("subject") == subject and topic.get("stage") == "college"
+        )
+        for subject in ("math", "physics", "computer_science", "economics")
+    }
+    curriculum_versions = {
+        str(value)
+        for topic in topics
+        for value in (
+            topic.get("curriculum_version")
+            if isinstance(topic.get("curriculum_version"), list)
+            else []
+        )
+    }
+    exam_regions = {
+        str(value)
+        for topic in topics
+        for value in (
+            topic.get("exam_region") if isinstance(topic.get("exam_region"), list) else []
+        )
+    }
+    exam_types = {
+        str(value)
+        for topic in topics
+        for value in (
+            topic.get("exam_type") if isinstance(topic.get("exam_type"), list) else []
+        )
+    }
+    senior_subject_counts = {
+        subject: sum(
+            1
+            for topic in topics
+            if topic.get("subject") == subject and topic.get("stage") == "senior_high"
+        )
+        for subject in ("physics", "chemistry", "biology", "english", "chinese")
+    }
+    senior_core_topics = [
+        topic
+        for topic in topics
+        if topic.get("subject") in senior_subject_counts
+        and topic.get("stage") == "senior_high"
+    ]
+    tagged_topics = [
+        topic for topic in topics if isinstance(topic.get("curriculum_tags"), list)
+    ]
+    rich_example_topics = [
+        topic
+        for topic in topics
+        if any(
+            isinstance(example, dict)
+            and example.get("common_traps")
+            and example.get("grading_points")
+            for example in topic.get("examples", [])
+        )
+    ]
+    assert len(topics) >= 750
+    assert len({topic.get("chapter") for topic in topics}) >= 100
+    assert len({topic.get("unit") for topic in topics}) >= 240
+    assert len(tagged_topics) >= 300
+    assert all(count >= 35 for count in senior_subject_counts.values())
+    assert college_subject_counts["math"] >= 70
+    assert college_subject_counts["physics"] >= 30
+    assert college_subject_counts["computer_science"] >= 40
+    assert college_subject_counts["economics"] >= 30
+    assert len(rich_example_topics) >= 180
+    assert all(topic in rich_example_topics for topic in senior_core_topics)
+    assert all(topic.get("curriculum_version") for topic in topics)
+    assert all(topic.get("exam_region") for topic in topics)
+    assert all(topic.get("exam_type") for topic in topics)
+    assert {
+        "renjiao_high_school",
+        "beishi_high_school",
+        "sujiao_high_school",
+        "renjiao_junior",
+        "beishi_junior",
+        "sujiao_junior",
+        "renjiao_primary",
+        "beishi_primary",
+        "sujiao_primary",
+    }.issubset(curriculum_versions)
+    assert {
+        "new_gaokao_i",
+        "new_gaokao_ii",
+        "national_a",
+        "national_b",
+        "zhongkao_beijing_style",
+        "zhongkao_shanghai_style",
+        "zhongkao_jiangsu_style",
+    }.issubset(exam_regions)
+    assert {
+        "gaokao_style",
+        "zhongkao_style",
+        "primary_term_exam",
+        "college_course_exam",
+    }.issubset(exam_types)
+    assert {
+        "math",
+        "english",
+        "chinese",
+        "physics",
+        "chemistry",
+        "biology",
+        "history",
+        "geography",
+        "politics",
+        "computer_science",
+        "economics",
+    }.issubset(subjects)
+    assert {"primary", "junior_high", "senior_high", "college"}.issubset(stages)
+    assert {
+        "function_composite_application",
+        "geometric_proof_strategy",
+        "mathematical_modeling",
+        "exam_error_checklist",
+        "senior_derivative_extrema",
+        "senior_derivative_constant_problem",
+        "senior_conic_synthesis",
+        "senior_conic_fixed_point",
+        "senior_solid_vector_angle",
+        "senior_new_gaokao_statistics_context",
+        "college_limit_concept",
+        "college_epsilon_delta_limit",
+        "college_eigenvalue",
+        "college_lagrange_multiplier",
+        "college_confidence_interval",
+        "college_hypothesis_testing",
+        "college_physics_gauss_law",
+        "college_physics_maxwell_equations_intro",
+        "college_c_pointer_address",
+        "college_ds_graph_traversal",
+        "college_micro_demand_supply",
+        "english_senior_continuation_writing",
+        "chinese_senior_poetry_appreciation",
+        "physics_senior_energy_momentum",
+        "physics_senior_multistage_synthesis",
+        "chem_senior_experiment_design",
+        "chem_senior_industrial_process_flow",
+        "bio_senior_experiment_design",
+        "bio_senior_gene_engineering",
+        "english_senior_cloze_logic",
+        "history_senior_material_analysis",
+        "geo_senior_regional_sustainability",
+        "pol_senior_rule_of_law",
+        "chinese_senior_new_gaokao_mixed_text",
+    }.issubset(topic_ids)
+    for topic in topics:
+        assert topic.get("stage") or payload.get("grade_level")
+        assert topic.get("subject") or payload.get("subject")
+        assert topic.get("chapter")
+        assert topic.get("unit")
+        assert topic.get("skills")
+        assert topic.get("question_types")
+        assert topic.get("examples")
+
+
+def test_study_knowledge_seed_validator_accepts_static_manifest() -> None:
+    seed_path = (
+        Path(__file__).resolve().parents[3]
+        / "plugins"
+        / "study_companion"
+        / "static"
+        / "knowledge_graph_seed.json"
+    )
+
+    result = validate_knowledge_seed_manifest(seed_path)
+
+    assert result.is_valid
+    assert not result.issues
+    assert len(result.topics) >= 650
+    assert result.report is not None
+    assert result.report["topic_count"] == len(result.topics)
+    assert result.report["schema_ready_topics"] == len(result.topics)
+    assert result.report["subject_schema_ready_counts"]["math"] > 0
+    expected_subjects = {
+        "biology",
+        "chemistry",
+        "chinese",
+        "computer_science",
+        "economics",
+        "english",
+        "geography",
+        "history",
+        "math",
+        "physics",
+        "politics",
+    }
+    assert set(result.report["subject_minimum_standards"]) == expected_subjects
+    assert set(result.report["subject_minimum_standard_topic_counts"]) == expected_subjects
+    assert set(result.report["subject_minimum_standard_ready_counts"]) == expected_subjects
+    assert set(result.report["subject_minimum_standard_gap_counts"]) == expected_subjects
+    for subject in expected_subjects:
+        assert (
+            result.report["subject_minimum_standard_ready_counts"][subject]
+            + result.report["subject_minimum_standard_gap_counts"][subject]
+            == result.report["subject_minimum_standard_topic_counts"][subject]
+        )
+    assert result.report["subject_minimum_standard_gap_counts"]["math"] <= 6
+    assert result.report["subject_minimum_standard_ready_rates"]["math"] >= 0.98
+    assert result.report["subject_minimum_standard_gap_rates"]["math"] <= 0.02
+    assert set(result.report["subject_minimum_standard_relation_gap_counts"]) <= {
+        "math"
+    }
+    assert result.report["subject_minimum_standard_uncovered_subject_counts"] == {}
+    assert set(result.report["sample_subject_minimum_standard_gaps"]) <= {"math"}
+    assert set(result.report["top_gap_topics_by_subject"]) <= {"math"}
+    assert set(result.report["top_missing_relation_by_subject"]) <= {"math"}
+    assert set(result.report["chapter_gap_counts"]) <= {"math"}
+    assert set(result.report["recommended_next_batch"]) <= {"math"}
+    assert len(result.report["recommended_next_batch"].get("math", [])) <= 6
+    assert _static_subject_component_counts() == {
+        subject: 1 for subject in expected_subjects
+    }
+    assert result.report["cross_subject_edge_counts"]
+    assert result.report["cross_subject_relation_counts"]
+    cross_subject_bridge_counts = _static_cross_subject_bridge_counts()
+    assert cross_subject_bridge_counts[("history", "politics")] >= 8
+    assert cross_subject_bridge_counts[("geography", "math")] >= 12
+    assert result.report["legacy_edges"] == 0
+    assert result.report["legacy_edge_samples"] == []
+    assert result.report["missing_stage"] == 0
+    assert result.report["missing_college_course_family"] == 0
+    assert result.report["typed_edges"] > 0
+    assert "application" in result.report["relation_counts"]
+
+
+def test_study_knowledge_seed_math_relationship_density_targets() -> None:
+    seed_path = (
+        Path(__file__).resolve().parents[3]
+        / "plugins"
+        / "study_companion"
+        / "static"
+        / "knowledge_graph_seed.json"
+    )
+
+    result = validate_knowledge_seed_manifest(seed_path)
+    payload = _read_static_knowledge_seed_payload()
+    topics = [
+        topic
+        for topic in payload.get("topics", [])
+        if isinstance(topic, dict) and topic.get("id")
+    ]
+    by_id = {str(topic["id"]): topic for topic in topics}
+    math_layer_counts = {
+        str(topic["id"]): {"core": 0, "diagnostic": 0, "transfer": 0}
+        for topic in topics
+        if topic.get("subject") == "math"
+    }
+    for topic in topics:
+        source_id = str(topic["id"])
+        for bucket in ("prerequisites", "related"):
+            edges = topic.get(bucket)
+            if not isinstance(edges, list):
+                continue
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                relation = str(
+                    edge.get("relation")
+                    or ("prerequisite" if bucket == "prerequisites" else "related")
+                )
+                target_id = str(edge.get("id") or "")
+                for topic_id in (source_id, target_id):
+                    if topic_id not in math_layer_counts or topic_id not in by_id:
+                        continue
+                    if relation in {"prerequisite", "procedure_step"}:
+                        math_layer_counts[topic_id]["core"] += 1
+                    if relation == "confusable":
+                        math_layer_counts[topic_id]["diagnostic"] += 1
+                    if relation in {"application", "co_occurs", "extends"}:
+                        math_layer_counts[topic_id]["transfer"] += 1
+
+    assert result.is_valid
+    assert result.report is not None
+    relation_counts = result.report["relation_counts"]
+    assert result.report["typed_edges"] >= 1100
+    assert result.report["legacy_edges"] == 0
+    assert result.report["cycles_in_prerequisites"] == 0
+    assert (
+        result.report["subject_minimum_standard_ready_counts"]["math"]
+        + result.report["subject_minimum_standard_gap_counts"]["math"]
+        == result.report["subject_minimum_standard_topic_counts"]["math"]
+    )
+    assert result.report["subject_minimum_standard_gap_counts"]["math"] <= 6
+    assert relation_counts.get("nearby", 0) == 0
+    assert relation_counts["next"] < 30
+    assert relation_counts["confusable"] >= 60
+    assert relation_counts["procedure_step"] >= 90
+    assert relation_counts["application"] >= 130
+    assert math_layer_counts
+    assert all(counts["core"] > 0 for counts in math_layer_counts.values())
+    assert sum(
+        counts["diagnostic"] == 0 for counts in math_layer_counts.values()
+    ) <= 4
+    assert sum(counts["transfer"] == 0 for counts in math_layer_counts.values()) <= 1
+
+
+def test_study_knowledge_seed_validator_reports_schema_errors(
+    tmp_path: Path,
+) -> None:
+    seed_dir = tmp_path / "knowledge_seeds"
+    seed_dir.mkdir()
+    (tmp_path / "knowledge_seed_taxonomy.json").write_text(
+        json.dumps(
+            {
+                "curriculum_version": {"generic_cn_high_school": {}},
+                "exam_region": {"new_gaokao_i": {}},
+                "exam_type": {"gaokao_style": {}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (seed_dir / "math.json").write_text(
+        json.dumps(
+            {
+                "subject": "math",
+                "grade_level": "senior_high",
+                "topics": [
+                    {
+                        "id": "duplicate_topic",
+                        "name": "Bad Topic",
+                        "chapter": "Bad Chapter",
+                        "unit": "Bad Unit",
+                        "prerequisites": [],
+                        "related": [{"id": "missing_topic"}],
+                        "skills": [],
+                        "question_types": ["综合题"],
+                        "examples": [{"prompt": "", "answer_outline": []}],
+                        "typical_misconceptions": ["忽略条件"],
+                        "exam_region": "",
+                    },
+                    {
+                        "id": "duplicate_topic",
+                        "name": "Duplicate Topic",
+                        "chapter": "Bad Chapter",
+                        "unit": "Bad Unit",
+                        "prerequisites": [],
+                        "related": [
+                            {"id": "duplicate_topic", "relation": "application"},
+                            {
+                                "id": "duplicate_topic",
+                                "relation": "mystery",
+                                "reason": "bad relation",
+                            },
+                            {
+                                "id": "duplicate_topic",
+                                "relation": "application",
+                                "reason": "bad use case",
+                                "use_cases": ["unsupported_case"],
+                            },
+                            {
+                                "id": "duplicate_topic",
+                                "relation": "application",
+                                "reason": "bad edge metadata",
+                                "priority": "urgent",
+                                "context": "quiz",
+                                "confidence": 1.5,
+                            },
+                        ],
+                        "skills": ["识别重复知识点"],
+                        "question_types": ["综合题"],
+                        "examples": [
+                            {
+                                "prompt": "指出该知识点和前一条为什么冲突。",
+                                "answer_outline": ["比较 id。"],
+                            }
+                        ],
+                        "typical_misconceptions": ["把同名条目当成不同知识点"],
+                        "curriculum_version": ["unknown_curriculum"],
+                        "exam_region": ["new_gaokao_i"],
+                        "exam_type": ["gaokao_style"],
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "knowledge_graph_seed.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "type": "knowledge_seed_manifest",
+                "files": [
+                    {"path": "knowledge_seeds/math.json", "topic_count": 99},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_knowledge_seed_manifest(manifest_path)
+
+    issue_codes = {issue.code for issue in result.issues}
+    assert not result.is_valid
+    assert {
+        "duplicate_topic_id",
+        "invalid_example",
+        "missing_reference",
+        "empty_reserved_field",
+        "manifest_topic_count_mismatch",
+        "unknown_reserved_field_value",
+        "invalid_typed_edge",
+        "unknown_edge_relation",
+        "unknown_edge_use_case",
+        "invalid_edge_priority",
+        "invalid_edge_context",
+        "invalid_edge_confidence",
+    }.issubset(issue_codes)
+
+
+def test_study_knowledge_seed_validator_reports_graph_quality_gaps(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed.json"
+    manifest = tmp_path / "knowledge_graph_seed.json"
+    manifest.write_text(
+        json.dumps({"files": [{"path": "seed.json", "topic_count": 2}]}),
+        encoding="utf-8",
+    )
+    common = {
+        "subject": "math",
+        "stage": "college",
+        "chapter": "Calculus",
+        "unit": "Derivatives",
+        "curriculum_version": "generic_college",
+        "exam_region": "college_course_generic",
+        "exam_type": "college_course_exam",
+        "skills": ["analyze prerequisite graph"],
+        "question_types": ["concept"],
+        "examples": [{"prompt": "Explain the dependency.", "answer_outline": ["A"]}],
+        "typical_misconceptions": ["cyclic dependencies hide true prerequisites"],
+        "related": [],
+    }
+    seed.write_text(
+        json.dumps(
+            {
+                "topics": [
+                    {
+                        **common,
+                        "id": "college_cycle_a",
+                        "name": "Cycle A",
+                        "prerequisites": [
+                            {
+                                "id": "college_cycle_b",
+                                "relation": "prerequisite",
+                                "reason": "A points to B.",
+                            }
+                        ],
+                    },
+                    {
+                        **common,
+                        "id": "college_cycle_b",
+                        "name": "Cycle B",
+                        "prerequisites": [
+                            {
+                                "id": "college_cycle_a",
+                                "relation": "prerequisite",
+                                "reason": "B points back to A.",
+                            }
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_knowledge_seed_manifest(manifest)
+
+    issue_codes = {issue.code for issue in result.issues}
+    assert "prerequisite_cycle" in issue_codes
+    assert "subject_minimum_standard_gap" not in issue_codes
+    assert result.report is not None
+    assert result.report["cycles_in_prerequisites"] == 2
+    assert result.report["missing_college_course_family"] == 2
+    assert result.report["subject_minimum_standard_topic_counts"]["math"] == 2
+    assert result.report["subject_minimum_standard_ready_counts"]["math"] == 0
+    assert result.report["subject_minimum_standard_gap_counts"]["math"] == 2
+    assert result.report["subject_minimum_standard_gap_rates"]["math"] == 1.0
+    assert result.report["subject_minimum_standard_relation_gap_counts"]["math"] == {
+        "application": 2,
+        "confusable": 2,
+        "procedure_step": 2,
+    }
+    assert result.report["sample_subject_minimum_standard_gaps"]["math"] == [
+        {
+            "id": "college_cycle_a",
+            "missing_relations": ["application", "confusable", "procedure_step"],
+            "missing_fields": [],
+        },
+        {
+            "id": "college_cycle_b",
+            "missing_relations": ["application", "confusable", "procedure_step"],
+            "missing_fields": [],
+        },
+    ]
+    assert set(result.report["sample_prerequisite_cycle_nodes"]) == {
+        "college_cycle_a",
+        "college_cycle_b",
+    }
+
+
+def test_study_knowledge_seed_validator_reports_subject_minimum_standard_summary(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed.json"
+    manifest = tmp_path / "knowledge_graph_seed.json"
+    manifest.write_text(
+        json.dumps({"files": [{"path": "seed.json", "topic_count": 3}]}),
+        encoding="utf-8",
+    )
+    common = {
+        "subject": "math",
+        "stage": "college",
+        "chapter": "Calculus",
+        "unit": "Derivatives",
+        "course_family": "calculus",
+        "curriculum_version": "generic_college",
+        "exam_region": "college_course_generic",
+        "exam_type": "college_course_exam",
+        "skills": ["analyze relation coverage"],
+        "question_types": ["concept"],
+        "examples": [{"prompt": "Explain the relation.", "answer_outline": ["A"]}],
+        "typical_misconceptions": ["missing graph edges hide learning gaps"],
+        "prerequisites": [],
+    }
+    seed.write_text(
+        json.dumps(
+            {
+                "topics": [
+                    {
+                        **common,
+                        "id": "math_ready",
+                        "name": "Ready",
+                        "prerequisites": [
+                            {
+                                "id": "math_proc",
+                                "relation": "prerequisite",
+                                "reason": "required foundation",
+                            }
+                        ],
+                        "related": [
+                            {
+                                "id": "math_proc",
+                                "relation": "procedure_step",
+                                "reason": "next step",
+                            },
+                            {
+                                "id": "math_confusion",
+                                "relation": "confusable",
+                                "reason": "compare concepts",
+                            },
+                            {
+                                "id": "math_confusion",
+                                "relation": "application",
+                                "reason": "apply the concept",
+                            },
+                        ],
+                    },
+                    {
+                        **common,
+                        "id": "math_proc",
+                        "name": "Procedure Only",
+                        "related": [
+                            {
+                                "id": "math_ready",
+                                "relation": "procedure_step",
+                                "reason": "next step",
+                            }
+                        ],
+                    },
+                    {
+                        **common,
+                        "id": "math_confusion",
+                        "name": "Confusion Target",
+                        "related": [
+                            {
+                                "id": "math_ready",
+                                "relation": "confusable",
+                                "reason": "compare concepts",
+                            }
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_knowledge_seed_manifest(manifest)
+
+    assert result.is_valid
+    assert result.report is not None
+    assert result.report["subject_minimum_standard_topic_counts"]["math"] == 3
+    assert result.report["subject_minimum_standard_ready_counts"]["math"] == 1
+    assert result.report["subject_minimum_standard_gap_counts"]["math"] == 2
+    assert result.report["subject_minimum_standard_ready_rates"]["math"] == pytest.approx(
+        1 / 3
+    )
+    assert result.report["subject_minimum_standard_relation_gap_counts"]["math"] == {
+        "application": 2,
+        "confusable": 1,
+        "prerequisite": 2,
+        "procedure_step": 1,
+    }
+    assert result.report["top_missing_relation_by_subject"]["math"] == [
+        {"relation": "application", "count": 2},
+        {"relation": "prerequisite", "count": 2},
+        {"relation": "confusable", "count": 1},
+        {"relation": "procedure_step", "count": 1},
+    ]
+    assert result.report["chapter_ready_counts"]["math"] == {"Calculus": 1}
+    assert result.report["chapter_gap_counts"]["math"] == {"Calculus": 2}
+    assert result.report["recommended_next_batch"]["math"] == [
+        "math_confusion",
+        "math_proc",
+    ]
+    assert result.report["top_gap_topics_by_subject"]["math"] == [
+        {
+            "id": "math_confusion",
+            "chapter": "Calculus",
+            "unit": "Derivatives",
+            "missing_relations": [
+                "application",
+                "prerequisite",
+                "procedure_step",
+            ],
+            "missing_fields": [],
+            "missing_count": 3,
+            "edge_count": 1,
+        },
+        {
+            "id": "math_proc",
+            "chapter": "Calculus",
+            "unit": "Derivatives",
+            "missing_relations": ["application", "confusable", "prerequisite"],
+            "missing_fields": [],
+            "missing_count": 3,
+            "edge_count": 1,
+        },
+    ]
+
+
+def test_study_knowledge_seed_validator_reports_subject_minimum_field_gaps(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed.json"
+    manifest = tmp_path / "knowledge_graph_seed.json"
+    manifest.write_text(
+        json.dumps({"files": [{"path": "seed.json", "topic_count": 2}]}),
+        encoding="utf-8",
+    )
+    common = {
+        "subject": "english",
+        "stage": "senior_high",
+        "chapter": "Reading",
+        "unit": "Main idea",
+        "curriculum_version": "generic_cn_high_school",
+        "exam_region": "new_gaokao_i",
+        "exam_type": "gaokao_style",
+        "skills": ["read a paragraph"],
+        "examples": [{"prompt": "Find the main idea.", "answer_outline": ["A"]}],
+        "typical_misconceptions": ["confusing detail with main idea"],
+        "prerequisites": [],
+    }
+    seed.write_text(
+        json.dumps(
+            {
+                "topics": [
+                    {
+                        **common,
+                        "id": "english_missing_field",
+                        "name": "Missing Field",
+                        "question_types": [],
+                        "related": [
+                            {
+                                "id": "english_ready",
+                                "relation": "procedure_step",
+                                "reason": "find the next step",
+                            }
+                        ],
+                    },
+                    {
+                        **common,
+                        "id": "english_ready",
+                        "name": "Ready",
+                        "question_types": ["main idea"],
+                        "related": [
+                            {
+                                "id": "english_missing_field",
+                                "relation": "procedure_step",
+                                "reason": "find the next step",
+                            }
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_knowledge_seed_manifest(manifest)
+
+    issue_codes = {issue.code for issue in result.issues}
+    assert "subject_minimum_standard_gap" not in issue_codes
+    assert result.report is not None
+    assert result.report["subject_minimum_standard_topic_counts"]["english"] == 2
+    assert result.report["subject_minimum_standard_ready_counts"]["english"] == 1
+    assert result.report["subject_minimum_standard_field_gap_counts"]["english"] == {
+        "question_types": 1
+    }
+
+
+def test_study_knowledge_seed_validator_reports_uncovered_subjects(
+    tmp_path: Path,
+) -> None:
+    seed = tmp_path / "seed.json"
+    manifest = tmp_path / "knowledge_graph_seed.json"
+    manifest.write_text(
+        json.dumps({"files": [{"path": "seed.json", "topic_count": 1}]}),
+        encoding="utf-8",
+    )
+    seed.write_text(
+        json.dumps(
+            {
+                "topics": [
+                    {
+                        "id": "art_color_theory",
+                        "name": "Color Theory",
+                        "subject": "art",
+                        "stage": "college",
+                        "chapter": "Design",
+                        "unit": "Color",
+                        "course_family": "visual_arts",
+                        "curriculum_version": "generic_college",
+                        "exam_region": "college_course_generic",
+                        "exam_type": "college_course_exam",
+                        "skills": ["compare colors"],
+                        "question_types": ["concept"],
+                        "examples": [
+                            {
+                                "prompt": "Compare warm and cool colors.",
+                                "answer_outline": ["A"],
+                            }
+                        ],
+                        "typical_misconceptions": ["treating hue and value as the same"],
+                        "prerequisites": [],
+                        "related": [],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_knowledge_seed_manifest(manifest)
+
+    assert result.is_valid
+    assert result.report is not None
+    assert result.report["subject_counts"]["art"] == 1
+    assert result.report["subject_minimum_standard_uncovered_subject_counts"] == {
+        "art": 1
+    }
 
 
 def test_study_store_enforces_sqlite_foreign_keys(tmp_path: Path) -> None:
@@ -1423,6 +2916,45 @@ def test_study_store_append_interaction_trims_on_interval(tmp_path: Path) -> Non
         store.close()
 
 
+def test_study_store_append_interaction_rolls_back_failed_trim(tmp_path: Path) -> None:
+    store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
+    store.open()
+    try:
+        store.append_interaction(
+            kind="concept_explain",
+            input_text="first",
+            output_text="kept",
+            history_limit=50,
+        )
+        conn = store._require_conn()
+        conn.execute(
+            """
+            CREATE TRIGGER fail_interaction_trim
+            BEFORE DELETE ON interactions
+            BEGIN
+                SELECT RAISE(FAIL, 'trim failed');
+            END
+            """
+        )
+        conn.commit()
+        store._interaction_count = store._INTERACTION_TRIM_INTERVAL - 1
+
+        with pytest.raises(Exception, match="trim failed"):
+            store.append_interaction(
+                kind="concept_explain",
+                input_text="second",
+                output_text="must roll back",
+                history_limit=1,
+            )
+
+        conn.execute("DROP TRIGGER fail_interaction_trim")
+        conn.commit()
+        history = store.list_interactions(10)
+        assert [item["input_text"] for item in history] == ["first"]
+    finally:
+        store.close()
+
+
 def test_study_store_open_resets_interaction_trim_counter(tmp_path: Path) -> None:
     store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
     store.open()
@@ -1509,17 +3041,43 @@ def test_knowledge_map_related_object_edges_use_topic_ids() -> None:
         ]
     )
 
-    assert payload["edges"] == [
-        {
-            "from": "quadratic_vertex_form",
-            "to": "linear_function_kb",
-            "relation": "compare",
-            "priority": "optional",
-            "context": "explanation",
-            "confidence": 0.65,
-        }
-    ]
+    edge = next(
+        edge
+        for edge in payload["edges"]
+        if edge["from"] == "quadratic_vertex_form" and edge["to"] == "linear_function_kb"
+    )
+    assert edge["relation"] == "compare"
+    assert edge["priority"] == "optional"
+    assert edge["context"] == "explanation"
+    assert edge["confidence"] == 0.65
     assert not any(str(edge["to"]).startswith("{") for edge in payload["edges"])
+
+
+def test_knowledge_map_keeps_subject_units_and_empty_misconceptions_distinct() -> None:
+    payload = build_knowledge_map_payload(
+        topics=[
+            {
+                "id": "math_unit",
+                "name": "Math Unit",
+                "subject": "math",
+                "unit": "综合应用",
+                "typical_misconceptions": [],
+                "misconceptions": ["legacy value"],
+            },
+            {
+                "id": "physics_unit",
+                "name": "Physics Unit",
+                "subject": "physics",
+                "unit": "综合应用",
+            },
+        ]
+    )
+
+    assert payload["summary"]["unit_counts"] == {
+        "math:综合应用": 1,
+        "physics:综合应用": 1,
+    }
+    assert payload["nodes"][0]["typical_misconceptions"] == []
 
 
 def test_build_tutor_payload_preserves_structured_summary() -> None:
@@ -1616,6 +3174,8 @@ def test_study_config_and_state_legacy_mode_migration(tmp_path: Path) -> None:
     assert legacy.mode == MODE_COMPANION
     assert legacy.default_mode == MODE_COMPANION
 
+    assert StudyConfig().auto_open_ui is False
+    assert build_config({}).auto_open_ui is False
     auto_open = build_config({"study": {"auto_open_ui": True}})
     assert auto_open.auto_open_ui is True
     assert build_config({"auto_open_ui": True}).auto_open_ui is True
@@ -1718,6 +3278,53 @@ def test_trusted_knowledge_candidate_is_deprecated_after_conflict(
         store.close()
 
 
+@pytest.mark.asyncio
+async def test_study_review_knowledge_candidate_approves_topic_into_base_library(
+    tmp_path: Path,
+) -> None:
+    store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
+    store.open()
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    plugin._store = store
+    plugin._knowledge_tracker = KnowledgeTracker(store)
+
+    try:
+        candidate = store.upsert_candidate_item(
+            item_type=KnowledgeCandidateType.TOPIC.value,
+            payload={
+                "id": "candidate_linear_equation",
+                "name": "Linear equation candidate",
+                "subject": "math",
+                "chapter": "Equations",
+                "unit": "One-variable equations",
+                "stage": "junior_high",
+                "skills": ["solve one-variable linear equations"],
+                "question_types": ["calculation"],
+                "examples": [{"prompt": "Solve 2x + 3 = 9."}],
+            },
+            source="unit-test",
+            dedupe_key="math:linear equation candidate",
+        )
+
+        result = await plugin.study_review_knowledge_candidate(
+            candidate_id=candidate["id"], decision="approve"
+        )
+
+        assert isinstance(result, Ok)
+        assert result.value["decision"] == "approve"
+        assert result.value["topic"]["id"] == "candidate_linear_equation"
+        assert result.value["topic"]["source"] == "runtime"
+        assert result.value["candidate"]["status"] == KnowledgeCandidateStatus.TRUSTED.value
+        topic = store.get_topic("candidate_linear_equation")
+        assert topic is not None
+        assert topic["unit"] == "One-variable equations"
+        assert topic["skills"] == ["solve one-variable linear equations"]
+        assert topic["question_types"] == ["calculation"]
+        assert topic["examples"] == [{"prompt": "Solve 2x + 3 = 9."}]
+    finally:
+        store.close()
+
+
 def test_study_screen_classifier_routes_summary_keywords_to_summary() -> None:
     english = classify_screen_from_ocr(
         "## Summary\n\nThe learner reviewed photosynthesis."
@@ -1789,14 +3396,16 @@ def test_study_prompt_builder_compacts_large_context_and_rejects_unknown_operati
     context = {
         "text": "x" * 20000,
         "language": "en",
-        "items": [{"body": "y" * 2000} for _ in range(30)],
-        **{f"k{i}": i for i in range(90)},
+        "history": [{"output_text": "y" * 2000} for _ in range(30)],
+        "recent_learning_events": [
+            {"summary": "z" * 2000} for _ in range(30)
+        ],
     }
 
     messages = build_operation_messages("question_generate", context)
 
     assert messages[1]["content"].count("_prompt_truncated") == 1
-    assert len(messages[1]["content"]) <= 9500
+    assert len(messages[1]["content"]) <= 12000
     with pytest.raises(ValueError):
         build_operation_messages("unsupported", {})
 
@@ -1816,36 +3425,1935 @@ def test_study_knowledge_map_payload_uses_topic_ids_for_object_edges() -> None:
                 "id": "number_axis",
                 "name": "Number Axis",
                 "stage": "junior_high",
+                "unit": "Number system",
+                "skills": ["read coordinates", "compare signed numbers"],
+                "question_types": ["concept", "calculation"],
+                "examples": [{"prompt": "Place -2 on the number line."}],
+                "typical_misconceptions": ["Confusing position with distance."],
                 "prerequisites": [
-                    {"id": "real_number_concept", "required_mastery": 0.55}
+                    {
+                        "id": "real_number_concept",
+                        "required_mastery": 0.55,
+                        "reason": "Number-axis work depends on real-number meaning.",
+                        "use_cases": ["learning_path"],
+                    }
                 ],
-                "related": [{"id": "absolute_value", "relation": "next"}],
+                "related": [
+                    {
+                        "id": "absolute_value",
+                        "relation": "application",
+                        "reason": "Absolute value is interpreted as distance on the number axis.",
+                        "use_cases": ["diagnosis", "hint_generation"],
+                    }
+                ],
             },
             {"id": "real_number_concept", "name": "Real Numbers"},
             {"id": "absolute_value", "name": "Absolute Value"},
         ]
     )
 
-    assert payload["edges"][0] == {
-        "from": "real_number_concept",
-        "to": "number_axis",
-        "relation": "prerequisite",
-        "required_mastery": 0.55,
-        "priority": "core",
-        "context": "diagnosis",
-        "confidence": 0.65,
-    }
-    assert payload["edges"][1] == {
-        "from": "number_axis",
-        "to": "absolute_value",
-        "relation": "next",
-        "priority": "optional",
-        "context": "review",
-        "confidence": 0.65,
-    }
+    prereq_edge = next(
+        edge
+        for edge in payload["edges"]
+        if edge["from"] == "real_number_concept" and edge["to"] == "number_axis"
+    )
+    assert prereq_edge["relation"] == "prerequisite"
+    assert prereq_edge["required_mastery"] == 0.55
+    assert prereq_edge["reason"] == "Number-axis work depends on real-number meaning."
+    assert prereq_edge["use_cases"] == ["learning_path"]
+    assert prereq_edge["priority"] == "core"
+    assert prereq_edge["context"] == "diagnosis"
+    assert prereq_edge["confidence"] == 0.9
+    application_edge = next(
+        edge
+        for edge in payload["edges"]
+        if edge["from"] == "number_axis" and edge["to"] == "absolute_value"
+    )
+    assert application_edge["relation"] == "application"
+    assert application_edge["reason"] == "Absolute value is interpreted as distance on the number axis."
+    assert application_edge["use_cases"] == ["diagnosis", "hint_generation"]
+    assert application_edge["priority"] == "useful"
+    assert application_edge["context"] == "practice"
+    assert application_edge["confidence"] == 0.9
     assert payload["nodes"][0]["stage"] == "junior_high"
+    assert payload["nodes"][0]["unit"] == "Number system"
+    assert payload["nodes"][0]["skills"] == ["read coordinates", "compare signed numbers"]
+    assert payload["nodes"][0]["question_types"] == ["concept", "calculation"]
+    assert payload["nodes"][0]["examples"] == [{"prompt": "Place -2 on the number line."}]
+    assert payload["nodes"][0]["typical_misconceptions"] == ["Confusing position with distance."]
     assert payload["summary"]["stage_counts"]["junior_high"] == 1
     assert all(not edge["from"].startswith("{") for edge in payload["edges"])
+
+
+def test_study_knowledge_guidance_payload_returns_path_applications_and_confusions() -> None:
+    topics = [
+        {
+            "id": "college_derivative",
+            "name": "导数",
+            "stage": "college",
+            "subject": "math",
+            "related": [
+                {
+                    "id": "college_extreme_points",
+                    "relation": "application",
+                    "reason": "求极值点通常要先求导。",
+                    "use_cases": ["diagnosis", "learning_path"],
+                }
+            ],
+        },
+        {
+            "id": "college_monotonicity",
+            "name": "函数单调性",
+            "stage": "college",
+            "subject": "math",
+            "related": [
+                {
+                    "id": "college_extreme_points",
+                    "relation": "procedure_step",
+                    "reason": "判断临界点两侧单调性是确认极值的关键步骤。",
+                }
+            ],
+        },
+        {
+            "id": "college_sign_chart",
+            "name": "导数符号表",
+            "stage": "college",
+            "subject": "math",
+            "related": [
+                {
+                    "id": "college_extreme_points",
+                    "relation": "procedure_step",
+                    "reason": "符号表能定位临界点两侧单调性变化。",
+                }
+            ],
+        },
+        {
+            "id": "college_stationary_point",
+            "name": "驻点",
+            "stage": "college",
+            "subject": "math",
+        },
+        {
+            "id": "college_optimization",
+            "name": "优化应用题",
+            "stage": "college",
+            "subject": "math",
+        },
+        {
+            "id": "college_advanced_extrema",
+            "name": "含参极值问题",
+            "stage": "college",
+            "subject": "math",
+        },
+        {
+            "id": "college_graph_analysis",
+            "name": "函数图像分析",
+            "stage": "college",
+            "subject": "math",
+        },
+        {
+            "id": "college_extreme_points",
+            "name": "求极值点",
+            "stage": "college",
+            "subject": "math",
+            "typical_misconceptions": ["导数为 0 不一定是极值点。"],
+            "prerequisites": [
+                {
+                    "id": "college_derivative",
+                    "relation": "prerequisite",
+                    "reason": "求极值点前要能计算导数。",
+                },
+                {
+                    "id": "college_monotonicity",
+                    "relation": "prerequisite",
+                    "reason": "需要看临界点两侧单调性是否变化。",
+                },
+            ],
+            "related": [
+                {
+                    "id": "college_optimization",
+                    "relation": "application",
+                    "reason": "优化题常把实际目标转化为极值问题。",
+                },
+                {
+                    "id": "college_advanced_extrema",
+                    "relation": "extends",
+                    "reason": "含参极值问题是在基本极值判断上的进阶扩展。",
+                },
+                {
+                    "id": "college_graph_analysis",
+                    "relation": "co_occurs",
+                    "reason": "图像分析常和单调性、极值、凹凸性一起出现。",
+                },
+                {
+                    "id": "college_stationary_point",
+                    "relation": "confusable",
+                    "reason": "驻点不一定是极值点，还要检查单调性变化。",
+                },
+            ],
+        },
+    ]
+
+    payload = build_knowledge_guidance_payload(
+        topics=topics,
+        query="我不会求极值点",
+    )
+
+    assert payload["topic"]["id"] == "college_extreme_points"
+    assert {edge["from"] for edge in payload["learning_path"]} >= {
+        "college_derivative",
+        "college_monotonicity",
+        "college_sign_chart",
+    }
+    assert payload["applications"][0]["to"] == "college_optimization"
+    assert payload["confusions"][0]["to"] == "college_stationary_point"
+    assert "导数为 0 不一定是极值点。" in payload["topic"]["typical_misconceptions"]
+    assert {
+        question["kind"] for question in payload["diagnosis_questions"]
+    } >= {
+        "prerequisite_probe",
+        "procedure_probe",
+        "confusion_check",
+        "application_practice",
+        "extension_suggestion",
+        "related_review",
+    }
+    assert payload["summary"]["matched"] is True
+    assert payload["summary"]["diagnosis_question_count"] >= 6
+
+
+def test_study_knowledge_guidance_treats_confusions_as_bidirectional() -> None:
+    topics = [
+        {
+            "id": "stationary_point",
+            "name": "Stationary point",
+            "subject": "math",
+            "stage": "college",
+            "related": [
+                {
+                    "id": "extreme_point",
+                    "relation": "confusable",
+                    "reason": "A stationary point is not always an extreme point.",
+                }
+            ],
+        },
+        {
+            "id": "extreme_point",
+            "name": "Extreme point",
+            "subject": "math",
+            "stage": "college",
+        },
+    ]
+
+    payload = build_knowledge_guidance_payload(
+        topics=topics,
+        topic_id="extreme_point",
+    )
+
+    assert payload["topic"]["id"] == "extreme_point"
+    assert payload["confusions"][0]["from"] == "stationary_point"
+    assert payload["confusions"][0]["to"] == "extreme_point"
+    assert payload["summary"]["confusion_count"] == 1
+
+
+def test_study_knowledge_guidance_aliases_rank_natural_query_matches() -> None:
+    topics = [
+        {
+            "id": "senior_derivative_extrema",
+            "name": "导数与极值最值",
+            "subject": "math",
+            "stage": "senior_high",
+            "typical_misconceptions": ["只令 f'(x)=0 而忘记检查端点和极值点"],
+        },
+        {
+            "id": "college_monotonic_extrema",
+            "name": "单调性极值与凹凸性",
+            "subject": "math",
+            "stage": "college",
+            "course_family": "calculus",
+            "aliases": ["求极值点", "极值点判断", "驻点与极值点"],
+        },
+    ]
+
+    matches = match_topics(topics, query="我不会求极值点", limit=2)
+
+    assert matches[0]["id"] == "college_monotonic_extrema"
+    assert "求极值点" in matches[0]["matched_terms"]
+
+
+def test_study_knowledge_guidance_prefers_specific_topic_over_learning_intent() -> None:
+    topics = [
+        {
+            "id": "college_definite_integral",
+            "name": "\u5b9a\u79ef\u5206",
+            "subject": "math",
+            "stage": "college",
+            "course_family": "calculus",
+            "aliases": ["\u5b9a\u79ef\u5206\u600e\u4e48\u5b66"],
+        },
+        {
+            "id": "college_ds_linked_list",
+            "name": "\u5355\u94fe\u8868\u64cd\u4f5c",
+            "subject": "computer_science",
+            "stage": "college",
+            "course_family": "data_structures",
+        },
+    ]
+
+    matches = match_topics(topics, query="\u94fe\u8868\u600e\u4e48\u5b66", limit=2)
+
+    assert matches[0]["id"] == "college_ds_linked_list"
+
+
+def test_study_knowledge_guidance_acceptance_queries_hit_relation_groups() -> None:
+    topics = _read_static_knowledge_seed_payload()["topics"]
+    cases = [
+        (
+            "\u6781\u9650\u548c\u51fd\u6570\u503c\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_limit_concept", "college_function_value"},
+        ),
+        (
+            "\u8fde\u7eed\u4e3a\u4ec0\u4e48\u4e0d\u4e00\u5b9a\u53ef\u5bfc\uff1f",
+            {"college_continuity", "college_derivative_existence"},
+        ),
+        (
+            "\u5bfc\u6570\u600e\u4e48\u7528\u6765\u6c42\u6781\u503c\uff1f",
+            {
+                "senior_derivative_extrema",
+                "college_monotonic_extrema",
+                "college_stationary_points",
+                "college_extreme_value_points",
+            },
+        ),
+        (
+            "\u6781\u503c\u548c\u6700\u503c\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_extreme_value_points", "college_absolute_extrema"},
+        ),
+        (
+            "\u5b9a\u79ef\u5206\u9762\u79ef\u9898\u600e\u4e48\u505a\uff1f",
+            {"college_integral_area_problem", "college_definite_integral", "college_integral_application"},
+        ),
+        (
+            "\u7279\u5f81\u503c\u600e\u4e48\u6c42\uff1f",
+            {
+                "college_eigenvalue",
+                "college_characteristic_matrix",
+                "college_characteristic_polynomial",
+            },
+        ),
+        (
+            "\u7279\u5f81\u503c\u548c\u5947\u5f02\u503c\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_eigenvalue", "college_singular_value"},
+        ),
+        (
+            "\u79e9\u548c\u7ef4\u6570\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_rank", "college_basis_dimension", "college_matrix_dimension"},
+        ),
+        (
+            "\u6392\u5217\u548c\u7ec4\u5408\u600e\u4e48\u533a\u5206\uff1f",
+            {"senior_probability_counting", "college_permutation", "college_combination"},
+        ),
+        (
+            "\u4e8c\u9879\u5206\u5e03\u548c\u6b63\u6001\u5206\u5e03\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_binomial_distribution", "college_normal_distribution"},
+        ),
+        (
+            "\u7f6e\u4fe1\u533a\u95f4\u548c\u5047\u8bbe\u68c0\u9a8c\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_confidence_interval", "college_hypothesis_testing"},
+        ),
+        (
+            "\u4e0d\u5b9a\u79ef\u5206\u548c\u5b9a\u79ef\u5206\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_indefinite_integral", "college_definite_integral"},
+        ),
+        (
+            "\u539f\u51fd\u6570\u548c\u4e0d\u5b9a\u79ef\u5206\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_antiderivative", "college_indefinite_integral"},
+        ),
+        (
+            "\u7279\u5f81\u5411\u91cf\u548c\u666e\u901a\u5411\u91cf\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_eigenvalue", "college_regular_vector", "college_eigenvector_solution"},
+        ),
+        (
+            "\u5047\u8bbe\u68c0\u9a8c\u600e\u4e48\u505a\uff1f",
+            {"college_hypothesis_testing", "college_null_hypothesis", "college_test_statistic"},
+        ),
+        (
+            "\u56fe\u7684\u6700\u77ed\u8def\u600e\u4e48\u5b66\uff1f",
+            {"college_graph_shortest_path", "college_graph_theory_intro"},
+        ),
+        (
+            "\u5bfc\u6570\u548c\u5207\u7ebf\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {
+                "senior_derivative_tangent",
+                "college_derivative_calculation",
+                "college_tangent_line_equation",
+            },
+        ),
+        (
+            "\u671f\u671b\u548c\u5e73\u5747\u503c\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_expectation_variance", "college_sample_mean"},
+        ),
+        (
+            "\u53d7\u529b\u5206\u6790\u600e\u4e48\u505a\uff1f",
+            {"college_force_analysis"},
+        ),
+        (
+            "BFS\u548cDFS\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_graph_traversal"},
+        ),
+        (
+            "\u6700\u77ed\u8def\u7b97\u6cd5\u600e\u4e48\u5b66\uff1f",
+            {"college_ds_shortest_path", "college_graph_shortest_path"},
+        ),
+        (
+            "\u901f\u5ea6\u548c\u52a0\u901f\u5ea6\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"physics_senior_experiment_acceleration", "college_physics_kinematics_calculus"},
+        ),
+        (
+            "\u725b\u987f\u7b2c\u4e8c\u5b9a\u5f8b\u9898\u600e\u4e48\u505a\uff1f",
+            {"physics_senior_newton_laws"},
+        ),
+        (
+            "\u529f\u548c\u80fd\u91cf\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"physics_junior_work_power", "college_physics_work_energy_theorem"},
+        ),
+        (
+            "\u6c27\u5316\u5242\u548c\u8fd8\u539f\u5242\u600e\u4e48\u533a\u5206\uff1f",
+            {"chem_senior_redox"},
+        ),
+        (
+            "\u6c27\u5316\u8fd8\u539f\u53cd\u5e94\u600e\u4e48\u914d\u5e73\uff1f",
+            {"chem_senior_redox", "chem_senior_redox_balance"},
+        ),
+        (
+            "\u5316\u5b66\u5e73\u8861\u79fb\u52a8\u600e\u4e48\u5224\u65ad\uff1f",
+            {"chem_senior_equilibrium", "chem_senior_equilibrium_constant"},
+        ),
+        (
+            "pH\u600e\u4e48\u8ba1\u7b97\uff1f",
+            {"chem_senior_ph_ionization"},
+        ),
+        (
+            "\u57fa\u56e0\u578b\u548c\u8868\u73b0\u578b\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"bio_senior_genetics_law", "bio_junior_inheritance_intro"},
+        ),
+        (
+            "\u9057\u4f20\u6982\u7387\u9898\u600e\u4e48\u505a\uff1f",
+            {"bio_junior_inheritance_intro", "bio_senior_genetics_law"},
+        ),
+        (
+            "\u51cf\u6570\u5206\u88c2\u548c\u6709\u4e1d\u5206\u88c2\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"bio_senior_meiosis", "bio_senior_mitosis_image"},
+        ),
+        (
+            "\u9605\u8bfb\u7406\u89e3\u4e3b\u65e8\u9898\u600e\u4e48\u505a\uff1f",
+            {"english_senior_reading_main_idea"},
+        ),
+        (
+            "\u5b8c\u5f62\u586b\u7a7a\u600e\u4e48\u505a\uff1f",
+            {"english_junior_cloze_context", "english_senior_cloze_logic"},
+        ),
+        (
+            "\u6570\u7ec4\u548c\u94fe\u8868\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_ds_linear_list", "college_ds_linked_list", "college_ds_dynamic_array"},
+        ),
+        (
+            "\u9012\u5f52\u548c\u8fed\u4ee3\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_ds_recursion_iteration", "college_c_recursion_basic"},
+        ),
+        (
+            "\u6808\u548c\u961f\u5217\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_ds_stack", "college_ds_queue_circular"},
+        ),
+        (
+            "\u5feb\u901f\u6392\u5e8f\u548c\u5f52\u5e76\u6392\u5e8f\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_ds_quick_merge_sort", "college_ds_sorting_basic"},
+        ),
+        (
+            "\u54c8\u5e0c\u8868\u51b2\u7a81\u600e\u4e48\u5904\u7406\uff1f",
+            {"college_ds_hash_table"},
+        ),
+        (
+            "\u5730\u56fe\u6bd4\u4f8b\u5c3a\u600e\u4e48\u770b\uff1f",
+            {"geo_junior_map_skills"},
+        ),
+        (
+            "\u5b63\u98ce\u6c14\u5019\u600e\u4e48\u5224\u65ad\uff1f",
+            {"geo_junior_climate_types", "geo_senior_atmospheric_circulation"},
+        ),
+        (
+            "\u6cb3\u6d41\u5730\u8c8c\u600e\u4e48\u5f62\u6210\uff1f",
+            {"geo_junior_river_landform", "geo_senior_geomorphology"},
+        ),
+        (
+            "\u5de5\u4e1a\u533a\u4f4d\u56e0\u7d20\u600e\u4e48\u5206\u6790\uff1f",
+            {"geo_senior_industrial_location", "geo_junior_agriculture_industry"},
+        ),
+        (
+            "\u79e6\u671d\u4e2d\u592e\u96c6\u6743\u6709\u4ec0\u4e48\u7279\u70b9\uff1f",
+            {"history_junior_qin_unification"},
+        ),
+        (
+            "\u9e26\u7247\u6218\u4e89\u4e3a\u4ec0\u4e48\u662f\u8fd1\u4ee3\u5f00\u7aef\uff1f",
+            {"history_junior_opium_war"},
+        ),
+        (
+            "\u5de5\u4e1a\u9769\u547d\u6709\u4ec0\u4e48\u5f71\u54cd\uff1f",
+            {"history_junior_industrial_revolution"},
+        ),
+        (
+            "\u53f2\u6599\u9898\u600e\u4e48\u5206\u6790\uff1f",
+            {"history_senior_material_analysis"},
+        ),
+        (
+            "\u5e02\u573a\u673a\u5236\u548c\u5b8f\u89c2\u8c03\u63a7\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"pol_senior_economy_market", "pol_senior_socialism_market"},
+        ),
+        (
+            "\u6743\u5229\u548c\u4e49\u52a1\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"pol_junior_rights_obligations"},
+        ),
+        (
+            "\u552f\u7269\u8fa9\u8bc1\u6cd5\u600e\u4e48\u7528\uff1f",
+            {"pol_senior_philosophy_dialectics"},
+        ),
+        (
+            "\u4f9d\u6cd5\u6cbb\u56fd\u6750\u6599\u9898\u600e\u4e48\u7b54\uff1f",
+            {"pol_senior_rule_of_law"},
+        ),
+        (
+            "\u6587\u8a00\u865a\u8bcd\u600e\u4e48\u5224\u65ad\uff1f",
+            {"chinese_junior_classical_function_words", "chinese_senior_classical_function_words"},
+        ),
+        (
+            "\u8bd7\u6b4c\u610f\u8c61\u548c\u60c5\u611f\u600e\u4e48\u5206\u6790\uff1f",
+            {"chinese_senior_poetry_image_emotion"},
+        ),
+        (
+            "\u6750\u6599\u4f5c\u6587\u600e\u4e48\u5ba1\u9898\u7acb\u610f\uff1f",
+            {"chinese_senior_composition_material_review"},
+        ),
+        (
+            "\u5c0f\u8bf4\u4eba\u7269\u5f62\u8c61\u600e\u4e48\u5206\u6790\uff1f",
+            {"chinese_senior_literary_image"},
+        ),
+        (
+            "\u9700\u6c42\u548c\u4f9b\u7ed9\u66f2\u7ebf\u600e\u4e48\u770b\uff1f",
+            {"college_micro_demand_supply"},
+        ),
+        (
+            "\u673a\u4f1a\u6210\u672c\u662f\u4ec0\u4e48\uff1f",
+            {"college_econ_scarcity_opportunity_cost"},
+        ),
+        (
+            "\u901a\u8d27\u81a8\u80c0\u548cCPI\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_macro_cpi_inflation"},
+        ),
+        (
+            "\u8d22\u653f\u653f\u7b56\u548c\u8d27\u5e01\u653f\u7b56\u6709\u4ec0\u4e48\u533a\u522b\uff1f",
+            {"college_macro_fiscal_policy", "college_macro_monetary_policy"},
+        ),
+        (
+            "\u5bfc\u6570\u548c\u901f\u5ea6\u52a0\u901f\u5ea6\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {
+                "physics_senior_experiment_acceleration",
+                "college_physics_kinematics_calculus",
+                "college_derivative_calculation",
+            },
+        ),
+        (
+            "\u8fb9\u9645\u6210\u672c\u4e3a\u4ec0\u4e48\u7528\u5bfc\u6570\uff1f",
+            {"college_derivative_definition", "college_micro_cost_short_run"},
+        ),
+        (
+            "\u77e9\u9635\u548c\u56fe\u7b97\u6cd5\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_rank", "college_matrix_operations", "college_ds_graph_representation"},
+        ),
+        (
+            "\u51fd\u6570\u56fe\u50cf\u600e\u4e48\u770b\u7269\u7406\u8fd0\u52a8\uff1f",
+            {"function_graph_reading", "physics_senior_motion_graph_synthesis"},
+        ),
+        (
+            "\u9700\u6c42\u4f9b\u7ed9\u66f2\u7ebf\u548c\u51fd\u6570\u56fe\u50cf\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_micro_demand_supply", "linear_function_graph"},
+        ),
+        (
+            "\u5f39\u6027\u5206\u6790\u548c\u659c\u7387\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_micro_elasticity", "linear_function_kb"},
+        ),
+        (
+            "\u6781\u503c\u600e\u4e48\u7528\u6765\u5206\u6790\u5229\u6da6\u6700\u5927\u5316\uff1f",
+            {
+                "college_micro_firm_profit",
+                "college_extreme_value_points",
+                "college_absolute_extrema",
+            },
+        ),
+        (
+            "\u79ef\u5206\u548c\u7269\u7406\u505a\u529f\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"physics_junior_work_power", "college_integral_physics_application"},
+        ),
+        (
+            "\u4e09\u89d2\u51fd\u6570\u548c\u7b80\u8c10\u8fd0\u52a8\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {
+                "trig_area",
+                "physics_senior_simple_harmonic",
+                "college_physics_simple_harmonic_oscillation",
+                "senior_trig_graph",
+            },
+        ),
+        (
+            "\u5411\u91cf\u548c\u529b\u7684\u5206\u89e3\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"physics_senior_force_decomposition", "senior_plane_vector_concept"},
+        ),
+        (
+            "\u9012\u5f52\u4e3a\u4ec0\u4e48\u548c\u8bc1\u660e\u601d\u8def\u6709\u5173\uff1f",
+            {"geometric_proof_strategy", "college_c_recursion_basic", "proof_writing"},
+        ),
+        (
+            "\u590d\u6742\u5ea6\u548c\u51fd\u6570\u589e\u957f\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {
+                "quadratic_monotonicity",
+                "college_ds_algorithm_complexity",
+                "function_thinking",
+                "senior_exponential_function",
+            },
+        ),
+        (
+            "\u56fe\u8bba\u548c\u56fe\u904d\u5386\u7b97\u6cd5\u600e\u4e48\u8fde\u8d77\u6765\uff1f",
+            {
+                "college_ds_algorithm_complexity",
+                "college_graph_theory_intro",
+                "college_ds_graph_traversal",
+            },
+        ),
+        (
+            "\u4e8c\u7ef4\u6570\u7ec4\u548c\u77e9\u9635\u8fd0\u7b97\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_matrix_operations", "college_c_2d_array_matrix"},
+        ),
+        (
+            "\u52a8\u6001\u89c4\u5212\u548c\u77e9\u9635\u601d\u7ef4\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_ds_greedy_dp_intro", "college_matrix_operations"},
+        ),
+        (
+            "\u8fb9\u9645\u6536\u76ca\u548c\u5bfc\u6570\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"college_derivative_definition", "college_micro_firm_profit"},
+        ),
+        (
+            "\u4f9b\u9700\u5747\u8861\u4e3a\u4ec0\u4e48\u8981\u770b\u4ea4\u70b9\uff1f",
+            {"linear_function_intersection", "college_micro_demand_supply"},
+        ),
+        (
+            "\u6bd4\u7387\u53d8\u5316\u548c\u7ecf\u6d4e\u5f39\u6027\u600e\u4e48\u8fde\u63a5\uff1f",
+            {"college_micro_elasticity", "function_concept"},
+        ),
+        (
+            "\u4f4d\u79fb\u65f6\u95f4\u56fe\u50cf\u548c\u4e00\u6b21\u51fd\u6570\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"linear_function_graph", "physics_senior_motion_graph_synthesis"},
+        ),
+        (
+            "\u52a0\u901f\u5ea6\u4e3a\u4ec0\u4e48\u53ef\u4ee5\u7528\u5bfc\u6570\u7406\u89e3\uff1f",
+            {"physics_senior_experiment_acceleration", "college_derivative_calculation"},
+        ),
+        (
+            "\u53d8\u529b\u505a\u529f\u4e3a\u4ec0\u4e48\u8981\u7528\u79ef\u5206\uff1f",
+            {"college_integral_physics_application", "physics_senior_work_energy_path"},
+        ),
+        (
+            "\u659c\u9762\u529b\u5206\u89e3\u548c\u4e09\u89d2\u51fd\u6570\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+            {"trig_area", "physics_senior_force_decomposition", "senior_trig_definitions"},
+        ),
+        (
+            "矢量空间和物理矢量有什么关系？",
+            {"college_physics_vector_calculus", "college_vector_space", "senior_vector_linear_operation"},
+        ),
+        (
+            "功和动能定理为什么要用被积函数和数量积？",
+            {
+                "college_integral_application_integrand",
+                "college_physics_work_energy_theorem",
+                "senior_vector_dot_product",
+            },
+        ),
+        (
+            "简谐运动为什么可以用三角函数描述？",
+            {
+                "college_physics_simple_harmonic_oscillation",
+                "physics_senior_simple_harmonic",
+                "senior_trig_graph",
+                "trig_area",
+            },
+        ),
+        (
+            "阻尼振动和指数函数增长衰减有什么关系？",
+            {"college_physics_damped_forced_oscillation", "senior_exponential_function"},
+        ),
+        (
+            "经济增长和指数函数有什么关系？",
+            {"college_econ_growth_productivity", "senior_exponential_function"},
+        ),
+        (
+            "经济数据图表为什么要懂期望方差和正态分布？",
+            {"college_econ_data_graph", "college_expectation_variance", "college_normal_distribution"},
+        ),
+        (
+            "生产可能性边界和数学建模怎么联系？",
+            {"college_econ_ppf", "college_econ_scarcity_opportunity_cost", "mathematical_modeling"},
+        ),
+        (
+            "短期成本曲线为什么要用导数和单调极值？",
+            {"college_derivative_calculation", "college_micro_cost_short_run", "college_monotonic_extrema"},
+        ),
+        (
+            "弹性分析为什么既看斜率又看导数？",
+            {"college_derivative_calculation", "college_micro_elasticity", "linear_function_kb"},
+        ),
+        (
+            "利润最大化为什么既看二次函数最值又看导数？",
+            {
+                "college_derivative_calculation",
+                "college_extreme_value_points",
+                "college_micro_firm_profit",
+                "quadratic_max_min",
+            },
+        ),
+        (
+            "图的存储结构和邻接矩阵怎么联系？",
+            {"college_c_2d_array_matrix", "college_ds_graph_representation", "college_matrix_operations"},
+        ),
+        (
+            "算法复杂度为什么要用函数思维和对数函数？",
+            {"college_ds_algorithm_complexity", "function_thinking", "senior_logarithmic_function"},
+        ),
+        (
+            "递归程序和数列递推有什么关系？",
+            {"college_c_recursion_basic", "college_ds_recursion_iteration", "senior_sequence_recursion"},
+        ),
+        (
+            "二维数组表示矩阵时行列维度容易混在哪里？",
+            {"college_c_2d_array_matrix", "college_matrix_dimension", "college_matrix_operations"},
+        ),
+        (
+            "图论里的遍历和算法里的BFS DFS有什么关系？",
+            {"college_ds_graph_traversal", "college_graph_theory_intro", "college_graph_traversal"},
+        ),
+        (
+            "英语概要写作的转述压缩和写作衔接怎么一起练？",
+            {"english_senior_summary_paraphrase", "english_senior_writing_cohesion"},
+        ),
+        (
+            "英语作者态度题和词义猜测、七选五连贯有什么关系？",
+            {
+                "english_senior_reading_author_attitude",
+                "english_senior_reading_word_guess",
+                "english_senior_seven_choice_coherence",
+            },
+        ),
+        (
+            "中式表达纠偏和语境词汇复习怎么一起做？",
+            {"english_senior_translation_chinese_interference", "english_senior_vocabulary_context_review"},
+        ),
+        (
+            "实用类文本信息筛选和信息类文本比较整合有什么区别？",
+            {"chinese_senior_modern_info_comparison", "chinese_senior_practical_filter"},
+        ),
+        (
+            "议论文论证层次和素材作文审题立意怎么连接？",
+            {
+                "chinese_senior_composition_argument_layer",
+                "chinese_senior_composition_example_argument",
+                "chinese_senior_composition_material_review",
+            },
+        ),
+        (
+            "地图三要素和比例尺有什么关系？",
+            {"geo_junior_map_skills", "primary_ratio_scale"},
+        ),
+        (
+            "世界气候类型和函数图像信息读取有什么关系？",
+            {"geo_junior_climate_types", "function_graph_reading"},
+        ),
+        (
+            "农业工业区位和需求供给模型有什么关系？",
+            {"geo_junior_agriculture_industry", "college_micro_demand_supply"},
+        ),
+        (
+            "区域可持续发展和政策权衡分析有什么关系？",
+            {"geo_senior_regional_sustainability", "college_econ_policy_tradeoff"},
+        ),
+        (
+            "秦统一与中央集权和全面依法治国有什么关系？",
+            {"history_junior_qin_unification", "pol_senior_rule_of_law"},
+        ),
+        (
+            "秦统一与中央集权和人民民主与政治参与有什么关系？",
+            {"history_junior_qin_unification", "pol_senior_political_participation"},
+        ),
+        (
+            "鸦片战争与近代开端和国际关系与中国外交有什么关系？",
+            {"history_junior_opium_war", "pol_senior_international_relations"},
+        ),
+        (
+            "工业革命和产业区位与区域发展有什么关系？",
+            {"history_junior_industrial_revolution", "geo_senior_industrial_location"},
+        ),
+        (
+            "史料实证方法和实用类文本信息筛选有什么关系？",
+            {"history_senior_material_analysis", "chinese_senior_practical_filter"},
+        ),
+        (
+            "权利与义务和阅读题规范分点有什么关系？",
+            {"pol_junior_rights_obligations", "chinese_senior_text_answer_template"},
+        ),
+        (
+            "市场机制与宏观调控和财政政策有什么关系？",
+            {"pol_senior_economy_market", "college_macro_fiscal_policy"},
+        ),
+        (
+            "唯物辩证法和议论文论证层次有什么关系？",
+            {"pol_senior_philosophy_dialectics", "chinese_senior_composition_argument_layer"},
+        ),
+        (
+            "国际关系与中国外交和世界市场与全球化有什么关系？",
+            {"pol_senior_international_relations", "history_senior_globalization"},
+        ),
+        (
+            "阅读细节定位题和实用类文本信息筛选有什么关系？",
+            {"english_senior_reading_detail_location", "chinese_senior_practical_filter"},
+        ),
+        (
+            "作者态度与观点题和逻辑与思维方法有什么关系？",
+            {"english_senior_reading_author_attitude", "pol_senior_logical_thinking"},
+        ),
+        (
+            "概要写作和压缩语段与概括有什么关系？",
+            {"english_senior_summary_writing", "chinese_senior_language_compression"},
+        ),
+        (
+            "化学方程式配平和一元一次方程有什么关系？",
+            {"chem_junior_chemical_equation", "linear_equation"},
+        ),
+        (
+            "弱电解质电离与 pH 和对数函数有什么关系？",
+            {"chem_senior_ph_ionization", "senior_logarithmic_function"},
+        ),
+        (
+            "化学反应速率影响因素和函数单调性有什么关系？",
+            {"chem_senior_rate_factors", "senior_function_monotonicity"},
+        ),
+        (
+            "酸碱中和滴定和一次函数交点有什么关系？",
+            {"chem_senior_acid_base_titration", "linear_function_intersection"},
+        ),
+        (
+            "孟德尔遗传定律和二项分布有什么关系？",
+            {"bio_senior_genetics_law", "senior_binomial_distribution"},
+        ),
+        (
+            "性状遗传初步和列表法与树状图有什么关系？",
+            {"bio_junior_inheritance_intro", "tree_diagram"},
+        ),
+        (
+            "酶活性曲线分析和导数与极值最值有什么关系？",
+            {"bio_senior_enzyme_curve", "senior_derivative_extrema"},
+        ),
+        (
+            "光合作用曲线分析和函数图像信息读取有什么关系？",
+            {"bio_senior_photosynthesis_curve", "function_graph_reading"},
+        ),
+        (
+            "实验误差与结论评价和方差有什么关系？",
+            {"bio_senior_experiment_error_analysis", "variance"},
+        ),
+        (
+            "电势图像和函数图像分析有什么关系？",
+            {"physics_senior_electric_potential_graph", "college_function_graph_analysis"},
+        ),
+        (
+            "实验数据处理和方差有什么关系？",
+            {"physics_senior_experiment_data", "variance"},
+        ),
+        (
+            "几何光学和相似三角形有什么关系？",
+            {"college_physics_geometric_optics", "similar_triangles"},
+        ),
+        (
+            "反应速率图像和函数单调性有什么关系？",
+            {"chem_senior_rate_factors", "senior_function_monotonicity"},
+        ),
+        (
+            "平衡常数和反比例函数图像有什么关系？",
+            {"chem_senior_equilibrium_constant", "inverse_function_graph"},
+        ),
+        (
+            "滴定误差和一次函数交点有什么关系？",
+            {"chem_senior_acid_base_titration", "linear_function_intersection"},
+        ),
+        (
+            "氧化还原滴定和方程配平有什么关系？",
+            {"chem_senior_redox_titration", "chem_senior_redox_balance"},
+        ),
+        (
+            "有机同分异构和排列组合有什么关系？",
+            {"chem_senior_organic_isomer", "college_combination"},
+        ),
+        (
+            "PCR和电泳与指数增长有什么关系？",
+            {"bio_senior_pcr_electrophoresis", "senior_exponential_function"},
+        ),
+        (
+            "种群增长和指数函数有什么关系？",
+            {"bio_senior_population_growth", "senior_exponential_function"},
+        ),
+        (
+            "群落演替和地理可持续发展有什么关系？",
+            {"bio_senior_community_succession", "geo_senior_regional_sustainability"},
+        ),
+        (
+            "细胞工程和实验控制有什么关系？",
+            {"bio_senior_cell_engineering", "bio_senior_experiment_control"},
+        ),
+        (
+            "阅读主旨题和语文信息筛选有什么关系？",
+            {"english_senior_reading_main_idea", "chinese_senior_practical_filter"},
+        ),
+        (
+            "概要写作和语文压缩语段有什么关系？",
+            {"english_senior_summary_writing", "chinese_senior_language_compression"},
+        ),
+        (
+            "续写情节逻辑和小说情节作用有什么关系？",
+            {"english_senior_continuation_plot_logic", "chinese_senior_literary_plot_effect"},
+        ),
+        (
+            "英语应用文通知和语文信息筛选有什么关系？",
+            {"english_senior_application_notice", "chinese_senior_practical_filter"},
+        ),
+        (
+            "词汇语境复习和语文衔接连贯有什么关系？",
+            {
+                "english_senior_vocabulary_context_review",
+                "chinese_senior_language_cohesion",
+                "chinese_senior_exam_revision_strategy",
+            },
+        ),
+        (
+            "史料实证和语文材料概括有什么关系？",
+            {"history_senior_material_analysis", "chinese_senior_language_compression"},
+        ),
+        (
+            "制度变迁和政治参与有什么关系？",
+            {"history_senior_institution_change", "pol_senior_political_participation"},
+        ),
+        (
+            "文化交流和英语阅读主旨有什么关系？",
+            {"history_senior_cultural_exchange", "english_senior_reading_main_idea"},
+        ),
+        (
+            "经济史和经济增长模型有什么关系？",
+            {"history_senior_economic_history", "college_econ_growth_productivity"},
+        ),
+        (
+            "国际关系和博弈论囚徒困境有什么关系？",
+            {"pol_senior_international_relations", "college_econ_game_prisoner"},
+        ),
+        (
+            "逻辑思维和议论文论证有什么关系？",
+            {"pol_senior_logical_thinking", "chinese_senior_composition_argument_layer"},
+        ),
+        (
+            "地貌形成和函数图像读取有什么关系？",
+            {"geo_senior_geomorphology", "function_graph_reading"},
+        ),
+        (
+            "区域可持续发展和群落演替有什么关系？",
+            {"geo_senior_regional_sustainability", "bio_senior_community_succession"},
+        ),
+        (
+            "产业区位和经济成本收益有什么关系？",
+            {"geo_senior_industrial_location", "college_econ_cost_benefit"},
+        ),
+    ]
+
+    expected_subjects = {
+        "biology",
+        "chemistry",
+        "chinese",
+        "computer_science",
+        "economics",
+        "english",
+        "geography",
+        "history",
+        "math",
+        "physics",
+        "politics",
+    }
+    minimum_subject_query_counts = {
+        "biology": 8,
+        "chemistry": 8,
+        "chinese": 8,
+        "computer_science": 10,
+        "economics": 8,
+        "english": 8,
+        "geography": 8,
+        "history": 8,
+        "math": 30,
+        "physics": 7,
+        "politics": 8,
+    }
+    topic_subjects = {
+        str(topic["id"]): str(topic["subject"])
+        for topic in topics
+        if "id" in topic and "subject" in topic
+    }
+    subject_query_counts = dict.fromkeys(expected_subjects, 0)
+
+    cross_subject_queries = {
+        "\u5bfc\u6570\u548c\u901f\u5ea6\u52a0\u901f\u5ea6\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u8fb9\u9645\u6210\u672c\u4e3a\u4ec0\u4e48\u7528\u5bfc\u6570\uff1f",
+        "\u51fd\u6570\u56fe\u50cf\u600e\u4e48\u770b\u7269\u7406\u8fd0\u52a8\uff1f",
+        "\u9700\u6c42\u4f9b\u7ed9\u66f2\u7ebf\u548c\u51fd\u6570\u56fe\u50cf\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u5f39\u6027\u5206\u6790\u548c\u659c\u7387\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u6781\u503c\u600e\u4e48\u7528\u6765\u5206\u6790\u5229\u6da6\u6700\u5927\u5316\uff1f",
+        "\u79ef\u5206\u548c\u7269\u7406\u505a\u529f\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u4e09\u89d2\u51fd\u6570\u548c\u7b80\u8c10\u8fd0\u52a8\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u5411\u91cf\u548c\u529b\u7684\u5206\u89e3\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u9012\u5f52\u4e3a\u4ec0\u4e48\u548c\u8bc1\u660e\u601d\u8def\u6709\u5173\uff1f",
+        "\u590d\u6742\u5ea6\u548c\u51fd\u6570\u589e\u957f\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u56fe\u8bba\u548c\u56fe\u904d\u5386\u7b97\u6cd5\u600e\u4e48\u8fde\u8d77\u6765\uff1f",
+        "\u4e8c\u7ef4\u6570\u7ec4\u548c\u77e9\u9635\u8fd0\u7b97\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u8fb9\u9645\u6536\u76ca\u548c\u5bfc\u6570\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u6bd4\u7387\u53d8\u5316\u548c\u7ecf\u6d4e\u5f39\u6027\u600e\u4e48\u8fde\u63a5\uff1f",
+        "\u4f4d\u79fb\u65f6\u95f4\u56fe\u50cf\u548c\u4e00\u6b21\u51fd\u6570\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "\u52a0\u901f\u5ea6\u4e3a\u4ec0\u4e48\u53ef\u4ee5\u7528\u5bfc\u6570\u7406\u89e3\uff1f",
+        "\u53d8\u529b\u505a\u529f\u4e3a\u4ec0\u4e48\u8981\u7528\u79ef\u5206\uff1f",
+        "\u659c\u9762\u529b\u5206\u89e3\u548c\u4e09\u89d2\u51fd\u6570\u6709\u4ec0\u4e48\u5173\u7cfb\uff1f",
+        "矢量空间和物理矢量有什么关系？",
+        "功和动能定理为什么要用被积函数和数量积？",
+        "简谐运动为什么可以用三角函数描述？",
+        "阻尼振动和指数函数增长衰减有什么关系？",
+        "经济增长和指数函数有什么关系？",
+        "经济数据图表为什么要懂期望方差和正态分布？",
+        "生产可能性边界和数学建模怎么联系？",
+        "短期成本曲线为什么要用导数和单调极值？",
+        "弹性分析为什么既看斜率又看导数？",
+        "利润最大化为什么既看二次函数最值又看导数？",
+        "图的存储结构和邻接矩阵怎么联系？",
+        "算法复杂度为什么要用函数思维和对数函数？",
+            "递归程序和数列递推有什么关系？",
+            "二维数组表示矩阵时行列维度容易混在哪里？",
+            "图论里的遍历和算法里的BFS DFS有什么关系？",
+            "地图三要素和比例尺有什么关系？",
+            "世界气候类型和函数图像信息读取有什么关系？",
+            "农业工业区位和需求供给模型有什么关系？",
+            "区域可持续发展和政策权衡分析有什么关系？",
+            "秦统一与中央集权和全面依法治国有什么关系？",
+            "秦统一与中央集权和人民民主与政治参与有什么关系？",
+            "鸦片战争与近代开端和国际关系与中国外交有什么关系？",
+            "工业革命和产业区位与区域发展有什么关系？",
+            "史料实证方法和实用类文本信息筛选有什么关系？",
+            "权利与义务和阅读题规范分点有什么关系？",
+            "市场机制与宏观调控和财政政策有什么关系？",
+            "唯物辩证法和议论文论证层次有什么关系？",
+            "国际关系与中国外交和世界市场与全球化有什么关系？",
+            "阅读细节定位题和实用类文本信息筛选有什么关系？",
+            "作者态度与观点题和逻辑与思维方法有什么关系？",
+            "概要写作和压缩语段与概括有什么关系？",
+            "化学方程式配平和一元一次方程有什么关系？",
+            "弱电解质电离与 pH 和对数函数有什么关系？",
+            "化学反应速率影响因素和函数单调性有什么关系？",
+            "酸碱中和滴定和一次函数交点有什么关系？",
+            "孟德尔遗传定律和二项分布有什么关系？",
+            "性状遗传初步和列表法与树状图有什么关系？",
+            "酶活性曲线分析和导数与极值最值有什么关系？",
+            "光合作用曲线分析和函数图像信息读取有什么关系？",
+            "实验误差与结论评价和方差有什么关系？",
+        }
+
+    cross_subject_queries.update(
+        {
+            "电势图像和函数图像分析有什么关系？",
+            "实验数据处理和方差有什么关系？",
+            "几何光学和相似三角形有什么关系？",
+            "反应速率图像和函数单调性有什么关系？",
+            "平衡常数和反比例函数图像有什么关系？",
+            "滴定误差和一次函数交点有什么关系？",
+            "有机同分异构和排列组合有什么关系？",
+            "PCR和电泳与指数增长有什么关系？",
+            "种群增长和指数函数有什么关系？",
+            "群落演替和地理可持续发展有什么关系？",
+            "阅读主旨题和语文信息筛选有什么关系？",
+            "概要写作和语文压缩语段有什么关系？",
+            "续写情节逻辑和小说情节作用有什么关系？",
+            "英语应用文通知和语文信息筛选有什么关系？",
+            "词汇语境复习和语文衔接连贯有什么关系？",
+            "史料实证和语文材料概括有什么关系？",
+            "制度变迁和政治参与有什么关系？",
+            "文化交流和英语阅读主旨有什么关系？",
+            "经济史和经济增长模型有什么关系？",
+            "国际关系和博弈论囚徒困境有什么关系？",
+            "逻辑思维和议论文论证有什么关系？",
+            "地貌形成和函数图像读取有什么关系？",
+            "区域可持续发展和群落演替有什么关系？",
+            "产业区位和经济成本收益有什么关系？",
+        }
+    )
+
+    assert len(cases) == 151
+    assert len(cross_subject_queries) >= 83
+    assert set(minimum_subject_query_counts) == expected_subjects
+    for _query, expected_topic_ids in cases:
+        covered_subjects = {topic_subjects[topic_id] for topic_id in expected_topic_ids}
+        assert covered_subjects <= expected_subjects
+        for subject in covered_subjects:
+            subject_query_counts[subject] += 1
+
+    assert {
+        subject
+        for subject, query_count in subject_query_counts.items()
+        if query_count > 0
+    } == expected_subjects
+    for subject, minimum_query_count in minimum_subject_query_counts.items():
+        assert subject_query_counts[subject] >= minimum_query_count
+
+    for query, expected_topic_ids in cases:
+        payload = build_knowledge_guidance_payload(topics=topics, query=query)
+
+        assert payload["topic"]["id"] in expected_topic_ids, query
+        subgraph = payload["relevant_subgraph"]
+        model_context = payload["model_context"]
+        assert model_context["mode"] == "guidance", query
+        assert model_context["query"] == query, query
+        assert model_context["focus"]["id"] == subgraph["focus_topics"][0]["id"], query
+        assert model_context["summary"]["node_count"] == subgraph["summary"]["node_count"], query
+        assert model_context["summary"]["edge_count"] == subgraph["summary"]["edge_count"], query
+        assert model_context["summary"]["raw_seed_included"] is False, query
+        for raw_key in ("topics", "nodes", "edges", "matches", "relation_groups"):
+            assert raw_key not in model_context, query
+        compact_fields = (
+            "prerequisites",
+            "procedure",
+            "confusions",
+            "applications",
+            "extensions",
+            "review_with",
+            "practice_suggestions",
+        )
+        for field in compact_fields:
+            assert isinstance(model_context[field], list), query
+            assert all(isinstance(item, str) for item in model_context[field]), query
+        assert len(model_context["practice_suggestions"]) <= 6, query
+        assert sum(1 for field in compact_fields[:4] if model_context[field]) >= 2, query
+        relation_groups = payload["relation_groups"]
+        active_core_groups = {
+            relation
+            for relation in ("prerequisite", "confusable", "procedure_step", "application")
+            if relation_groups[relation]["items"]
+        }
+        assert len(active_core_groups) >= 2, query
+        if query in cross_subject_queries:
+            node_subjects = {
+                str(node["id"]): str(node.get("subject") or "")
+                for node in subgraph.get("nodes", [])
+                if isinstance(node, dict) and node.get("id")
+            }
+            node_subjects.update(
+                {
+                    topic_id: subject
+                    for topic_id, subject in topic_subjects.items()
+                    if topic_id not in node_subjects
+                }
+            )
+            node_labels = {
+                str(node["id"]): str(node.get("label") or node.get("id") or "")
+                for node in subgraph.get("nodes", [])
+                if isinstance(node, dict) and node.get("id")
+            }
+            cross_subject_edges = [
+                edge
+                for edge in subgraph.get("edges", [])
+                if isinstance(edge, dict)
+                and node_subjects.get(str(edge.get("from") or ""))
+                and node_subjects.get(str(edge.get("to") or ""))
+                and node_subjects[str(edge.get("from") or "")]
+                != node_subjects[str(edge.get("to") or "")]
+            ]
+            assert cross_subject_edges, query
+            compact_text = "\n".join(
+                item
+                for field in compact_fields
+                for item in model_context[field]
+            )
+            assert any(
+                node_labels.get(str(edge.get(endpoint) or ""))
+                and node_labels[str(edge.get(endpoint) or "")] in compact_text
+                for edge in cross_subject_edges
+                for endpoint in ("from", "to")
+            ), query
+
+
+def test_study_knowledge_retrieval_eval_reports_focus_and_cross_subject_quality() -> None:
+    topics = _read_static_knowledge_seed_payload()["topics"]
+    cases = [
+        {
+            "query": "导数和速度加速度有什么关系？",
+            "expected_topic_ids": [
+                "physics_senior_experiment_acceleration",
+                "college_physics_kinematics_calculus",
+                "college_derivative_calculation",
+            ],
+            "expect_cross_subject": True,
+        },
+        {
+            "query": "PCR和电泳与指数增长有什么关系？",
+            "expected_topic_ids": ["bio_senior_pcr_electrophoresis", "senior_exponential_function"],
+            "expect_cross_subject": True,
+        },
+        {
+            "query": "概要写作和语文压缩语段有什么关系？",
+            "expected_topic_ids": ["english_senior_summary_writing", "chinese_senior_language_compression"],
+            "expect_cross_subject": True,
+        },
+        {
+            "query": "驻点和极值点怎么区分？",
+            "expected_topic_ids": ["college_stationary_points", "college_critical_points"],
+            "expect_cross_subject": False,
+        },
+    ]
+
+    report = evaluate_knowledge_retrieval_queries(topics=topics, cases=cases)
+
+    assert report["summary"]["case_count"] == len(cases)
+    assert report["summary"]["focus_hit_count"] == len(cases)
+    assert report["summary"]["cross_subject_case_count"] == 3
+    assert report["summary"]["cross_subject_edge_count"] >= 3
+    assert report["summary"]["model_context_cross_subject_cue_count"] >= 3
+    assert report["summary"]["thin_relation_group_count"] == 0
+    assert report["summary"]["raw_seed_included_count"] == 0
+    for result in report["results"]:
+        assert result["query"]
+        assert result["focus_topic_id"] in result["expected_topic_ids"]
+        assert len(result["top_matches"]) <= 5
+        assert result["subgraph_node_ids"]
+        assert result["model_context"]["summary"]["raw_seed_included"] is False
+        assert result["focus_hit"] is True
+        assert result["has_raw_seed"] is False
+        assert result["thin_relation_groups"] == []
+        if result["expect_cross_subject"]:
+            assert result["has_cross_subject_edge"] is True
+            assert result["model_context_has_cross_subject_cue"] is True
+
+
+def test_study_knowledge_retrieval_eval_static_cases_meet_quality_gate() -> None:
+    topics = _read_static_knowledge_seed_payload()["topics"]
+    cases_path = (
+        Path(__file__).resolve().parents[3]
+        / "plugins"
+        / "study_companion"
+        / "static"
+        / "knowledge_eval_cases.json"
+    )
+    payload = json.loads(cases_path.read_text(encoding="utf-8"))
+    cases = payload.get("cases")
+    assert isinstance(cases, list)
+    assert 80 <= len(cases) <= 130
+
+    report = evaluate_knowledge_retrieval_queries(topics=topics, cases=cases)
+    summary = report["summary"]
+    cross_subject_case_count = int(summary["cross_subject_case_count"])
+
+    assert summary["case_count"] == len(cases)
+    assert summary["focus_hit_count"] / len(cases) >= 0.95
+    assert summary["raw_seed_included_count"] == 0
+    assert summary["thin_relation_group_count"] == 0
+    assert cross_subject_case_count >= 40
+    assert summary["cross_subject_edge_count"] / cross_subject_case_count >= 0.95
+    assert (
+        summary["model_context_cross_subject_cue_count"] / cross_subject_case_count
+        >= 0.95
+    )
+    assert summary["bad_hub_absorption_count"] <= 4
+
+    bad_hub_cases = [
+        result
+        for result in report["results"]
+        if result["bad_hub_absorbed"]
+    ]
+    for result in bad_hub_cases:
+        assert result["top_matches"], result["query"]
+        assert result["expected_topic_ids"], result["query"]
+
+
+def test_study_knowledge_guidance_groups_edges_into_user_facing_sections() -> None:
+    topics = _read_static_knowledge_seed_payload()["topics"]
+
+    payload = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u5bfc\u6570\u600e\u4e48\u7528\u6765\u6c42\u6781\u503c\uff1f",
+    )
+
+    assert set(payload["relation_groups"]) >= {
+        "prerequisite",
+        "confusable",
+        "procedure_step",
+        "application",
+        "extends",
+        "co_occurs",
+    }
+    sections = {section["relation"]: section for section in payload["guidance_sections"]}
+    assert sections["prerequisite"]["title"] == "\u5148\u8865\u4ec0\u4e48"
+    assert sections["confusable"]["title"] == "\u5bb9\u6613\u6df7\u5728\u54ea\u91cc"
+    assert sections["procedure_step"]["title"] == "\u89e3\u9898\u6d41\u7a0b\u4e0b\u4e00\u6b65"
+    assert sections["application"]["title"] == "\u5178\u578b\u7528\u9014"
+    assert sections["extends"]["title"] == "\u540e\u7eed\u62d3\u5c55"
+    assert sections["co_occurs"]["title"] == "\u4e00\u8d77\u590d\u4e60"
+    assert any(
+        item["relation"] == "procedure_step"
+        and {
+            item["from"],
+            item["to"],
+        }
+        & {"college_critical_points", "college_stationary_points"}
+        for item in sections["procedure_step"]["items"]
+    )
+    for section in sections.values():
+        for item in section["items"]:
+            assert item["priority"] in {"core", "useful", "optional"}
+            assert item["context"] in {"diagnosis", "explanation", "practice", "review"}
+            assert 0.0 <= item["confidence"] <= 1.0
+    assert payload["summary"]["active_relation_group_count"] >= 2
+
+
+def test_study_knowledge_map_ui_groups_semantic_relation_layers() -> None:
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
+    static_source = "\n".join(
+        (plugin_dir / "static" / name).read_text(encoding="utf-8")
+        for name in ("main.js", "knowledge-map.js")
+    )
+    static_css = (plugin_dir / "static" / "style.css").read_text(encoding="utf-8")
+    surface_source = (
+        plugin_dir / "surfaces" / "knowledge_map.tsx"
+    ).read_text(encoding="utf-8")
+    surface_utils = (
+        plugin_dir / "surfaces" / "study_surface_utils.ts"
+    ).read_text(encoding="utf-8")
+    locale_bundles = {
+        path.stem: json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((plugin_dir / "i18n").glob("*.json"))
+    }
+    en_i18n = locale_bundles["en"]
+    zh_i18n = locale_bundles["zh-CN"]
+    relation_keys = {
+        "application",
+        "procedure_step",
+        "confusable",
+        "co_occurs",
+        "supports",
+        "analogy",
+    }
+
+    for source in (static_source, surface_source):
+        for relation in relation_keys:
+            assert f"ui.knowledge.edge_relation.{relation}" in source
+        assert "data-relation" in source
+        assert "data-priority" in source
+        assert "data-context" in source
+        assert "knowledge-edge-row__reason" in source
+        assert "knowledge-edge-row__meta" in source
+    assert "function renderKnowledgeEdgeGraph" in static_source
+    assert "const visibleGroups = Array.from(groups.values()).slice(0, 12)" in static_source
+    assert "renderKnowledgeEdgeGraph(visibleGroups)" in static_source
+    assert ".flatMap((group) => (group.items || []).slice(0, 6)" in static_source
+    assert "knowledge-edge-graph__svg" in static_source
+    assert "marker-end" in static_source
+    assert "knowledge-edge-arrow" in static_source
+    assert "function edgeGraph" in surface_source
+    assert "markerEnd=\"url(#knowledge-edge-arrow-surface)\"" in surface_source
+    assert "knowledge-edge-graph__svg" in surface_source
+    for relation in relation_keys:
+        assert en_i18n[f"ui.knowledge.edge_relation.{relation}"]
+        zh_value = zh_i18n[f"ui.knowledge.edge_relation.{relation}"]
+        assert zh_value and zh_value != "??"
+    assert len(locale_bundles) == 8
+    for locale, bundle in locale_bundles.items():
+        for key in ("ui.knowledge.subject_uncategorized", "ui.knowledge.edge_graph_label"):
+            value = bundle.get(key)
+            assert value and value != "??", f"{locale} is missing {key}"
+    for source in (static_css, surface_utils):
+        assert ".knowledge-edge-graph" in source
+        assert ".knowledge-edge-graph__edge" in source
+        assert ".knowledge-edge-graph__node rect" in source
+        assert 'data-relation="confusable"' in source
+        assert 'data-relation="application"' in source
+        assert 'data-relation="procedure_step"' in source
+        assert 'data-relation="extends"' in source
+        assert 'data-relation="co_occurs"' in source
+    assert "white-space: nowrap" in static_css
+    assert "function knowledgeEdgeMeta" in static_source
+    assert "${relation} (${meta}): ${other}" in static_source
+    assert "function renderKnowledgeNodeDetail" in static_source
+    assert "function renderKnowledgeNodeDetailDialog" in static_source
+    assert "knowledge-node-detail-dialog" in static_source
+    assert "knowledge-node-detail-dialog" in static_css
+    assert "knowledge-node-detail-dialog" in surface_utils
+    assert "background: #ffffff" in static_css
+    assert "background: #ffffff" in surface_utils
+    assert ".knowledge-group-summary" in static_css
+    assert ".knowledge-group-summary::-webkit-details-marker" in static_css
+    assert ".knowledge-stage-group[open] > .knowledge-group-summary::after" in static_css
+    assert "backdrop-filter: blur(3px)" in static_css
+    assert "backdrop-filter: blur(3px)" in surface_utils
+    assert "knowledge-node-detail" in surface_source
+    assert "setSelectedNode(null)" in surface_source
+    assert "ui.knowledge.node_detail.why" in surface_source
+    assert "ui.knowledge.node_detail.why" in static_source
+    assert "ui.knowledge.node_detail.next" in static_source
+    assert "ui.knowledge.node_detail.practice" in static_source
+    assert "ui.knowledge.node_detail.misconceptions" in static_source
+    assert "ui.knowledge.node_detail.empty" in static_source
+    assert en_i18n["ui.knowledge.node_detail.why"] == "Why connected"
+    assert zh_i18n["ui.knowledge.node_detail.why"] == "关联原因"
+    assert zh_i18n["ui.knowledge.node_detail.empty"]
+    assert "knowledgeSubjectLabel(subjectValueFromNode(node))" in static_source
+    assert "subjectLabel(props, currentNode.subject)" in surface_source
+
+
+def test_study_knowledge_graph_index_builds_lookup_maps_and_edges() -> None:
+    topics = _read_static_knowledge_seed_payload()["topics"]
+
+    index = KnowledgeGraphIndex(topics)
+
+    assert "college_derivative_calculation" in index.by_id
+    assert "math" in index.subject_to_ids
+    assert "college" in index.stage_to_ids
+    assert index.relation_counts["procedure_step"] >= 90
+    assert index.relation_counts["application"] >= 130
+    matches = index.match(
+        query="\u5bfc\u6570\u600e\u4e48\u7528\u6765\u6c42\u6781\u503c\uff1f",
+        limit=3,
+    )
+    assert matches
+    assert matches[0]["id"] in {
+        "senior_derivative_extrema",
+        "college_monotonic_extrema",
+        "college_stationary_points",
+        "college_extreme_value_points",
+    }
+
+
+def test_study_knowledge_relevant_subgraph_respects_budget_and_relation_limits() -> None:
+    topics = _read_static_knowledge_seed_payload()["topics"]
+    budget = SubgraphBudget(
+        focus_topics=2,
+        max_depth=2,
+        max_nodes=12,
+        max_edges=10,
+        relation_limits={
+            "prerequisite": 2,
+            "procedure_step": 3,
+            "confusable": 2,
+            "application": 2,
+            "extends": 1,
+            "co_occurs": 1,
+        },
+    )
+
+    subgraph = build_relevant_subgraph(
+        topics,
+        query="\u5bfc\u6570\u600e\u4e48\u7528\u6765\u6c42\u6781\u503c\uff1f",
+        budget=budget,
+    )
+
+    assert subgraph["summary"]["matched"] is True
+    assert subgraph["summary"]["raw_seed_included"] is False
+    assert subgraph["summary"]["node_count"] <= 12
+    assert subgraph["summary"]["edge_count"] <= 10
+    assert len(subgraph["focus_topics"]) <= 2
+    for relation, limit in budget.relation_limits.items():
+        assert len(subgraph["relation_groups"][relation]["items"]) <= limit
+    assert any(
+        edge["relation"] in {"procedure_step", "application", "confusable", "prerequisite"}
+        for edge in subgraph["edges"]
+    )
+
+
+def test_study_knowledge_compressed_subgraph_payload_omits_raw_seed_topics() -> None:
+    topics = _read_static_knowledge_seed_payload()["topics"]
+    subgraph = build_relevant_subgraph(
+        KnowledgeGraphIndex(topics),
+        query="\u5bfc\u6570\u600e\u4e48\u7528\u6765\u6c42\u6781\u503c\uff1f",
+        budget=SubgraphBudget(max_nodes=20, max_edges=30),
+    )
+
+    compressed = compress_subgraph_payload(subgraph)
+
+    assert compressed["summary"]["raw_seed_included"] is False
+    assert "topics" not in compressed
+    assert "nodes" not in compressed
+    assert "edges" not in compressed
+    assert compressed["focus"]["id"]
+    assert compressed["procedure"] or compressed["applications"]
+    assert compressed["confusions"] or compressed["prerequisites"]
+    assert compressed["summary"]["node_count"] <= 20
+    assert compressed["summary"]["edge_count"] <= 30
+
+
+def test_study_knowledge_guidance_includes_budgeted_model_context() -> None:
+    topics = _read_static_knowledge_seed_payload()["topics"]
+
+    payload = build_knowledge_guidance_payload(
+        topics=topics,
+        topic_id="college_stationary_points",
+        query="\u5bfc\u6570\u4e3a0\u4e3a\u4ec0\u4e48\u4e0d\u4e00\u5b9a\u662f\u6781\u503c\u70b9\uff1f",
+    )
+
+    subgraph = payload["relevant_subgraph"]
+    model_context = payload["model_context"]
+    assert payload["summary"]["raw_seed_included"] is False
+    assert subgraph["summary"]["raw_seed_included"] is False
+    assert subgraph["summary"]["node_count"] <= 20
+    assert subgraph["summary"]["edge_count"] <= 30
+    assert payload["summary"]["subgraph_node_count"] == subgraph["summary"]["node_count"]
+    assert payload["summary"]["subgraph_edge_count"] == subgraph["summary"]["edge_count"]
+    assert model_context["summary"]["raw_seed_included"] is False
+    assert "topics" not in model_context
+    assert "nodes" not in model_context
+    assert "edges" not in model_context
+    assert model_context["focus"]["id"] == "college_stationary_points"
+    assert model_context["confusions"] or model_context["prerequisites"]
+    assert model_context["procedure"] or model_context["applications"]
+
+
+def test_study_knowledge_guidance_real_seed_explains_stationary_point_confusion() -> None:
+    seed_root = Path("plugin/plugins/study_companion/static")
+    manifest = json.loads((seed_root / "knowledge_graph_seed.json").read_text(encoding="utf-8"))
+    topics = []
+    for item in manifest["files"]:
+        payload = json.loads((seed_root / item["path"]).read_text(encoding="utf-8"))
+        topics.extend(payload.get("topics", []))
+
+    payload = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u5bfc\u6570\u4e3a0\u4e3a\u4ec0\u4e48\u4e0d\u662f\u6781\u503c\u70b9",
+    )
+
+    assert payload["topic"]["id"] == "college_stationary_points"
+    confusion_targets = {edge["to"] for edge in payload["confusions"]}
+    next_targets = {edge["to"] for edge in payload["next_practice_topics"]}
+    assert "college_monotonic_extrema" in confusion_targets
+    assert {
+        "college_monotonic_extrema",
+        "college_second_derivative_test",
+    }.issubset(next_targets)
+    diagnosis = payload["diagnosis_questions"]
+    assert any(
+        item["kind"] == "procedure_probe"
+        and item["topic_id"] == "college_monotonic_extrema"
+        for item in diagnosis
+    )
+
+
+def test_study_knowledge_guidance_real_seed_covers_integral_application_and_confusions() -> None:
+    seed_root = Path("plugin/plugins/study_companion/static")
+    manifest = json.loads((seed_root / "knowledge_graph_seed.json").read_text(encoding="utf-8"))
+    topics = []
+    for item in manifest["files"]:
+        payload = json.loads((seed_root / item["path"]).read_text(encoding="utf-8"))
+        topics.extend(payload.get("topics", []))
+
+    application = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u6211\u4e0d\u4f1a\u5b9a\u79ef\u5206\u5e94\u7528",
+    )
+
+    assert application["topic"]["id"] == "college_integral_application"
+    prerequisite_targets = {edge["from"] for edge in application["learning_path"]}
+    application_targets = {edge["to"] for edge in application["applications"]}
+    assert "college_definite_integral" in prerequisite_targets
+    assert {
+        "college_integral_area_problem",
+        "college_integral_volume_problem",
+    }.issubset(application_targets)
+    assert any(
+        item["kind"] == "prerequisite_probe"
+        and item["topic_id"] == "college_definite_integral"
+        for item in application["diagnosis_questions"]
+    )
+
+    confusion = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u4e0d\u5b9a\u79ef\u5206\u548c\u5b9a\u79ef\u5206\u6709\u4ec0\u4e48\u533a\u522b",
+    )
+
+    assert confusion["topic"]["id"] in {
+        "college_indefinite_integral",
+        "college_definite_integral",
+    }
+    confusion_targets = {
+        edge["to"] if edge["from"] == confusion["topic"]["id"] else edge["from"]
+        for edge in confusion["confusions"]
+    }
+    assert {
+        "college_indefinite_integral",
+        "college_definite_integral",
+    } - {confusion["topic"]["id"]} <= confusion_targets
+    assert any(
+        item["kind"] == "prerequisite_probe"
+        and item["topic_id"]
+        in {
+            "college_indefinite_integral",
+            "college_definite_integral",
+        }
+        - {confusion["topic"]["id"]}
+        for item in confusion["diagnosis_questions"]
+    )
+
+    substitution = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u6362\u5143\u79ef\u5206\u4ec0\u4e48\u65f6\u5019\u7528",
+    )
+
+    assert substitution["topic"]["id"] == "college_substitution_integration"
+    assert "college_indefinite_integral" in {
+        edge["from"] for edge in substitution["learning_path"]
+    }
+
+
+def test_study_knowledge_guidance_real_seed_covers_eigenvalue_procedure() -> None:
+    seed_root = Path("plugin/plugins/study_companion/static")
+    manifest = json.loads((seed_root / "knowledge_graph_seed.json").read_text(encoding="utf-8"))
+    topics = []
+    for item in manifest["files"]:
+        payload = json.loads((seed_root / item["path"]).read_text(encoding="utf-8"))
+        topics.extend(payload.get("topics", []))
+
+    payload = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u4e3a\u4ec0\u4e48\u8981\u6c42 det(A-\u03bbI)=0",
+    )
+
+    assert payload["topic"]["id"] == "college_characteristic_polynomial"
+    prerequisite_targets = {edge["from"] for edge in payload["learning_path"]}
+    application_targets = {edge["to"] for edge in payload["applications"]}
+    assert "college_determinant" in prerequisite_targets
+    assert "college_eigenvalue" in application_targets
+    assert any(
+        item["kind"] == "prerequisite_probe"
+        and item["topic_id"] == "college_determinant"
+        for item in payload["diagnosis_questions"]
+    )
+
+    overview = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u7279\u5f81\u503c\u600e\u4e48\u5b66",
+    )
+
+    assert overview["topic"]["id"] == "college_eigenvalue"
+    assert "college_diagonalization" in {
+        edge["to"] for edge in overview["applications"]
+    }
+    assert "college_characteristic_polynomial" in {
+        edge["from"] for edge in overview["learning_path"]
+    }
+
+    diagonalization = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u4ec0\u4e48\u65f6\u5019\u77e9\u9635\u53ef\u4ee5\u5bf9\u89d2\u5316",
+    )
+
+    assert diagonalization["topic"]["id"] == "college_diagonalization"
+    assert {
+        "college_eigenvalue",
+        "college_linear_independence",
+    }.issubset({edge["from"] for edge in diagonalization["learning_path"]})
+    assert any(
+        item["kind"] == "prerequisite_probe"
+        and item["topic_id"] == "college_eigenvalue"
+        for item in diagonalization["diagnosis_questions"]
+    )
+
+    eigenvector = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u7279\u5f81\u503c\u548c\u7279\u5f81\u5411\u91cf\u6709\u4ec0\u4e48\u5173\u7cfb",
+    )
+
+    assert eigenvector["topic"]["id"] == "college_eigenvalue"
+
+    singular_value = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u7279\u5f81\u503c\u548c\u5947\u5f02\u503c\u6709\u4ec0\u4e48\u533a\u522b",
+    )
+
+    assert singular_value["topic"]["id"] in {
+        "college_eigenvalue",
+        "college_singular_value",
+    }
+    assert {
+        "college_eigenvalue",
+        "college_singular_value",
+    } - {singular_value["topic"]["id"]} <= {
+        edge["to"] if edge["from"] == singular_value["topic"]["id"] else edge["from"]
+        for edge in singular_value["confusions"]
+    }
+
+    vector = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u7279\u5f81\u5411\u91cf\u548c\u666e\u901a\u5411\u91cf\u6709\u4ec0\u4e48\u533a\u522b",
+    )
+
+    assert vector["topic"]["id"] in {
+        "college_eigenvalue",
+        "college_regular_vector",
+    }
+    assert {
+        "college_eigenvalue",
+        "college_regular_vector",
+    } - {vector["topic"]["id"]} <= {
+        edge["to"] if edge["from"] == vector["topic"]["id"] else edge["from"]
+        for edge in vector["confusions"]
+    }
+
+
+def test_study_knowledge_guidance_real_seed_covers_probability_confusions() -> None:
+    seed_root = Path("plugin/plugins/study_companion/static")
+    manifest = json.loads((seed_root / "knowledge_graph_seed.json").read_text(encoding="utf-8"))
+    topics = []
+    for item in manifest["files"]:
+        payload = json.loads((seed_root / item["path"]).read_text(encoding="utf-8"))
+        topics.extend(payload.get("topics", []))
+
+    independent = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u72ec\u7acb\u548c\u4e92\u65a5\u6709\u4ec0\u4e48\u533a\u522b",
+    )
+
+    assert independent["topic"]["id"] in {
+        "college_conditional_probability",
+        "college_mutually_exclusive_events",
+    }
+    independent_confusions = {
+        edge["to"] if edge["from"] == independent["topic"]["id"] else edge["from"]
+        for edge in independent["confusions"]
+    }
+    assert {
+        "college_conditional_probability",
+        "college_mutually_exclusive_events",
+    } - {independent["topic"]["id"]} <= independent_confusions
+
+    variance = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u65b9\u5dee\u4e3a\u4ec0\u4e48\u8981\u5e73\u65b9",
+    )
+
+    assert variance["topic"]["id"] == "college_expectation_variance"
+    variance_confusions = {
+        edge["to"] if edge["from"] == variance["topic"]["id"] else edge["from"]
+        for edge in variance["confusions"]
+    }
+    assert "college_standard_deviation" in variance_confusions
+    assert any(
+        item["kind"] == "procedure_probe" and item["topic_id"] == "variance"
+        for item in variance["diagnosis_questions"]
+    )
+
+    expectation = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u671f\u671b\u65b9\u5dee\u4e0d\u4f1a",
+    )
+
+    assert expectation["topic"]["id"] == "college_expectation_variance"
+
+    mean = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u671f\u671b\u548c\u5e73\u5747\u503c\u6709\u4ec0\u4e48\u533a\u522b",
+    )
+
+    assert mean["topic"]["id"] in {
+        "college_expectation_variance",
+        "college_sample_mean",
+    }
+    assert {
+        "college_expectation_variance",
+        "college_sample_mean",
+    } - {mean["topic"]["id"]} <= {
+        edge["to"] if edge["from"] == mean["topic"]["id"] else edge["from"]
+        for edge in mean["confusions"]
+    }
+
+    inference = build_knowledge_guidance_payload(
+        topics=topics,
+        query="\u7f6e\u4fe1\u533a\u95f4\u548c\u5047\u8bbe\u68c0\u9a8c\u6709\u4ec0\u4e48\u5173\u7cfb",
+    )
+
+    assert inference["topic"]["id"] in {
+        "college_confidence_interval",
+        "college_hypothesis_testing",
+    }
+    assert {
+        "college_confidence_interval",
+        "college_hypothesis_testing",
+    } - {inference["topic"]["id"]} <= {
+        edge["to"] if edge["from"] == inference["topic"]["id"] else edge["from"]
+        for edge in [*inference["confusions"], *inference["next_practice_topics"]]
+    }
+
+
+def test_study_knowledge_seed_contains_college_graph_template_edges() -> None:
+    seed_root = Path("plugin/plugins/study_companion/static")
+    manifest = json.loads((seed_root / "knowledge_graph_seed.json").read_text(encoding="utf-8"))
+    topics = []
+    for item in manifest["files"]:
+        payload = json.loads((seed_root / item["path"]).read_text(encoding="utf-8"))
+        topics.extend(payload.get("topics", []))
+    by_id = {topic["id"]: topic for topic in topics}
+
+    required_topic_ids = {
+        "college_derivative_existence",
+        "college_derivative_rules",
+        "college_chain_rule",
+        "college_tangent_line_equation",
+        "college_convavity_inflection",
+        "college_antiderivative",
+        "college_rational_function_integration",
+        "college_definite_integral_properties",
+        "college_variable_upper_limit_integral",
+        "college_linear_transformation",
+        "college_similar_matrix",
+        "college_binomial_distribution",
+        "college_normal_distribution",
+    }
+    assert required_topic_ids <= set(by_id)
+
+    def has_edge(source_id: str, target_id: str, relation: str) -> bool:
+        for topic in topics:
+            topic_id = topic["id"]
+            for edge in topic.get("prerequisites") or []:
+                if not isinstance(edge, dict):
+                    continue
+                if (
+                    edge.get("id") == source_id
+                    and topic_id == target_id
+                    and edge.get("relation") == relation
+                ):
+                    return True
+            for edge in topic.get("related") or []:
+                if not isinstance(edge, dict):
+                    continue
+                if (
+                    topic_id == source_id
+                    and edge.get("id") == target_id
+                    and edge.get("relation") == relation
+                ):
+                    return True
+        return False
+
+    assert has_edge("college_continuity", "college_derivative_existence", "prerequisite")
+    assert has_edge("college_derivative_definition", "college_derivative_rules", "prerequisite")
+    assert has_edge("college_derivative_rules", "college_chain_rule", "prerequisite")
+    assert has_edge("college_derivative_calculation", "college_tangent_line_equation", "application")
+    assert has_edge("college_second_derivative_test", "college_convavity_inflection", "application")
+    assert has_edge("college_antiderivative", "college_indefinite_integral", "confusable")
+    assert has_edge("college_limit_concept", "college_function_value", "confusable")
+    assert has_edge("college_continuity", "college_derivative_existence", "confusable")
+    assert has_edge("college_stationary_points", "college_extreme_value_points", "confusable")
+    assert has_edge("college_eigenvalue", "college_singular_value", "confusable")
+    assert has_edge("college_rank", "college_basis_dimension", "confusable")
+    assert has_edge("college_permutation", "college_combination", "confusable")
+    assert has_edge("college_definite_integral", "college_definite_integral_properties", "supports")
+    assert has_edge("college_newton_leibniz", "college_variable_upper_limit_integral", "procedure_step")
+    assert has_edge("college_derivative_calculation", "college_critical_points", "procedure_step")
+    assert has_edge("college_critical_points", "college_stationary_points", "procedure_step")
+    assert has_edge("college_stationary_points", "college_second_derivative_test", "procedure_step")
+    assert has_edge("college_integral_application_interval", "college_integral_application_integrand", "procedure_step")
+    assert has_edge("college_characteristic_matrix", "college_determinant", "procedure_step")
+    assert has_edge("college_determinant", "college_characteristic_polynomial", "procedure_step")
+    assert has_edge("college_null_hypothesis", "college_test_statistic", "procedure_step")
+    assert has_edge("college_matrix_operations", "college_linear_transformation", "supports")
+    assert has_edge("college_similar_matrix", "college_diagonalization", "prerequisite")
+    assert has_edge("college_eigenvalue", "college_diagonalization", "application")
+    assert has_edge("college_eigenvalue", "college_quadratic_form", "application")
+    assert has_edge("college_binomial_distribution", "college_expectation_variance", "application")
+    assert has_edge("college_normal_distribution", "college_confidence_interval", "application")
+    assert has_edge("college_graph_theory_intro", "college_graph_shortest_path", "application")
+    assert has_edge("college_derivative_calculation", "college_physics_kinematics_calculus", "application")
+    assert has_edge("college_definite_integral", "college_physics_work_energy_theorem", "application")
+    assert has_edge("college_graph_theory_intro", "college_ds_shortest_path", "application")
+    assert has_edge("college_matrix_operations", "college_c_2d_array_matrix", "application")
+    assert has_edge("college_expectation_variance", "bio_senior_genetics_law", "application")
+    assert has_edge("senior_exponential_function", "chem_senior_ph_ionization", "application")
+
+
+@pytest.mark.asyncio
+async def test_study_knowledge_guidance_entry_uses_store_topics(tmp_path: Path) -> None:
+    store = StudyStore(tmp_path / "study.db", tmp_path / "seed.json", _Logger())
+    store.open()
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    plugin._store = store
+
+    try:
+        store.upsert_topic(
+            {
+                "id": "derivative",
+                "name": "导数",
+                "subject": "math",
+                "chapter": "微积分",
+                "stage": "college",
+                "unit": "导数",
+                "course_family": "calculus",
+                "related": [
+                    {
+                        "id": "extreme_points",
+                        "relation": "application",
+                        "reason": "导数用于定位极值候选点。",
+                    }
+                ],
+            }
+        )
+        store.upsert_topic(
+            {
+                "id": "extreme_points",
+                "name": "求极值点",
+                "subject": "math",
+                "chapter": "微积分",
+                "stage": "college",
+                "unit": "导数应用",
+                "course_family": "calculus",
+                "prerequisites": [
+                    {
+                        "id": "derivative",
+                        "relation": "prerequisite",
+                        "reason": "先会求导再判断极值。",
+                    }
+                ],
+            }
+        )
+        store.upsert_topic(
+            {
+                "id": "physics_power_extreme",
+                "name": "Power extreme value",
+                "subject": "physics",
+                "chapter": "Electricity",
+                "stage": "college",
+                "unit": "Circuits",
+                "course_family": "physics",
+            }
+        )
+
+        result = await plugin.study_knowledge_guidance(
+            query="求极值点",
+            stage="college",
+            course_family="calculus",
+        )
+
+        assert isinstance(result, Ok)
+        assert result.value["topic"]["id"] == "extreme_points"
+        assert result.value["topic"]["course_family"] == "calculus"
+        assert result.value["learning_path"][0]["from"] == "derivative"
+        assert result.value["diagnosis_questions"][0]["kind"] == "prerequisite_probe"
+        assert result.value["summary"]["topic_count"] == 2
+        assert result.value["summary"]["learning_path_count"] == 1
+    finally:
+        store.close()
 
 
 def test_study_knowledge_map_weak_topic_count_matches_visible_nodes() -> None:
@@ -1911,9 +5419,12 @@ def test_study_companion_i18n_bundles_are_present() -> None:
         assert "status.mode.teaching" in bundle
         assert "ui.status.mode_switching" in bundle
         assert "ui.error.mode_switch_failed" in bundle
+        assert "docs.onboarding.title" in bundle
         assert "entries.knowledge_map.name" in bundle
         assert "entries.set_knowledge_contribution_opt_in.name" in bundle
         assert "entries.export_notes.name" in bundle
+        assert "ui.profile.stage.cross_stage" in bundle
+        assert "qwen" not in bundle["ui.error.llm_model_not_supported"].casefold()
 
     en_bundle = json.loads(
         (plugin_dir / "i18n" / "en.json").read_text(encoding="utf-8")
@@ -1924,6 +5435,10 @@ def test_study_companion_i18n_bundles_are_present() -> None:
         bundle = bundles[locale]
         assert any(bundle[key] != en_bundle[key] for key in phase3_keys)
     assert bundles["ja"]["entries.open_ui.name"] != en_bundle["entries.open_ui.name"]
+    assert bundles["zh-CN"]["ui.profile.stage.cross_stage"] == "跨学段"
+    assert bundles["en"]["ui.profile.stage.cross_stage"] == "Cross-stage"
+    assert bundles["zh-CN"]["docs.onboarding.title"] == "猫娘伴学入门"
+    assert bundles["en"]["docs.onboarding.title"] == "Study Companion Onboarding"
     assert (
         bundles["ja"]["entries.download_rapidocr_models.description"]
         != en_bundle["entries.download_rapidocr_models.description"]
@@ -1939,30 +5454,86 @@ def test_study_companion_i18n_bundles_are_present() -> None:
         "plugin_ui": plugin_ui,
         "i18n": config["plugin"]["i18n"],
     }
-    surfaces, warnings = _build_surfaces_sync("study_companion", meta)
+    surfaces, warnings = _build_surfaces_sync("study_companion", meta, locale="en")
+    zh_surfaces, zh_warnings = _build_surfaces_sync(
+        "study_companion",
+        meta,
+        locale="zh-CN",
+    )
+    actions = _build_plugin_list_actions_from_meta("study_companion", meta)
     assert warnings == []
-    assert any(
-        surface["id"] == "study-panel" and surface["available"] is True
+    assert zh_warnings == []
+    assert plugin_ui["expose_legacy_static_panel"] is False
+    assert not any(surface["kind"] == "panel" for surface in surfaces)
+    onboarding_surface = next(
+        surface
         for surface in surfaces
+        if surface["id"] == "onboarding" and surface["kind"] == "docs"
     )
-    study_panel_surface = next(
-        surface for surface in surfaces if surface["id"] == "study-panel"
+    zh_onboarding_surface = next(
+        surface
+        for surface in zh_surfaces
+        if surface["id"] == "onboarding" and surface["kind"] == "docs"
     )
-    assert "action:call" in study_panel_surface["permissions"]
-    assert any(
-        surface["id"] == "knowledge-map" and surface["available"] is True
-        for surface in surfaces
+    assert onboarding_surface["available"] is True
+    assert onboarding_surface["title"] == bundles["en"]["docs.onboarding.title"]
+    assert zh_onboarding_surface["available"] is True
+    assert zh_onboarding_surface["title"] == bundles["zh-CN"]["docs.onboarding.title"]
+    assert actions == [
+        {
+            "id": "open_ui",
+            "kind": "ui",
+            "target": "/plugin/study_companion/ui/",
+            "open_in": "new_tab",
+        },
+        {
+            "id": "open_guide",
+            "kind": "route",
+            "target": "/plugins/study_companion?tab=guide",
+        },
+    ]
+    zh_doc_path, zh_doc_locale = resolve_localized_surface_entry_path(
+        meta,
+        "onboarding.md",
+        "zh-CN",
     )
-    assert any(
-        surface["id"] == "knowledge-contribution-settings"
-        and surface["available"] is True
-        for surface in surfaces
+    en_doc_path, en_doc_locale = resolve_localized_surface_entry_path(
+        meta,
+        "onboarding.md",
+        "en",
     )
-    assert any(
-        surface["id"] == "note-exporter" and surface["available"] is True
-        for surface in surfaces
+    zh_tw_doc_path, zh_tw_doc_locale = resolve_localized_surface_entry_path(
+        meta,
+        "onboarding.md",
+        "zh-TW",
     )
-    assert not any(surface["id"] == "quickstart" for surface in surfaces)
+    pt_doc_path, pt_doc_locale = resolve_localized_surface_entry_path(
+        meta,
+        "onboarding.md",
+        "pt",
+    )
+    ru_doc_path, ru_doc_locale = resolve_localized_surface_entry_path(
+        meta,
+        "onboarding.md",
+        "ru",
+    )
+    assert zh_doc_path == plugin_dir / "onboarding.md"
+    assert zh_doc_locale is None
+    assert en_doc_path == plugin_dir / "onboarding.en.md"
+    assert en_doc_locale == "en"
+    assert zh_tw_doc_path == plugin_dir / "onboarding.zh-TW.md"
+    assert zh_tw_doc_locale == "zh-TW"
+    assert pt_doc_path == plugin_dir / "onboarding.en.md"
+    assert pt_doc_locale == "en"
+    assert ru_doc_path == plugin_dir / "onboarding.en.md"
+    assert ru_doc_locale == "en"
+    for doc_path in [zh_doc_path, en_doc_path, zh_tw_doc_path]:
+        assert doc_path is not None
+        doc_text = doc_path.read_text(encoding="utf-8").lstrip()
+        assert not doc_text.startswith("# ")
+    assert "选择学习模式" in zh_doc_path.read_text(encoding="utf-8")
+    assert "Choose A Mode" in en_doc_path.read_text(encoding="utf-8")
+    assert "選擇學習模式" in zh_tw_doc_path.read_text(encoding="utf-8")
 
     index_html = (plugin_dir / "static" / "index.html").read_text(encoding="utf-8")
     main_js = (plugin_dir / "static" / "main.js").read_text(encoding="utf-8")
@@ -1978,11 +5549,10 @@ def test_study_companion_ui7_surfaces_use_brand_css_and_quickstart_is_removed() 
 
     with (plugin_dir / "plugin.toml").open("rb") as handle:
         config = tomllib.load(handle)
-    panel_ids = {surface["id"] for surface in config["plugin"]["ui"]["panel"]}
-    assert "quickstart" not in panel_ids
+    panel_ids = {surface["id"] for surface in config["plugin"]["ui"].get("panel", [])}
+    assert panel_ids == set()
+    assert config["plugin"]["ui"]["expose_legacy_static_panel"] is False
     assert not config["plugin"]["ui"].get("guide")
-    assert "study-panel" in panel_ids
-    assert "memory-deck-list" in panel_ids
 
     quickstart_path = plugin_dir / "surfaces" / "quickstart.tsx"
     assert quickstart_path.exists()
@@ -2057,7 +5627,7 @@ def test_study_companion_ui_refactor_static_and_hosted_contracts() -> None:
     assert "@media (prefers-reduced-motion: reduce)" in style_css
     assert "clip-path: inset(50%);" in style_css
 
-    assert "const modeSwitch = document.getElementById('modeSwitch');" in main_js
+    assert "const modeSwitch = $id('modeSwitch');" in main_js
     assert "function updateModeIndicator()" in main_js
     assert "modeSwitch.dataset.active = currentMode" in main_js
     assert "modeSwitch.offsetParent === null" in main_js
@@ -2102,11 +5672,19 @@ def test_study_companion_ui_refactor_static_and_hosted_contracts() -> None:
     assert "openSurface" in plugin_ui_frame
     assert "payload.pluginId.trim()" in plugin_ui_frame
     assert "payload.kind.trim()" in plugin_ui_frame
-    assert "sendStudySurfaceMessage" in plugin_ui_frame
-    assert '@open-surface="openHostedSurfaceFromStaticUi"' in plugin_detail
+    assert "sendSurfaceMessage" in plugin_ui_frame
+    assert "pendingSurfaceMessages" in plugin_ui_frame
+    assert "flushSurfaceMessages()" in plugin_ui_frame
+    assert "iframeGeneration" in plugin_ui_frame
+    assert "isCurrentIframeEvent" in plugin_ui_frame
     assert '@message="relayHostedSurfaceMessageToStaticUi"' in plugin_detail
-    assert "studySurfaceRelayMessageTypes" in plugin_detail
-    assert "staticUiFrameRef.value?.sendStudySurfaceMessage(data)" in plugin_detail
+    assert "studySurfaceRelayMessageTypes" not in plugin_detail
+    assert "panelSurfaceFrameRefs.get(surface.id)?.sendSurfaceMessage(data)" in plugin_detail
+    assert "PluginUIFrame" not in plugin_detail
+    assert "needsLegacyStaticUiRelay" not in plugin_detail
+    assert "const displayedPanelSurfaces = computed(() => renderablePanelSurfaces.value)" in plugin_detail
+    assert "const defaultPanelSurface = computed(() =>" in plugin_detail
+    assert "availableDeclaredPanelSurfaces.value.find((surface) => surface.mode === 'hosted-tsx')" in plugin_detail
     assert "const preferGuide = payload.kind === 'guide' || payload.kind === 'docs'" in plugin_detail
     assert "activeGuideSurfaceId.value = guide.id" in plugin_detail
     assert "surface: activeSurfaceId" in plugin_detail
@@ -2134,7 +5712,11 @@ const staticDir = process.env.STUDY_COMPANION_STATIC_DIR;
 const i18nDir = process.env.STUDY_COMPANION_I18N_DIR;
 const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
 const mainJs = fs.readFileSync(path.join(staticDir, 'main.js'), 'utf8');
+const requestUtilsJs = fs.readFileSync(path.join(staticDir, 'request-utils.js'), 'utf8');
+const documentControllerJs = fs.readFileSync(path.join(staticDir, 'document-controller.js'), 'utf8');
+const outcomeFormattersJs = fs.readFileSync(path.join(staticDir, 'outcome-formatters.js'), 'utf8');
 const surfacePanelsJs = fs.readFileSync(path.join(staticDir, 'surface-panels.js'), 'utf8');
+const knowledgeMapJs = fs.readFileSync(path.join(staticDir, 'knowledge-map.js'), 'utf8');
 const i18nJs = fs.readFileSync(path.join(staticDir, 'i18n.js'), 'utf8');
 const enBundle = JSON.parse(fs.readFileSync(path.join(i18nDir, 'en.json'), 'utf8'));
 
@@ -2203,7 +5785,10 @@ window.fetch = async (rawUrl, options = {}) => {
 
 window.eval(i18nJs);
 window.eval(surfacePanelsJs);
-window.eval(mainJs);
+window.eval(documentControllerJs);
+window.eval(outcomeFormattersJs);
+window.eval(requestUtilsJs);
+window.eval(`${knowledgeMapJs}\n${mainJs}`);
 
 async function waitFor(predicate, label) {
   const deadline = Date.now() + 3000;
@@ -2301,6 +5886,10 @@ const staticDir = process.env.STUDY_COMPANION_STATIC_DIR;
 const i18nDir = process.env.STUDY_COMPANION_I18N_DIR;
 const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
 const mainJs = fs.readFileSync(path.join(staticDir, 'main.js'), 'utf8');
+const requestUtilsJs = fs.readFileSync(path.join(staticDir, 'request-utils.js'), 'utf8');
+const documentControllerJs = fs.readFileSync(path.join(staticDir, 'document-controller.js'), 'utf8');
+const outcomeFormattersJs = fs.readFileSync(path.join(staticDir, 'outcome-formatters.js'), 'utf8');
+const knowledgeMapJs = fs.readFileSync(path.join(staticDir, 'knowledge-map.js'), 'utf8');
 const i18nJs = fs.readFileSync(path.join(staticDir, 'i18n.js'), 'utf8');
 const zhBundle = JSON.parse(fs.readFileSync(path.join(i18nDir, 'zh-CN.json'), 'utf8'));
 
@@ -2353,7 +5942,10 @@ window.fetch = async (rawUrl, options = {}) => {
 };
 
 window.eval(i18nJs);
-window.eval(mainJs);
+window.eval(documentControllerJs);
+window.eval(outcomeFormattersJs);
+window.eval(requestUtilsJs);
+window.eval(`${knowledgeMapJs}\n${mainJs}`);
 
 async function waitFor(predicate, label) {
   const deadline = Date.now() + 3000;
@@ -2529,7 +6121,11 @@ const staticDir = process.env.STUDY_COMPANION_STATIC_DIR;
 const i18nDir = process.env.STUDY_COMPANION_I18N_DIR;
 const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
 const mainJs = fs.readFileSync(path.join(staticDir, 'main.js'), 'utf8');
+const requestUtilsJs = fs.readFileSync(path.join(staticDir, 'request-utils.js'), 'utf8');
+const documentControllerJs = fs.readFileSync(path.join(staticDir, 'document-controller.js'), 'utf8');
+const outcomeFormattersJs = fs.readFileSync(path.join(staticDir, 'outcome-formatters.js'), 'utf8');
 const surfacePanelsJs = fs.readFileSync(path.join(staticDir, 'surface-panels.js'), 'utf8');
+const knowledgeMapJs = fs.readFileSync(path.join(staticDir, 'knowledge-map.js'), 'utf8');
 const i18nJs = fs.readFileSync(path.join(staticDir, 'i18n.js'), 'utf8');
 const enBundle = JSON.parse(fs.readFileSync(path.join(i18nDir, 'en.json'), 'utf8'));
 
@@ -2555,6 +6151,7 @@ let configPayload = {
     study: { default_mode: 'interactive', language: 'en', history_limit: 50, auto_open_ui: false },
     ocr_reader: { enabled: false, backend_selection: 'rapidocr', languages: 'eng' },
     llm: { llm_call_timeout_seconds: 45, llm_vision_enabled: false, llm_vision_max_image_px: 1024 },
+    doc_export: { enabled: false, pdf_backend: 'reportlab', default_style: 'compact', xmind_enabled: false },
   },
 };
 let statusPayload = {
@@ -2614,7 +6211,10 @@ window.fetch = async (rawUrl, options = {}) => {
 
 window.eval(i18nJs);
 window.eval(surfacePanelsJs);
-window.eval(mainJs);
+window.eval(documentControllerJs);
+window.eval(outcomeFormattersJs);
+window.eval(requestUtilsJs);
+window.eval(`${knowledgeMapJs}\n${mainJs}`);
 
 async function waitFor(predicate, label) {
   const deadline = Date.now() + 3000;
@@ -2704,11 +6304,19 @@ if (document.getElementById('settingsLlmTimeout').value !== '45') {
 if (document.getElementById('settingsLlmVisionEnabled').checked !== false) {
   throw new Error('LLM vision checkbox did not load from config');
 }
+const settingsDocExportEnabled = document.getElementById('settingsDocExportEnabled');
+if (!settingsDocExportEnabled) {
+  throw new Error('note export settings control is missing');
+}
+if (settingsDocExportEnabled.checked !== false) {
+  throw new Error('note export enabled checkbox did not load from config');
+}
 document.getElementById('settingsDefaultMode').value = 'teaching';
 document.getElementById('settingsOcrEnabled').checked = true;
 document.getElementById('settingsOcrLanguages').value = 'chi_sim+eng';
 document.getElementById('settingsLlmTimeout').value = '90';
 document.getElementById('settingsLlmVisionEnabled').checked = true;
+settingsDocExportEnabled.checked = true;
 document.getElementById('settingsSaveBtn').click();
 await waitFor(
   () => runEntries.some((entry) => entry.entry_id === 'study_update_settings_config'),
@@ -2723,6 +6331,10 @@ if (
   || savedConfig.llm.llm_call_timeout_seconds !== 90
   || savedConfig.llm.llm_vision_enabled !== true
   || savedConfig.llm.llm_vision_max_image_px !== 1024
+  || savedConfig.doc_export.enabled !== true
+  || savedConfig.doc_export.pdf_backend !== 'reportlab'
+  || savedConfig.doc_export.default_style !== 'compact'
+  || savedConfig.doc_export.xmind_enabled !== false
   || savedConfig.plugin.id !== 'study_companion'
 ) {
   throw new Error(`settings save payload mismatch: ${JSON.stringify(savedConfig)}`);
@@ -2731,6 +6343,9 @@ await waitFor(
   () => document.getElementById('settingsConfigStatus').textContent.includes('Saved'),
   'settings saved status',
 );
+if (!parentMessages.some((message) => message?.type === 'neko-plugin-context-invalidated')) {
+  throw new Error(`settings save did not invalidate hosted context: ${JSON.stringify(parentMessages)}`);
+}
 
 const memoryTab = document.getElementById('tab-memory');
 memoryTab.click();
@@ -2812,11 +6427,36 @@ await waitFor(
 
 document.querySelector('[data-feature-action="export"]').click();
 assertSurfaceDrawer('note-exporter');
+await waitFor(
+  () => !document.querySelector('#surfaceDrawerBody [data-surface-action="export-preview"]')?.disabled,
+  'export drawer availability',
+);
 document.querySelector('#surfaceDrawerBody [data-surface-action="export-preview"]').click();
 await waitFor(
   () => runEntries.some((entry) => entry.entry_id === 'study_export_notes' && entry.args.fmt),
   'export drawer preview',
 );
+
+const exportCallCountBeforeDisable = runEntries.filter((entry) => entry.entry_id === 'study_export_notes').length;
+settingsDocExportEnabled.checked = false;
+document.getElementById('settingsDataSaveBtn').click();
+await waitFor(
+  () => runEntries.filter((entry) => entry.entry_id === 'study_update_settings_config').length === 2,
+  'note export disabled from data settings',
+);
+const disabledConfig = runEntries.filter((entry) => entry.entry_id === 'study_update_settings_config')[1].args.config;
+if (disabledConfig.doc_export.enabled !== false) {
+  throw new Error(`note export disable payload mismatch: ${JSON.stringify(disabledConfig.doc_export)}`);
+}
+await waitFor(
+  () => document.querySelector('#surfaceDrawerBody [data-surface-action="export-preview"]')?.disabled === true,
+  'open export drawer disabled after settings save',
+);
+document.querySelector('#surfaceDrawerBody [data-surface-action="export-preview"]').click();
+await new Promise((resolve) => window.setTimeout(resolve, 0));
+if (runEntries.filter((entry) => entry.entry_id === 'study_export_notes').length !== exportCallCountBeforeDisable) {
+  throw new Error('disabled export drawer must not call study_export_notes');
+}
 
 const statusRunCountBeforeMessage = runEntries.filter((entry) => entry.entry_id === 'study_status').length;
 window.dispatchEvent(new window.MessageEvent('message', {
@@ -2857,20 +6497,95 @@ if (consoleErrors.length) {
     assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
+def test_study_companion_static_export_panel_blocks_disabled_entry() -> None:
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
+    frontend_dir = Path(__file__).resolve().parents[4] / "frontend" / "plugin-manager"
+    if not (frontend_dir / "node_modules" / "happy-dom").is_dir():
+        pytest.skip(
+            "frontend/plugin-manager node_modules with happy-dom is not installed"
+        )
+
+    script = r"""
+import { Window } from 'happy-dom';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const staticDir = process.env.STUDY_COMPANION_STATIC_DIR;
+const source = fs.readFileSync(path.join(staticDir, 'surface-panels.js'), 'utf8');
+const window = new Window({ url: 'http://testserver/plugin/study_companion/ui/' });
+const { document } = window;
+const calls = [];
+
+window.eval(source);
+const root = window.StudyCompanionSurfacePanels.render('note-exporter', {
+  t: (_key, fallback) => fallback,
+  label: () => 'Export',
+  callPlugin: async (entryId, args = {}) => {
+    calls.push({ entryId, args });
+    if (entryId === 'study_get_settings_config') {
+      return { config: { doc_export: { enabled: false, xmind_enabled: false } } };
+    }
+    throw new Error(`unexpected entry call: ${entryId}`);
+  },
+});
+document.body.appendChild(root);
+
+for (let attempt = 0; attempt < 20; attempt += 1) {
+  if (calls.some((call) => call.entryId === 'study_get_settings_config')) break;
+  await new Promise((resolve) => window.setTimeout(resolve, 0));
+}
+await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+const previewButton = root.querySelector('[data-surface-action="export-preview"]');
+const exportButton = root.querySelector('[data-surface-action="export-download"]');
+if (!previewButton?.disabled || !exportButton?.disabled) {
+  throw new Error('disabled export must keep preview and download unavailable');
+}
+previewButton.click();
+exportButton.click();
+await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+if (calls.some((call) => call.entryId === 'study_export_notes')) {
+  throw new Error('disabled export must not call study_export_notes');
+}
+if (!root.textContent.includes('Export is disabled by doc_export.enabled')) {
+  throw new Error(`disabled export status missing: ${root.textContent}`);
+}
+"""
+    env = {
+        **os.environ,
+        "STUDY_COMPANION_STATIC_DIR": str(plugin_dir / "static"),
+    }
+    completed = subprocess.run(
+        ["node", "--input-type=module", "-e", script],
+        cwd=frontend_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
 def test_study_companion_hosted_panel_uses_long_running_entry_poll_budget() -> None:
     plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
     source = (plugin_dir / "surfaces" / "study_panel.tsx").read_text(encoding="utf-8")
 
     assert "ENTRY_TIMEOUT_MS" in source
     assert "study_set_mode: 15000" in source
-    assert "study_explain_text: 310000" in source
-    assert "study_generate_question: 310000" in source
-    assert "study_evaluate_answer: 310000" in source
+    assert "study_explain_text: 120000" in source
+    assert "study_generate_question: 75000" in source
+    assert "study_generate_targeted_question: 60000" in source
+    assert "study_evaluate_answer: 75000" in source
+    assert "study_summarize_session: 90000" in source
     assert "callPlugin as callHostedPlugin" in source
-    assert (
-        "return callHostedPlugin<T>(api, entryId, args, { signal, timeoutMs: timeoutForEntry(entryId) });"
-        in source
-    )
+    assert "{ ...args, locale: String(locale || '').trim() }" in source
+    assert "{ signal, timeoutMs: timeoutForEntry(entryId) }" in source
+    assert "{ timeoutMs: STUDY_DOCUMENT_PARSE_TIMEOUT_MS, signal: controller.signal }" in source
     assert "fetch('/runs'" not in source
     assert "fetch(`/runs/" not in source
     assert "for (let i = 0; i < 40; i += 1)" not in source
@@ -2911,9 +6626,8 @@ def test_study_companion_hosted_surface_actions_are_bridge_authorized() -> None:
 
     with (plugin_dir / "plugin.toml").open("rb") as handle:
         config = tomllib.load(handle)
-    for surface in config["plugin"]["ui"]["panel"]:
-        assert surface["context"] == "study", surface["id"]
-        assert "action:call" in surface["permissions"], surface["id"]
+    assert config["plugin"]["ui"].get("panel", []) == []
+    assert config["plugin"]["ui"]["expose_legacy_static_panel"] is False
 
     for action_id in HOSTED_SURFACE_ACTION_IDS:
         assert re.search(
@@ -2926,7 +6640,8 @@ def test_study_companion_hosted_surface_actions_are_bridge_authorized() -> None:
         encoding="utf-8"
     )
     assert re.search(
-        r"@ui\.action\([^)]*\)\s+async def _study_export_notes_entry",
+        r"@ui\.action\([^)]*\)\s+@plugin_entry\([\s\S]*?\)\s+"
+        r"async def study_export_notes",
         export_source,
         re.MULTILINE,
     )
@@ -2972,7 +6687,8 @@ def test_study_companion_hosted_panel_supports_image_paste_contract() -> None:
     assert "study-panel__paste-error" in source
     assert "beginPasteSignal" in source
     assert "signal.aborted" in source
-    assert "onPaste={handleTextPaste}" in source
+    assert "onPaste={handleStudyPaste}" in source
+    assert "await handleTextPaste(event);" in source
     assert "onPaste={handleAnswerPaste}" in source
     assert "const [pastePending, setPastePending] = useState(false);" in source
     assert "pastePendingRef.current = value;" in source
@@ -3050,10 +6766,8 @@ def test_study_companion_static_ui_supports_image_paste_contract() -> None:
     assert "answerInput.addEventListener('paste', createImagePasteHandler({" in source
     assert "args.vision_image_base64 = studyInputImageValue;" in source
     assert "t('ui.status.solving_problem'" in source
-    assert (
-        "setReply(studyInputImageValue ? t('ui.status.solving_problem', 'Solving problem...') : t('ui.status.explaining', 'Explaining...'));"
-        in source
-    )
+    assert "const pending = studyInputImageValue" in source
+    assert "setReply(n ? `${n}\\n\\n${pending}` : pending);" in source
     assert "function scrollReplyIntoView()" in source
     assert "replyPanel.scrollIntoView({ block: 'start', behavior: 'smooth' });" in source
     assert "scrollReplyIntoView();" in source
@@ -3082,27 +6796,65 @@ def test_study_companion_explain_timeouts_cover_vision_solving() -> None:
         plugin_config = tomllib.load(handle)
     llm_timeout = float(plugin_config["llm"]["llm_call_timeout_seconds"])
 
-    assert "study_explain_text: 310000" in static_source
-    assert "study_generate_question: 310000" in static_source
-    assert "study_evaluate_answer: 310000" in static_source
-    assert "study_explain_text: 310000" in hosted_source
-    assert "study_generate_question: 310000" in hosted_source
-    assert "study_evaluate_answer: 310000" in hosted_source
-    assert "timeout=310.0" in explain_source
-    assert "timeout=310.0" in question_source
-    assert "timeout=310.0" in answer_source
-    assert submit_meta.timeout == 310.0
-    assert meta.timeout == 310.0
-    assert question_meta.timeout == 310.0
-    assert answer_meta.timeout == 310.0
-    assert "llm_call_timeout_seconds = 300" in plugin_toml
+    assert "study_explain_text: 120000" in static_source
+    assert "study_generate_question: 75000" in static_source
+    assert "study_evaluate_answer: 75000" in static_source
+    assert "study_explain_text: 120000" in hosted_source
+    assert "study_generate_question: 75000" in hosted_source
+    assert "study_evaluate_answer: 75000" in hosted_source
+    assert "timeout=105.0" in explain_source
+    assert "timeout=70.0" in question_source
+    assert "timeout=70.0" in answer_source
+    assert submit_meta.timeout == 105.0
+    assert meta.timeout == 105.0
+    assert question_meta.timeout == 70.0
+    assert answer_meta.timeout == 70.0
+    assert 120.0 > submit_meta.timeout
+    assert 120.0 > meta.timeout
+    assert "llm_call_timeout_seconds = 120" in plugin_toml
     for entry_timeout in (
         submit_meta.timeout,
         meta.timeout,
         question_meta.timeout,
         answer_meta.timeout,
     ):
-        assert entry_timeout > llm_timeout + 0.5
+        assert entry_timeout > 60.0
+    assert llm_timeout == 120.0
+
+
+def test_study_companion_static_knowledge_map_groups_by_base_library_hierarchy() -> None:
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
+    source = "\n".join(
+        (plugin_dir / "static" / name).read_text(encoding="utf-8")
+        for name in ("main.js", "knowledge-map.js")
+    )
+
+    assert "knowledge-subject-group" in source
+    assert "knowledgeMapSubject" in source
+    assert "renderKnowledgeSubjectSelector" in source
+    assert "KNOWLEDGE_SUBJECT_OPTIONS" in source
+    assert "'math'" in source
+    assert "'computer_science'" in source
+    assert "ui.knowledge.subject.${normalized}" in source
+    assert "study_knowledge_map', { limit: 1000 })" in source
+    assert "study_knowledge_map', { limit: 1000, subject:" not in source
+    assert "stage: normalizedStage" not in source
+    assert "const knownSubjects = KNOWLEDGE_SUBJECT_OPTIONS.filter((subject) => counts.has(subject));" in source
+    assert "knowledgeMapSubject = ''" in source
+    assert "ui.knowledge.subject_label" in source
+    assert "ui.knowledge.subject_all" in source
+    assert "visibleKnowledgeScopeNodes(nodes, activeStage, activeSubject)" in source
+    assert "visibleKnowledgeEdges(edges, shownNodes, activeStage)" in source
+    assert "knowledge-chapter-group" in source
+    assert "knowledge-unit-group" in source
+    assert "drawerElement('details', className)" in source
+    assert "knowledge-group-summary" in source
+    assert "knowledgeSubjectLabel(subject)} / ${subjectItems.length}" in source
+    assert "chapterGroups.size === 1 && chapterItems.length <= 12" in source
+    assert "unitGroups.size === 1 && unitItems.length <= 8" in source
+    assert "subjectValueFromNode(node)" in source
+    assert "valueLabel(node.chapter" in source
+    assert "valueLabel(node.unit" in source
 
 
 def test_study_companion_note_exporter_uses_backend_export_poll_budget() -> None:
@@ -3115,10 +6867,27 @@ def test_study_companion_note_exporter_uses_backend_export_poll_budget() -> None
     assert "return timeoutSeconds * 1000 + POLL_TIMEOUT_BUFFER_MS;" in source
     assert "pollTimeoutMs = getEntryTimeoutMs(exportEntry)" in source
     assert "{ timeoutMs: pollTimeoutMs }" in source
+    assert "exportConfig?.enabled !== true" in source
+    assert "value !== 'xmind' || xmindEnabled" in source
     assert "fetch('/runs'" not in source
     assert "fetch(`/runs/" not in source
     assert "for (let attempt = 0; attempt < 40; attempt += 1)" not in source
     assert "for (let i = 0; i < 40; i += 1)" not in source
+
+
+def test_study_companion_note_exporter_is_not_exposed_as_manager_panel() -> None:
+    import tomllib
+
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
+    manifest = tomllib.loads(
+        (plugin_dir / "plugin.toml").read_text(encoding="utf-8")
+    )
+
+    assert all(
+        panel["id"] != "note-exporter"
+        for panel in manifest["plugin"]["ui"].get("panel", [])
+    )
+    assert (plugin_dir / "surfaces" / "note_exporter.tsx").is_file()
 
 
 def test_study_companion_ui_export_failures_are_not_silent_successes() -> None:
@@ -3196,6 +6965,10 @@ const html = `<!doctype html><html><head><title>Study Companion</title></head><b
 
 const i18nJs = fs.readFileSync(process.env.STUDY_COMPANION_I18N_JS, 'utf8');
 const mainJs = fs.readFileSync(process.env.STUDY_COMPANION_STATIC_JS, 'utf8');
+const requestUtilsJs = fs.readFileSync(process.env.STUDY_COMPANION_REQUEST_UTILS_JS, 'utf8');
+const documentControllerJs = fs.readFileSync(process.env.STUDY_COMPANION_DOCUMENT_CONTROLLER_JS, 'utf8');
+const outcomeFormattersJs = fs.readFileSync(process.env.STUDY_COMPANION_OUTCOME_FORMATTERS_JS, 'utf8');
+const knowledgeMapJs = fs.readFileSync(process.env.STUDY_COMPANION_KNOWLEDGE_MAP_JS, 'utf8');
 const enBundle = JSON.parse(fs.readFileSync(path.join(process.env.STUDY_COMPANION_I18N_DIR, 'en.json'), 'utf8'));
 
 const window = new Window({ url: 'http://testserver/plugin/study_companion/ui/?locale=en' });
@@ -3256,7 +7029,10 @@ window.fetch = async (rawUrl, options = {}) => {
 };
 
 window.eval(i18nJs);
-window.eval(mainJs);
+window.eval(documentControllerJs);
+window.eval(outcomeFormattersJs);
+window.eval(requestUtilsJs);
+window.eval(`${knowledgeMapJs}\n${mainJs}`);
 
 async function waitFor(predicate, label) {
   const deadline = Date.now() + 3000;
@@ -3286,6 +7062,18 @@ if (document.querySelector('[data-mode="interactive"]').getAttribute('aria-press
     env = {
         **os.environ,
         "STUDY_COMPANION_STATIC_JS": str(plugin_dir / "static" / "main.js"),
+        "STUDY_COMPANION_REQUEST_UTILS_JS": str(
+            plugin_dir / "static" / "request-utils.js"
+        ),
+        "STUDY_COMPANION_DOCUMENT_CONTROLLER_JS": str(
+            plugin_dir / "static" / "document-controller.js"
+        ),
+        "STUDY_COMPANION_OUTCOME_FORMATTERS_JS": str(
+            plugin_dir / "static" / "outcome-formatters.js"
+        ),
+        "STUDY_COMPANION_KNOWLEDGE_MAP_JS": str(
+            plugin_dir / "static" / "knowledge-map.js"
+        ),
         "STUDY_COMPANION_I18N_JS": str(plugin_dir / "static" / "i18n.js"),
         "STUDY_COMPANION_I18N_DIR": str(plugin_dir / "i18n"),
     }
@@ -3418,10 +7206,23 @@ eval(source);
 
 
 def test_study_companion_i18n_scan_dom_localizes_alt_attributes() -> None:
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
+    locales = ["zh-CN", "en", "ja", "ko", "ru", "zh-TW", "es", "pt"]
+    bundles = {
+        locale: json.loads(
+            (plugin_dir / "i18n" / f"{locale}.json").read_text(encoding="utf-8")
+        )
+        for locale in locales
+    }
+    en_keys = set(bundles["en"])
+    assert "ui.coach.sprite_alt" not in en_keys
+    for locale, bundle in bundles.items():
+        assert set(bundle) == en_keys, f"{locale} locale keys differ from en"
+        assert "ui.coach.sprite_alt" not in bundle
+
     if shutil.which("node") is None:
         pytest.skip("node is not installed")
 
-    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
     script = r"""
 const fs = require('node:fs');
 const source = fs.readFileSync(process.env.STUDY_COMPANION_I18N_JS, 'utf8');
@@ -3446,8 +7247,8 @@ function element(attrs) {
 }
 
 const image = element({
-  'data-i18n-alt': 'ui.coach.sprite_alt',
-  alt: 'Neko study companion',
+  'data-i18n-alt': 'test.fixture.image_alt',
+  alt: 'Fixture image',
 });
 const root = {
   querySelectorAll(selector) {
@@ -3456,11 +7257,11 @@ const root = {
 };
 
 window.I18n._bundle = {
-  'ui.coach.sprite_alt': 'Localized companion alt',
+  'test.fixture.image_alt': 'Localized fixture alt',
 };
 window.I18n.scanDOM(root);
 
-if (image.getAttribute('alt') !== 'Localized companion alt') {
+if (image.getAttribute('alt') !== 'Localized fixture alt') {
   throw new Error(`unexpected alt: ${image.getAttribute('alt')}`);
 }
 """
@@ -4411,6 +8212,128 @@ async def test_targeted_question_context_generate_and_attempt_guard(
 
 
 @pytest.mark.asyncio
+async def test_targeted_question_rejects_scope_changed_during_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _BlockingQuestionAgent(_FakeTutorAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def question_generate(
+            self,
+            text: str,
+            *,
+            mode: str = MODE_COMPANION,
+            context: dict[str, object] | None = None,
+        ) -> TutorReply:
+            self.inputs.append((text, dict(context or {}), mode))
+            self.started.set()
+            await self.release.wait()
+            return TutorReply(
+                operation="question_generate",
+                input_text=text,
+                reply="stale practice question",
+                payload={
+                    "question": "What is d(x^2)/dx?",
+                    "answer": "2x",
+                    "topic": "derivatives",
+                },
+                created_at="2026-08-19T00:00:00Z",
+            )
+
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    plugin = StudyCompanionPlugin(
+        _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    )
+    assert isinstance(await plugin.startup(), Ok)
+    agent = _BlockingQuestionAgent()
+    plugin._agent = agent
+    release_finalize = asyncio.Event()
+
+    try:
+        plugin._store.ensure_topic(topic_id="derivatives", name="Derivatives")
+        targeted_context = plugin._store_targeted_context(
+            {
+                "selected_topic_id": "derivatives",
+                "selected_topic_name": "Derivatives",
+                "selection_reason": "weak_topic",
+                "question_params": {},
+                "scope_key": "",
+                "scope_revision": 0,
+                "practice_scope": {},
+                "scope_topic_count": 0,
+            }
+        )
+        generation = asyncio.create_task(
+            plugin.study_generate_targeted_question(
+                selection_context_id=targeted_context["selection_context_id"]
+            )
+        )
+        await agent.started.wait()
+        async with plugin._lock:
+            plugin._state.practice_scope_revision = 1
+        agent.release.set()
+
+        result = await generation
+
+        assert isinstance(result, Err)
+        assert result.error.code == "SELECTION_SCOPE_CHANGED"
+        assert plugin._state.current_question == {}
+        assert plugin._store.list_interactions(limit=20) == []
+
+        async with plugin._lock:
+            plugin._state.practice_scope_revision = 0
+        commit_race_context = plugin._store_targeted_context(
+            {
+                "selected_topic_id": "derivatives",
+                "selected_topic_name": "Derivatives",
+                "selection_reason": "weak_topic",
+                "question_params": {},
+                "scope_key": "",
+                "scope_revision": 0,
+                "practice_scope": {},
+                "scope_topic_count": 0,
+            }
+        )
+        original_finalize_tutor_call = plugin._finalize_tutor_call
+        finalize_started = asyncio.Event()
+
+        async def _pause_before_finalize(*args, **kwargs):
+            finalize_started.set()
+            await release_finalize.wait()
+            return await original_finalize_tutor_call(*args, **kwargs)
+
+        monkeypatch.setattr(plugin, "_finalize_tutor_call", _pause_before_finalize)
+        commit_race_generation = asyncio.create_task(
+            plugin.study_generate_targeted_question(
+                selection_context_id=commit_race_context["selection_context_id"]
+            )
+        )
+        await finalize_started.wait()
+        scope_change = asyncio.create_task(plugin.study_clear_practice_scope())
+        try:
+            await asyncio.wait_for(asyncio.shield(scope_change), timeout=0.2)
+            scope_changed_while_finalize_paused = True
+        except TimeoutError:
+            scope_changed_while_finalize_paused = False
+        release_finalize.set()
+
+        commit_race_result = await commit_race_generation
+        scope_change_result = await scope_change
+
+        assert scope_changed_while_finalize_paused is False
+        assert isinstance(commit_race_result, Ok)
+        assert isinstance(scope_change_result, Ok)
+        assert len(plugin._store.list_interactions(limit=20)) == 1
+    finally:
+        agent.release.set()
+        release_finalize.set()
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_study_explain_text_continues_when_mode_switch_is_locked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4513,6 +8436,562 @@ async def test_learning_context_builds_question_params_off_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_learning_context_includes_knowledge_graph_guidance_for_explain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+
+    try:
+        plugin._store.upsert_topic(
+            {
+                "id": "derivative",
+                "name": "\u5bfc\u6570",
+                "subject": "math",
+                "stage": "college",
+                "course_family": "calculus",
+                "related": [
+                    {
+                        "id": "extrema",
+                        "relation": "application",
+                        "reason": "\u5bfc\u6570\u7528\u4e8e\u5224\u65ad\u6781\u503c\u5019\u9009\u70b9\u3002",
+                    }
+                ],
+            }
+        )
+        plugin._store.upsert_topic(
+            {
+                "id": "extrema",
+                "name": "\u6c42\u6781\u503c\u70b9",
+                "subject": "math",
+                "stage": "college",
+                "course_family": "calculus",
+                "aliases": ["\u6781\u503c\u70b9\u5224\u65ad"],
+                "prerequisites": [
+                    {
+                        "id": "derivative",
+                        "relation": "prerequisite",
+                        "reason": "\u6c42\u6781\u503c\u70b9\u524d\u8981\u5148\u80fd\u6c42\u5bfc\u3002",
+                    }
+                ],
+            }
+        )
+
+        context = await plugin._build_learning_context(
+            "concept_explain",
+            input_text="\u6211\u4e0d\u4f1a\u6c42\u6781\u503c\u70b9",
+            extra={
+                "source_text": "\u6211\u4e0d\u4f1a\u6c42\u6781\u503c\u70b9",
+                "selected_topic_id": "extrema",
+            },
+        )
+
+        guidance = context["knowledge_guidance"]
+        assert guidance["topic"]["id"] == "extrema"
+        assert guidance["learning_path"][0]["from"] == "derivative"
+        assert guidance["diagnosis_questions"] == []
+        assert context["study_response_mode"] == "general_explanation"
+        assert context["study_semantic_status"] == "available"
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_non_concept_learning_context_uses_compact_knowledge_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+
+    try:
+        context = await plugin._build_learning_context(
+            "question_generate",
+            input_text="\u5bfc\u6570\u4e3a0\u4e3a\u4ec0\u4e48\u4e0d\u662f\u6781\u503c\u70b9",
+            extra={"selected_topic_id": "college_stationary_points"},
+        )
+
+        guidance = context["knowledge_guidance"]
+        assert guidance["focus"]["id"] == "college_stationary_points"
+        assert "relevant_subgraph" not in guidance
+        assert "diagnosis_questions" not in guidance
+        assert "learning_path" not in guidance
+
+        public_guidance = getattr(context, "public_knowledge_guidance")
+        assert public_guidance["topic"]["id"] == "college_stationary_points"
+        assert public_guidance["diagnosis_questions"]
+        assert "relevant_subgraph" in public_guidance
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_answer_prompt_uses_compact_guidance_but_public_payload_is_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    plugin._agent = fake_agent
+
+    try:
+        evaluated = await plugin.study_evaluate_answer(
+            question="\u5bfc\u6570\u4e3a0\u4e3a\u4ec0\u4e48\u4e0d\u662f\u6781\u503c\u70b9\uff1f",
+            expected_answer="\u8fd8\u8981\u68c0\u67e5\u5355\u8c03\u6027\u662f\u5426\u53d8\u5316\u3002",
+            answer="\u9700\u8981\u770b\u5355\u8c03\u6027\u53d8\u5316\u3002",
+            selected_topic_id="college_stationary_points",
+        )
+
+        assert isinstance(evaluated, Ok)
+        prompt_context = fake_agent.evaluations[-1][3]
+        prompt_guidance = prompt_context["knowledge_guidance"]
+        assert prompt_guidance["focus"]["id"] == "college_stationary_points"
+        assert "relevant_subgraph" not in prompt_guidance
+        assert "diagnosis_questions" not in prompt_guidance
+        assert "learning_path" not in prompt_guidance
+
+        public_guidance = evaluated.value["knowledge_guidance"]
+        assert public_guidance["topic"]["id"] == "college_stationary_points"
+        assert public_guidance["diagnosis_questions"]
+        assert "relevant_subgraph" in public_guidance
+        assert evaluated.value["diagnosis_questions"] == public_guidance[
+            "diagnosis_questions"
+        ]
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_study_explain_text_passes_knowledge_guidance_to_tutor_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    fake_agent.semantic_routing_result = json.dumps(
+        {
+            "subject": "math",
+            "content_type": "calculus_concept",
+            "intent": "explanation",
+            "response_mode": "general_explanation",
+            "entity": "stationary and extreme points",
+            "retrieval_concepts": ["驻点", "极值点", "导数为零"],
+            "confidence": 0.98,
+        },
+        ensure_ascii=False,
+    )
+    plugin._agent = fake_agent
+
+    try:
+        explained = await plugin.study_explain_text(
+            "\u5bfc\u6570\u4e3a0\u4e3a\u4ec0\u4e48\u4e0d\u662f\u6781\u503c\u70b9"
+        )
+
+        assert isinstance(explained, Ok)
+        context = fake_agent.inputs[-1][1]
+        guidance = context["knowledge_guidance"]  # type: ignore[index]
+        assert guidance["topic"]["id"] == "college_stationary_points"  # type: ignore[index]
+        assert guidance["diagnosis_questions"] == []  # type: ignore[index]
+        assert context["study_response_mode"] == "general_explanation"
+        assert explained.value["knowledge_guidance"]["topic"]["id"] == "college_stationary_points"
+        assert explained.value["diagnosis_questions"] == []
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_study_explain_text_semantically_routes_literary_work_to_chinese_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    fake_agent.semantic_routing_result = json.dumps(
+        {
+            "subject": "chinese",
+            "content_type": "literary_work",
+            "intent": "interpretation",
+            "response_mode": "general_discussion",
+            "entity": "《活着》",
+            "retrieval_concepts": [
+                "文学类文本阅读",
+                "小说主题",
+                "人物形象",
+                "情节与叙事",
+            ],
+            "confidence": 0.95,
+        },
+        ensure_ascii=False,
+    )
+    plugin._agent = fake_agent
+
+    try:
+        explained = await plugin.study_explain_text("谈谈你对活着这本书的理解")
+
+        assert isinstance(explained, Ok)
+        assert [operation for _messages, operation in fake_agent.semantic_routing_calls] == [
+            "knowledge_semantic_route"
+        ]
+        context = fake_agent.inputs[-1][1]
+        guidance = context["knowledge_guidance"]  # type: ignore[index]
+        assert guidance["topic"]["id"] == "chinese_senior_literary_text"  # type: ignore[index]
+        assert guidance["topic"]["subject"] == "chinese"  # type: ignore[index]
+        assert all(
+            item.get("subject") == "chinese"
+            for item in guidance["relevant_subgraph"]["nodes"]  # type: ignore[index]
+        )
+        assert explained.value["knowledge_guidance_applied"] is True
+        assert explained.value["knowledge_guidance_status"] == "applied"
+        assert explained.value["knowledge_guidance_subject"] == "chinese"
+        assert explained.value["study_semantic_status"] == "available"
+        assert explained.value["study_response_mode"] == "general_discussion"
+        assert explained.value["study_semantic_content_type"] == "literary_work"
+        assert explained.value["study_semantic_intent"] == "interpretation"
+        assert context["study_response_mode"] == "general_discussion"
+        assert guidance["model_context"]["procedure"] == []  # type: ignore[index]
+        assert guidance["model_context"]["practice_suggestions"] == []  # type: ignore[index]
+        assert explained.value["knowledge_guidance_focus_topic"] == {
+            "id": "chinese_senior_literary_text",
+            "label": "文学类文本阅读",
+        }
+        assert all(
+            topic["id"] != "reading_comprehension_math"
+            for topic in explained.value["knowledge_guidance_related_topics"]
+        )
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_semantic_route_failure_keeps_explanation_without_graph_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    fake_agent.semantic_routing_result = RuntimeError("route failed")
+    plugin._agent = fake_agent
+
+    try:
+        explained = await plugin.study_explain_text("谈谈一部作品的主题")
+
+        assert isinstance(explained, Ok)
+        assert fake_agent.inputs[-1][0] == "谈谈一部作品的主题"
+        assert "knowledge_guidance" not in fake_agent.inputs[-1][1]
+        assert explained.value["knowledge_guidance_applied"] is False
+        assert explained.value["knowledge_guidance_status"] == "routing_unavailable"
+        assert explained.value["knowledge_guidance_subject"] == "unknown"
+        assert explained.value["study_response_mode"] == "unknown"
+        assert explained.value["study_semantic_reason"] == "call_failed"
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_semantic_route_reserves_last_agent_credit_for_primary_explanation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    reservation = object()
+
+    async def reserve_optional_agent_call(_operation: str):
+        return False, reservation
+
+    fake_agent.reserve_optional_agent_call = reserve_optional_agent_call  # type: ignore[attr-defined]
+    plugin._agent = fake_agent
+
+    try:
+        explained = await plugin.study_explain_text("谈谈一部文学作品的主题")
+
+        assert isinstance(explained, Ok)
+        assert fake_agent.semantic_routing_calls == []
+        assert fake_agent.inputs[-1][1]["_agent_quota_reservation"] is reservation
+        assert explained.value["study_semantic_reason"] == "primary_quota_reserved"
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_semantic_route_timeout_is_short_and_does_not_block_explanation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    monkeypatch.setattr(
+        "plugin.plugins.study_companion.entry_tutor_context_support._SEMANTIC_ROUTE_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def _timeout_route(
+        messages: list[dict[str, object]],
+        *,
+        operation: str = "concept_explain",
+        deadline: float | None = None,
+    ) -> str:
+        fake_agent.semantic_routing_calls.append((messages, operation))
+        if deadline is not None:
+            fake_agent.semantic_routing_deadlines.append(deadline)
+        await asyncio.sleep(1)
+        return "{}"
+
+    fake_agent._call_model = _timeout_route  # type: ignore[method-assign]
+    plugin._agent = fake_agent
+
+    try:
+        started = time.monotonic()
+        explained = await plugin.study_explain_text("谈谈一部文学作品的主题")
+
+        assert isinstance(explained, Ok)
+        assert fake_agent.inputs[-1][0] == "谈谈一部文学作品的主题"
+        assert explained.value["knowledge_guidance_status"] == "routing_unavailable"
+        assert time.monotonic() - started < 0.5
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_concept_guidance_explicit_topic_skips_semantic_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    plugin._agent = fake_agent
+
+    try:
+        context = await plugin._build_learning_context(
+            "concept_explain",
+            input_text="为什么导数为零不一定是极值点",
+            extra={"selected_topic_id": "college_stationary_points"},
+        )
+
+        assert fake_agent.semantic_routing_calls == []
+        assert context["knowledge_guidance_status"] == "applied"
+        assert context["knowledge_guidance_source"] == "selected_topic"
+        assert context["study_response_mode"] == "general_explanation"
+        assert context["study_semantic_status"] == "available"
+        assert context["knowledge_guidance_focus_topic"]["id"] == (
+            "college_stationary_points"
+        )
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_semantics_cannot_inject_cross_subject_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "zh-CN", "default_mode": MODE_COMPANION, "auto_open_ui": False},
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    fake_agent.semantic_routing_result = json.dumps(
+        {
+            "subject": "math",
+            "content_type": "reading",
+            "intent": "interpretation",
+            "response_mode": "problem_solving",
+            "entity": "",
+            "retrieval_concepts": ["数学阅读理解题"],
+            "confidence": 0.3,
+        },
+        ensure_ascii=False,
+    )
+    plugin._agent = fake_agent
+
+    try:
+        explained = await plugin.study_explain_text("谈谈你的理解")
+
+        assert isinstance(explained, Ok)
+        assert "knowledge_guidance" not in fake_agent.inputs[-1][1]
+        assert explained.value["knowledge_guidance_status"] == "low_confidence"
+        assert explained.value["knowledge_guidance_applied"] is False
+        assert explained.value["study_response_mode"] == "unknown"
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_semantic_route_for_image_keeps_image_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {
+                "language": "zh-CN",
+                "default_mode": MODE_COMPANION,
+                "auto_open_ui": False,
+                "llm_vision_enabled": True,
+            },
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    assert isinstance(result, Ok)
+    fake_agent = _FakeTutorAgent()
+    fake_agent.semantic_routing_result = json.dumps(
+        {
+            "subject": "chinese",
+            "content_type": "literary_text",
+            "intent": "analysis",
+            "response_mode": "general_explanation",
+            "entity": "image text",
+            "retrieval_concepts": ["文学类文本阅读"],
+            "confidence": 0.9,
+        },
+        ensure_ascii=False,
+    )
+    plugin._agent = fake_agent
+
+    try:
+        context = await plugin._build_learning_context(
+            "concept_explain",
+            input_text="分析图片中的文学选段",
+            extra={
+                "source_text": "分析图片中的文学选段",
+                "vision_image_base64": "data:image/png;base64,c2FmZQ==",
+            },
+        )
+
+        operations = [operation for _messages, operation in fake_agent.semantic_routing_calls]
+        assert operations == ["image:data:image/png;base64,c2FmZQ==", "knowledge_semantic_route"]
+        route_messages = fake_agent.semantic_routing_calls[-1][0]
+        content = route_messages[-1]["content"]
+        assert isinstance(content, list)
+        assert content[-1] == {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64,c2FmZQ==",
+                "detail": "auto",
+            },
+        }
+        remaining_seconds = (
+            fake_agent.semantic_routing_deadlines[-1] - time.monotonic()
+        )
+        assert remaining_seconds > 0
+        assert remaining_seconds <= 12.0 + 1e-6
+        assert context["knowledge_guidance_subject"] == "chinese"
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_study_evaluate_answer_does_not_reuse_old_expected_answer_for_custom_question(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4581,26 +9060,7 @@ async def test_study_evaluate_answer_custom_question_does_not_reuse_old_topic(
                     "error_type": "organelle_function",
                     "feedback": "The nucleus stores genetic material.",
                     "next_action": "Review nucleus function.",
-                },
-                created_at="2026-05-11T00:00:00Z",
-            )
-
-        async def knowledge_track(
-            self,
-            *,
-            mode: str = MODE_COMPANION,
-            context: dict[str, object] | None = None,
-        ) -> TutorReply:
-            return TutorReply(
-                operation="knowledge_track",
-                input_text=str((context or {}).get("input_text") or ""),
-                reply="cell nucleus",
-                payload={
-                    "topic": "cell_nucleus",
-                    "mastery_delta": -0.1,
-                    "confidence": 0.8,
-                    "weak_points": ["organelle_function"],
-                    "next_steps": ["Review nucleus function"],
+                    "related_topics": ["cell_nucleus"],
                 },
                 created_at="2026-05-11T00:00:00Z",
             )
@@ -4719,6 +9179,7 @@ async def test_study_evaluate_answer_persists_knowledge_tracking(
     result = await plugin.startup()
     assert isinstance(result, Ok)
     plugin._agent = _TrackingTutorAgent()
+    plugin._knowledge_guidance_topics_cache = {"all:5000": [{"id": "stale"}]}
 
     try:
         async with plugin._lock:
@@ -4755,7 +9216,487 @@ async def test_study_evaluate_answer_persists_knowledge_tracking(
         assert "anonymous_knowledge_stats_summary" in status.value
         assert status.value["weak_topics"]
         assert status.value["mastery_overview"]
+        assert plugin._knowledge_guidance_topics_cache == {}
     finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_document_job_shutdown_does_not_stop_remaining_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+
+    class _FailingDocumentJobs:
+        async def shutdown(self) -> None:
+            raise RuntimeError("document jobs shutdown failed")
+
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "en", "auto_open_ui": False},
+            "study_companion": {"communication": {"enabled": True}},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    started = await plugin.startup()
+    assert isinstance(started, Ok)
+    bus = plugin._event_bus
+    assert bus is not None
+    plugin.logger = ctx.logger
+    plugin._document_jobs = _FailingDocumentJobs()
+
+    shutdown_result = await plugin.shutdown()
+
+    assert isinstance(shutdown_result, Ok)
+    assert bus._worker_task is None
+    assert any(
+        "study shutdown document jobs cleanup failed" in str(args[0])
+        for args, _kwargs in ctx.logger.warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_document_job_shutdown_does_not_stop_startup_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+
+    class _FailingDocumentJobs:
+        async def shutdown(self) -> None:
+            raise RuntimeError("document jobs shutdown failed")
+
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "en", "auto_open_ui": False},
+            "study_companion": {"communication": {"enabled": True}},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    started = await plugin.startup()
+    assert isinstance(started, Ok)
+    bus = plugin._event_bus
+    assert bus is not None
+    plugin.logger = ctx.logger
+    plugin._document_jobs = _FailingDocumentJobs()
+
+    await plugin._cleanup_after_failed_startup()
+
+    assert plugin._event_bus is None
+    assert bus._worker_task is None
+    assert any(
+        "study startup cleanup document jobs failed" in str(args[0])
+        for args, _kwargs in ctx.logger.warnings
+    )
+
+
+@pytest.mark.asyncio
+async def test_degraded_tutor_calls_do_not_pollute_learning_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _TimeoutTutorAgent(_FakeTutorAgent):
+        @staticmethod
+        def _timeout_reply(operation: str, input_text: str) -> TutorReply:
+            return TutorReply(
+                operation=operation,
+                input_text=input_text,
+                reply="The Qwen request timed out.",
+                payload={
+                    "question": "fallback question",
+                    "answer": "fallback answer",
+                    "summary": "fallback summary",
+                },
+                degraded=True,
+                diagnostic="timeout",
+                created_at="2026-05-11T00:00:00Z",
+            )
+
+        async def concept_explain(
+            self,
+            text: str,
+            *,
+            mode: str = MODE_COMPANION,
+            context: dict[str, object] | None = None,
+        ) -> TutorReply:
+            return self._timeout_reply("concept_explain", text)
+
+        async def question_generate(
+            self,
+            text: str,
+            *,
+            mode: str = MODE_COMPANION,
+            context: dict[str, object] | None = None,
+        ) -> TutorReply:
+            return self._timeout_reply("question_generate", text)
+
+        async def summarize_session(
+            self,
+            history: list[dict[str, object]],
+            *,
+            mode: str = MODE_COMPANION,
+            context: dict[str, object] | None = None,
+        ) -> TutorReply:
+            return self._timeout_reply("summarize_session", "session")
+
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    plugin = StudyCompanionPlugin(
+        _Ctx(
+            tmp_path,
+            {
+                "study": {
+                    "language": "en",
+                    "default_mode": MODE_COMPANION,
+                    "auto_open_ui": False,
+                }
+            },
+        )
+    )
+    assert isinstance(await plugin.startup(), Ok)
+    plugin._agent = _TimeoutTutorAgent()
+    summarized_events: list[dict[str, object]] = []
+
+    async def _record_summary_event(payload: dict[str, object]) -> None:
+        summarized_events.append(dict(payload))
+
+    monkeypatch.setattr(plugin, "_emit_session_summarized_event", _record_summary_event)
+
+    try:
+        explained = await plugin.study_explain_text(text="derivative")
+        generated = await plugin.study_generate_question(text="derivative")
+        summarized = await plugin.study_summarize_session()
+
+        assert all(isinstance(result, Ok) for result in (explained, generated, summarized))
+        assert all(result.value["degraded"] is True for result in (explained, generated, summarized))
+        assert all(result.value["diagnostic"] == "timeout" for result in (explained, generated, summarized))
+        assert plugin._state.current_question == {}
+        assert plugin._state.last_session_summary == ""
+        assert plugin._state.recent_learning_events == []
+        assert plugin._state.session_summary_seed == {}
+        assert plugin._store.list_interactions(limit=20) == []
+        assert summarized_events == []
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_degraded_answer_clears_pending_without_updating_learning_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _TimeoutTutorAgent(_FakeTutorAgent):
+        async def answer_evaluate(
+            self,
+            *,
+            question: str = "",
+            answer: str = "",
+            expected_answer: str = "",
+            mode: str = MODE_COMPANION,
+            context: dict[str, object] | None = None,
+        ) -> TutorReply:
+            return TutorReply(
+                operation="answer_evaluate",
+                input_text=answer,
+                reply="The Qwen request timed out.",
+                payload={
+                    "verdict": "wrong",
+                    "score": 0,
+                    "error_type": "timeout_fallback",
+                    "feedback": "fallback feedback",
+                    "next_action": "retry",
+                    "related_topics": ["derivatives"],
+                },
+                degraded=True,
+                diagnostic="timeout",
+                created_at="2026-05-11T00:00:00Z",
+            )
+
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    plugin = StudyCompanionPlugin(
+        _Ctx(
+            tmp_path,
+            {
+                "study": {
+                    "language": "en",
+                    "default_mode": MODE_COMPANION,
+                    "auto_open_ui": False,
+                }
+            },
+        )
+    )
+    assert isinstance(await plugin.startup(), Ok)
+    plugin._agent = _TimeoutTutorAgent()
+    emitted_events: list[dict[str, object]] = []
+
+    async def _record_answer_event(**payload: object) -> None:
+        emitted_events.append(dict(payload))
+
+    monkeypatch.setattr(plugin, "_emit_answer_evaluated_event", _record_answer_event)
+
+    try:
+        plugin._store.ensure_topic(topic_id="derivatives", name="Derivatives")
+        async with plugin._lock:
+            plugin._state.current_question = {
+                "question": "What is d(x^2)/dx?",
+                "answer": "2x",
+                "topic": "derivatives",
+                "question_id": "q-timeout",
+                "attempt_id": "a-timeout",
+            }
+
+        evaluated = await plugin.study_evaluate_answer(
+            answer="x",
+            question_id="q-timeout",
+            attempt_id="a-timeout",
+        )
+
+        assert isinstance(evaluated, Ok)
+        assert evaluated.value["degraded"] is True
+        assert evaluated.value["diagnostic"] == "timeout"
+        current_question = plugin._state.current_question
+        assert "attempt_evaluation_pending" not in current_question
+        assert "attempt_evaluated" not in current_question
+        assert "answer_evaluation_cache" not in current_question
+        assert plugin._state.last_answer_evaluation == {}
+        assert plugin._state.recent_learning_events == []
+        assert plugin._state.session_summary_seed == {}
+        assert plugin._store.list_interactions(limit=20) == []
+        assert plugin._store.get_latest_mastery("derivatives") is None
+        assert plugin._store.get_fsrs_card("derivatives") is None
+        assert plugin._store.list_wrong_questions(topic_id="derivatives") == []
+        assert emitted_events == []
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_answer_final_persist_failure_reuses_cache_without_duplicate_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    plugin = StudyCompanionPlugin(
+        _Ctx(
+            tmp_path,
+            {
+                "study": {
+                    "language": "en",
+                    "default_mode": MODE_COMPANION,
+                    "auto_open_ui": False,
+                }
+            },
+        )
+    )
+    assert isinstance(await plugin.startup(), Ok)
+    plugin._agent = _FakeTutorAgent()
+    original_persist_state = plugin._persist_state
+    persist_calls = 0
+
+    async def _fail_second_persist() -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 2:
+            raise RuntimeError("final attempt persistence failed")
+        await original_persist_state()
+
+    monkeypatch.setattr(plugin, "_persist_state", _fail_second_persist)
+
+    try:
+        async with plugin._lock:
+            plugin._state.current_question = {
+                "question": "What is d(x^2)/dx?",
+                "answer": "2x",
+                "topic": "derivatives",
+                "question_id": "q-persist-failure",
+                "attempt_id": "a-persist-failure",
+            }
+
+        failed = await plugin.study_evaluate_answer(
+            answer="2x",
+            question_id="q-persist-failure",
+            attempt_id="a-persist-failure",
+        )
+
+        assert isinstance(failed, Err)
+        current_question = plugin._state.current_question
+        assert "attempt_evaluation_pending" not in current_question
+        assert current_question["attempt_evaluated"] is True
+        assert current_question["answer_evaluation_cache"]["attempt_id"] == (
+            "a-persist-failure"
+        )
+        persisted_question = plugin._store.load_state(
+            build_initial_state()
+        ).current_question
+        assert "attempt_evaluation_pending" not in persisted_question
+        assert persisted_question["attempt_evaluated"] is True
+        assert persisted_question["attempt_evaluation_recovery"] is True
+        interaction_count = len(plugin._store.list_interactions(limit=20))
+        evaluation_count = len(plugin._agent.evaluations)
+
+        retried = await plugin.study_evaluate_answer(
+            answer="2x",
+            question_id="q-persist-failure",
+            attempt_id="a-persist-failure",
+        )
+        assert isinstance(retried, Ok)
+        assert retried.value["attempt_id"] == "a-persist-failure"
+        assert len(plugin._agent.evaluations) == evaluation_count
+        assert len(plugin._store.list_interactions(limit=20)) == interaction_count
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_answer_clears_pending_and_allows_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _BlockingTutorAgent(_FakeTutorAgent):
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def answer_evaluate(self, **_kwargs) -> TutorReply:
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    plugin = StudyCompanionPlugin(
+        _Ctx(
+            tmp_path,
+            {
+                "study": {
+                    "language": "en",
+                    "default_mode": MODE_COMPANION,
+                    "auto_open_ui": False,
+                }
+            },
+        )
+    )
+    assert isinstance(await plugin.startup(), Ok)
+    blocking_agent = _BlockingTutorAgent()
+    plugin._agent = blocking_agent
+
+    try:
+        async with plugin._lock:
+            plugin._state.current_question = {
+                "question": "What is d(x^2)/dx?",
+                "answer": "2x",
+                "topic": "derivatives",
+                "question_id": "q-canceled",
+                "attempt_id": "a-canceled",
+            }
+
+        evaluation = asyncio.create_task(
+            plugin.study_evaluate_answer(
+                answer="x",
+                question_id="q-canceled",
+                attempt_id="a-canceled",
+            )
+        )
+        await blocking_agent.started.wait()
+        evaluation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await evaluation
+
+        assert "attempt_evaluation_pending" not in plugin._state.current_question
+        plugin._agent = _FakeTutorAgent()
+        retried = await plugin.study_evaluate_answer(
+            answer="2x",
+            question_id="q-canceled",
+            attempt_id="a-canceled",
+        )
+        assert isinstance(retried, Ok)
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_finalized_answer_reuses_cache_without_duplicate_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    plugin = StudyCompanionPlugin(
+        _Ctx(
+            tmp_path,
+            {
+                "study": {
+                    "language": "en",
+                    "default_mode": MODE_COMPANION,
+                    "auto_open_ui": False,
+                }
+            },
+        )
+    )
+    assert isinstance(await plugin.startup(), Ok)
+    plugin._agent = _FakeTutorAgent()
+    mastery_lookup_started = threading.Event()
+    release_mastery_lookup = threading.Event()
+    mastery_calls = 0
+
+    def _blocking_third_mastery_lookup(_topic: str) -> float:
+        nonlocal mastery_calls
+        mastery_calls += 1
+        if mastery_calls == 3:
+            mastery_lookup_started.set()
+            assert release_mastery_lookup.wait(timeout=5)
+        return 0.5
+
+    monkeypatch.setattr(
+        plugin._knowledge_tracker,
+        "get_mastery",
+        _blocking_third_mastery_lookup,
+    )
+
+    try:
+        async with plugin._lock:
+            plugin._state.current_question = {
+                "question": "What is d(x^2)/dx?",
+                "answer": "2x",
+                "topic": "derivatives",
+                "question_id": "q-cancel-after-finalize",
+                "attempt_id": "a-cancel-after-finalize",
+            }
+
+        evaluation = asyncio.create_task(
+            plugin.study_evaluate_answer(
+                answer="2x",
+                question_id="q-cancel-after-finalize",
+                attempt_id="a-cancel-after-finalize",
+            )
+        )
+        assert await asyncio.to_thread(mastery_lookup_started.wait, 5)
+        evaluation.cancel()
+        release_mastery_lookup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await evaluation
+
+        current_question = plugin._state.current_question
+        assert "attempt_evaluation_pending" not in current_question
+        assert current_question["attempt_evaluated"] is True
+        assert current_question["attempt_evaluation_recovery"] is True
+        persisted_question = plugin._store.load_state(
+            build_initial_state()
+        ).current_question
+        assert "attempt_evaluation_pending" not in persisted_question
+        assert persisted_question["attempt_evaluated"] is True
+        assert persisted_question["attempt_evaluation_recovery"] is True
+        evaluation_count = len(plugin._agent.evaluations)
+        interaction_count = len(plugin._store.list_interactions(limit=20))
+
+        retried = await plugin.study_evaluate_answer(
+            answer="2x",
+            question_id="q-cancel-after-finalize",
+            attempt_id="a-cancel-after-finalize",
+        )
+
+        assert isinstance(retried, Ok)
+        assert retried.value["attempt_id"] == "a-cancel-after-finalize"
+        assert len(plugin._agent.evaluations) == evaluation_count
+        assert len(plugin._store.list_interactions(limit=20)) == interaction_count
+    finally:
+        release_mastery_lookup.set()
         await plugin.shutdown()
 
 
@@ -4772,13 +9713,61 @@ async def test_tutor_agent_prompt_and_reply_contract(
     assert messages[0]["role"] == "system"
     assert "unit-test" in messages[1]["content"]
     assert "Mode: interactive" in messages[1]["content"]
+    guided_messages = build_concept_explain_messages(
+        text="\u6211\u4e0d\u4f1a\u6c42\u6781\u503c\u70b9",
+        language="zh-CN",
+        mode=MODE_COMPANION,
+        context={
+            "source": "unit-test",
+            "mode": MODE_COMPANION,
+            "knowledge_guidance": {
+                "topic": {"id": "extrema", "label": "\u6c42\u6781\u503c\u70b9"},
+                "diagnosis_questions": [
+                    {
+                        "kind": "prerequisite_probe",
+                        "question": "\u4f60\u662f\u4e0d\u4f1a\u6c42\u5bfc\u5417\uff1f",
+                    }
+                ],
+            },
+        },
+    )
+    assert "Knowledge graph guidance" in guided_messages[1]["content"]
+    assert "\u6c42\u6781\u503c\u70b9" in guided_messages[1]["content"]
+    assert "\u4f60\u662f\u4e0d\u4f1a\u6c42\u5bfc\u5417" in guided_messages[1]["content"]
+    compact_guided_messages = build_concept_explain_messages(
+        text="\u6211\u4e0d\u4f1a\u6c42\u6781\u503c\u70b9",
+        language="zh-CN",
+        mode=MODE_COMPANION,
+        context={
+            "source": "unit-test",
+            "mode": MODE_COMPANION,
+            "knowledge_guidance": {
+                "topic": {"id": "extrema", "label": "\u6c42\u6781\u503c\u70b9"},
+                "learning_path": [{"from": "derivative", "to": "extrema"}],
+                "model_context": {
+                    "focus": {"id": "extrema", "label": "\u6c42\u6781\u503c\u70b9"},
+                    "prerequisites": ["\u5bfc\u6570"],
+                    "procedure": ["\u6c42\u5bfc"],
+                    "summary": {"raw_seed_included": False},
+                },
+            },
+        },
+    )
+    compact_content = compact_guided_messages[1]["content"]
+    assert "\u6c42\u6781\u503c\u70b9" in compact_content
+    assert "\u5bfc\u6570" in compact_content
+    assert "learning_path" not in compact_content
+    assert "derivative" not in compact_content
 
     agent = TutorLLMAgent(logger=_Logger(), config=StudyConfig(language="en"))
 
-    async def _fake_call_model(_messages):
-        return "A derivative is the slope at one point."
+    async def _fake_call_model_result(_messages, **_kwargs):
+        return SimpleNamespace(
+            text="A derivative is the slope at one point.",
+            output_limit_reached=False,
+        )
 
-    monkeypatch.setattr(agent, "_call_model", _fake_call_model)
+    monkeypatch.setattr(agent, "_call_model_result", _fake_call_model_result)
     reply = await agent.concept_explain("derivative", mode=MODE_INTERACTIVE)
 
     assert reply.operation == "concept_explain"
@@ -4795,10 +9784,13 @@ async def test_tutor_agent_teaching_prefix_is_applied_once(
         MODE_TEACHING, language="en", outcome="changed"
     )
 
-    async def _fake_call_model(_messages):
-        return f"{teaching_prefix}\n\nA derivative is the slope at one point."
+    async def _fake_call_model_result(_messages, **_kwargs):
+        return SimpleNamespace(
+            text=f"{teaching_prefix}\n\nA derivative is the slope at one point.",
+            output_limit_reached=False,
+        )
 
-    monkeypatch.setattr(agent, "_call_model", _fake_call_model)
+    monkeypatch.setattr(agent, "_call_model_result", _fake_call_model_result)
     reply = await agent.concept_explain("derivative", mode=MODE_TEACHING)
 
     assert reply.operation == "concept_explain"
@@ -4814,10 +9806,10 @@ async def test_tutor_agent_handles_empty_and_model_failures() -> None:
     assert empty.degraded is True
     assert empty.diagnostic == "empty_input"
 
-    async def _broken_call_model(_messages):
+    async def _broken_call_model_result(_messages, **_kwargs):
         raise RuntimeError("llm unavailable")
 
-    agent._call_model = _broken_call_model  # type: ignore[method-assign]
+    agent._call_model_result = _broken_call_model_result  # type: ignore[method-assign]
     fallback = await agent.concept_explain("photosynthesis converts light")
 
     assert fallback.degraded is True
@@ -4829,7 +9821,7 @@ async def test_tutor_agent_handles_empty_and_model_failures() -> None:
     assert zh_empty.diagnostic == "empty_input"
     assert "请先提供文本" in zh_empty.reply
 
-    zh_agent._call_model = _broken_call_model  # type: ignore[method-assign]
+    zh_agent._call_model_result = _broken_call_model_result  # type: ignore[method-assign]
     zh_fallback = await zh_agent.concept_explain("光合作用")
     assert zh_fallback.diagnostic == "llm_call_failed"
     assert "关键文本：光合作用" in zh_fallback.reply
@@ -4838,7 +9830,7 @@ async def test_tutor_agent_handles_empty_and_model_failures() -> None:
     ja_empty = await ja_agent.concept_explain(" ")
     assert "テキスト" in ja_empty.reply
 
-    ja_agent._call_model = _broken_call_model  # type: ignore[method-assign]
+    ja_agent._call_model_result = _broken_call_model_result  # type: ignore[method-assign]
     ja_fallback = await ja_agent.concept_explain("微分")
     assert ja_fallback.diagnostic == "llm_call_failed"
     assert "重要なテキスト：微分" in ja_fallback.reply
@@ -4964,8 +9956,11 @@ async def test_tutor_agent_structured_operations_normal_path(
 ) -> None:
     agent = TutorLLMAgent(logger=_Logger(), config=StudyConfig(language="en"))
 
-    async def _fake_call_model(_messages, *, operation: str = "concept_explain"):
+    async def _fake_call_model(
+        _messages, *, operation: str = "concept_explain", deadline: float | None = None
+    ):
         assert operation == operation_name
+        assert deadline is not None
         return json.dumps(response_json)
 
     monkeypatch.setattr(agent, "_call_model", _fake_call_model)
@@ -5037,10 +10032,11 @@ async def test_tutor_agent_structured_operations_degrade_with_generic_diagnostic
 async def test_tutor_agent_llm_cache_distinguishes_rotated_api_keys(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from utils import config_manager, llm_client, token_tracker
+    from plugin.plugins.study_companion import study_model_gateway
+    from utils import config_manager
 
     config_groups: list[str] = []
-    call_types: list[str] = []
+    generic_calls: list[dict[str, object]] = []
 
     class _ConfigManager:
         def __init__(self) -> None:
@@ -5049,30 +10045,35 @@ async def test_tutor_agent_llm_cache_distinguishes_rotated_api_keys(
         def get_model_api_config(self, group: str):
             config_groups.append(group)
             return {
-                "base_url": "https://llm.example.test/v1",
-                "model": "study-model",
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "model": "qwen-plus",
                 "api_key": self.api_key,
             }
 
-    class _FakeLLM:
-        def __init__(self, api_key: str) -> None:
-            self.api_key = api_key
+        async def aconsume_agent_daily_quota(self, **_kwargs):
+            return True, {}
+
+    class _GenericClient:
+        def __init__(self, key: str) -> None:
+            self.key = key
 
         async def ainvoke(self, _messages):
-            return SimpleNamespace(content=f"reply from {self.api_key}")
+            return SimpleNamespace(
+                content=f"reply from {self.key}",
+                response_metadata={"finish_reason": "stop"},
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    async def _generic_factory(**kwargs):
+        generic_calls.append(dict(kwargs))
+        return _GenericClient(str(kwargs["api_key"]))
 
     cfg_mgr = _ConfigManager()
-    created_keys: list[str] = []
-    create_kwargs: list[dict[str, object]] = []
-
-    def _create_chat_llm(*, api_key: str, **kwargs):
-        created_keys.append(api_key)
-        create_kwargs.append(dict(kwargs))
-        return _FakeLLM(api_key)
 
     monkeypatch.setattr(config_manager, "get_config_manager", lambda: cfg_mgr)
-    monkeypatch.setattr(llm_client, "create_chat_llm", _create_chat_llm)
-    monkeypatch.setattr(token_tracker, "set_call_type", call_types.append)
+    monkeypatch.setattr(study_model_gateway, "create_chat_llm_async", _generic_factory)
 
     agent = TutorLLMAgent(logger=_Logger(), config=StudyConfig(language="en"))
     first = await agent._call_model([{"role": "user", "content": "one"}])
@@ -5082,13 +10083,12 @@ async def test_tutor_agent_llm_cache_distinguishes_rotated_api_keys(
     assert first == "reply from old-key"
     assert second == "reply from new-key"
     assert config_groups == ["agent", "agent"]
-    assert call_types == ["agent", "agent"]
-    assert created_keys == ["old-key", "new-key"]
-    assert create_kwargs
-    assert all("temperature" not in item for item in create_kwargs)
-    assert all("max_completion_tokens" not in item for item in create_kwargs)
-    assert "old-key" not in repr(agent._client_cache._cache)
-    assert "new-key" not in repr(agent._client_cache._cache)
+    assert [call["api_key"] for call in generic_calls] == ["old-key", "new-key"]
+    assert all(call["model"] == "qwen-plus" for call in generic_calls)
+    assert all(call["max_completion_tokens"] == 3072 for call in generic_calls)
+    assert all(call["timeout"] > 0 for call in generic_calls)
+    assert all("temperature" not in call for call in generic_calls)
+    assert not hasattr(agent, "_client_cache")
 
 
 @pytest.mark.asyncio
@@ -5171,6 +10171,12 @@ async def test_study_pomodoro_stop_offloads_timer_operation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Timer:
+        def status(self) -> dict[str, object]:
+            return {
+                "state": "focusing",
+                "current_focus_session": {"id": "focus-1", "status": "running"},
+            }
+
         def stop(self) -> dict[str, object]:
             return {
                 "state": "cancelled",
@@ -5202,8 +10208,73 @@ async def test_study_pomodoro_stop_offloads_timer_operation(
 
     assert isinstance(status, Ok)
     assert status.value["state"] == "cancelled"
-    assert to_thread_calls == ["stop"]
+    assert to_thread_calls == ["status", "stop"]
     assert supervision.focus_end_count == 1
+
+
+@pytest.mark.asyncio
+async def test_study_pomodoro_stop_emits_focus_completion_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Timer:
+        def status(self) -> dict[str, object]:
+            return {
+                "state": "focusing",
+                "current_focus_session": {"id": "focus-deadline"},
+            }
+
+        def stop(self) -> dict[str, object]:
+            return {
+                "state": "short_break",
+                "current_focus_session": {
+                    "id": "focus-deadline",
+                    "status": "completed",
+                },
+            }
+
+    class _Supervision:
+        def __init__(self) -> None:
+            self.focus_end_count = 0
+
+        def on_focus_end(self) -> None:
+            self.focus_end_count += 1
+
+    class _EventBus:
+        def __init__(self) -> None:
+            self.events: list[StudyEvent] = []
+
+        async def emit(self, event: StudyEvent) -> None:
+            self.events.append(event)
+
+    async def _to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(study_companion_module.asyncio, "to_thread", _to_thread)
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    supervision = _Supervision()
+    event_bus = _EventBus()
+    plugin._habit_store = object()
+    plugin._checkin_manager = object()
+    plugin._pomodoro_timer = _Timer()
+    plugin._supervision = supervision
+    plugin._event_bus = event_bus
+    plugin._pomodoro_session_id = "focus-deadline"
+    plugin._pomodoro_target_lanlan = "lanlan-at-start"
+
+    result = await plugin.study_pomodoro_stop()
+
+    assert isinstance(result, Ok)
+    assert result.value["state"] == "short_break"
+    assert supervision.focus_end_count == 1
+    assert len(event_bus.events) == 1
+    assert event_bus.events[0].name == "pomodoro_focus_completed"
+    assert event_bus.events[0].payload == {
+        "session_id": "focus-deadline",
+        "break_type": "short_break",
+        "target_lanlan": "lanlan-at-start",
+    }
+    assert plugin._pomodoro_session_id == "focus-deadline"
+    assert plugin._pomodoro_target_lanlan == "lanlan-at-start"
 
 
 @pytest.mark.asyncio
@@ -5299,14 +10370,22 @@ async def test_study_pomodoro_start_offloads_blocking_operations(
     plugin._checkin_manager = object()
     plugin._pomodoro_timer = _Timer()
     plugin._supervision = supervision
+    plugin.ctx = SimpleNamespace(_current_lanlan="fallback-character")
 
-    status = await plugin.study_pomodoro_start(goal_id="goal-1", focus_minutes=30)
+    status = await plugin.study_pomodoro_start(
+        goal_id="goal-1",
+        focus_minutes=30,
+        _ctx={"lanlan_name": "yui-at-start"},
+    )
+    plugin.ctx._current_lanlan = "another-character"
 
     assert isinstance(status, Ok)
     assert status.value["state"] == "focusing"
     assert to_thread_calls == ["status", "start", "get_goal"]
     assert supervision.goal == {"id": "goal-1", "title": "read"}
     assert supervision.planned_minutes == 30.0
+    assert plugin._pomodoro_session_id == "focus-2"
+    assert plugin._pomodoro_target_lanlan == "yui-at-start"
 
 
 @pytest.mark.asyncio
@@ -5504,6 +10583,214 @@ async def test_study_supervision_toggle_parses_string_false() -> None:
     assert supervision.calls == [False]
 
 
+class _MemoryCardItemTypeStore:
+    def __init__(self) -> None:
+        self.item_types: list[str] = []
+
+    def get_or_create_default_deck(self, *, deck_type: str):
+        assert deck_type == "custom"
+        return {"id": "default-deck"}
+
+    def upsert_item(self, *, item_type: str, **_kwargs):
+        self.item_types.append(item_type)
+        return {
+            "created": True,
+            "item": {"id": f"item-{item_type}", "item_type": item_type},
+        }
+
+    def compat_card_payload(self, item):
+        return {"item": item}
+
+
+@pytest.mark.asyncio
+async def test_memory_card_upsert_item_type_schema_and_default() -> None:
+    schema = StudyCompanionPlugin.study_memory_card_upsert.__neko_event_meta__.input_schema
+    assert schema["properties"]["item_type"] == {
+        "type": "string",
+        "enum": ["word", "sentence", "paragraph", "cloze", "custom"],
+        "default": "custom",
+    }
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    store = _MemoryCardItemTypeStore()
+    plugin._memory_deck_store = store
+
+    result = await plugin.study_memory_card_upsert(front="Prompt", back="Answer")
+
+    assert isinstance(result, Ok)
+    assert store.item_types == ["custom"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "item_type", ["word", "sentence", "paragraph", "cloze", "custom"]
+)
+async def test_memory_card_upsert_accepts_supported_item_types(item_type: str) -> None:
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    store = _MemoryCardItemTypeStore()
+    plugin._memory_deck_store = store
+
+    result = await plugin.study_memory_card_upsert(
+        front="Prompt", back="Answer", item_type=item_type
+    )
+
+    assert isinstance(result, Ok)
+    assert store.item_types == [item_type]
+
+
+@pytest.mark.asyncio
+async def test_memory_card_upsert_rejects_unsupported_item_type() -> None:
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    store = _MemoryCardItemTypeStore()
+    plugin._memory_deck_store = store
+
+    result = await plugin.study_memory_card_upsert(
+        front="Prompt", back="Answer", item_type="formula"
+    )
+
+    assert isinstance(result, Err)
+    assert "unsupported memory item type" in str(result.error)
+    assert store.item_types == []
+
+
+class _LegacyTopicReviewStore:
+    def __init__(self) -> None:
+        self.review_calls: list[dict[str, str]] = []
+
+    def get_item(self, _item_id: str):
+        return None
+
+    def get_or_create_default_deck(self, *, deck_type: str):
+        assert deck_type == "custom"
+        return {"id": "default-deck"}
+
+    def review_item(self, *, item_id: str, rating: str, deck_id: str = ""):
+        self.review_calls.append(
+            {"item_id": item_id, "rating": rating, "deck_id": deck_id}
+        )
+        return {
+            "item": {"id": "default-item", "deck_id": deck_id},
+            "rating": 3,
+            "schedule": {"scheduled_days": 1.0},
+        }
+
+    def compat_card_payload(self, item):
+        return {"item_id": item["id"], "deck_id": item["deck_id"]}
+
+
+@pytest.mark.asyncio
+async def test_legacy_topic_review_limits_metadata_lookup_to_default_deck() -> None:
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    store = _LegacyTopicReviewStore()
+    plugin.ctx = SimpleNamespace(_current_lanlan="")
+    plugin._memory_deck_store = store
+    plugin._count_total_due_reviews = lambda: 0
+
+    async def ignore_review_event(_payload, **_kwargs) -> None:
+        return None
+
+    plugin._emit_memory_review_answer_event = ignore_review_event
+
+    reviewed = await plugin.study_memory_card_review(
+        topic_id="shared-topic", rating="good"
+    )
+
+    assert isinstance(reviewed, Ok)
+    assert store.review_calls == [
+        {
+            "item_id": "shared-topic",
+            "rating": "good",
+            "deck_id": "default-deck",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_memory_deck_item_listing_exposes_stable_pagination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    try:
+        assert isinstance(result, Ok)
+        deck = plugin._memory_deck_store.create_deck(
+            name="Paged Deck", deck_type="word"
+        )
+        created_ids = {
+            plugin._memory_deck_store.add_word(
+                deck_id=deck["id"],
+                word=f"word-{index}",
+                meaning=f"meaning-{index}",
+            )["item"]["id"]
+            for index in range(3)
+        }
+
+        first = await plugin.study_memory_list_deck_items(
+            deck_id=deck["id"], limit=2, offset=0
+        )
+        assert isinstance(first, Ok)
+        assert len(first.value["items"]) == 2
+        assert first.value["has_more"] is True
+        assert first.value["next_offset"] == 2
+
+        second = await plugin.study_memory_list_deck_items(
+            deck_id=deck["id"], limit=2, offset=first.value["next_offset"]
+        )
+        assert isinstance(second, Ok)
+        assert len(second.value["items"]) == 1
+        assert second.value["has_more"] is False
+        assert second.value["next_offset"] is None
+        returned_ids = {
+            item["id"] for item in [*first.value["items"], *second.value["items"]]
+        }
+        assert returned_ids == created_ids
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_memory_deck_listing_exposes_continuation_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    try:
+        assert isinstance(result, Ok)
+        created_ids = {
+            plugin._memory_deck_store.create_deck(
+                name=f"Paged Deck {index}", deck_type="custom"
+            )["id"]
+            for index in range(3)
+        }
+
+        first = await plugin.study_memory_list_decks(limit=2, offset=0)
+        assert isinstance(first, Ok)
+        assert len(first.value["decks"]) == 2
+        assert first.value["has_more"] is True
+        assert first.value["next_offset"] == 2
+
+        second = await plugin.study_memory_list_decks(
+            limit=2, offset=first.value["next_offset"]
+        )
+        assert isinstance(second, Ok)
+        assert len(second.value["decks"]) == 1
+        assert second.value["has_more"] is False
+        assert second.value["next_offset"] is None
+        returned_ids = {
+            deck["id"] for deck in [*first.value["decks"], *second.value["decks"]]
+        }
+        assert returned_ids == created_ids
+    finally:
+        await plugin.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_study_plugin_starts_and_collects_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -5524,16 +10811,23 @@ async def test_study_plugin_starts_and_collects_entries(
     assert isinstance(result, Ok)
     entries = plugin.collect_entries()
     assert "study_status" in entries
+    assert entries["study_status"].meta.metadata["result_kind"] == "event"
     assert "study_explain_text" in entries
     assert "study_ocr_snapshot" in entries
     assert "study_set_mode" in entries
     assert "study_detect_mode_intent" in entries
-    assert "study_export_notes" not in entries
+    assert "study_export_notes" in entries
+    disabled_export = await entries["study_export_notes"].handler(
+        fmt="markdown", preview_only=True
+    )
+    assert isinstance(disabled_export, Err)
     assert "study_knowledge_map" in entries
+    assert "study_knowledge_guidance" in entries
     assert "study_memory_card_upsert" in entries
     assert "study_memory_deck" in entries
     assert "study_memory_card_review" in entries
     assert "study_memory_create_deck" in entries
+    assert "study_memory_list_deck_items" in entries
     assert "study_memory_import_words" in entries
     assert "study_memory_import_passage" in entries
     assert "study_memory_due_reviews" in entries
@@ -5544,6 +10838,35 @@ async def test_study_plugin_starts_and_collects_entries(
         fmt="markdown", preview_only=True, title="Default Notes"
     )
     assert isinstance(disabled_export, Err)
+    selected_deck = await plugin.study_memory_create_deck(
+        name="Selected Deck", deck_type="custom", source="ui"
+    )
+    assert isinstance(selected_deck, Ok)
+    selected_card = await plugin.study_memory_card_upsert(
+        deck_id=selected_deck.value["id"],
+        front="Selected prompt",
+        back="Selected answer",
+        source="ui",
+    )
+    assert isinstance(selected_card, Ok)
+    assert selected_card.value["deck"]["id"] == selected_deck.value["id"]
+    selected_items = await plugin.study_memory_list_deck_items(
+        deck_id=selected_deck.value["id"]
+    )
+    assert isinstance(selected_items, Ok)
+    assert selected_items.value["deck"]["name"] == "Selected Deck"
+    assert [item["prompt"] for item in selected_items.value["items"]] == [
+        "Selected prompt"
+    ]
+    selected_review = await plugin.study_memory_card_review(
+        topic_id=selected_card.value["card"]["item_id"], rating="good"
+    )
+    assert isinstance(selected_review, Ok)
+    decks_after_selected_review = await plugin.study_memory_list_decks()
+    assert isinstance(decks_after_selected_review, Ok)
+    assert [deck["name"] for deck in decks_after_selected_review.value["decks"]] == [
+        "Selected Deck"
+    ]
     memory_card = await plugin.study_memory_card_upsert(
         topic_id="phase7_plugin_memory",
         front="What does the study memory deck store?",
@@ -5726,7 +11049,11 @@ async def test_communication_disabled_skips_eventbus(
         status = await plugin.study_neko_communication_status()
         assert isinstance(status, Ok)
         assert status.value == {
+            "configured_enabled": False,
+            "solution_narration_enabled": True,
             "available": False,
+            "command_subscription_active": False,
+            "command_worker_active": False,
             "events_emitted": 0,
             "events_blocked": 0,
         }
@@ -6004,12 +11331,186 @@ async def test_memory_review_emits_answer_evaluated(
         )["item"]
 
         reviewed = await plugin.study_memory_review_item(
-            item_id=item["id"], rating="good", correct=True
+            item_id=item["id"],
+            rating="good",
+            correct=True,
+            _ctx={"lanlan_name": "active-character"},
         )
 
         assert isinstance(reviewed, Ok)
         await _drain_scheduled_events()
         assert any("[Answer Evaluated]" in text for text in _study_push_texts(ctx))
+        assert any(
+            message.get("target_lanlan") == "active-character"
+            and "[Answer Evaluated]"
+            in str(((message.get("parts") or [{}])[0]).get("text") or "")
+            for message in ctx.pushed_messages
+        )
+        assert any(
+            "[Review Session Completed]" in text for text in _study_push_texts(ctx)
+        )
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_memory_review_does_not_emit_completion_while_due_cards_remain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    try:
+        assert isinstance(result, Ok)
+        deck = plugin._memory_deck_store.create_deck(name="Two Cards", deck_type="word")
+        first = plugin._memory_deck_store.add_word(
+            deck_id=deck["id"], word="one", meaning="1"
+        )["item"]
+        plugin._memory_deck_store.add_word(
+            deck_id=deck["id"], word="two", meaning="2"
+        )
+
+        reviewed = await plugin.study_memory_review_item(
+            item_id=first["id"], rating="good", correct=True
+        )
+
+        assert isinstance(reviewed, Ok)
+        await _drain_scheduled_events()
+        assert not any(
+            "[Review Session Completed]" in text for text in _study_push_texts(ctx)
+        )
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_memory_review_does_not_complete_while_knowledge_review_is_due(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    try:
+        assert isinstance(result, Ok)
+        deck = plugin._memory_deck_store.create_deck(
+            name="Mixed Reviews", deck_type="word"
+        )
+        item = plugin._memory_deck_store.add_word(
+            deck_id=deck["id"], word="one", meaning="1"
+        )["item"]
+        plugin._store.ensure_topic(topic_id="topic-due", name="Topic Due")
+        topic_card = plugin._knowledge_tracker.fsrs.new_knowledge_card(
+            "topic-due"
+        ).to_dict()
+        plugin._store.upsert_fsrs_card(
+            topic_id="topic-due", card=topic_card, last_rating=0
+        )
+
+        reviewed = await plugin.study_memory_review_item(
+            item_id=item["id"], rating="good", correct=True
+        )
+
+        assert isinstance(reviewed, Ok)
+        await _drain_scheduled_events()
+        assert not any(
+            "[Review Session Completed]" in text for text in _study_push_texts(ctx)
+        )
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_card_review_emits_completion_for_total_queue_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    completed: list[dict[str, object]] = []
+
+    async def _capture_completion(**kwargs) -> bool:
+        completed.append(dict(kwargs))
+        return True
+
+    try:
+        assert isinstance(result, Ok)
+        plugin._emit_review_session_completed_event = (  # type: ignore[method-assign]
+            _capture_completion
+        )
+        plugin._store.ensure_topic(topic_id="derivatives", name="Derivatives")
+        topic_card = plugin._knowledge_tracker.fsrs.new_knowledge_card(
+            "derivatives"
+        ).to_dict()
+        plugin._store.upsert_fsrs_card(
+            topic_id="derivatives", card=topic_card, last_rating=0
+        )
+
+        reviewed = await plugin.study_memory_card_review(
+            topic_id="derivatives",
+            rating="good",
+            _ctx={"lanlan_name": "active-character"},
+        )
+
+        assert isinstance(reviewed, Ok)
+        assert completed == [
+            {
+                "reviewed_count": 1,
+                "deck_name": "Derivatives",
+                "target_lanlan": "active-character",
+            }
+        ]
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_final_reviews_emit_one_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    completed: list[dict[str, object]] = []
+
+    async def _capture_completion(**kwargs) -> bool:
+        completed.append(dict(kwargs))
+        return True
+
+    try:
+        assert isinstance(result, Ok)
+        plugin._emit_review_session_completed_event = (  # type: ignore[method-assign]
+            _capture_completion
+        )
+        deck = plugin._memory_deck_store.create_deck(
+            name="Concurrent Reviews", deck_type="word"
+        )
+        first = plugin._memory_deck_store.add_word(
+            deck_id=deck["id"], word="one", meaning="1"
+        )["item"]
+        second = plugin._memory_deck_store.add_word(
+            deck_id=deck["id"], word="two", meaning="2"
+        )["item"]
+
+        reviews = await asyncio.gather(
+            plugin.study_memory_review_item(item_id=first["id"], rating="good"),
+            plugin.study_memory_review_item(item_id=second["id"], rating="good"),
+        )
+
+        assert all(isinstance(review, Ok) for review in reviews)
+        assert len(completed) == 1
+        assert completed[0]["deck_name"] == "Concurrent Reviews"
     finally:
         await plugin.shutdown()
 
@@ -6036,7 +11537,7 @@ async def test_memory_review_event_failure_does_not_fail_review(
             meaning="give up",
         )["item"]
 
-        async def _fail_emit(_payload: dict[str, object]) -> None:
+        async def _fail_emit(_payload: dict[str, object], **_kwargs) -> None:
             raise RuntimeError("event enrichment failed")
 
         plugin._emit_memory_review_answer_event = _fail_emit  # type: ignore[method-assign]
@@ -6189,6 +11690,71 @@ async def test_recitation_emits_answer_evaluated(
         assert any("[Answer Evaluated]" in text for text in _study_push_texts(ctx))
     finally:
         await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_recitation_emits_completion_for_total_queue_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    plugin = StudyCompanionPlugin(ctx)
+    result = await plugin.startup()
+    completed: list[dict[str, object]] = []
+
+    async def _capture_completion(**kwargs) -> bool:
+        completed.append(dict(kwargs))
+        return True
+
+    try:
+        assert isinstance(result, Ok)
+        plugin.ctx._current_lanlan = "fallback-character"
+        plugin._emit_review_session_completed_event = (  # type: ignore[method-assign]
+            _capture_completion
+        )
+        deck = plugin._memory_deck_store.create_deck(
+            name="Recitation", deck_type="passage"
+        )
+        imported = plugin._memory_deck_store.import_passage(
+            deck_id=deck["id"], title="One Line", text="Only sentence."
+        )
+
+        recited = await plugin.study_memory_recitation_attempt(
+            item_id=imported["items"][0]["id"],
+            user_input_text="Only sentence.",
+        )
+
+        assert isinstance(recited, Ok)
+        assert completed == [
+            {
+                "reviewed_count": 1,
+                "deck_name": "Recitation",
+                "target_lanlan": "fallback-character",
+            }
+        ]
+    finally:
+        await plugin.shutdown()
+
+
+def test_study_target_lanlan_resolution_prefers_entry_context() -> None:
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+    plugin.ctx = SimpleNamespace(_current_lanlan="fallback-character")
+
+    assert plugin._resolve_study_target_lanlan(
+        {"_ctx": {"lanlan_name": "entry-character"}}
+    ) == "entry-character"
+    assert plugin._resolve_study_target_lanlan({"_ctx": {}}) is None
+    assert plugin._resolve_study_target_lanlan({}) == "fallback-character"
+    plugin.ctx._current_lanlan = ""
+    assert plugin._resolve_study_target_lanlan({}) is None
+
+
+def test_study_target_lanlan_resolution_without_runtime_context_returns_none() -> None:
+    plugin = StudyCompanionPlugin.__new__(StudyCompanionPlugin)
+
+    assert plugin._resolve_study_target_lanlan({}) is None
 
 
 @pytest.mark.asyncio
@@ -6392,9 +11958,9 @@ async def test_study_plugin_doc_export_dynamic_entry_and_knowledge_settings(
         assert "study_export_notes" in entries
         properties = entries["study_export_notes"].meta.input_schema["properties"]
         export_formats = properties["fmt"]["enum"]
-        assert export_formats == ["markdown", "pdf", "docx"]
+        assert export_formats == ["markdown", "pdf", "docx", "xmind"]
         assert "range" not in properties
-        assert properties["style"]["default"] == "compact"
+        assert "default" not in properties["style"]
         assert properties["time_range"]["default"] == "recent"
         assert properties["recent_limit"]["default"] == 30
         assert properties["topic_ids"]["default"] == []
@@ -6429,6 +11995,8 @@ async def test_study_plugin_doc_export_dynamic_entry_and_knowledge_settings(
         assert isinstance(knowledge_map, Ok)
         assert knowledge_map.value["summary"]["topic_count"] >= 0
         assert isinstance(knowledge_map.value["nodes"], list)
+        map_properties = entries["study_knowledge_map"].meta.input_schema["properties"]
+        assert map_properties["subject"]["default"] == ""
 
         opt_in = await plugin.study_set_knowledge_contribution_opt_in(opt_in=True)
         assert isinstance(opt_in, Ok)
@@ -6569,3 +12137,281 @@ async def test_study_plugin_startup_failure_cleans_partial_resources(
     assert plugin._store._conn is None
     assert plugin.get_static_ui_config() is None
     assert plugin.get_list_actions() == []
+
+
+@pytest.mark.asyncio
+async def test_evaluate_current_question_rejects_forged_client_topic_before_llm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {
+                "language": "en",
+                "default_mode": MODE_COMPANION,
+                "auto_open_ui": False,
+            },
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    started = await plugin.startup()
+    assert isinstance(started, Ok)
+    fake_agent = _FakeTutorAgent()
+    plugin._agent = fake_agent
+
+    try:
+        async with plugin._lock:
+            plugin._state.current_question = {
+                "question": "What is the absolute value of -4?",
+                "answer": "4",
+                "question_id": "question-trusted-topic",
+                "attempt_id": "attempt-trusted-topic",
+                "topic": "absolute_value",
+                "selected_topic_id": "absolute_value",
+                "scope_key": "scope-old",
+                "scope_revision": 1,
+            }
+
+        evaluated = await plugin.study_evaluate_answer(
+            answer="4",
+            question_id="question-trusted-topic",
+            attempt_id="attempt-trusted-topic",
+            selected_topic_id="number_axis",
+        )
+
+        assert isinstance(evaluated, Err)
+        assert evaluated.error.code == "QUESTION_MISMATCH"
+        assert fake_agent.evaluations == []
+        async with plugin._lock:
+            current_question = dict(plugin._state.current_question)
+        assert not current_question.get("attempt_evaluation_pending")
+        assert not current_question.get("attempt_evaluated")
+        assert current_question["selected_topic_id"] == "absolute_value"
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_current_question_rejects_forged_text_and_expected_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {"language": "en", "auto_open_ui": False},
+            "study_companion": {"communication": {"enabled": False}},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    started = await plugin.startup()
+    assert isinstance(started, Ok)
+    fake_agent = _FakeTutorAgent()
+    plugin._agent = fake_agent
+    try:
+        async with plugin._lock:
+            plugin._state.current_question = {
+                "question": "Trusted question",
+                "answer": "trusted answer",
+                "question_id": "trusted-q",
+                "attempt_id": "trusted-a",
+                "selected_topic_id": "absolute_value",
+            }
+
+        forged_text = await plugin.study_evaluate_answer(
+            answer="attacker",
+            question="Different question",
+            question_id="trusted-q",
+            attempt_id="trusted-a",
+            selected_topic_id="number_axis",
+        )
+        legacy_supplied = await plugin.study_evaluate_answer(
+            answer="attacker",
+            question="Different question",
+            selected_topic_id="number_axis",
+        )
+        forged_expected = await plugin.study_evaluate_answer(
+            answer="attacker answer",
+            expected_answer="attacker answer",
+            question_id="trusted-q",
+            attempt_id="trusted-a",
+            selected_topic_id="absolute_value",
+        )
+
+        assert isinstance(forged_text, Err)
+        assert forged_text.error.code == "QUESTION_MISMATCH"
+        assert isinstance(forged_expected, Err)
+        assert forged_expected.error.code == "QUESTION_MISMATCH"
+        assert isinstance(legacy_supplied, Ok)
+        assert len(fake_agent.evaluations) == 1
+        assert fake_agent.evaluations[0][3]["question_payload"].get("scope_key") is None
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_evaluate_old_question_uses_its_private_topic_and_scope_after_scope_switch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(runtime_root))
+    ctx = _Ctx(
+        tmp_path,
+        {
+            "study": {
+                "language": "en",
+                "default_mode": MODE_COMPANION,
+                "auto_open_ui": False,
+            },
+            "ocr_reader": {"enabled": True},
+            "rapidocr": {"lang_type": "ch"},
+        },
+    )
+    plugin = StudyCompanionPlugin(ctx)
+    started = await plugin.startup()
+    assert isinstance(started, Ok)
+    fake_agent = _FakeTutorAgent()
+    plugin._agent = fake_agent
+
+    try:
+        async with plugin._lock:
+            plugin._state.current_question = {
+                "question": "What is the absolute value of -4?",
+                "answer": "4",
+                "question_id": "question-old-scope",
+                "attempt_id": "attempt-old-scope",
+                "topic": "absolute_value",
+                "selected_topic_id": "absolute_value",
+                "scope_key": "scope-old",
+                "scope_revision": 1,
+            }
+            plugin._state.active_practice_scope = {
+                "schema_version": 1,
+                "mode": "explicit_topic",
+                "stage": "junior_high",
+                "subject": "math",
+                "chapter": "Real numbers",
+                "unit": "Foundations",
+                "topic_id": "number_axis",
+                "scope_key": "scope-new",
+                "scope_revision": 2,
+                "display_path": [
+                    "junior_high",
+                    "math",
+                    "Real numbers",
+                    "Foundations",
+                    "number_axis",
+                ],
+            }
+            plugin._state.practice_scope_revision = 2
+
+        evaluated = await plugin.study_evaluate_answer(
+            answer="4",
+            question_id="question-old-scope",
+            attempt_id="attempt-old-scope",
+            selected_topic_id="absolute_value",
+        )
+
+        assert isinstance(evaluated, Ok)
+        assert evaluated.value["selected_topic_id"] == "absolute_value"
+        assert len(fake_agent.evaluations) == 1
+        evaluation_context = fake_agent.evaluations[0][3]
+        assert evaluation_context["selected_topic_id"] == "absolute_value"
+        assert evaluation_context["question_payload"]["selected_topic_id"] == (
+            "absolute_value"
+        )
+        assert evaluation_context["question_payload"]["scope_key"] == "scope-old"
+        assert evaluation_context["question_payload"]["scope_revision"] == 1
+        assert evaluation_context["current_question"]["scope_key"] == "scope-old"
+        assert evaluation_context["current_question"]["scope_revision"] == 1
+        assert plugin._state.active_practice_scope["scope_key"] == "scope-new"
+        assert plugin._state.practice_scope_revision == 2
+    finally:
+        await plugin.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_single_topic_correct_answer_returns_completion_without_leaving_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _CorrectAgent(_FakeTutorAgent):
+        async def answer_evaluate(self, **kwargs) -> TutorReply:
+            context = dict(kwargs.get("context") or {})
+            self.evaluations.append(
+                (
+                    str(kwargs.get("question") or ""),
+                    str(kwargs.get("answer") or ""),
+                    str(kwargs.get("expected_answer") or ""),
+                    context,
+                    str(kwargs.get("mode") or ""),
+                )
+            )
+            return TutorReply(
+                operation="answer_evaluate",
+                input_text=str(kwargs.get("answer") or ""),
+                reply="correct",
+                payload={
+                    "verdict": "correct",
+                    "score": 100,
+                    "topic": "number_axis",
+                    "feedback": "Correct",
+                },
+                created_at="2026-08-13T00:00:00Z",
+            )
+
+    monkeypatch.setenv("NEKO_STORAGE_SELECTED_ROOT", str(tmp_path / "runtime"))
+    plugin = StudyCompanionPlugin(
+        _Ctx(tmp_path, {"study": {"language": "en", "auto_open_ui": False}})
+    )
+    assert isinstance(await plugin.startup(), Ok)
+    plugin._agent = _CorrectAgent()
+    try:
+        async with plugin._lock:
+            plugin._state.current_question = {
+                "question": "What is |-4|?",
+                "answer": "4",
+                "question_id": "single-topic-q",
+                "attempt_id": "single-topic-a",
+                "selected_topic_id": "absolute_value",
+                "topic": "absolute_value",
+                "scope_key": "single-topic-scope",
+                "scope_revision": 1,
+                "scope_topic_count": 1,
+            }
+
+        result = await plugin.study_evaluate_answer(
+            answer="4",
+            question_id="single-topic-q",
+            attempt_id="single-topic-a",
+            selected_topic_id="absolute_value",
+        )
+
+        assert isinstance(result, Ok)
+        assert result.value["topic"] == "absolute_value"
+        assert result.value["selected_topic_id"] == "absolute_value"
+        assert result.value["scope_key"] == "single-topic-scope"
+        assert result.value["practice_scope_status"] == "completed"
+        assert result.value["can_continue_review"] is True
+    finally:
+        await plugin.shutdown()
+
+
+def test_practice_scope_completion_is_rendered_without_automatic_generation() -> None:
+    plugin_dir = Path(__file__).resolve().parents[3] / "plugins" / "study_companion"
+    static_source = "\n".join(
+        (plugin_dir / "static" / name).read_text(encoding="utf-8")
+        for name in ("main.js", "knowledge-map.js")
+    )
+    hosted_source = (plugin_dir / "surfaces" / "study_panel.tsx").read_text(
+        encoding="utf-8"
+    )
+
+    for source in (static_source, hosted_source):
+        assert "practice_scope_status === 'completed'" in source
+        assert "ui.practice.scope_completed" in source
+        assert "ui.button.continue_practice_review" in source

@@ -16,18 +16,32 @@ agent server 与本插件通过单一 WebSocket 连接通信，JSON 帧格式：
 | ← agent | `task_finished` | `{"type": "task_finished", "status": "ok", "text": "...", "task_id": "<uuid>"}` |
 | ← agent | `agent_status` | informational, ignored by callbacks |
 
+`task_finished` 的 `status` 是一个字符串，插件**容忍任意取值**（当作不透明
+串透传，不做枚举校验，未知值不会崩）。agent 目前会发这些：`ok`（真正完成）、
+`interrupted`（被打断）、`superseded`（被更新的任务顶替而中止——中性的"没跑完"，
+与 `interrupted` 同类，**不算失败**）、`failed`（真正执行失败）、`timeout`。
+插件据此给对话 LLM 分档措辞：`ok`→成功、`interrupted`/`superseded`→中性"换/停"、
+其余→失败。**约定**：失败绝不能报成 `ok`（否则猫娘会把翻车当成功叙述）。
+
 `task_id` 是**可选的**显式关联字段。插件每次发 `task` 帧都会带一个新生成
 的 UUID；agent 如果在对应的 `task_finished` 帧里把这个 UUID 原样回传，插件
 就用 ID 严格匹配 pending 任务，跳过 FIFO 的 stale-frame 启发式。**不回传
 也兼容**——插件会回退到按完成顺序匹配（见下方"已知限制"）。建议有内部并发
 的 agent 实现一定带上 `task_id` 以避免 out-of-order 完成被错误归属。
 
-agent 端启动方式由你自己决定（一般是 `node minecraft-agent/index.js --port 48909`
-或类似命令），插件只负责连进去。
+agent 端启动方式由你自己决定：绿色包用户在解压出来的包根双击 `启动.bat`，
+开发态直接 `node main.js`。桥接端口不是命令行参数，而是环境变量
+`NEKO_PLUGIN_WS_PORT`（默认 `48909`）。插件只负责连进去。
 
 ## 启用步骤
 
-1. 启动 Minecraft agent server，记下监听端口（默认 `48909`）
+1. 启动 Minecraft agent server（绿色包双击 `启动.bat` 即可，端口默认
+   `48909` 不用管）。密钥、模型、MC 端口都在 mc-agent 自己的控制面板
+   `http://localhost:8765` 里填，不需要手动编辑它的任何配置文件。
+
+   > 改桥接端口要**改两处**：agent 侧的 `NEKO_PLUGIN_WS_PORT` 只挪动它自己
+   > 的监听端口，插件侧读的是下面 `[game_agent]` 里独立的 `ws_url`（默认
+   > `ws://localhost:48909`）。只改一处两边就连不上了。
 2. 在 N.E.K.O 插件管理界面启用 `game_agent_minecraft` 插件
 3. 如需修改配置，编辑 `plugin.toml` 的 `[game_agent]` 节后调
    `game_agent_reload_config` entry 应用：
@@ -49,10 +63,18 @@ agent 端启动方式由你自己决定（一般是 `node minecraft-agent/index.
 | `ws_url` | `ws://localhost:48909` | agent server WebSocket 地址 |
 | `reconnect_interval_seconds` | `5.0` | WS 断开后等待多久重连 |
 | `task_timeout_seconds` | `120.0` | `minecraft_task` 单次调用最长等待 agent 完成的秒数；超时返回 `{status: "timeout"}` 给 LLM。默认 120s 给 mine/craft 类多步动作留余量（实测 60–90s 较常见）；先前 25s 默认在挖矿场景下普遍误超时 |
-| `system_prompt_interval_seconds` | `5.0` | 自动 nudge 循环的最小间隔；不影响 `main_server` 自身的对话节奏控制 |
+| `system_prompt_interval_seconds` | `15.0` | 自动 nudge 循环的最小间隔（节流，降低对话密度）；不影响 `main_server` 自身的对话节奏控制 |
 | `skip_system_prompt_if_busy` | `true` | 任务进行中跳过 nudge，避免堆叠 |
-| `stream_screenshots_to_llm` | `true` | 收到 agent 截图就立即 push 到模型视觉上下文（`ai_behavior="read"`） |
+| `stream_screenshots_to_llm` | `true` | 收到 agent 截图就 push 到模型视觉上下文（`ai_behavior="read"`），按下面的最小间隔节流 |
+| `screenshot_stream_min_interval_seconds` | `6.0` | 内联截图流 push 的最小间隔（节流，防止按 agent ~1Hz 速率灌爆模型视觉上下文）；窗口内的帧折叠为最新一张 |
 | `screenshot_cache_size` | `3` | 内存里保留的最近 N 张截图，nudge 时一并发出 |
+
+> 截图节流阀从 mc-agent v0.2.0 起才真的开始工作：更早的发行包里 bot 视角截图
+> 默认是关的（一帧都不发），v0.2.0 把它默认打开成 ~1Hz。插件侧不用改代码——
+> `screenshot_stream_min_interval_seconds` 本来就是按这个速率设计的——但视觉
+> 上下文的实际 token 消耗会从零变成有，嫌多就调大这个值或直接把
+> `stream_screenshots_to_llm` 关掉，也可以在 mc-agent 面板的「高级 → 视觉」里
+> 关掉或降频。
 
 ## LLM 工具：`minecraft_task`
 
@@ -76,10 +98,16 @@ agent 端启动方式由你自己决定（一般是 `node minecraft-agent/index.
 | 形态 | 时机 |
 |------|------|
 | `{"status": "ok", "query": "..."}` | agent 正常完成 |
+| `{"status": "failed", "query": "...", "text": "..."}` | agent 报告任务真正执行失败 |
+| `{"status": "superseded", "query": "...", "text": "..."}` | agent 因更新的任务顶替而中止本任务（中性非完成，与 `interrupted` 同类，不算失败） |
 | `{"status": "timeout", "query": "...", "reason": "..."}` | `task_timeout_seconds` 内 agent 未完成 |
 | `{"status": "interrupted", "query": "...", "reason": "..."}` | 被新任务（`overwrite=True`）抢占 |
 | `{"result": "busy", "currently_executing": "...", "hint": "..."}` | 已有任务在跑且 `overwrite=False`，新任务被拒 |
 | `{"output": {"error": "..."}, "is_error": true, "error": "AGENT_DISCONNECTED"}` | agent server 当前不可达 |
+
+> `status` 直接透传 agent 的原值：`ok`/`interrupted` 之外，agent 现也可能发
+> `failed`/`superseded`。插件对 `interrupted`、`superseded` 用中性"没跑完"措辞，
+> 对 `failed`（及 `timeout`、断连）用失败措辞，只有 `ok` 判成功。
 
 ## 自动 nudge 循环
 

@@ -13,6 +13,12 @@ export SSL_DOMAIN=${SSL_DOMAIN:-project-neko.online}
 export SSL_DAYS=${SSL_DAYS:-365000}  # 1000年
 export NGINX_AUTO_RELOAD=${NGINX_AUTO_RELOAD:-1}  # 是否启用自动重载，默认启用
 
+# Docker 容器内 Nginx 作为反向代理前置，强制启用 uvicorn proxy_headers
+export NEKO_BEHIND_PROXY=true
+# Nginx 保留客户端 Host；将配置的部署域名显式加入应用层可信主机。
+# loopback 和 IP 字面量由中间件默认允许，因此本地/IP 访问不依赖此项。
+export NEKO_TRUSTED_HOSTS="${NEKO_TRUSTED_HOSTS:-${SSL_DOMAIN}}"
+
 # 1. 信号处理优化
 setup_signal_handlers() {
     trap 'echo "🛑 Received shutdown signal"; nginx -s stop 2>/dev/null || true; for pid in "${PIDS[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done; [ -n "$RELOADER_PID" ] && kill -TERM "$RELOADER_PID" 2>/dev/null || true; wait; exit 0' TERM INT
@@ -65,6 +71,26 @@ check_dependencies() {
     echo "   Python version: $(python3 --version 2>/dev/null || echo "Not found")"
     echo "   Nginx version: $(nginx -v 2>&1 | head -1 || echo "Not found")"
     echo "   OpenSSL version: $(openssl version 2>/dev/null || echo "Not found")"
+}
+
+# Configure the process and system timezone before any service or certificate
+# code runs.  ``tzdata`` is installed in both image variants; an invalid
+# user-provided TZ intentionally falls back to the image default rather than
+# preventing the application from starting.
+configure_timezone() {
+    local timezone="${TZ:-Asia/Shanghai}"
+    local zoneinfo="/usr/share/zoneinfo/$timezone"
+
+    if [ ! -f "$zoneinfo" ]; then
+        echo "⚠️ Invalid TZ '$timezone'; falling back to Asia/Shanghai"
+        timezone="Asia/Shanghai"
+        zoneinfo="/usr/share/zoneinfo/$timezone"
+    fi
+
+    ln -snf "$zoneinfo" /etc/localtime
+    printf '%s\n' "$timezone" > /etc/timezone
+    export TZ="$timezone"
+    echo "🕒 Container timezone: $timezone"
 }
 
 # 输出详细的SSL证书信息（这个就是为了图一乐，不给关！）
@@ -436,10 +462,10 @@ setup_nginx_proxy() {
     
     # 生成SSL证书和密钥（如果不存在）
     echo "🔐 Setting up SSL certificates..."
-    mkdir -p /root/ssl
+    mkdir -p /home/neko/ssl
     
-    local cert_file="/root/ssl/N.E.K.O.crt"
-    local key_file="/root/ssl/N.E.K.O.key"
+    local cert_file="/home/neko/ssl/N.E.K.O.crt"
+    local key_file="/home/neko/ssl/N.E.K.O.key"
     
     # 如果证书或密钥不存在，直接生成新的
     if [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; then
@@ -549,6 +575,40 @@ server {
     # 取消客户端请求体大小限制
     client_max_body_size 0;
 
+    # 代理到用户插件服务 (Plugin Server, 内嵌于 agent_server 进程)
+    location ~ ^/(ui|plugins?|plugin/|available|server/|logs/|metrics|runs|packages|plugin-cli/|market/|health|market-bridge/) {
+        proxy_pass http://127.0.0.1:48916;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 86400;
+    }
+
+    # 插件 WebSocket 路径 → 插件服务器 (48916)
+    location ~ ^/ws/(run|admin|logs)(/|$) {
+        proxy_pass http://127.0.0.1:48916;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 86400;
+    }
+    
     # 代理到N.E.K.O主服务
     location / {
         proxy_pass http://127.0.0.1:${NEKO_MAIN_SERVER_PORT};
@@ -556,6 +616,7 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
         
         # WebSocket支持
         proxy_http_version 1.1;
@@ -634,6 +695,40 @@ server {
     # 取消客户端请求体大小限制
     client_max_body_size 0;
 
+    # 代理到用户插件服务 (Plugin Server, 内嵌于 agent_server 进程)
+    location ~ ^/(ui|plugins?|plugin/|available|server/|logs/|metrics|runs|packages|plugin-cli/|market/|health|market-bridge/) {
+        proxy_pass http://127.0.0.1:48916;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 86400;
+    }
+
+    # 插件 WebSocket 路径 → 插件服务器 (48916)
+    location ~ ^/ws/(run|admin|logs)(/|$) {
+        proxy_pass http://127.0.0.1:48916;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 86400;
+    }
+    
     # 代理到N.E.K.O主服务
     location / {
         proxy_pass http://127.0.0.1:${NEKO_MAIN_SERVER_PORT};
@@ -641,6 +736,7 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
         
         # WebSocket支持
         proxy_http_version 1.1;
@@ -720,8 +816,8 @@ start_nginx_reloader() {
     # 记录初始配置文件的修改时间
     local nginx_conf="/etc/nginx/nginx.conf"
     local site_conf="/etc/nginx/conf.d/neko-proxy.conf"
-    local ssl_cert="/root/ssl/N.E.K.O.crt"
-    local ssl_key="/root/ssl/N.E.K.O.key"
+    local ssl_cert="/home/neko/ssl/N.E.K.O.crt"
+    local ssl_key="/home/neko/ssl/N.E.K.O.key"
     
     local last_conf_time=$(stat -c %Y "$nginx_conf" "$site_conf" 2>/dev/null)
     local last_ssl_time=""
@@ -803,9 +899,48 @@ start_nginx_reloader() {
 }
 
 # 5. 配置管理优化
+migrate_legacy_bootstrap_config() {
+    # Older images generated this file below /app, which is normally a
+    # container-writable layer rather than a persistent mount.  When it is
+    # still available (for example an operator retains an old /app/config
+    # mount), seed the new runtime root before setup_configuration decides
+    # whether a bootstrap file exists.  An explicit force update intentionally
+    # wins over this compatibility path.
+    local LEGACY_CONFIG_FILE="/app/config/core_config.json"
+    local CONFIG_ROOT="${NEKO_STORAGE_SELECTED_ROOT:-${XDG_DATA_HOME:-/home/neko/.local/share}/N.E.K.O}"
+    local RUNTIME_CONFIG_FILE="$CONFIG_ROOT/config/core_config.json"
+    local RUNTIME_CONFIG_DIR="$(dirname "$RUNTIME_CONFIG_FILE")"
+    local TEMP_CONFIG_FILE=""
+
+    if [ -n "${NEKO_FORCE_ENV_UPDATE:-}" ] || [ -f "$RUNTIME_CONFIG_FILE" ] || [ ! -f "$LEGACY_CONFIG_FILE" ]; then
+        return 0
+    fi
+
+    mkdir -p "$RUNTIME_CONFIG_DIR"
+    if ! TEMP_CONFIG_FILE=$(mktemp "$RUNTIME_CONFIG_DIR/.core_config.json.migrate.XXXXXX"); then
+        echo "❌ Failed to create a temporary file for legacy configuration migration"
+        return 1
+    fi
+    if ! cp "$LEGACY_CONFIG_FILE" "$TEMP_CONFIG_FILE"; then
+        rm -f "$TEMP_CONFIG_FILE"
+        echo "❌ Failed to copy legacy configuration into the persistent runtime root"
+        return 1
+    fi
+    if ! mv -f "$TEMP_CONFIG_FILE" "$RUNTIME_CONFIG_FILE"; then
+        rm -f "$TEMP_CONFIG_FILE"
+        echo "❌ Failed to finalize legacy configuration migration"
+        return 1
+    fi
+    echo "📦 Migrated legacy /app/config/core_config.json into the persistent runtime root"
+}
+
 setup_configuration() {
     echo "📝 Setting up configuration..."
-    local CONFIG_DIR="/app/config"
+    # Keep the bootstrap file in the same runtime root selected by
+    # ConfigManager.  /app/config belongs to the image layer and would be lost
+    # whenever the container is recreated.
+    local CONFIG_ROOT="${NEKO_STORAGE_SELECTED_ROOT:-${XDG_DATA_HOME:-/home/neko/.local/share}/N.E.K.O}"
+    local CONFIG_DIR="$CONFIG_ROOT/config"
     local CORE_CONFIG_FILE="$CONFIG_DIR/core_config.json"
     
     mkdir -p "$CONFIG_DIR"
@@ -873,6 +1008,12 @@ setup_dependencies() {
         fi
     fi
     
+    # uv sync 以 root 运行，生成的文件归 root；服务以 neko 用户运行，须修正权限
+    echo "🔧 Fixing .venv permissions for neko user..."
+    chown -R neko:neko /app/.venv 2>/dev/null || echo "⚠️ Could not chown .venv (non-fatal)"
+    # 同时确保文档和模板目录可被 neko 读取（用于 OpenClaw 指南等静态内容）
+    chown -R neko:neko /app/docs /app/templates /app/static 2>/dev/null || echo "⚠️ Could not chown doc/template/static dirs (non-fatal)"
+    
     echo "✅ Dependencies installed successfully"
     
     # 安装 Playwright 浏览器（用于 browser_use 自动化）
@@ -888,6 +1029,8 @@ setup_dependencies() {
         # 尝试安装 Chromium，失败时不中断启动
         if uv run --no-sync python -m playwright install chromium --with-deps 2>&1; then
             echo "✅ Playwright Chromium installed successfully"
+            echo "🔧 Fixing Playwright browser permissions for neko user..."
+            chown -R neko:neko "${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}" 2>/dev/null || echo "⚠️ Could not chown Playwright browsers (non-fatal)"
         else
             echo "⚠️ Playwright Chromium installation failed (will retry on next start)"
             echo "   Browser automation features may not work until Playwright is installed"
@@ -896,6 +1039,60 @@ setup_dependencies() {
 }
 
 # 7. 服务启动优化
+# ── OpenFang (Rust A2A agent daemon) ──────────────────────────
+start_openfang_daemon() {
+    if ! command -v openfang &>/dev/null; then
+        echo "⚠️ OpenFang binary not found, skipping OpenFang daemon"
+        return 0
+    fi
+    echo "🚀 Starting OpenFang A2A daemon..."
+    cd /app
+
+    # OpenFang 工作目录（~neko/.openfang）
+    local OF_HOME="/home/neko/.openfang"
+    local OF_CONFIG="$OF_HOME/config.toml"
+
+    if [ ! -f "$OF_CONFIG" ]; then
+        echo "   Initializing OpenFang workspace..."
+        runuser -u neko -- openfang init 2>&1 || {
+            echo "⚠️ OpenFang init failed (non-critical)"
+        }
+        # 首次初始化时清除预装 agent（默认用 Groq 但用户无 key → 刷 heartbeat WARN）
+        if [ -d "$OF_HOME/agents" ]; then
+            echo "   Removing pre-installed agents (no Groq API key configured)..."
+            rm -rf "$OF_HOME/agents"
+        fi
+    fi
+
+    # 确保 A2A 协议已启用（N.E.K.O 通过 A2A 接口与 OpenFang 通信）
+    if [ -f "$OF_CONFIG" ]; then
+        if ! grep -q '^\s*\[a2a\]' "$OF_CONFIG" 2>/dev/null; then
+            echo "   Enabling A2A protocol in OpenFang config..."
+            printf '\n[a2a]\nenabled = true\n' >> "$OF_CONFIG"
+        fi
+    fi
+
+    local OF_PORT="${OPENFANG_PORT:-50051}"
+    echo "   Starting openfang daemon (API listen: 127.0.0.1:${OF_PORT})..."
+    OPENFANG_LISTEN="127.0.0.1:${OF_PORT}" runuser -u neko -- openfang start &
+    local of_pid=$!
+    PIDS+=("$of_pid")
+    echo "     OpenFang daemon PID: $of_pid"
+
+    # 等待健康检查
+    local of_retries=15
+    while [ $of_retries -gt 0 ]; do
+        if curl -sf "http://127.0.0.1:${OF_PORT}/api/health" >/dev/null 2>&1; then
+            echo "✅ OpenFang daemon is healthy"
+            return 0
+        fi
+        sleep 2
+        of_retries=$((of_retries - 1))
+    done
+    echo "⚠️ OpenFang health check timed out (continuing anyway)"
+    return 0
+}
+
 start_services() {
     echo "🚀 Starting N.E.K.O. services..."
     cd /app
@@ -916,13 +1113,13 @@ start_services() {
     # 根的 sys.path，config 等顶层包会 import 不到）。
     # PR #2264: memory_server 同样包化（app/memory_server/），走同一机制；
     # 其 __main__.py 顶部另带 sys.path bootstrap，文件直跑亦等价，但统一用 -m。
-    local services=("app/memory_server/__main__.py" "app/main_server.py" "app/agent_server/__main__.py")
+    local services=("app/memory_server/__main__.py" "app/main_server/__main__.py" "app/agent_server/__main__.py")
 
     for service in "${services[@]}"; do
         if [ ! -f "$service" ]; then
             echo "❌ Service file $service not found!"
             # 对关键服务直接失败
-            if [[ "$service" == "app/main_server.py" ]] || [[ "$service" == "app/memory_server/__main__.py" ]]; then
+            if [[ "$service" == "app/main_server/__main__.py" ]] || [[ "$service" == "app/memory_server/__main__.py" ]]; then
                 return 1
             fi
             continue
@@ -934,6 +1131,8 @@ start_services() {
             runuser -u neko -- "$VENV_PYTHON" -m app.agent_server &
         elif [[ "$service" == "app/memory_server/__main__.py" ]]; then
             runuser -u neko -- "$VENV_PYTHON" -m app.memory_server &
+        elif [[ "$service" == "app/main_server/__main__.py" ]]; then
+            runuser -u neko -- "$VENV_PYTHON" -m app.main_server &
         else
             runuser -u neko -- "$VENV_PYTHON" "$service" &
         fi
@@ -1031,18 +1230,165 @@ start_nginx_proxy() {
     return 0
 }
 
+# ── 旧版挂载布局检测 ──────────────────────────────────────────
+# 数据挂载从 ./N.E.K.O + ./ssl 两条合并成了 ./neko-home 一条。被落下的旧目录在
+# 宿主机上，根本没挂进容器，所以这里无法自动迁移；能做的只是在认出「这是一次升级」
+# 时把话说清楚，免得用户把一个空数据目录当成正常的全新安装。仍可访问的旧
+# /app/config/core_config.json 会被迁移；已经随旧容器删除的那份则无法自动恢复。
+# 快照必须在本脚本自己往 /home/neko 和 /app/logs 写东西之前取。
+LEGACY_LAYOUT_HINT=""
+
+detect_legacy_layout() {
+    local data_root="/home/neko/.local/share/N.E.K.O"
+
+    # 放错位置的旧目录先查，且不拿「数据根是否为空」当前提。用户很可能是先用新版
+    # 起了一次（应用于是往数据根写了一份默认配置），发现东西不见了才去搬旧目录，
+    # 而后搬错层 —— 那正是最该提醒的时刻，此时数据根恰恰是非空的。这两个目录名
+    # 应用自己永远不会在家目录根下创建，出现即是人为放置。
+    #
+    # 痕迹一：旧的 N.E.K.O 目录被整个当成了 neko-home，数据根的子目录直接躺在家目录里
+    if [ -d /home/neko/config ] || [ -d /home/neko/memory ]; then
+        LEGACY_LAYOUT_HINT="wrong-level"
+        return 0
+    fi
+
+    # 痕迹二：旧目录搬进 neko-home 了，但没落到 XDG 路径下
+    if [ -d /home/neko/N.E.K.O ]; then
+        LEGACY_LAYOUT_HINT="wrong-depth"
+        return 0
+    fi
+
+    # 剩下这条必须以数据根为空为前提：日志有历史 + 数据根有内容 = 正常运行中
+    if [ -n "$(ls -A "$data_root" 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    # 痕迹三：./logs 里有历史日志 → 这个部署以前跑起来过，而数据目录却是空的。
+    # 典型的「直接 pull 新镜像重启」，旧数据还留在宿主机的 ./N.E.K.O 里。
+    if [ -n "$(find /app/logs -type f -name '*.log' 2>/dev/null | head -n 1)" ]; then
+        LEGACY_LAYOUT_HINT="stale-logs"
+    fi
+
+    return 0
+}
+
+warn_legacy_layout() {
+    if [ -z "$LEGACY_LAYOUT_HINT" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo "=================================================="
+    echo "⚠️  检测到旧版部署的痕迹"
+    case "$LEGACY_LAYOUT_HINT" in
+        wrong-level)
+            echo "   /home/neko 下直接出现了 config/ 或 memory/ —— 旧的 N.E.K.O 目录"
+            echo "   可能被整个当成了 neko-home。它应该放在下面这一层："
+            echo "       neko-home/.local/share/N.E.K.O/"
+            echo "   若那个位置已经有本次启动生成的默认配置，别直接覆盖，按内容合并："
+            echo "       cp -a neko-home/config neko-home/memory ... neko-home/.local/share/N.E.K.O/"
+            ;;
+        wrong-depth)
+            echo "   /home/neko/N.E.K.O 存在，但服务读的是 .local/share 下的路径。"
+            echo "   请把它的内容并到：neko-home/.local/share/N.E.K.O/"
+            echo "       cp -a neko-home/N.E.K.O/. neko-home/.local/share/N.E.K.O/ \\"
+            echo "         && rm -rf neko-home/N.E.K.O"
+            ;;
+        stale-logs)
+            echo "   日志目录里有历史日志，说明这个部署以前跑过，而数据目录是空的。"
+            echo "   本版本把 ./N.E.K.O + ./ssl 两个挂载合并成了 ./neko-home 一个。"
+            echo "   先看宿主机上的 N.E.K.O/ 是不是空的："
+            echo "     · 非空 —— 数据还在，停容器后执行（直接 mv 会多套一层，本次"
+            echo "       启动已经在 neko-home 下建好了同名目录）："
+            echo "         mkdir -p neko-home/.local/share/N.E.K.O neko-home/ssl"
+            echo "         cp -a N.E.K.O/. neko-home/.local/share/N.E.K.O/ && rm -rf N.E.K.O"
+            echo "         cp -a ssl/.     neko-home/ssl/                 && rm -rf ssl"
+            echo "     · 空 —— 此前跟的是旧版 README，其挂载目标从来对不上服务的实际"
+            echo "       写入位置，数据只存在于旧容器里。若那个容器已被重建或删除，"
+            echo "       这部分数据无法找回；OpenFang 状态同理。"
+            ;;
+    esac
+    echo "   详见 README「从旧版本升级」一节。全新安装可忽略本提示。"
+    echo "=================================================="
+    echo ""
+}
+
 # 9. 主执行流程
 main() {
     echo "=================================================="
     echo "   N.E.K.O. Container with Nginx Proxy - Startup"
     echo "=================================================="
-    
+
+    # 先取快照：后面的 setup_* 会往 /home/neko 和 /app/logs 里写东西
+    detect_legacy_layout
+
     setup_signal_handlers
     check_dependencies
+    configure_timezone
+    migrate_legacy_bootstrap_config
     setup_configuration
     setup_dependencies
     setup_nginx_proxy
-    
+    # 确保数据目录对 neko 用户可写（Docker volume 可能以 root 创建）。
+    #
+    # 只认应用真正要写的两棵子树，不扫整个 home。合并挂载之后 /home/neko 是宿主
+    # 目录，用户完全可以往它下面再挂别的东西；递归整棵树意味着那些嵌套挂载的宿主
+    # 侧对象会被改成 neko —— 挂进来的要是个 docker socket，等于把 docker 控制权
+    # 交给以 neko 运行的业务进程和插件代码。（-xdev 挡不住：同一宿主文件系统的
+    # bind mount 设备号相同。）
+    #
+    # /home/neko 本身只非递归地给一次：neko 要能在自己家里创建 .cache 之类的
+    # 目录，否则运行期任何往 $HOME 写东西的库都会踩坑；但它下面挂了什么不归我们管。
+    #
+    # ssl/ 因此天然不在范围内。私钥由 root 生成并 chmod 600，nginx 主进程也以
+    # root 读取，业务进程没有任何理由读得到它。
+    #
+    # 只改属主不对的条目：稳态下这一遍是纯遍历、不产生写入。chown 必须带 -h，
+    # 否则它会解引用符号链接去改**目标**（`chown -R` 默认 -P 有这层保护，换成
+    # find 驱动就没有了）。
+    #
+    # 失败必须停：三个业务进程都以 neko 跑，数据目录不可写的话它们会在运行期
+    # 各处零散报错，比在这里干脆退出难诊断得多。
+    #
+    # 属主写字面量 1000:1000 而不是 neko:neko —— 两者在本镜像里是同一个（Dockerfile
+    # 用 `useradd -u 1000 -g 1000` 固定住了），但这些路径是 bind mount 出去的，落到
+    # 宿主机上只有数字有意义：宿主那边没有叫 neko 的账户，它看到的就是 1000，而 1000
+    # 恰是绝大多数发行版第一个普通用户的号，对上之后用户不必 sudo 就能管自己的备份。
+    # 写死数字也让这层契约在文件里是可见的：改 Dockerfile 里的号就必须同步改这里。
+    # 状态目录不接受软链。两条 chown 都带了 -h（不带会解引用命令行参数去改目标），
+    # 但那挡不住 find：路径中间那几段的符号链接是内核在解析路径时就跟随掉的，
+    # find 根本无从拒绝，于是它会走到 /home/neko 之外的树上，把那里每个不属于
+    # 1000 的条目都改掉。与其想办法处理，不如直接不收 —— 想把数据放到别的磁盘，
+    # 该在 compose 里把 neko-home 挂到那个位置，而不是在里面做软链。
+    for _state_dir in /home/neko/.local /home/neko/.local/share \
+                      /home/neko/.local/share/N.E.K.O /home/neko/.openfang; do
+        if [ -L "$_state_dir" ]; then
+            echo "❌ $_state_dir 是符号链接，数据目录不支持这样放"
+            echo "   启动时的属主修复会顺着它改到 /home/neko 之外的宿主路径上。"
+            echo "   请把它换成真实目录；想让数据落在别的位置，就在 compose 里把"
+            echo "   neko-home 直接挂到那个位置。"
+            exit 1
+        fi
+    done
+    unset _state_dir
+
+    mkdir -p /home/neko/.local/share/N.E.K.O /home/neko/.openfang
+    if ! chown -h 1000:1000 /home/neko /home/neko/.local /home/neko/.local/share \
+        || ! find /home/neko/.local/share/N.E.K.O /home/neko/.openfang \
+               \( ! -uid 1000 -o ! -gid 1000 \) -exec chown -h 1000:1000 {} + ; then
+        echo "❌ 无法把数据目录的属主改为 1000:1000（容器内的 neko）"
+        echo "   宿主机的挂载可能不允许改属主 —— NFS 带 root_squash、CIFS 没带"
+        echo "   cifsacl、或只读挂载都会这样。容器内的服务以 neko 身份运行，"
+        echo "   数据目录写不进去会在启动之后才零散暴露，所以这里直接停。"
+        exit 1
+    fi
+
+    # 启动 OpenFang A2A 守护进程（编译在镜像中的 Rust 二进制）
+    start_openfang_daemon
+
+    # 放在服务启动前打印：此时前面的初始化日志已经刷完，这条不会被淹掉
+    warn_legacy_layout
+
     # 启动N.E.K.O服务
     if ! start_services; then
         echo "❌ Failed to start N.E.K.O services"

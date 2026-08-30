@@ -30,11 +30,13 @@ import path ``main_logic.core`` is unchanged):
   (``context_append``, ``focus``, ``tts_runtime``, ``turn``,
   ``tool_calling``, ``lifecycle``, ``proactive``, ``greeting``,
   ``streaming``, ``notify``), which hold methods only.
-- ``__init__``: re-exports of every top-level name of the old module so
-  existing imports and test monkeypatches (``main_logic.core.<attr>``) keep
-  working unchanged -- mixin methods read the test-patchable symbols late
-  through this module's namespace (see the re-export block below), which is
-  exactly what tests patch.
+- ``__init__``: re-exports the supported compatibility surface of the old
+  module so retained imports and test monkeypatches
+  (``main_logic.core.<attr>``) keep working unchanged. Helpers explicitly
+  retired by later refactors are not recreated as facade aliases. Mixin
+  methods read supported test-patchable symbols late through this module's
+  namespace (see the re-export block below), which is exactly what tests
+  patch.
 """
 import asyncio
 import contextvars
@@ -60,6 +62,9 @@ from main_logic.omni_offline_client import OmniOfflineClient, _is_safety_violati
 from main_logic.tts_client import (
     get_tts_worker,
     dummy_tts_worker,
+    selected_configured_tts_preset_provider_key,
+    tts_provider_falls_back_on_failure,
+    tts_provider_uses_configured_preset_voice,
     TTS_PROVIDER_REGISTRY,
     VLLM_OMNI_DEFAULT_BASE_URL,
     VLLM_OMNI_DEFAULT_MODEL,
@@ -104,7 +109,6 @@ from config.prompts.prompts_sys import (
     SESSION_INIT_PROMPT, SESSION_INIT_PROMPT_AGENT,
     AGENT_TASK_STATUS_RUNNING, AGENT_TASK_STATUS_QUEUED,
     AGENT_TASKS_HEADER, AGENT_TASKS_NOTICE,
-    CONTEXT_SUMMARY_READY,
     SYSTEM_NOTIFICATION_TASK_ACTIVE,
     SYSTEM_NOTIFICATION_TASK_PASSIVE,
     SYSTEM_NOTIFICATION_EVENT_ACTIVE,
@@ -127,7 +131,6 @@ from config.prompts.prompts_memory import (
 
 
 from config.prompts.prompts_avatar_interaction import (
-    _normalize_avatar_interaction_payload,
     _build_avatar_interaction_instruction,
     _build_avatar_interaction_memory_meta,
 )
@@ -141,7 +144,7 @@ from config.prompts.prompts_avatar_interaction import (
 # )
 from utils.config_manager import _as_bool, get_config_manager, get_reserved
 from utils.logger_config import get_module_logger
-from utils.native_voice_registry import (
+from utils.tts.native_voice_registry import (
     is_free_preset_voice_id,
     resolve_native_voice_for_routing,
 )
@@ -159,10 +162,12 @@ import soxr
 import httpx
 
 
-# Re-exports from the package submodules. Everything the old single-file
-# module defined at top level stays importable as ``main_logic.core.<name>``,
-# so every import in this file is intentional even though the class body no
-# longer lives here (ruff F401 is not enforced on this facade).
+# Re-exports from the package submodules. Supported names retained from the
+# old single-file module stay importable as ``main_logic.core.<name>``. A
+# private helper deliberately replaced by a public contract API is not kept
+# merely because the old module imported it at top level. Every remaining
+# import in this file is intentional even though the class body no longer
+# lives here (ruff F401 is not enforced on this facade).
 #
 # Rebind/monkeypatch semantics: ``LLMSessionManager`` methods live in the
 # mixin modules, whose functions resolve globals against their OWN module
@@ -184,8 +189,8 @@ import httpx
 # (#2148).
 #
 # State-carrying objects (the notice queue/lock, the
-# ``_proactive_expected_sid`` ContextVar, ``_notified_legacy_voices``) are
-# re-exported by reference; their single owner is the defining submodule.
+# proactive ContextVars, ``_notified_legacy_voices``) are re-exported by
+# reference; their single owner is the defining submodule.
 # ``notices._prominent_notice_seq`` is intentionally NOT re-exported: the
 # owner rebinds that int on every enqueue, so a facade snapshot would go
 # stale immediately (no external reader exists).
@@ -216,6 +221,7 @@ from ._shared import (  # noqa: F401
     FRONTEND_START_SESSION_TIMEOUT_SECONDS,
     CROSS_MODE_RESTART_WAIT_SECONDS,
     _proactive_expected_sid,
+    _proactive_published_text_chunks,
     NO_RETRY_TTS_CODES,
     IMMEDIATE_REPORT_TTS_CODES,
     _STATIC_LOCALES_DIR,
@@ -223,6 +229,7 @@ from ._shared import (  # noqa: F401
     _get_chat_locale_text,
     _START_LLM_CONCURRENT_ABORTED,
     ContextAppendResult,
+    FreshScreenshot,
     _purge_closed_tool_calls,
 )
 from .callback_render import (  # noqa: F401

@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, MutableMapping, Protocol, TypeAlias
+from typing import (
+    Any,
+    Callable,
+    Literal,
+    Mapping,
+    MutableMapping,
+    Protocol,
+    TypeAlias,
+    TypedDict,
+)
 
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -13,6 +22,42 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 Metadata: TypeAlias = Mapping[str, JsonValue]
 InputSchema: TypeAlias = Mapping[str, JsonValue]
 EntryHandler: TypeAlias = Callable[..., object]
+
+
+PushMessageFailureReason: TypeAlias = Literal[
+    "backpressure",
+    # The SDK measured the wire payload the way the host's ingest server does
+    # and it blew MESSAGE_PLANE_PAYLOAD_MAX_BYTES. Unlike "backpressure" this
+    # is not transient: the host would discard the WHOLE push (text parts
+    # included) and the author would only ever see it in the host log, so the
+    # SDK rejects it locally instead of reporting a submission that silently
+    # goes nowhere. Retrying an identical payload cannot help -- the push has
+    # to get smaller, which for images means ctx.images.upload().
+    "payload_too_large",
+    "transport_error",
+    "transport_unavailable",
+]
+
+
+class PushMessageSubmitted(TypedDict):
+    """The SDK accepted responsibility for a local message submission."""
+
+    submitted: Literal[True]
+
+
+class PushMessageRejected(TypedDict):
+    """The SDK synchronously rejected a local message submission."""
+
+    ok: Literal[False]
+    submitted: Literal[False]
+    reason: PushMessageFailureReason
+
+
+# Immediate local submission result. ``submitted=True`` only means that the
+# SDK's authoritative local submission path accepted responsibility for the
+# payload; it does not acknowledge host consumption, model generation, or
+# playback.
+PushMessageResult: TypeAlias = PushMessageSubmitted | PushMessageRejected
 
 
 class LoggerLike(Protocol):
@@ -81,7 +126,20 @@ class BusProtocol(Protocol):
     memory: BusMemoryProtocol | None
 
 
+class PluginImagesProtocol(Protocol):
+    async def upload(
+        self,
+        data: bytes | bytearray,
+        *,
+        mime: str | None = None,
+        timeout: float = 3.0,
+    ) -> dict[str, object]: ...
+
+
 class PluginContextProtocol(Protocol):
+    @property
+    def images(self) -> PluginImagesProtocol: ...
+
     plugin_id: str
     metadata: Metadata
     logger: LoggerLike | None
@@ -97,6 +155,10 @@ class PluginContextProtocol(Protocol):
     async def get_own_profile_config(self, profile_name: str, timeout: float = 5.0) -> object: ...
 
     async def get_own_effective_config(self, profile_name: str | None = None, timeout: float = 5.0) -> object: ...
+
+    async def update_own_config(self, updates: JsonObject, timeout: float = 10.0) -> object: ...
+
+    async def replace_own_config(self, config: JsonObject, timeout: float = 10.0) -> object: ...
 
     async def upsert_own_profile_config(
         self,
@@ -187,7 +249,7 @@ class PluginContextProtocol(Protocol):
         fast_mode: bool = False,
         delivery: str | bool | None = None,
         reply: bool | None = None,
-    ) -> object: ...
+    ) -> PushMessageResult: ...
 
     def update_status(self, status: dict[str, object]) -> None: ...
 
@@ -223,5 +285,10 @@ __all__ = [
     "MutableStateProtocol",
     "PluginContextProtocol",
     "PluginRef",
+    "PushMessageFailureReason",
+    "PushMessageRejected",
+    "PushMessageResult",
+    "PluginImagesProtocol",
+    "PushMessageSubmitted",
     "RouterProtocol",
 ]

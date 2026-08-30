@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from tests.static_app_parts import read_js_parts
+
+from tests.yui_guide_director_parts import read_director_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,12 +15,12 @@ ICEBREAKER_FREE_TEXT_RUNTIME_PATH = ROOT / "static" / "tutorial" / "icebreaker" 
 SCRIPTS_PATH = ROOT / "static" / "tutorial" / "icebreaker" / "icebreaker_scripts.json"
 LOCALE_PATH = ROOT / "static" / "tutorial" / "icebreaker" / "locales" / "zh-CN.json"
 LOCALES_DIR = ROOT / "static" / "tutorial" / "icebreaker" / "locales"
-CHAT_HOST_PATH = ROOT / "static" / "app" / "app-react-chat-window.js"
+CHAT_HOST_PATH = ROOT / "static" / "app" / "app-react-chat-window"
 APP_WEBSOCKET_PATH = ROOT / "static" / "app" / "app-websocket.js"
 APP_PROACTIVE_PATH = ROOT / "static" / "app" / "app-proactive.js"
-APP_PROMPT_PATH = ROOT / "static" / "tutorial" / "core" / "app-prompt.js"
+SEVEN_DAY_STATE_PATH = ROOT / "static" / "tutorial" / "core" / "seven-day-state.js"
 UNIVERSAL_TUTORIAL_MANAGER_PATH = ROOT / "static" / "tutorial" / "core" / "universal-manager.js"
-APP_INTERPAGE_PATH = ROOT / "static" / "app" / "app-interpage.js"
+APP_INTERPAGE_PATH = ROOT / "static" / "app" / "app-interpage"
 INDEX_TEMPLATE_PATH = ROOT / "templates" / "index.html"
 WEBSOCKET_ROUTER_PATH = ROOT / "main_routers" / "websocket_router.py"
 GAME_ROUTER_DIR = ROOT / "main_routers" / "game_router"
@@ -360,7 +363,8 @@ def test_day1_icebreaker_fallback_redirect_is_node_agnostic():
 
 def test_icebreaker_runtime_wires_choice_prompt_and_project_tts():
     runtime = RUNTIME_PATH.read_text(encoding="utf-8")
-    chat_host = CHAT_HOST_PATH.read_text(encoding="utf-8")
+    seven_day_state = SEVEN_DAY_STATE_PATH.read_text(encoding="utf-8")
+    chat_host = read_js_parts(CHAT_HOST_PATH)
     app_websocket = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     index_html = INDEX_TEMPLATE_PATH.read_text(encoding="utf-8")
 
@@ -390,7 +394,8 @@ def test_icebreaker_runtime_wires_choice_prompt_and_project_tts():
     assert "day = 1" not in runtime
     assert "playExpression(normalizedEmotion, normalizedExpressionFile)" not in runtime
     assert "bootstrapFromRecentEndState" in runtime
-    assert "neko_avatar_floating_guide_v1" in runtime
+    assert "window.NekoSevenDayTutorialState" in runtime
+    assert "neko_avatar_floating_guide_v1" in seven_day_state
     assert "resolveRecentPersistedEndState" in runtime
     assert "setIcebreakerChoicePrompt" in chat_host
     assert "clearIcebreakerChoicePrompt" in chat_host
@@ -553,7 +558,7 @@ def test_icebreaker_context_append_requires_successful_json_payload():
 
 def test_icebreaker_assistant_messages_update_compact_caption_like_normal_chat():
     runtime = RUNTIME_PATH.read_text(encoding="utf-8")
-    interpage_runtime = APP_INTERPAGE_PATH.read_text(encoding="utf-8")
+    interpage_runtime = read_js_parts(APP_INTERPAGE_PATH)
 
     assert "function syncIcebreakerAssistantCompactCaption(role, message)" in runtime
     assert "function finalizeIcebreakerAssistantSubtitleTranslation(role, message)" in runtime
@@ -981,7 +986,7 @@ def test_icebreaker_deferred_start_promise_cleanup_has_no_unreachable_rejection_
 
 
 def test_yui_guide_bridge_timestamp_helper_exists_for_cursor_relay():
-    interpage = APP_INTERPAGE_PATH.read_text(encoding="utf-8")
+    interpage = read_js_parts(APP_INTERPAGE_PATH)
 
     assert "function getYuiGuideBridgeMessageTimestamp(message)" in interpage
     assert "timestamp: getYuiGuideBridgeMessageTimestamp(message)" in interpage
@@ -1022,6 +1027,7 @@ def test_home_tutorial_release_events_carry_current_avatar_round_end_state():
     tutorial_manager = UNIVERSAL_TUTORIAL_MANAGER_PATH.read_text(encoding="utf-8")
     runtime = RUNTIME_PATH.read_text(encoding="utf-8")
     reset_runtime = (ROOT / "static" / "tutorial" / "avatar" / "floating-guide-reset.js").read_text(encoding="utf-8")
+    seven_day_state = SEVEN_DAY_STATE_PATH.read_text(encoding="utf-8")
 
     assert "avatarFloatingEndState = recordAvatarFloatingGuideEndState(" in tutorial_manager
     assert "day: avatarFloatingEndState ? avatarFloatingEndState.day : undefined" in tutorial_manager
@@ -1030,8 +1036,8 @@ def test_home_tutorial_release_events_carry_current_avatar_round_end_state():
     assert "neko:avatar-floating-guide-complete" in tutorial_manager
     assert "day: avatarFloatingEndState.day" in tutorial_manager
     assert "lastEndState" in tutorial_manager
-    assert "lastEndState" in reset_runtime
-    assert "state.lastEndState" in reset_runtime
+    assert "STATE_API.resetRound" in reset_runtime
+    assert "state.lastEndState" in seven_day_state
     assert "state.lastEndState" in runtime
 
     assert "window.addEventListener('neko:avatar-floating-guide-skip', handleGuideEndEvent)" not in runtime
@@ -1082,7 +1088,7 @@ def test_avatar_floating_angry_exit_skip_event_preserves_raw_end_state():
 
 def test_icebreaker_uses_broadcast_channel_for_desktop_chat_window():
     runtime = RUNTIME_PATH.read_text(encoding="utf-8")
-    interpage = (ROOT / "static" / "app" / "app-interpage.js").read_text(encoding="utf-8")
+    interpage = read_js_parts(ROOT / "static" / "app" / "app-interpage")
 
     assert "broadcastIcebreakerAppendMessage" in runtime
     assert "broadcastIcebreakerChoicePrompt" in runtime
@@ -1127,7 +1133,7 @@ def test_icebreaker_uses_broadcast_channel_for_desktop_chat_window():
 
 def test_icebreaker_desktop_bridge_has_storage_fallback():
     runtime = RUNTIME_PATH.read_text(encoding="utf-8")
-    interpage = (ROOT / "static" / "app" / "app-interpage.js").read_text(encoding="utf-8")
+    interpage = read_js_parts(ROOT / "static" / "app" / "app-interpage")
 
     assert "ICEBREAKER_BRIDGE_STORAGE_KEY" in runtime
     assert "localStorage.setItem(ICEBREAKER_BRIDGE_STORAGE_KEY" in runtime
@@ -1140,7 +1146,7 @@ def test_icebreaker_desktop_bridge_has_storage_fallback():
 
 
 def test_icebreaker_source_clear_bridge_cannot_clear_non_icebreaker_prompt():
-    interpage = APP_INTERPAGE_PATH.read_text(encoding="utf-8")
+    interpage = read_js_parts(APP_INTERPAGE_PATH)
 
     source_clear_block = interpage.split("function clearIcebreakerChoicePromptSourceFromBroadcast(source, reason)", 1)[1].split(
         "function getIcebreakerMessageText",
@@ -1164,8 +1170,8 @@ def test_icebreaker_page_exit_clears_choice_prompt_before_route_end():
 
 
 def test_yui_guide_chat_bridge_has_storage_queue_fallback():
-    director = (ROOT / "static" / "tutorial" / "yui-guide" / "director.js").read_text(encoding="utf-8")
-    interpage = (ROOT / "static" / "app" / "app-interpage.js").read_text(encoding="utf-8")
+    director = read_director_source(ROOT)
+    interpage = read_js_parts(ROOT / "static" / "app" / "app-interpage")
 
     assert "YUI_GUIDE_CHAT_BRIDGE_QUEUE_KEY" in director
     assert "enqueueYuiGuideChatBridgeMessage" in director
@@ -1185,7 +1191,7 @@ def test_yui_guide_chat_bridge_has_storage_queue_fallback():
 
 
 def test_yui_guide_native_relay_uses_defined_chat_helpers():
-    interpage = (ROOT / "static" / "app" / "app-interpage.js").read_text(encoding="utf-8")
+    interpage = read_js_parts(ROOT / "static" / "app" / "app-interpage")
     relay_block = interpage.split("function handleYuiGuideRelayedMessage(message)", 1)[1].split(
         "yuiGuideInterpageResources.addEventListener(window, 'neko:tutorial-overlay-relay'",
         1,
@@ -1344,14 +1350,16 @@ def test_icebreaker_start_dedupes_pending_tutorial_end_triggers():
 def test_home_tutorial_reset_also_resets_day1_icebreaker_state():
     reset_source = (ROOT / "static" / "tutorial" / "avatar" / "floating-guide-reset.js").read_text(encoding="utf-8")
     memory_browser_source = (ROOT / "static" / "js" / "memory_browser.js").read_text(encoding="utf-8")
+    seven_day_state = SEVEN_DAY_STATE_PATH.read_text(encoding="utf-8")
 
     assert "neko.new_user_icebreaker.v1" in reset_source
     assert "resetIcebreakerDay(round)" in reset_source
     assert "delete store.days[key]" in reset_source
     assert "function resetAllIcebreakerDays()" in reset_source
     assert "resetAllAvatarFloatingGuideDays" in reset_source
-    assert "state.completedRounds = []" in reset_source
-    assert "state.skippedRounds = []" in reset_source
+    assert "STATE_API.resetAll" in reset_source
+    assert "state.completedRounds = []" in seven_day_state
+    assert "state.skippedRounds = []" in seven_day_state
     assert "selection.pageKey === 'all'" in memory_browser_source
     assert "resetAllAvatarFloatingGuideDays({" in memory_browser_source
     home_all_block = memory_browser_source.split("if (selection.type === 'home-all') {", 1)[1].split(
@@ -1362,19 +1370,13 @@ def test_home_tutorial_reset_also_resets_day1_icebreaker_state():
         "if (selection.type === 'home-all'",
         1,
     )[0]
-    prompt_reset_helper = memory_browser_source.split("async function resetHomeTutorialPromptState(", 1)[1].split(
-        "async function resetSelectedTutorial()",
-        1,
-    )[0]
-    assert "resetHomeTutorialPromptState('memory_browser_home_day_reset')" in home_day_block
-    assert "resetHomeTutorialPromptState('memory_browser_home_all_reset')" in home_all_block
-    assert "window.universalTutorialManager.resetHomeTutorialPromptState(" in prompt_reset_helper
-    assert "resetHomeTutorialPromptStateViaApi(" in prompt_reset_helper
-    assert "'/api/tutorial-prompt/reset'" in memory_browser_source
+    assert "resetAvatarFloatingGuideDay" in home_day_block
+    assert "resetAllAvatarFloatingGuideDays" in home_all_block
+    assert "/api/tutorial-prompt/" not in memory_browser_source
 
 
 def test_react_chat_fallback_sort_key_stays_after_existing_timestamped_messages():
-    chat_host = CHAT_HOST_PATH.read_text(encoding="utf-8")
+    chat_host = read_js_parts(CHAT_HOST_PATH)
 
     assert "getNextAppendSortKey" in chat_host
     assert "maxExistingSortKey" in chat_host
@@ -1497,7 +1499,11 @@ def test_react_chat_assets_use_react_chat_cache_version():
     react_chat_assets = [
         "/static/react/neko-chat/neko-chat-window.css",
         "/static/react/neko-chat/neko-chat-window.iife.js",
-        "/static/app/app-react-chat-window.js",
+        "/static/app/app-react-chat-window/bootstrap-state-and-geometry.js",
+        "/static/app/app-react-chat-window/geometry-and-messages.js",
+        "/static/app/app-react-chat-window/message-bundle-actions-and-prompts.js",
+        "/static/app/app-react-chat-window/minimize-and-idle-dock.js",
+        "/static/app/app-react-chat-window/resize-drag-and-api.js",
         "/static/app/app-chat-adapter.js",
         "/static/app/app-buttons.js",
     ]
@@ -1506,4 +1512,39 @@ def test_react_chat_assets_use_react_chat_cache_version():
         assert f'{asset}?v={{{{ react_chat_asset_version }}}}' in index_html
         assert f'{asset}?v={{{{ react_chat_asset_version }}}}' in chat_html
 
-    assert pages_router.count('_PROJECT_ROOT / "static/app/app-interpage.js"') == 1
+    assert pages_router.count('_PROJECT_ROOT.glob("static/app/app-interpage/*.js")') == 1
+
+
+def test_icebreaker_uses_electron_bridge_for_isolated_full_chat_partition():
+    runtime = RUNTIME_PATH.read_text(encoding="utf-8")
+    interpage = read_js_parts(APP_INTERPAGE_PATH)
+
+    assert "window.nekoElectronIcebreakerBridge" in runtime
+    assert "electronBridge.send(message)" in runtime
+    assert "window.nekoElectronIcebreakerBridge" in interpage
+    assert "window.__nekoPendingIcebreakerBridgeMessages" in interpage
+    assert "window.__nekoIcebreakerBridgeReady = true" in interpage
+    assert re.search(
+        r"yuiGuideInterpageResources\.addEventListener\(\s*window,\s*"
+        r"['\"]neko:electron-icebreaker-bridge['\"]\s*,\s*"
+        r"handleIcebreakerElectronBridgeEvent\s*\)",
+        interpage,
+    )
+    assert re.search(
+        r"pendingIcebreakerBridgeMessages\.forEach\(function \(message\) \{\s*"
+        r"handleIcebreakerBridgeData\(message\)",
+        interpage,
+    )
+
+
+def test_icebreaker_electron_messages_wait_for_async_chat_identity():
+    interpage = read_js_parts(APP_INTERPAGE_PATH)
+
+    assert "_pendingIcebreakerIdentityMessages" in interpage
+    assert "ICEBREAKER_IDENTITY_QUEUE_MAX = 80" in interpage
+    assert "function queueIcebreakerBridgeMessageUntilIdentity(data)" in interpage
+    assert "flushPendingIcebreakerIdentityMessages" in interpage
+    assert "if (!getCurrentLanlanName())" in interpage
+    assert "queueIcebreakerBridgeMessageUntilIdentity(data);" in interpage
+    assert "'neko:config-injected',\n        schedulePendingIcebreakerIdentityFlush" in interpage
+    assert "window.pageConfigReady.then(schedulePendingIcebreakerIdentityFlush)" in interpage

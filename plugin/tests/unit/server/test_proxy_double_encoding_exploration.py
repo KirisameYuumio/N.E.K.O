@@ -3,7 +3,7 @@
 Bug 1.1 — Proxy double Content-Encoding
 =======================================
 
-``proxy_user_plugin_market_bridge`` in ``app/main_server.py`` (around
+``proxy_user_plugin_market_bridge`` in ``app/main_server/__init__.py`` (around
 line 1604) forwards the client's ``Accept-Encoding`` upstream, lets
 httpx auto-decompress the upstream response body, and then forwards the
 upstream ``Content-Encoding: gzip`` header back to the browser. The
@@ -144,7 +144,7 @@ async def _run_one(body: bytes) -> None:
     try:
         async with original_async_client(
             transport=httpx.ASGITransport(app=app),
-            base_url="http://testserver",
+            base_url="http://127.0.0.1:48911",
         ) as client:
             # Stream the response so we can inspect headers AND read
             # raw bytes via ``aiter_raw`` without httpx auto-decoding
@@ -217,7 +217,7 @@ async def test_proxy_uses_runtime_user_plugin_server_port(monkeypatch: pytest.Mo
     try:
         async with original_async_client(
             transport=httpx.ASGITransport(app=app),
-            base_url="http://testserver",
+            base_url="http://127.0.0.1:48911",
         ) as client:
             response = await client.get("/market/status?x=1")
     finally:

@@ -11,8 +11,10 @@ from ..core.archive_utils import (
     read_manifest,
     read_metadata,
     safe_archive_path,
+    validate_archive_structure,
     validate_package_type,
     validate_plugin_layout,
+    validate_plugin_manifest_types,
     verify_payload_hash,
 )
 
@@ -25,7 +27,9 @@ __all__ = [
     "read_manifest",
     "read_metadata",
     "safe_archive_path",
+    "validate_archive_structure",
     "validate_package_type",
     "validate_plugin_layout",
+    "validate_plugin_manifest_types",
     "verify_payload_hash",
 ]

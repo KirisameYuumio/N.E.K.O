@@ -1,6 +1,9 @@
 from pathlib import Path
+from tests.static_app_parts import read_js_parts
 
 import pytest
+
+from tests.yui_guide_director_parts import read_director_source
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,12 +15,11 @@ DAY5_GUIDE_PATH = ROOT / "static" / "tutorial/yui-guide/days/day5-personalizatio
 DAY6_GUIDE_PATH = ROOT / "static" / "tutorial/yui-guide/days/day6-agent-guide.js"
 DAY7_GUIDE_PATH = ROOT / "static" / "tutorial/yui-guide/days/day7-graduation-guide.js"
 STEPS_PATH = ROOT / "static" / "tutorial/yui-guide/steps.js"
-DIRECTOR_PATH = ROOT / "static" / "tutorial/yui-guide/director.js"
 SCENE_ORCHESTRATOR_PATH = ROOT / "static" / "tutorial/core/scene-orchestrator.js"
-INTERPAGE_PATH = ROOT / "static" / "app" / "app-interpage.js"
+INTERPAGE_PATH = ROOT / "static" / "app" / "app-interpage"
 REACT_APP_PATH = ROOT / "frontend" / "react-neko-chat" / "src" / "App.tsx"
 REACT_SCHEMA_PATH = ROOT / "frontend" / "react-neko-chat" / "src" / "message-schema.ts"
-REACT_HOST_PATH = ROOT / "static" / "app" / "app-react-chat-window.js"
+REACT_HOST_PATH = ROOT / "static" / "app" / "app-react-chat-window"
 MANAGER_PATH = ROOT / "static" / "tutorial/core/universal-manager.js"
 PAGE_TUTORIAL_MANAGER_PATH = ROOT / "static" / "tutorial/core/page-tutorial-manager.js"
 OVERLAY_PATH = ROOT / "static" / "tutorial/yui-guide/overlay.js"
@@ -270,7 +272,7 @@ def test_day4_round_wrap_returns_to_capsule_input_like_day2_wrap():
     for scene_id in EXPECTED_DAY4_SCENES:
         assert f"id: '{scene_id}'" in round_block
     assert_scene_order(round_block, EXPECTED_DAY4_SCENES)
-    assert "target: 'chat-input'" in wrap_block
+    assert "target: 'chat-capsule-input'" in wrap_block
     assert "cursorAction: 'move'" in wrap_block
     assert "operation: 'cleanup'" in wrap_block
     assert "petalTransition: true" in wrap_block
@@ -306,7 +308,7 @@ def test_day6_round_wrap_returns_to_capsule_input_like_day2_wrap():
     if not DAY6_GUIDE_PATH.exists():
         pytest.skip("Day 6 guide is not shipped in this PR")
     source = DAY6_GUIDE_PATH.read_text(encoding="utf-8")
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
     round_block = source.split("round: {", 1)[1]
     plugin_side_panel_block = round_block.split("id: 'day6_plugin_side_panel'", 1)[1].split(
         "id: 'day6_plugin_dashboard'",
@@ -366,11 +368,11 @@ def test_day7_round_wrap_returns_to_capsule_input_like_day2_wrap():
 
 
 def test_compact_chat_tutorial_bridge_exposes_new_targets_and_requests():
-    director = DIRECTOR_PATH.read_text(encoding="utf-8")
-    interpage = INTERPAGE_PATH.read_text(encoding="utf-8")
+    director = read_director_source(ROOT)
+    interpage = read_js_parts(INTERPAGE_PATH)
     react_app = REACT_APP_PATH.read_text(encoding="utf-8")
     react_schema = REACT_SCHEMA_PATH.read_text(encoding="utf-8")
-    react_host = REACT_HOST_PATH.read_text(encoding="utf-8")
+    react_host = read_js_parts(REACT_HOST_PATH)
 
     for token in [
         "chat-history-handle",
@@ -392,15 +394,15 @@ def test_compact_chat_tutorial_bridge_exposes_new_targets_and_requests():
 
 
 def test_external_chat_cursor_retry_cannot_replay_stale_wobble_after_clear():
-    source = INTERPAGE_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(INTERPAGE_PATH)
 
     assert "yuiGuideChatCursorRequestToken" in source
-    assert "var cursorRequestToken = ++yuiGuideChatCursorRequestToken;" in source
+    assert "var cursorRequestToken = yuiGuideChatCursorRequestToken;" in source
     assert "if (cursorRequestToken !== yuiGuideChatCursorRequestToken) {" in source
 
 
 def test_tutorial_exit_clears_externalized_guide_chat_messages():
-    director = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director = read_director_source(ROOT)
     takeover = (ROOT / "static" / "tutorial/core/interaction-takeover.js").read_text(encoding="utf-8")
 
     termination_block = director.split("beginTerminationVisualCleanup()", 1)[1].split(
@@ -432,7 +434,7 @@ def test_tutorial_exit_clears_externalized_guide_chat_messages():
 
 
 def test_pc_external_chat_ghost_cursor_uses_overlay_with_dom_fallback():
-    source = INTERPAGE_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(INTERPAGE_PATH)
     cursor_block = source.split("function applyYuiGuideChatCursor(kind, options)", 1)[1].split(
         "function clearYuiGuideChatSpotlightTracking()",
         1,
@@ -447,12 +449,12 @@ def test_pc_external_chat_ghost_cursor_uses_overlay_with_dom_fallback():
     assert "cursor: {" in cursor_block
     assert "visible: true" in cursor_block
     assert "effect: normalizedOptions.effect || ''" in cursor_block
-    assert "cursor.hidden = false" in cursor_block
+    assert "cursor.hidden = false" in source
     assert "if (isYuiGuidePcCursorOnlyMode())" in cursor_block
 
 
 def test_pc_external_chat_spotlight_uses_overlay_without_dom_fallback():
-    source = INTERPAGE_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(INTERPAGE_PATH)
     spotlight_block = source.split("function getYuiGuideChatSpotlightElement(createIfMissing)", 1)[1].split(
         "function getYuiGuidePcOverlayHost",
         1,
@@ -469,7 +471,7 @@ def test_pc_external_chat_spotlight_uses_overlay_without_dom_fallback():
 
 
 def test_pc_external_chat_spotlight_reuses_last_rect_during_transient_layout_gaps():
-    source = INTERPAGE_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(INTERPAGE_PATH)
     update_block = source.split("function updateYuiGuideChatSpotlight(kind", 1)[1].split(
         "function applyYuiGuideChatSpotlight",
         1,
@@ -479,7 +481,7 @@ def test_pc_external_chat_spotlight_reuses_last_rect_during_transient_layout_gap
         1,
     )[0]
 
-    missing_rect_block = update_block.split("if (!rect || rect.width <= 0 || rect.height <= 0) {", 1)[1].split(
+    missing_rect_block = update_block.split("if (!sourceRect || sourceRect.width <= 0 || sourceRect.height <= 0) {", 1)[1].split(
         "var padding = kind === 'window'",
         1,
     )[0]
@@ -494,9 +496,9 @@ def test_pc_external_chat_spotlight_reuses_last_rect_during_transient_layout_gap
 
 
 def test_pc_external_chat_spotlight_preserves_highlight_during_resistance_pause():
-    interpage_source = INTERPAGE_PATH.read_text(encoding="utf-8")
+    interpage_source = read_js_parts(INTERPAGE_PATH)
     takeover_source = (ROOT / "static" / "tutorial/core/interaction-takeover.js").read_text(encoding="utf-8")
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
     apply_block = interpage_source.split("function applyYuiGuideChatSpotlight(kind, options)", 1)[1].split(
         "function applyYuiGuideChatCursorRelay",
         1,
@@ -523,10 +525,10 @@ def test_pc_external_chat_spotlight_preserves_highlight_during_resistance_pause(
 
 
 def test_externalized_chat_spotlight_keeps_variant_pipeline_but_day1_uses_capsule_target():
-    interpage_source = INTERPAGE_PATH.read_text(encoding="utf-8")
+    interpage_source = read_js_parts(INTERPAGE_PATH)
     takeover_source = (ROOT / "static" / "tutorial/core/interaction-takeover.js").read_text(encoding="utf-8")
     scene_source = SCENE_ORCHESTRATOR_PATH.read_text(encoding="utf-8")
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
     visual_runtime_source = (ROOT / "static" / "tutorial/core/visual-runtime.js").read_text(encoding="utf-8")
     day1_source = DAY1_GUIDE_PATH.read_text(encoding="utf-8")
 
@@ -538,10 +540,10 @@ def test_externalized_chat_spotlight_keeps_variant_pipeline_but_day1_uses_capsul
     assert "preserveDuringResistance: true" in takeover_source
     assert "variant: typeof message.variant === 'string' ? message.variant : ''" in interpage_source
     assert "variant: typeof event.data.variant === 'string' ? event.data.variant : ''" in interpage_source
-    assert "var yuiGuideChatSpotlightVariant = '';" in interpage_source
-    assert "var yuiGuideChatSpotlightLastPcVariant = '';" in interpage_source
+    assert "yuiGuideChatSpotlightVariant = '';" in interpage_source
+    assert "yuiGuideChatSpotlightLastPcVariant = '';" in interpage_source
     assert "toYuiGuideScreenRect({" in interpage_source
-    assert "}, kind, yuiGuideChatSpotlightVariant)" in interpage_source
+    assert "}, kind, yuiGuideChatSpotlightVariant, pcWindowMetrics)" in interpage_source
     assert "rememberYuiGuideChatPcSpotlightRects(kind, pcRects, yuiGuideChatSpotlightVariant);" in interpage_source
     assert "yuiGuideChatSpotlightLastPcVariant === yuiGuideChatSpotlightVariant" in interpage_source
     assert "const sceneSpotlightVariant = scene && typeof scene.spotlightVariant === 'string'" in scene_source
@@ -571,14 +573,20 @@ def test_external_chat_ready_replays_compact_fixed_layout_when_tutorial_is_activ
     assert "reason: typeof reason === 'string' ? reason : ''" in fixed_method_block
 
 
-def test_pc_overlay_sequence_is_shared_between_home_and_external_chat():
-    interpage_source = INTERPAGE_PATH.read_text(encoding="utf-8")
+def test_pc_overlay_sequence_collision_retries_without_rotating_tutorial_run():
+    interpage_source = read_js_parts(INTERPAGE_PATH)
     overlay_source = (ROOT / "static" / "tutorial/yui-guide/overlay.js").read_text(encoding="utf-8")
 
     assert "YUI_GUIDE_PC_OVERLAY_SEQUENCE_KEY = 'yuiGuidePcOverlaySequence'" in interpage_source
     assert "PC_OVERLAY_SEQUENCE_STORAGE_KEY = 'yuiGuidePcOverlaySequence'" in overlay_source
-    assert "function nextYuiGuidePcOverlaySequence()" in interpage_source
-    assert "const nextSequence = () => {" in overlay_source
+    assert "YUI_GUIDE_PC_OVERLAY_MAX_SAME_RUN_STALE_RETRIES = 3" in interpage_source
+    assert "PC_OVERLAY_MAX_SAME_RUN_STALE_RETRIES = 3" in overlay_source
+    assert "YUI_GUIDE_PC_OVERLAY_MAX_TOTAL_STALE_RETRIES = 6" in interpage_source
+    assert "PC_OVERLAY_MAX_TOTAL_SAME_RUN_STALE_RETRIES = 6" in overlay_source
+    assert "YUI_GUIDE_PC_OVERLAY_DEFERRED_RECONCILIATION_DELAY_MS = 48" in interpage_source
+    assert "PC_OVERLAY_DEFERRED_RECONCILIATION_DELAY_MS = 48" in overlay_source
+    assert "function nextYuiGuidePcOverlaySequence(minimumSequence)" in interpage_source
+    assert "const nextSequence = (minimumSequence) => {" in overlay_source
     assert "window.localStorage.getItem(YUI_GUIDE_PC_OVERLAY_SEQUENCE_KEY)" in interpage_source
     assert "window.localStorage.setItem(YUI_GUIDE_PC_OVERLAY_SEQUENCE_KEY" in interpage_source
     assert "window.localStorage.getItem(PC_OVERLAY_SEQUENCE_STORAGE_KEY)" in overlay_source
@@ -587,12 +595,34 @@ def test_pc_overlay_sequence_is_shared_between_home_and_external_chat():
     assert "sequence = nextSequence();" in overlay_source
     assert "yuiGuidePcOverlaySequence = Math.max(yuiGuidePcOverlaySequence + 1, Date.now() * 1000);" not in interpage_source
     assert "sequence = Math.max(sequence + 1, Date.now() * 1000);" not in overlay_source
+    assert "result.reason === 'stale-sequence'" in interpage_source
+    assert "result.reason === 'stale-sequence'" in overlay_source
+    assert "result.activeTutorialRunId === attemptedRunId" in interpage_source
+    assert "result.activeTutorialRunId === attemptedRunId" in overlay_source
+    assert "nextYuiGuidePcOverlaySequence(result.activeSequence)" in interpage_source
+    assert "nextSequence(result.activeSequence)" in overlay_source
+    assert "retryCount < YUI_GUIDE_PC_OVERLAY_MAX_SAME_RUN_STALE_RETRIES" in interpage_source
+    assert "retryCount < PC_OVERLAY_MAX_SAME_RUN_STALE_RETRIES" in overlay_source
+    assert "retryCount < YUI_GUIDE_PC_OVERLAY_MAX_TOTAL_STALE_RETRIES" in interpage_source
+    assert "retryCount < PC_OVERLAY_MAX_TOTAL_SAME_RUN_STALE_RETRIES" in overlay_source
+    assert "scheduleYuiGuidePcOverlayDeferredReconciliation(" in interpage_source
+    assert "scheduleDeferredReconciliation(retryCount, attemptedSequence)" in overlay_source
+    assert "sendYuiGuidePcOverlayPatch({}, retryCount + 1, {" in interpage_source
+    assert "send({}, true, retryCount + 1);" in overlay_source
+    assert "readStoredYuiGuidePcOverlaySequence() > attemptedSequence" in interpage_source
+    assert "readStoredSequence() > attemptedSequence" in overlay_source
+    assert "isDifferentRunStale && retryCount > 0" in interpage_source
+    assert "attemptedOwnedRun && retryCount < YUI_GUIDE_PC_OVERLAY_MAX_TOTAL_STALE_RETRIES" in interpage_source
+    assert "attemptedSequence !== yuiGuidePcOverlaySequence" in interpage_source
+    assert "attemptedSequence !== sequence" in overlay_source
+    assert "activeSequence > attemptedSequence" in interpage_source
+    assert "activeSequence > attemptedSequence" in overlay_source
 
 
 def test_pc_overlay_screen_coordinates_use_niri_virtual_origin_and_crop_safe_area():
-    interpage_source = INTERPAGE_PATH.read_text(encoding="utf-8")
+    interpage_source = read_js_parts(INTERPAGE_PATH)
     overlay_source = OVERLAY_PATH.read_text(encoding="utf-8")
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
     skip_controller_source = SKIP_CONTROLLER_PATH.read_text(encoding="utf-8")
     page_tutorial_source = PAGE_TUTORIAL_MANAGER_PATH.read_text(encoding="utf-8")
     yui_guide_css = YUI_GUIDE_CSS_PATH.read_text(encoding="utf-8")
@@ -609,11 +639,15 @@ def test_pc_overlay_screen_coordinates_use_niri_virtual_origin_and_crop_safe_are
     assert "var screenBounds = cropState.virtualBounds || cropState.cropBounds;" in interpage_source
     assert "x: Number(screenBounds.x || 0) + Number(x || 0)" in interpage_source
     assert "y: Number(screenBounds.y || 0) + Number(y || 0)" in interpage_source
-    assert "api.toVirtualPoint({" in interpage_source
-    assert "api.toVirtualRect({" in interpage_source
+    assert "typeof api.toLayoutVirtualPoint === 'function'" in interpage_source
+    assert "? api.toLayoutVirtualPoint" in interpage_source
+    assert ": api.toVirtualPoint" in interpage_source
+    assert "typeof api.toLayoutVirtualRect === 'function'" in interpage_source
+    assert "? api.toLayoutVirtualRect" in interpage_source
+    assert ": api.toVirtualRect" in interpage_source
     assert "toYuiGuideNiriPetPhysicalCropVirtualPointWithState" in interpage_source
-    assert "if (cropState && cropState.metricsVirtualized) {" in interpage_source
-    assert "Number(cropState && cropState.offsetY || 0)" in interpage_source
+    assert "if (cropState) {" in interpage_source
+    assert "Number(cropState.offsetY || 0)" in interpage_source
     assert "var viewport = shouldApplyYuiGuideVisualViewportOffset(metrics) ? (window.visualViewport || null) : null;" in interpage_source
     assert "if (metrics && (metrics.contentBounds || metrics.bounds))" in overlay_source
     assert "const getNiriPetPhysicalCropState = (metrics) => {" in overlay_source
@@ -625,11 +659,15 @@ def test_pc_overlay_screen_coordinates_use_niri_virtual_origin_and_crop_safe_are
     assert "const screenBounds = cropState.virtualBounds || cropState.cropBounds;" in overlay_source
     assert "x: Number(screenBounds.x || 0) + Number(x || 0)" in overlay_source
     assert "y: Number(screenBounds.y || 0) + Number(y || 0)" in overlay_source
-    assert "api.toVirtualPoint({" in overlay_source
-    assert "api.toVirtualRect({" in overlay_source
+    assert "typeof api.toLayoutVirtualPoint === 'function'" in overlay_source
+    assert "? api.toLayoutVirtualPoint" in overlay_source
+    assert ": api.toVirtualPoint" in overlay_source
+    assert "typeof api.toLayoutVirtualRect === 'function'" in overlay_source
+    assert "? api.toLayoutVirtualRect" in overlay_source
+    assert ": api.toVirtualRect" in overlay_source
     assert "toNiriPetPhysicalCropVirtualPointWithState" in overlay_source
-    assert "cropState && cropState.metricsVirtualized ? {" in overlay_source
-    assert "Number(cropState && cropState.offsetY || 0)" in overlay_source
+    assert "cropState ? {" in overlay_source
+    assert "Number(cropState.offsetY || 0)" in overlay_source
     assert "let lastLocalSpotlightEntries = [];" in overlay_source
     assert "window.addEventListener('neko:niri-pet-physical-crop-state-applied', refreshSpotlightsForCropState);" in overlay_source
     assert "const viewport = shouldApplyVisualViewportOffset(metrics) ? (window.visualViewport || null) : null;" in overlay_source
@@ -638,12 +676,16 @@ def test_pc_overlay_screen_coordinates_use_niri_virtual_origin_and_crop_safe_are
     assert "metrics.niriPetPhysicalCropMetricsVirtualized === true" in director_source
     assert "metrics.niriPetPhysicalCropBounds || metrics.contentBounds || metrics.bounds" in director_source
     assert "const api = typeof window !== 'undefined' ? window.__nekoNiriPetPhysicalCrop : null;" in director_source
-    assert "api.toVirtualPoint(point)" in director_source
-    assert "api.toLocalPoint(point)" in director_source
+    assert "typeof api.toLayoutVirtualPoint === 'function'" in director_source
+    assert "? api.toLayoutVirtualPoint" in director_source
+    assert ": api.toVirtualPoint" in director_source
+    assert "typeof api.toLayoutLocalPoint === 'function'" in director_source
+    assert "? api.toLayoutLocalPoint" in director_source
+    assert ": api.toLocalPoint" in director_source
     assert "toNiriPetPhysicalCropVirtualPointWithState(point, cropState)" in director_source
     assert "toNiriPetPhysicalCropLocalPointWithState(virtualPoint, cropState)" in director_source
-    assert "if (cropState && cropState.metricsVirtualized) {" in director_source
-    assert "- Number(cropState && cropState.offsetY || 0)" in director_source
+    assert "if (cropState) {" in director_source
+    assert "- Number(cropState.offsetY || 0)" in director_source
     assert "x: point.x - Number(screenBounds.x || 0)" in director_source
     assert "y: point.y - Number(screenBounds.y || 0)" in director_source
     assert "x: Number(screenBounds.x || 0) + virtualPoint.x" in director_source
@@ -762,7 +804,7 @@ def test_pc_overlay_cursor_effect_is_one_shot_not_persisted_on_home_bridge():
 def test_pc_overlay_resistance_cursor_uses_cursor_only_patch_without_touching_spotlight():
     overlay_source = OVERLAY_PATH.read_text(encoding="utf-8")
     ghost_source = GHOST_CURSOR_PATH.read_text(encoding="utf-8")
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
     resistance_source = RESISTANCE_CONTROLLER_PATH.read_text(encoding="utf-8")
 
     cursor_only_block = overlay_source.split("const sendCursorOnly = (cursor, retried) => {", 1)[1].split(
@@ -780,7 +822,8 @@ def test_pc_overlay_resistance_cursor_uses_cursor_only_patch_without_touching_sp
 
     assert "const payload = completeStateStore.applyPatch({ cursor: cursor });" in cursor_only_block
     assert "const payload = { cursor: cursor };" not in cursor_only_block
-    assert "handleCursorOnlyStaleResult(result, cursor, retried === true, beginRunId);" in cursor_only_block
+    assert "handleCursorOnlyStaleResult(result, cursor, retryCount, updateRunId, updateSequence);" in cursor_only_block
+    assert "handleCursorOnlyStaleResult(result, cursor, retried === true, beginRunId);" not in cursor_only_block
     assert "result && result.ok === false" in cursor_only_block
     assert "moveCursorOnlyTo(x, y, durationMs, effect, effectDurationMs)" in overlay_source
     assert "normalizedOptions.forcePcOverlay === true" in move_cursor_block
@@ -796,7 +839,7 @@ def test_pc_overlay_resistance_cursor_uses_cursor_only_patch_without_touching_sp
 
 
 def test_externalized_resistance_restores_home_cursor_visibility_before_animating():
-    source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    source = read_director_source(ROOT)
     resistance_block = source.split("playCursorResistanceToUserMotion(x, y, distance, motionDx, motionDy)", 1)[1].split(
         "isCursorTransientMotionActive()",
         1,
@@ -814,7 +857,7 @@ def test_externalized_resistance_restores_home_cursor_visibility_before_animatin
 
 
 def test_pc_overlay_cursor_effect_is_one_shot_not_persisted_on_external_chat_bridge():
-    source = INTERPAGE_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(INTERPAGE_PATH)
     bridge_block = source.split("function sendYuiGuidePcOverlayPatch(patch, retried, options)", 1)[1].split(
         "function isYuiGuidePcCursorOnlyMode()",
         1,
@@ -829,7 +872,7 @@ def test_pc_overlay_cursor_effect_is_one_shot_not_persisted_on_external_chat_bri
 def test_day1_round_start_uses_avatar_floating_round_lifecycle():
     source = MANAGER_PATH.read_text(encoding="utf-8")
     start_block = source.split("async startAvatarFloatingGuideRound(day, options = {})", 1)[1].split(
-        "clearModelManagerTutorialRecheckTimer()",
+        "async waitForTutorialTeardownSettled(reason = '')",
         1,
     )[0]
 
@@ -842,18 +885,18 @@ def test_avatar_floating_round_start_keeps_tutorial_model_reload_before_first_sc
     source = MANAGER_PATH.read_text(encoding="utf-8")
     prelude_source = (ROOT / "static" / "tutorial/core/round-prelude-controller.js").read_text(encoding="utf-8")
     start_block = source.split("async startAvatarFloatingGuideRound(day, options = {})", 1)[1].split(
-        "clearModelManagerTutorialRecheckTimer()",
+        "async waitForTutorialTeardownSettled(reason = '')",
         1,
     )[0]
 
     assert "this._tutorialModelPrefix = 'live2d';" in start_block
-    assert "await this.playAvatarFloatingRoundPrelude(round, source, director);" in start_block
+    assert "await this.playAvatarFloatingRoundPrelude(round, source, director, {" in start_block
     assert "this.beginAvatarOverride({" in prelude_source
     assert "deferRevealPrepared" in prelude_source
     assert "this.ensureVisible(sceneId, {" in prelude_source
     assert "deferRevealPrepared" in prelude_source
     assert "director.playAvatarFloatingRound(round" in start_block
-    assert start_block.index("this.playAvatarFloatingRoundPrelude(round, source, director)") < start_block.index(
+    assert start_block.index("this.playAvatarFloatingRoundPrelude(round, source, director,") < start_block.index(
         "director.playAvatarFloatingRound(round"
     )
 
@@ -862,7 +905,7 @@ def test_avatar_floating_round_waits_after_tutorial_model_is_visible():
     source = MANAGER_PATH.read_text(encoding="utf-8")
     prelude_source = (ROOT / "static" / "tutorial/core/round-prelude-controller.js").read_text(encoding="utf-8")
     start_block = source.split("async startAvatarFloatingGuideRound(day, options = {})", 1)[1].split(
-        "clearModelManagerTutorialRecheckTimer()",
+        "async waitForTutorialTeardownSettled(reason = '')",
         1,
     )[0]
 
@@ -873,7 +916,7 @@ def test_avatar_floating_round_waits_after_tutorial_model_is_visible():
         "await toPromise(() => this.sleep(delayMs));"
     )
     assert "deferRevealPrepared: true" in source
-    assert start_block.index("this.playAvatarFloatingRoundPrelude(round, source, director)") < start_block.index(
+    assert start_block.index("this.playAvatarFloatingRoundPrelude(round, source, director,") < start_block.index(
         "director.playAvatarFloatingRound(round"
     )
 
@@ -881,7 +924,7 @@ def test_avatar_floating_round_waits_after_tutorial_model_is_visible():
 def test_avatar_floating_round_does_not_preheat_surface_before_playback():
     source = MANAGER_PATH.read_text(encoding="utf-8")
     start_block = source.split("async startAvatarFloatingGuideRound(day, options = {})", 1)[1].split(
-        "clearModelManagerTutorialRecheckTimer()",
+        "async waitForTutorialTeardownSettled(reason = '')",
         1,
     )[0]
 
@@ -960,20 +1003,26 @@ def test_day1_chat_input_round_rect_highlight_excludes_mid_flow_cursor_scenes():
     assert "cursorTarget: 'chat-history-handle'" in history_block
     assert "spotlight: false" in history_block
     assert "persistent: 'chat-input'" not in history_block
-    assert "cursorAction: 'move'" in screen_entry_block
+    assert "cursorAction: 'click'" in screen_entry_block
     assert "cursorAction: 'wobble'" not in screen_entry_block
-    assert "cursorAction: 'move'" in screen_invite_block
+    assert "target: '.${p}-trigger-btn'" in screen_entry_block
+    assert "spotlight: false" in screen_entry_block
+    assert "operation: 'day1-screen-share-entry-flow'" in screen_entry_block
+    assert "target: '#${p}-btn-screen'" not in screen_entry_block
+    assert "cursorAction: 'hold'" in screen_invite_block
     assert "cursorAction: 'wobble'" not in screen_invite_block
+    assert "target: '#${p}-popup-mic [data-neko-mic-main-action-row=\"screen\"]'" in screen_invite_block
+    assert "target: '#${p}-btn-screen'" not in screen_invite_block
 
     return_control_scene = round_block.split("id: 'day1_takeover_return_control'", 1)[1]
     assert "cursorAction: 'move'" in return_control_scene
     assert "cursorAction: 'wobble'" not in return_control_scene
 
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
     assert "scene.cursorTarget || scene.target || ''" in director_source
     assert "scene.cursorTarget || scene.target" in director_source
 
-    director = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director = read_director_source(ROOT)
     activation_block = director.split("async playDay1IntroActivationRoundScene", 1)[1].split(
         "async playDay1IntroGreetingRoundScene",
         1,
@@ -1009,7 +1058,7 @@ def test_day1_capsule_drag_hint_copy_uses_single_click_language():
 
 
 def test_day1_intro_basic_voice_moves_from_history_handle_anchor():
-    director = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director = read_director_source(ROOT)
     showcase_block = director.split("async runIntroVoiceControlButtonShowcase", 1)[1].split(
         "async runTakeoverKeyboardControlSequence",
         1,
@@ -1021,7 +1070,7 @@ def test_day1_intro_basic_voice_moves_from_history_handle_anchor():
 
 
 def test_day1_takeover_restores_original_agent_switches():
-    director = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director = read_director_source(ROOT)
     operations = (ROOT / "static" / "tutorial/core/operation-registry.js").read_text(encoding="utf-8")
     restore_block = director.split("async restoreDay1TakeoverAgentSwitches(reason)", 1)[1].split(
         "async clickAgentSidePanelAction",
@@ -1117,15 +1166,34 @@ def test_daily_intro_avatar_motion_presets_are_fixed_per_day():
         assert "{ at: 0, command: 'operation.run', operation: 'daily-intro-avatar-performance', blocking: false }" in scene_block
 
 
-def test_day3_intro_bottom_rise_uses_slow_half_body_motion_after_day_swap():
+def test_day3_intro_bottom_rise_uses_shared_two_second_opening_motion_after_day_swap():
     source = DAY3_GUIDE_PATH.read_text(encoding="utf-8")
+    avatar_stage_source = (ROOT / "static" / "tutorial/avatar/yui-stage.js").read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
     scene_block = source.split("id: 'day3_intro_context'", 1)[1].split(
         "id: 'day3_personalization_space'",
         1,
     )[0]
+    daily_intro_block = director_source.split("async runDailyIntroAvatarPerformance(scene, day, options)", 1)[1].split(
+        "async runIntroGreetingHugPerformance()",
+        1,
+    )[0]
+    probe_motion_block = avatar_stage_source.split(
+        "async function playTutorialAvatarProbeFrameMotion(options, preset)",
+        1,
+    )[1].split("async function playAvatarMotion(options)", 1)[0]
+    play_motion_block = avatar_stage_source.split("async function playAvatarMotion(options)", 1)[1].split(
+        "async function playSettingsPeekPanic(options)",
+        1,
+    )[0]
 
     assert "preset: 'bottom-rise'" in scene_block
-    assert "approachMs: 1500" in scene_block
+    assert "approachMs:" not in scene_block
+    assert "narrationBudgeted: tutorialDay >= 2 && tutorialDay <= 7" in daily_intro_block
+    assert "if (normalizedOptions.narrationBudgeted === true)" in play_motion_block
+    assert "return playTutorialAvatarProbeFrameMotion(normalizedOptions, preset);" in play_motion_block
+    assert "const TUTORIAL_AVATAR_PROBE_APPROACH_MS = 2000;" in avatar_stage_source
+    assert "enterMs: TUTORIAL_AVATAR_PROBE_APPROACH_MS" in probe_motion_block
     assert "restore: 'half-body'" in scene_block
 
 
@@ -1165,7 +1233,7 @@ def test_peek_intro_avatar_motions_keep_floating_buttons_attached_only_for_intro
         (DAY5_GUIDE_PATH, "day5_character_settings", "day5_character_panic"),
         (DAY6_GUIDE_PATH, "day6_intro_agent", "day6_agent_status_master"),
     ]
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
 
     for guide_path, first_scene_id, next_scene_id in guide_specs:
         source = guide_path.read_text(encoding="utf-8")
@@ -1182,7 +1250,7 @@ def test_corner_intro_avatar_motions_rotate_floating_buttons_with_model_when_mod
     day2_source = DAY2_GUIDE_PATH.read_text(encoding="utf-8")
     day5_source = DAY5_GUIDE_PATH.read_text(encoding="utf-8")
     day6_source = DAY6_GUIDE_PATH.read_text(encoding="utf-8")
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
 
     day2_block = day2_source.split("id: 'day2_tool_toggle_intro'", 1)[1].split(
         "id: 'day2_avatar_tools'",
@@ -1199,32 +1267,31 @@ def test_corner_intro_avatar_motions_rotate_floating_buttons_with_model_when_mod
     assert "rotateFloatingButtons: performance.rotateFloatingButtons === true" in director_source
 
 
-def test_peek_intro_half_body_fade_in_restores_full_opacity_after_fadeout():
+def test_peek_intro_half_body_session_fades_out_and_restores_full_opacity():
     source = (ROOT / "static" / "tutorial/avatar/yui-stage.js").read_text(encoding="utf-8")
     corner_block = source.split("async function playTimedAvatarCornerPeek(options, position)", 1)[1].split(
         "async function playFrameAvatarMotion",
         1,
     )[0]
-    fade_in_block = source.split("async function fadeInAvatarMotionHalfBodyPlacement(options)", 1)[1].split(
-        "async function playTimedAvatarCornerPeek",
+    corner_session_block = source.split("class Live2DAvatarCornerPeekSession", 1)[1].split(
+        "class Live2DSettingsPeekPanicSession",
         1,
     )[0]
 
-    assert "const targetAlpha = 1;" in fade_in_block
-    assert "const targetDisplayAlpha = 1;" in fade_in_block
-    assert "readModelAlpha(context.model)" not in fade_in_block
-    assert "captureAvatarMotionHalfBodyFadeTarget" not in source
-    assert "await fadeOutAvatarMotionVisibleLayer(normalizedOptions);" in corner_block
-    assert "await fadeInAvatarMotionHalfBodyPlacement(normalizedOptions);" in corner_block
+    assert "restoreMode: normalizedOptions.restore || normalizedOptions.restoreMode || 'half-body'" in corner_block
+    assert "await handle.stop('avatar_motion_complete');" in corner_block
+    assert "this.restoreAlpha = this.restoreMode === 'half-body' ? 1 : this.initialAlpha;" in corner_session_block
+    assert "lerp(1, 0, progress)" in corner_session_block
+    assert "lerp(0, this.restoreAlpha, progress)" in corner_session_block
 
 
 def test_avatar_floating_intro_motion_reveals_prepared_tutorial_model():
     manager_source = MANAGER_PATH.read_text(encoding="utf-8")
     orchestrator_source = SCENE_ORCHESTRATOR_PATH.read_text(encoding="utf-8")
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
 
-    prelude_block = manager_source.split("async playAvatarFloatingRoundPrelude(round, source, director)", 1)[1].split(
-        "async waitForTutorialTeardownSettled",
+    prelude_block = manager_source.split("async playAvatarFloatingRoundPrelude(round, source, director, options = {})", 1)[1].split(
+        "async checkAndStartTutorial()",
         1,
     )[0]
     assert "deferRevealPrepared: true" in prelude_block
@@ -1244,10 +1311,22 @@ def test_avatar_floating_intro_motion_reveals_prepared_tutorial_model():
     assert "this.operationRegistry.run(scene, primaryTarget, narrationStartedAt, narrationPromise, operationContext)" in director_source
 
 
+def test_day1_externalized_intro_greeting_uses_scene_orchestrator_without_cursor_wobble():
+    source = SCENE_ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    externalized_block = source.split("if (introExternalizedChatSpotlightKind) {", 1)[1].split(
+        "} else if (introChatSpotlightTarget)",
+        1,
+    )[0]
+
+    assert "director.interactionTakeover.setExternalizedChatSpotlight(" in externalized_block
+    assert "introExternalizedChatSpotlightKind" in externalized_block
+    assert "effect: 'wobble'" not in externalized_block
+
+
 def test_day1_legacy_externalized_intro_greeting_does_not_send_cursor_wobble():
-    source = DIRECTOR_PATH.read_text(encoding="utf-8")
-    externalized_block = source.split("async runChatIntroPreludeExternalized", 1)[1].split(
-        "const introText = this.resolvePerformanceBubbleText",
+    source = read_director_source(ROOT)
+    externalized_block = source.split("async playDay1IntroGreetingRoundScene(sceneRunId)", 1)[1].split(
+        "await this.playIntroGreetingReply()",
         1,
     )[0]
 
@@ -1260,7 +1339,7 @@ def test_day1_legacy_externalized_intro_greeting_does_not_send_cursor_wobble():
 
 def test_day2_intro_externalized_cursor_uses_scene_action_not_wobble():
     orchestrator_source = SCENE_ORCHESTRATOR_PATH.read_text(encoding="utf-8")
-    director_source = DIRECTOR_PATH.read_text(encoding="utf-8")
+    director_source = read_director_source(ROOT)
     first_daily_externalized_block = orchestrator_source.split("if (introExternalizedChatSpotlightKind) {", 1)[1].split(
         "} else if (introChatSpotlightTarget)",
         1,
@@ -1294,15 +1373,17 @@ def test_day1_intro_externalized_chat_suppresses_home_pc_cursor_before_hiding_it
     )
 
 
-def test_day1_return_control_preserves_externalized_cursor_from_capture_scene():
-    source = DIRECTOR_PATH.read_text(encoding="utf-8")
-    preserve_block = source.split("shouldPreserveExternalizedChatCursor(previousSceneId, scene)", 1)[1].split(
-        "shouldPreserveIntroExternalizedChatCursor(scene)",
-        1,
-    )[0]
+def test_day1_return_control_declares_externalized_cursor_preservation():
+    source = DAY1_GUIDE_PATH.read_text(encoding="utf-8")
+    round_block = extract_day1_round_block(source)
+    scene_id_index = round_block.index("id: 'day1_takeover_return_control'")
+    scene_start = round_block.rfind("\n                {", 0, scene_id_index)
+    scene_end = round_block.find("\n                }", scene_id_index)
+    assert scene_start != -1
+    assert scene_end != -1
+    return_control_scene = round_block[scene_start:scene_end]
 
-    assert "previousSceneId === 'day1_takeover_capture_cursor'" in preserve_block
-    assert "nextSceneId === 'day1_takeover_return_control'" in preserve_block
+    assert "preserveExternalizedChatGuideTarget: true" in return_control_scene
 
 
 def test_only_day1_tutorial_configs_use_cursor_wobble():

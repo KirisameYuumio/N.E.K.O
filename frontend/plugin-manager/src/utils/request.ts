@@ -2,13 +2,21 @@
  * HTTP 请求封装
  */
 import axios from 'axios'
-import type { AxiosInstance, InternalAxiosRequestConfig, AxiosResponse, AxiosError } from 'axios'
+import type { AxiosInstance, InternalAxiosRequestConfig, AxiosResponse, AxiosError, AxiosRequestConfig } from 'axios'
 import { ElMessage } from 'element-plus'
 import { API_BASE_URL, API_TIMEOUT } from './constants'
 import { useConnectionStore } from '@/stores/connection'
 import { i18n } from '@/i18n'
 
 let lastNetworkErrorShownAt = 0
+
+export type ErrorDisplayRequestConfig = AxiosRequestConfig & {
+  /** Let the caller replace the generic interceptor toast with a domain message. */
+  suppressErrorMessage?: boolean
+  /** Suppress only the expected stopped-plugin response for panel probes. */
+  suppressPluginNotRunningMessage?: boolean
+  preserveMessagesOn404?: boolean
+}
 
 type HeaderBag = Record<string, unknown> & {
   delete?: (name: string) => void
@@ -83,6 +91,38 @@ export function formatHttpError(error: unknown): string {
   return !anyError?.response && error instanceof Error ? error.message : ''
 }
 
+function readErrorCode(error: AxiosError): string {
+  const headers = error.response?.headers
+  if (headers && typeof headers.get === 'function') {
+    const value = headers.get('X-Error-Code')
+    if (value != null) return String(value)
+  }
+  const headerValue = headers?.['x-error-code'] ?? headers?.['X-Error-Code']
+  if (headerValue != null) return String(headerValue)
+  const data = error.response?.data
+  if (data && typeof data === 'object') {
+    const record = data as Record<string, unknown>
+    if (typeof record.code === 'string') return record.code
+    if (record.detail && typeof record.detail === 'object') {
+      const detail = record.detail as Record<string, unknown>
+      if (typeof detail.code === 'string') return detail.code
+    }
+  }
+  return ''
+}
+
+export function shouldSuppressPluginNotRunningMessage(error: AxiosError): boolean {
+  const requested = Boolean(
+    (error.config as ErrorDisplayRequestConfig | undefined)?.suppressPluginNotRunningMessage,
+  )
+  return requested && readErrorCode(error) === 'PLUGIN_NOT_RUNNING'
+}
+
+export function shouldSuppressErrorMessage(error: AxiosError): boolean {
+  return Boolean((error.config as ErrorDisplayRequestConfig | undefined)?.suppressErrorMessage)
+    || shouldSuppressPluginNotRunningMessage(error)
+}
+
 // 创建 axios 实例
 const service: AxiosInstance = axios.create({
   baseURL: API_BASE_URL,
@@ -116,10 +156,14 @@ service.interceptors.response.use(
     return response.data
   },
   async (error: AxiosError) => {
+    if (axios.isCancel(error) || error.code === 'ERR_CANCELED') {
+      return Promise.reject(error)
+    }
     // 对于 404 错误，不输出错误日志（这是正常的，某些资源可能不存在）
     // 对于 401/403 错误，也不输出错误日志
     const status = error.response?.status
-    if (status !== 404 && status !== 401 && status !== 403) {
+    const suppressErrorMessage = shouldSuppressErrorMessage(error)
+    if (!suppressErrorMessage && status !== 404 && status !== 401 && status !== 403) {
       console.error('Response error:', error)
     }
 
@@ -133,8 +177,6 @@ service.interceptors.response.use(
         console.debug('Connection store not available:', err)
       }
       // 服务器返回了错误状态码
-      const data = error.response.data as any
-
       switch (status) {
         case 400:
           message = formatHttpError(error) || i18n.global.t('messages.badRequest')
@@ -145,11 +187,17 @@ service.interceptors.response.use(
         case 403:
           message = formatHttpError(error) || i18n.global.t('auth.forbidden')
           break
-        case 404:
+        case 404: {
           message = formatHttpError(error) || i18n.global.t('messages.resourceNotFound')
           // 404 错误不显示通用错误消息，让调用方自己处理
-          ElMessage.closeAll()
+          const preserveMessagesOn404 = Boolean(
+            (error.config as ErrorDisplayRequestConfig | undefined)?.preserveMessagesOn404,
+          )
+          if (!preserveMessagesOn404) {
+            ElMessage.closeAll()
+          }
           break
+        }
         case 500:
           message = formatHttpError(error) || i18n.global.t('messages.internalServerError')
           break
@@ -167,7 +215,7 @@ service.interceptors.response.use(
         const wasDisconnected = connectionStore.disconnected
         connectionStore.markDisconnected()
         const now = Date.now()
-        if (!wasDisconnected && now - lastNetworkErrorShownAt > 15000) {
+        if (!suppressErrorMessage && !wasDisconnected && now - lastNetworkErrorShownAt > 15000) {
           lastNetworkErrorShownAt = now
           ElMessage.error(message)
         }
@@ -188,7 +236,9 @@ service.interceptors.response.use(
       return Promise.reject(error)
     }
 
-    ElMessage.error(message)
+    if (!suppressErrorMessage) {
+      ElMessage.error(message)
+    }
     return Promise.reject(error)
   }
 )

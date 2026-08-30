@@ -28,7 +28,7 @@ import sys
 import time
 import asyncio
 import threading
-from typing import Dict
+from typing import Callable, Dict
 
 import httpx
 
@@ -167,6 +167,8 @@ async def _start_embedded_user_plugin_server() -> None:
         log_config=None,
         backlog=4096,
         timeout_keep_alive=30,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None
@@ -244,13 +246,22 @@ async def _stop_embedded_user_plugin_server() -> None:
             server.force_exit = True
 
 
-async def _ensure_plugin_lifecycle_started() -> bool:
-    """Start the plugin lifecycle (load & run plugins). Returns True on success."""
-    if _shared.Modules.plugin_lifecycle_started:
-        return True
+async def _ensure_plugin_lifecycle_started(
+    should_start: Callable[[], bool] | None = None,
+) -> bool:
+    """Start the plugin lifecycle (load and run plugins).
+
+    Returns ``False`` both when startup fails and when ``should_start`` says
+    that the caller no longer owns the current lifecycle generation. Callers
+    must re-check ownership before treating ``False`` as a startup failure.
+    """
+    if should_start is not None and not should_start():
+        return False
     if _shared.Modules._plugin_lifecycle_lock is None:
         _shared.Modules._plugin_lifecycle_lock = asyncio.Lock()
     async with _shared.Modules._plugin_lifecycle_lock:
+        if should_start is not None and not should_start():
+            return False
         if _shared.Modules.plugin_lifecycle_started:
             return True
         try:
@@ -264,13 +275,17 @@ async def _ensure_plugin_lifecycle_started() -> bool:
             return False
 
 
-async def _ensure_plugin_lifecycle_stopped() -> None:
+async def _ensure_plugin_lifecycle_stopped(
+    should_stop: Callable[[], bool] | None = None,
+) -> None:
     """Stop the plugin lifecycle (stop plugin processes, cleanup)."""
-    if not _shared.Modules.plugin_lifecycle_started:
+    if should_stop is not None and not should_stop():
         return
     if _shared.Modules._plugin_lifecycle_lock is None:
         _shared.Modules._plugin_lifecycle_lock = asyncio.Lock()
     async with _shared.Modules._plugin_lifecycle_lock:
+        if should_stop is not None and not should_stop():
+            return
         if not _shared.Modules.plugin_lifecycle_started:
             return
         try:

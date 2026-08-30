@@ -8,15 +8,16 @@ same substitution helper:
    the LLM prompt.
 2. ``_format_voice_swap_item`` — voice-mode ``pending_extra_replies``
    hot-swap rendering into ``prime_context``.
-3. ``app/main_server.py`` direct_reply — plugin text bypassing the LLM and
+3. ``app/main_server/character_runtime.py`` direct_reply — plugin text bypassing the LLM and
    going verbatim to TTS via ``send_lanlan_response``.
-4. ``app/main_server.py`` ``passthrough_to_chat_bubble`` — ``visibility=["chat"]``
-   + ``ai_behavior="blind"`` blind chat-bubble passthrough.
-5. ``app/main_server.py`` HUD ``agent_notification`` — ``visibility=["hud"]``
+4. ``app/main_server/character_runtime.py`` ``render_chat_blocks`` — the text
+   blocks of a ``visibility=["chat"]`` push, rendered as a system message for
+   every ``ai_behavior`` (blind included).
+5. ``app/main_server/character_runtime.py`` HUD ``agent_notification`` — ``visibility=["hud"]``
    toast text.
 
 If any of these grow a new code path that bypasses ``apply_role_placeholders``,
-plugins emitting ``"向 {MASTER_NAME} 汇报…"`` style text will end up speaking /
+plugins emitting ``"向 {MASTER_NAME} 汇报…"`` style text will end up speaking /  # noqa: DOCSTRING_CJK
 displaying the literal token to the user. This file is the canary.
 
 The substitution uses ``str.replace``, not ``str.format`` — JSON fragments
@@ -202,6 +203,7 @@ def _mgr_for_main_server(send_lanlan_return=True):
     fake_mgr.send_lanlan_response = AsyncMock(return_value=send_lanlan_return)
     fake_mgr.handle_proactive_complete = AsyncMock()
     fake_mgr.passthrough_to_chat_bubble = AsyncMock(return_value=True)
+    fake_mgr.render_chat_blocks = AsyncMock(return_value=True)
     fake_mgr.enqueue_agent_callback = MagicMock()
     fake_mgr.trigger_agent_callbacks = AsyncMock()
     fake_mgr.websocket = MagicMock()
@@ -211,12 +213,12 @@ def _mgr_for_main_server(send_lanlan_return=True):
 
 
 def _patch_main_server(monkeypatch, fake_mgr):
-    monkeypatch.setattr("app.main_server._get_session_manager", lambda name: fake_mgr)
-    monkeypatch.setattr("app.main_server._is_websocket_connected", lambda ws: True)
+    monkeypatch.setattr("app.main_server.character_runtime._get_session_manager", lambda name: fake_mgr)
+    monkeypatch.setattr("app.main_server.character_runtime._is_websocket_connected", lambda ws: True)
 
 
 @pytest.mark.unit
-async def test_main_server_direct_reply_substitutes_master_name(monkeypatch):
+async def test_main_server_direct_reply_substitutes_master_name(monkeypatch, capsys):
     """task_result + direct_reply → text goes verbatim to send_lanlan_response
     (skipping the LLM). The placeholder must be expanded at this boundary or
     the literal token reaches TTS."""
@@ -224,13 +226,14 @@ async def test_main_server_direct_reply_substitutes_master_name(monkeypatch):
 
     fake_mgr = _mgr_for_main_server()
     _patch_main_server(monkeypatch, fake_mgr)
+    private_reply = "PRIVATE_DIRECT_REPLY_MARKER"
 
     await main_server._handle_agent_event(
         {
             "event_type": "task_result",
             "lanlan_name": "兰兰",
             "text": "ignored",
-            "detail": "搞定了，要不要跟 {MASTER_NAME} 报告一下？",
+            "detail": f"搞定了，{private_reply}，要不要跟 {{MASTER_NAME}} 报告一下？",
             "direct_reply": True,
             "channel": "plugin:demo",
             "task_id": "t-1",
@@ -242,13 +245,16 @@ async def test_main_server_direct_reply_substitutes_master_name(monkeypatch):
     sent_text = fake_mgr.send_lanlan_response.await_args.args[0]
     assert "{MASTER_NAME}" not in sent_text
     assert "跟 小明 报告" in sent_text
+    captured = capsys.readouterr()
+    assert private_reply not in captured.out
+    assert private_reply not in captured.err
 
 
 @pytest.mark.unit
 async def test_main_server_chat_passthrough_substitutes_master_name(monkeypatch):
     """visibility=["chat"] + ai_behavior="blind" → text goes verbatim to
-    ``passthrough_to_chat_bubble`` (skipping the LLM). Without substitution
-    the literal placeholder renders in the chat bubble. This is the codex
+    ``render_chat_blocks`` (skipping the LLM). Without substitution the
+    literal placeholder renders in the chat bubble. This is the codex
     P2 finding on PR #1422."""
     from app import main_server
 
@@ -270,26 +276,32 @@ async def test_main_server_chat_passthrough_substitutes_master_name(monkeypatch)
         }
     )
 
-    fake_mgr.passthrough_to_chat_bubble.assert_awaited_once()
-    sent_text = fake_mgr.passthrough_to_chat_bubble.await_args.args[0]
+    # Plugin chat output is a system message now; the placeholder contract is
+    # unchanged, it just lives inside the text block rather than a bare string.
+    fake_mgr.render_chat_blocks.assert_awaited_once()
+    blocks = fake_mgr.render_chat_blocks.await_args.args[0]
+    sent_text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
     assert "{MASTER_NAME}" not in sent_text
     assert "小明 你看一下这个" in sent_text
 
 
 @pytest.mark.unit
-async def test_main_server_hud_notification_substitutes_master_name(monkeypatch):
+async def test_main_server_hud_notification_substitutes_master_name(
+    monkeypatch, capsys
+):
     """visibility=["hud"] toast text reaches the frontend verbatim. Without
     substitution the placeholder shows up in the toast literal."""
     from app import main_server
 
     fake_mgr = _mgr_for_main_server()
     _patch_main_server(monkeypatch, fake_mgr)
+    private_notification = "PRIVATE_HUD_NOTIFICATION_MARKER"
 
     await main_server._handle_agent_event(
         {
             "event_type": "proactive_message",
             "lanlan_name": "兰兰",
-            "text": "提醒 {MASTER_NAME}：番茄钟到点了",
+            "text": f"提醒 {{MASTER_NAME}}：{private_notification}，番茄钟到点了",
             "channel": "plugin:demo",
             "task_id": "t-3",
             "ai_behavior": "blind",
@@ -308,4 +320,69 @@ async def test_main_server_hud_notification_substitutes_master_name(monkeypatch)
     assert len(hud_calls) == 1
     notif_text = hud_calls[0].get("text", "")
     assert "{MASTER_NAME}" not in notif_text
-    assert "提醒 小明：番茄钟到点了" in notif_text
+    assert "提醒 小明：" in notif_text
+    captured = capsys.readouterr()
+    assert private_notification not in captured.out
+    assert private_notification not in captured.err
+
+
+@pytest.mark.unit
+async def test_main_server_event_failure_logs_only_exception_type(monkeypatch):
+    """Unexpected dispatch failures stay visible without persisting private text."""
+    from app import main_server
+    from app.main_server import character_runtime
+
+    private_error = "PRIVATE_EXCEPTION_MESSAGE_MARKER"
+
+    def fail_session_lookup(_lanlan_name):
+        raise RuntimeError(private_error)
+
+    test_logger = MagicMock()
+    test_logger.isEnabledFor.return_value = True
+    printed: list[int] = []
+    monkeypatch.setattr(character_runtime, "_get_session_manager", fail_session_lookup)
+    monkeypatch.setattr(character_runtime, "logger", test_logger)
+    monkeypatch.setattr(
+        character_runtime.traceback, "print_exc", lambda *a, **k: printed.append(1)
+    )
+
+    await main_server._handle_agent_event(
+        {
+            "event_type": "task_update",
+            "lanlan_name": "兰兰",
+            "task": {},
+        }
+    )
+
+    test_logger.warning.assert_called_once_with(
+        "[EventBus] handle_agent_event failed (error_type=%s)",
+        "RuntimeError",
+    )
+    rendered = (
+        test_logger.warning.call_args.args[0] % test_logger.warning.call_args.args[1:]
+    )
+    assert private_error not in rendered
+
+    # 异常消息可能带用户对话文本，所以一个 logger 级别都不能碰——DEBUG 也不行：
+    # 源码运行且 log_level<=DEBUG 时 setup_logging 会挂一个只收 DEBUG 的
+    # RotatingFileHandler 落到 logs/，logger.debug 同样会被持久化。仓库规则见
+    # .agent/rules/neko-guide.md 与 docs/contributing/code-style.md。
+    for forbidden in ("debug", "info", "error", "critical", "exception"):
+        assert not getattr(test_logger, forbidden).called, (
+            f"异常详情不得进 logger.{forbidden}（logger 输出会落盘）"
+        )
+    # traceback 走 print，且只在 DEBUG 级下输出
+    assert printed == [1], "DEBUG 级下应通过 print 输出 traceback"
+
+    # DEBUG 关闭时连 print 也不该有
+    printed.clear()
+    test_logger.reset_mock()
+    test_logger.isEnabledFor.return_value = False
+    await main_server._handle_agent_event(
+        {
+            "event_type": "task_update",
+            "lanlan_name": "兰兰",
+            "task": {},
+        }
+    )
+    assert printed == [], "非 DEBUG 级下不应打印 traceback"

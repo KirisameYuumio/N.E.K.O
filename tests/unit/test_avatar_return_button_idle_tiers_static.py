@@ -1,15 +1,23 @@
 from pathlib import Path
+from tests.static_app_parts import read_js_parts
 
 from PIL import Image
 
 from main_routers import pages_router
+from tests.unit.avatar_ui_buttons_source import read_avatar_ui_buttons_source
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-AVATAR_UI_BUTTONS_PATH = PROJECT_ROOT / "static" / "avatar" / "avatar-ui-buttons.js"
-APP_UI_PATH = PROJECT_ROOT / "static" / "app" / "app-ui.js"
-APP_INTERPAGE_PATH = PROJECT_ROOT / "static" / "app" / "app-interpage.js"
-APP_REACT_CHAT_WINDOW_PATH = PROJECT_ROOT / "static" / "app" / "app-react-chat-window.js"
+AVATAR_UI_BUTTONS_DIR = PROJECT_ROOT / "static" / "avatar" / "avatar-ui-buttons"
+
+
+def _read_avatar_ui_buttons_source() -> str:
+    return read_avatar_ui_buttons_source()
+
+
+APP_UI_PATH = PROJECT_ROOT / "static" / "app" / "app-ui"
+APP_INTERPAGE_PATH = PROJECT_ROOT / "static" / "app" / "app-interpage"
+APP_REACT_CHAT_WINDOW_PATH = PROJECT_ROOT / "static" / "app" / "app-react-chat-window"
 COMMON_UI_HUD_PATH = PROJECT_ROOT / "static" / "common-ui-hud.js"
 LIVE2D_UI_BUTTONS_PATH = PROJECT_ROOT / "static" / "live2d" / "live2d-ui-buttons.js"
 VRM_UI_BUTTONS_PATH = PROJECT_ROOT / "static" / "vrm" / "vrm-ui-buttons.js"
@@ -75,8 +83,8 @@ def _assert_source_order(block, block_name, *expected_markers):
 
 
 def test_return_button_idle_tier_assets_are_mapped_in_source():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
+    app_ui_source = read_js_parts(APP_UI_PATH)
 
     # Non-click states
     assert "/static/assets/neko-idle/cat-idle-cat1.gif" in source
@@ -143,7 +151,7 @@ def test_return_button_idle_tier_assets_are_mapped_in_source():
 
 
 def test_cat1_question_mark_keyboard_trigger_replaces_drag_sequence():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
     pages_router_paths = {path.relative_to(PROJECT_ROOT).as_posix() for path in pages_router._YUI_GUIDE_ASSET_VERSION_PATHS}
 
     assert CAT1_QUESTION_MARK_ASSET_PATH.exists()
@@ -188,7 +196,7 @@ def test_cat1_question_mark_keyboard_trigger_replaces_drag_sequence():
 
 
 def test_cat1_playground_drop_lifecycle_and_physics_are_centralized():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     assert "function _acquireNekoIdleCat1PlaygroundDropLifecycle(button, entryDetail)" in source
     assert "function _releaseNekoIdleCat1PlaygroundDropLifecycle(button, reason)" in source
@@ -508,7 +516,7 @@ def test_cat1_playground_drop_lifecycle_and_physics_are_centralized():
     assert "_releaseAllNekoIdleCat1PlaygroundDropLifecycles('beforeunload');" in source
 
 def test_cat1_playground_click_exit_is_not_armed_as_drag_on_pointerdown():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     assert "function _getNekoIdleCat1PlaygroundPointerVelocity(samples)" in source
     assert "function _handleNekoIdleCat1PlaygroundCatClick(button, event)" in source
@@ -656,9 +664,9 @@ def test_cat1_playground_click_exit_is_not_armed_as_drag_on_pointerdown():
 
 
 def test_cat1_playground_entry_minimizes_chat_to_yarn_before_drop():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
-    interpage_source = APP_INTERPAGE_PATH.read_text(encoding="utf-8")
-    app_source = APP_REACT_CHAT_WINDOW_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
+    interpage_source = read_js_parts(APP_INTERPAGE_PATH)
+    app_source = read_js_parts(APP_REACT_CHAT_WINDOW_PATH)
 
     assert "function _requestNekoIdleCat1PlaygroundYarnTarget(detail)" in source
     assert "function _startNekoIdleCat1PlaygroundDropAfterYarnTargetReady(button, detail)" in source
@@ -765,12 +773,12 @@ def test_cat1_playground_entry_minimizes_chat_to_yarn_before_drop():
 
 
 def test_model_cat_transition_contract_is_present():
-    source = APP_UI_PATH.read_text(encoding="utf-8")
-    avatar_source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(APP_UI_PATH)
+    avatar_source = _read_avatar_ui_buttons_source()
 
     assert "function playNekoModelCatTransition" in source
     assert "window.playNekoModelCatTransition = playNekoModelCatTransition" in source
-    assert "let nekoModelCatTransitionActive = null" in source
+    assert "nekoModelCatTransitionActive = null" in source
     assert "function isNekoModelCatTransitionActive(direction = '')" in source
     assert "function reserveNekoModelCatTransition(direction)" in source
     assert "function releaseNekoModelCatTransition(token)" in source
@@ -829,6 +837,12 @@ def test_model_cat_transition_contract_is_present():
     assert "NEKO_MODEL_GOODBYE_VISUAL_FADE_TRANSITION = 'opacity 240ms ease-in'" in source
     assert "function getActiveModelTransitionRect()" in source
     assert "getModelScreenBounds" in source
+    assert "toNekoVirtualTransitionRect" in source
+    assert "cropApi.toVirtualRect" in source
+    assert "getNekoTransitionVirtualViewportSize" in source
+    assert "virtualViewport.width - containerWidth" in source
+    assert "virtualViewport.height - containerHeight" in source
+    assert "savedGoodbyeRect = toNekoVirtualTransitionRect(r)" in source
     assert "savedGoodbyeRect = savedModelRect || savedGoodbyeRect" in source
     assert "NEKO_MODEL_CAT_REVEAL_BEFORE_SMOKE_HIDE_MS = 48" in source
     assert "NEKO_MODEL_CAT_TRANSITION_DURATION_MS = 850" in source
@@ -873,7 +887,7 @@ def test_model_cat_transition_contract_is_present():
     assert "top: Math.round(centerY - size / 2)" in transition_rect_block
     assert "maxLeft" not in transition_rect_block
     assert "maxTop" not in transition_rect_block
-    assert "const transitionAnchorRect = savedGoodbyeRect || activeReturnButtonContainer.getBoundingClientRect()" in source
+    assert "toNekoVirtualTransitionRect(activeReturnButtonContainer.getBoundingClientRect())" in source
     assert "function mergeNekoTransitionAnchorRect(anchorRect, coverRect)" in source
     assert "const coverRect = options.coverRect || null" in source
     assert "coverRect: window._savedGoodbyeRect || getActiveModelTransitionRect()" in source
@@ -889,7 +903,7 @@ def test_model_cat_transition_contract_is_present():
     assert "window.dispatchEvent(event);" in avatar_source
     assert "dispatchReturnEvent();" in avatar_source
     assert "returnButtonContainer.setAttribute('data-neko-model-cat-transitioning', 'cat-to-model');" not in avatar_source
-    assert "let nekoModelCatRevealPlaybackToken = 0" in source
+    assert "nekoModelCatRevealPlaybackToken = 0" in source
     assert "function buildNekoModelCatRevealPlaybackUrl(src, playbackToken)" in source
     assert "url.searchParams.set('reveal'" in source
     assert "function restartNekoModelCatRevealArt(container)" in source
@@ -1045,8 +1059,8 @@ def test_model_cat_transition_contract_is_present():
 
 
 def test_goodbye_idle_breathing_ball_shape_contract_is_present():
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
-    avatar_source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    app_ui_source = read_js_parts(APP_UI_PATH)
+    avatar_source = _read_avatar_ui_buttons_source()
     css_source = INDEX_CSS_PATH.read_text(encoding="utf-8")
 
     assert "NEKO_GOODBYE_IDLE_APPEARANCE_BALL = 'ball'" in app_ui_source
@@ -1080,9 +1094,11 @@ def test_goodbye_idle_breathing_ball_shape_contract_is_present():
     _assert_source_order(
         app_auto_goodbye_listener_block,
         "breathing ball state change sends one desktop bridge payload",
+        "const container = getVisibleIdleReturnBallContainer();",
         "if (getNekoGoodbyeIdleAppearance() === NEKO_GOODBYE_IDLE_APPEARANCE_BALL) {",
         "syncGoodbyeIdleAppearanceForReturnButtons('goodbye-idle-appearance-visual-tier');",
-        "return;\n        }\n        scheduleIdleReturnBallDesktopBridge(",
+        "return;\n        }\n        if (container && container.__nekoLive2DPeekEdgeAnchor) {",
+        "scheduleIdleReturnBallDesktopBridge(",
     )
     dispatch_return_ball_block = _source_slice_between(
         app_ui_source,
@@ -1145,7 +1161,7 @@ def test_goodbye_idle_breathing_ball_shape_contract_is_present():
 
 
 def test_pngtuber_return_restores_pointer_events():
-    source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(APP_UI_PATH)
     branch = source[
         source.index("} else if (effectiveModelType === 'pngtuber') {"):
         source.index("const live2dContainerPngtuber = document.getElementById('live2d-container');")
@@ -1162,7 +1178,7 @@ def test_pngtuber_return_restores_pointer_events():
 
 
 def test_pngtuber_return_replays_model_enter_animation_after_preparing_container():
-    source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(APP_UI_PATH)
     branch = source[
         source.index("} else if (effectiveModelType === 'pngtuber') {"):
         source.index("const live2dContainerPngtuber = document.getElementById('live2d-container');")
@@ -1179,7 +1195,7 @@ def test_pngtuber_return_replays_model_enter_animation_after_preparing_container
 
 def test_return_button_idle_tier_styles_are_present():
     source = INDEX_CSS_PATH.read_text(encoding="utf-8")
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
+    app_ui_source = read_js_parts(APP_UI_PATH)
 
     assert '.neko-idle-return-btn[data-neko-idle-tier="cat2"]' in source
     assert '.neko-idle-return-btn[data-neko-idle-tier="cat3"]' in source
@@ -1211,8 +1227,8 @@ def test_return_button_idle_tier_styles_are_present():
 
 
 def test_cat1_edge_peek_only_applies_after_drag_release():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
+    app_ui_source = read_js_parts(APP_UI_PATH)
 
     assert "_NEKO_IDLE_CAT1_EDGE_PEEK_TRIGGER_RATIO = 0.025" in source
     assert "_NEKO_IDLE_CAT1_EDGE_PEEK_HIDDEN_RATIO = 0.4" in source
@@ -1274,11 +1290,84 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
     )
     assert "if (!container || !_isNekoIdleCat1EdgePeekEligible(container)) return false;" in edge_apply_block
     assert "_getNekoIdleCat1EdgePeekPlacement(left, top, w, h, viewportWidth, viewportHeight)" in edge_apply_block
+    assert "EDGE_PEEK_AFTER_DRAG" not in edge_apply_block
+    assert "_dispatchNekoIdleCat1EdgePeekAfterDragObservation" not in edge_apply_block
     assert "function _isNekoIdleCat1EdgePeekActive(containerOrButton)" in source
+    assert "function _isNekoIdleCat1TransferredPeekAnchorActive(containerOrButton)" in source
+    assert "function _isNekoIdleCat1MovementAnchored(containerOrButton)" in source
     assert "function _getNekoIdleCat1EdgePeekActiveEdge(containerOrButton)" in source
     assert "function _reclampNekoIdleCat1EdgePeekToViewport(containerOrButton)" in source
     assert "return button.classList.contains(className);" in source
     assert "function _clearNekoIdleCat1EdgePeekForTierExit(container)" in source
+
+    clear_edge_block = _source_slice_between(
+        source,
+        "function _clearNekoIdleCat1EdgePeek(containerOrButton)",
+        "function _isNekoIdleCat1EdgePeekActive(containerOrButton)",
+        "cat1 edge peek clear",
+    )
+    _assert_source_order(
+        clear_edge_block,
+        "cat1 edge peek clear owns the visual shift lifecycle",
+        "button.classList.remove(className);",
+        "button.querySelector('.neko-idle-return-art');",
+        "art.style.removeProperty('--neko-idle-return-edge-visual-shift-y');",
+        "_syncNekoIdleCat1QuestionMarkKeyboardAvailabilityForButton(button);",
+    )
+
+    edge_active_block = _source_slice_between(
+        source,
+        "function _isNekoIdleCat1EdgePeekActive(containerOrButton)",
+        "function _getNekoIdleCat1EdgePeekActiveEdge(containerOrButton)",
+        "cat1 edge peek active predicate",
+    )
+    assert "_NEKO_IDLE_CAT1_EDGE_PEEK_CLASSES.some" in edge_active_block
+    assert "data-neko-live2d-peek-anchor" not in edge_active_block
+
+    transferred_anchor_block = _source_slice_between(
+        source,
+        "function _isNekoIdleCat1TransferredPeekAnchorActive(containerOrButton)",
+        "function _isNekoIdleCat1MovementAnchored(containerOrButton)",
+        "transferred live2d peek anchor predicate",
+    )
+    assert "data-neko-live2d-peek-anchor" in transferred_anchor_block
+    assert "_NEKO_IDLE_CAT1_EDGE_PEEK_CLASSES" not in transferred_anchor_block
+
+    movement_anchor_block = _source_slice_between(
+        source,
+        "function _isNekoIdleCat1MovementAnchored(containerOrButton)",
+        "function _dispatchNekoIdleCat1EdgePeekAfterDragObservation(containerOrButton)",
+        "cat1 movement anchor predicate",
+    )
+    _assert_source_order(
+        movement_anchor_block,
+        "cat1 movement anchor combines but does not merge edge states",
+        "_isNekoIdleCat1EdgePeekActive(containerOrButton)",
+        "_isNekoIdleCat1TransferredPeekAnchorActive(containerOrButton)",
+    )
+    assert source.count("_isNekoIdleCat1MovementAnchored(") == 8
+    assert source.count("_isNekoIdleCat1TransferredPeekAnchorActive(") == 2
+
+    edge_observation_block = _source_slice_between(
+        source,
+        "function _dispatchNekoIdleCat1EdgePeekAfterDragObservation(containerOrButton)",
+        "function _isNekoIdleCat1EdgePeekEligible(containerOrButton)",
+        "cat1 edge peek drag observation",
+    )
+    _assert_source_order(
+        edge_observation_block,
+        "cat1 edge peek drag observation retains its detail contract",
+        "const edge = _getNekoIdleCat1EdgePeekActiveEdge(button);",
+        "if (!button || !edge) return false;",
+        "_NEKO_CAT_IDLE_OBSERVATION_TYPES.EDGE_PEEK_AFTER_DRAG",
+        "source: 'return-ball'",
+        "tier: button.getAttribute('data-neko-idle-tier')",
+        "reason: 'drag-edge-peek'",
+        "edge: edge",
+        "return true;",
+    )
+    assert "data-neko-live2d-peek-anchor" not in edge_observation_block
+    assert source.count("_dispatchNekoIdleCat1EdgePeekAfterDragObservation(") == 2
 
     apply_edge_block = _source_slice_between(
         source,
@@ -1304,8 +1393,9 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
         edge_reclamp_block,
         "cat1 edge peek viewport reclamp preserves the active edge",
         "const edge = _getNekoIdleCat1EdgePeekActiveEdge(button);",
-        "const viewportW = Math.max(w, window.innerWidth || 0);",
-        "const viewportH = Math.max(h, window.innerHeight || 0);",
+        "const virtualViewport = _getNekoDesktopVirtualViewportSize();",
+        "const viewportW = Math.max(w, virtualViewport.width || 0);",
+        "const viewportH = Math.max(h, virtualViewport.height || 0);",
         "const nextLeft = edge.includes('left')",
         "? -hiddenX",
         "? viewportW - w + hiddenX",
@@ -1327,12 +1417,15 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
 
     finish_drag_block = _source_slice_between(
         source,
-        "const finishDragState = (moved, safetyToken) => {",
+        "const finishDragState = (moved, safetyToken, suppressClick = moved) => {",
         "const resetDragStateAfterMissingEnd = (safetyToken) => {",
         "return button drag finish",
     )
+    regular_finish_block = finish_drag_block.split(
+        "if (!dragActivityFacts) {", 1
+    )[1].split("return;", 1)[1]
     _assert_source_order(
-        finish_drag_block,
+        regular_finish_block,
         "cat1 edge peek before drag-end event",
         "if (moved) {",
         "const finalLeft = parseFloat(container.style.left);",
@@ -1356,9 +1449,9 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
     )
     _assert_source_order(
         journey_sync_block,
-        "cat1 edge peek blocks automatic walk",
+        "cat1 movement anchors block automatic walk",
         "if (!button) return;",
-        "if (_isNekoIdleCat1EdgePeekActive(button)) {",
+        "if (_isNekoIdleCat1MovementAnchored(button)) {",
         "_cancelNekoIdleCat1Journey(button, { resetArt: false, preserveObservers: true });",
         "if (_isNekoIdleCompactSurfaceDragging()) return;",
     )
@@ -1377,9 +1470,9 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
     )
     _assert_source_order(
         walk_start_block,
-        "cat1 edge peek blocks already queued walk start",
+        "cat1 movement anchors block already queued walk start",
         "if (!state) return;",
-        "if (_isNekoIdleCat1EdgePeekActive(button)) {",
+        "if (_isNekoIdleCat1MovementAnchored(button)) {",
         "_cancelNekoIdleCat1Journey(button, { resetArt: false, preserveObservers: true });",
     )
     assert (
@@ -1397,9 +1490,9 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
     )
     _assert_source_order(
         schedule_walk_block,
-        "cat1 edge peek blocks new walk scheduling",
+        "cat1 movement anchors block new walk scheduling",
         "if (!state || state.paused) return;",
-        "if (_isNekoIdleCat1EdgePeekActive(button)) {",
+        "if (_isNekoIdleCat1MovementAnchored(button)) {",
         "_cancelNekoIdleCat1Journey(button, { resetArt: false, preserveObservers: true });",
     )
     assert (
@@ -1409,6 +1502,20 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
         "    const profile = state.profile || _NEKO_IDLE_RETURN_SUBACTION_CAT1_CHAT_FOLLOW;"
     ) in schedule_walk_block
 
+    pair_move_prepare_block = _source_slice_between(
+        source,
+        "function _prepareNekoIdleCat1PairMoveStart(button, state)",
+        "function _canScheduleNekoIdleCat1PairMove(button, state)",
+        "cat1 pair move preparation gate",
+    )
+    _assert_source_order(
+        pair_move_prepare_block,
+        "cat1 movement anchors block pair move preparation",
+        "if (!button || !state || state.paused || state.pairMovePlan || state.pairMoveFrame) return;",
+        "if (_isNekoIdleCat1MovementAnchored(button)) return;",
+        "if (_isNekoIdleCat1IndependentActionActive(button)) return;",
+    )
+
     pair_move_gate_block = _source_slice_between(
         source,
         "function _canScheduleNekoIdleCat1PairMove(button, state)",
@@ -1417,23 +1524,25 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
     )
     _assert_source_order(
         pair_move_gate_block,
-        "cat1 edge peek blocks random pair move scheduling",
+        "cat1 movement anchors block random pair move scheduling",
         "if (!button || !state || state.paused || state.pairMovePlan || state.pairMoveFrame) return false;",
-        "if (_isNekoIdleCat1EdgePeekActive(button)) return false;",
+        "if (_isNekoIdleCat1MovementAnchored(button)) return false;",
         "const profile = state.profile || _NEKO_IDLE_RETURN_SUBACTION_CAT1_CHAT_FOLLOW;",
     )
 
     start_pair_move_block = _source_slice_between(
         source,
         "function _startNekoIdleCat1PairMove(button)",
-        "function _scheduleNekoIdleCat1PairMove(button)",
+        "function _refreshNekoIdleCat1Observer",
         "cat1 pair move start",
     )
     _assert_source_order(
         start_pair_move_block,
-        "cat1 edge peek blocks already queued pair move",
+        "cat1 movement anchors block already queued pair move",
+        "const isCatMindRun = catMindRunOptions.source === 'cat_mind';",
+        "if (!isCatMindRun) return false;",
         "const state = _getNekoIdleCat1Journey(button);",
-        "if (_isNekoIdleCat1EdgePeekActive(button)) {",
+        "if (_isNekoIdleCat1MovementAnchored(button)) {",
         "_cancelNekoIdleCat1Journey(button, { resetArt: false, preserveObservers: true });",
     )
     assert (
@@ -1451,7 +1560,8 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
     )
     _assert_source_order(
         journey_schedule_block,
-        "cat1 edge peek reclamps before blocking queued journey sync",
+        "cat1 movement anchors block queued journey sync while only cat edge peek reclamps",
+        "if (_isNekoIdleCat1MovementAnchored(button)) {",
         "if (_isNekoIdleCat1EdgePeekActive(button)) {",
         "_reclampNekoIdleCat1EdgePeekToViewport(button);",
         "_cancelNekoIdleCat1Journey(button, { resetArt: false, preserveObservers: true });",
@@ -1459,7 +1569,10 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
         "if (!state || state.syncFrame) return;",
     )
     assert (
-        "_reclampNekoIdleCat1EdgePeekToViewport(button);\n"
+        "if (_isNekoIdleCat1MovementAnchored(button)) {\n"
+        "        if (_isNekoIdleCat1EdgePeekActive(button)) {\n"
+        "            _reclampNekoIdleCat1EdgePeekToViewport(button);\n"
+        "        }\n"
         "        _cancelNekoIdleCat1Journey(button, { resetArt: false, preserveObservers: true });\n"
         "        return;\n"
         "    }\n"
@@ -1467,6 +1580,7 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
         "    if (!state || state.syncFrame) return;\n"
         "    if (_isNekoIdleCompactSurfaceDragging() || _nekoIdleCompactSurfaceSettleTimer) return;"
     ) in journey_schedule_block
+    assert journey_schedule_block.count("_reclampNekoIdleCat1EdgePeekToViewport(button);") == 1
 
     drag_start_block = _source_slice_between(
         source,
@@ -1478,7 +1592,8 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
         drag_start_block,
         "cat1 edge peek clears before drag",
         "_restoreNekoIdleCat1EdgePeekBeforeDrag(container);",
-        "_dispatchNekoIdleReturnBallManualMove(container, 'return-ball-drag-start');",
+        "_dispatchNekoIdleReturnBallManualMove(container, 'return-ball-drag-start', {",
+        "dragSessionId: safetyToken",
     )
 
     presentation_block = _source_slice_between(
@@ -1503,7 +1618,8 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
         "_clearNekoIdleCat1EdgePeek(container);",
         "if (!wasEdgePeekActive) return;",
         "const w = container.offsetWidth || 64;",
-        "const viewportW = Math.max(w, window.innerWidth || 0);",
+        "const virtualViewport = _getNekoDesktopVirtualViewportSize();",
+        "const viewportW = Math.max(w, virtualViewport.width || 0);",
         "container.style.left = `${Math.round(_clampNekoIdleCat1EdgePeekCoordinate(currentLeft, 0, viewportW - w))}px`;",
         "container.style.top = `${Math.round(_clampNekoIdleCat1EdgePeekCoordinate(currentTop, 0, viewportH - h))}px`;",
     )
@@ -1516,15 +1632,23 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
     )
     _assert_source_order(
         manual_move_block,
-        "cat1 edge peek skips drag-end recheck",
+        "cat1 edge peek dispatches one shared drag-end observation before cancelling movement",
         "if (detail.reason === 'return-ball-drag-end') {",
         "_finishNekoIdleReturnDragActionForContainer(detail.container);",
         "if (_isNekoIdleCat1EdgePeekActive(detail.container)) {",
+        "const dragMoved = [",
+        "detail.movedDistancePx,",
+        "detail.displacementPx,",
+        "detail.pathDistancePx",
+        "].some((distance) => Number(distance) > 0);",
+        "if (detail.dragCancelled !== true && dragMoved) {",
+        "_dispatchNekoIdleCat1EdgePeekAfterDragObservation(detail.container);",
         "_cancelNekoIdleCat1JourneyForContainer(detail.container, {",
         "resetArt: false,",
         "preserveObservers: true",
         "_updateNekoIdleCat1CompactTopEdgeRearmAfterManualMove(detail.container);",
     )
+    assert manual_move_block.count("_dispatchNekoIdleCat1EdgePeekAfterDragObservation(detail.container);") == 1
     assert (
         "_cancelNekoIdleCat1JourneyForContainer(detail.container, {\n"
         "                    resetArt: false,\n"
@@ -1568,7 +1692,7 @@ def test_cat1_edge_peek_only_applies_after_drag_release():
 
 def test_model_goodbye_exit_shrinks_in_place_instead_of_sliding_right():
     source = INDEX_CSS_PATH.read_text(encoding="utf-8")
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
+    app_ui_source = read_js_parts(APP_UI_PATH)
 
     assert "translateX(300px)" not in source
     assert "#live2d-container.minimized" in source
@@ -1608,7 +1732,7 @@ def test_model_goodbye_exit_shrinks_in_place_instead_of_sliding_right():
 
 
 def test_desktop_return_ball_drag_viewport_preserves_measured_cat_size():
-    source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(APP_UI_PATH)
 
     assert "MULTI_WINDOW_RETURN_BALL_DRAG_SHRINK_SIZE = 160" in source
     assert "container.style.setProperty('--neko-ball-drag-size', `${state.savedBallWidth}px`)" in source
@@ -1618,7 +1742,7 @@ def test_desktop_return_ball_drag_viewport_preserves_measured_cat_size():
 
 
 def test_desktop_return_ball_drag_stops_native_drag_without_waiting_for_frame():
-    source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(APP_UI_PATH)
 
     finish_index = source.index("async function finishDrag(screenX, screenY)")
     hide_index = source.index("container.style.visibility = 'hidden';", finish_index)
@@ -1636,7 +1760,7 @@ def test_desktop_return_ball_drag_stops_native_drag_without_waiting_for_frame():
 
 
 def test_desktop_return_ball_drag_lifecycle_waits_for_restored_viewport_before_reveal():
-    source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(APP_UI_PATH)
 
     assert "MULTI_WINDOW_RETURN_BALL_DRAG_SHRINK_FALLBACK_MS = 220" in source
     assert "MULTI_WINDOW_RETURN_BALL_DRAG_RESTORE_FALLBACK_MS = 600" in source
@@ -1835,7 +1959,7 @@ def test_desktop_return_ball_drag_lifecycle_waits_for_restored_viewport_before_r
 
 
 def test_desktop_return_ball_drag_recovers_when_mouse_release_is_lost():
-    source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = read_js_parts(APP_UI_PATH)
 
     assert "RETURN_BALL_DRAG_RECOVERY_POLL_MS = 250" in source
     assert "RETURN_BALL_DRAG_STALE_RECOVERY_MS = 12000" in source
@@ -1876,7 +2000,7 @@ def test_desktop_return_ball_drag_recovers_when_mouse_release_is_lost():
 
 
 def test_return_button_drag_has_single_owner_per_runtime_path():
-    avatar_source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    avatar_source = _read_avatar_ui_buttons_source()
     live2d_source = LIVE2D_UI_BUTTONS_PATH.read_text(encoding="utf-8")
     vrm_source = VRM_UI_BUTTONS_PATH.read_text(encoding="utf-8")
     mmd_source = MMD_UI_BUTTONS_PATH.read_text(encoding="utf-8")
@@ -1890,15 +2014,277 @@ def test_return_button_drag_has_single_owner_per_runtime_path():
     assert "this._setupReturnButtonDrag(returnButtonContainer)" not in vrm_source
     assert "this._setupReturnButtonDrag(returnButtonContainer)" not in mmd_source
 
+    vrm_handle_end_marker = "const handleEnd = (cancelled = false) => {"
+    vrm_handle_start = _source_slice_between(
+        vrm_source,
+        "const handleStart = (clientX, clientY) => {",
+        vrm_handle_end_marker,
+        "VRM return-button drag start handler",
+    )
     vrm_handle_end = vrm_source[
-        vrm_source.index("const handleEnd = () => {"):
-        vrm_source.index("returnButtonContainer.addEventListener('mousedown'", vrm_source.index("const handleEnd = () => {"))
+        vrm_source.index(vrm_handle_end_marker):
+        vrm_source.index("returnButtonContainer.addEventListener('mousedown'", vrm_source.index(vrm_handle_end_marker))
     ]
     assert vrm_handle_end.index("commitDragPosition();") < vrm_handle_end.index("const moved =")
+    assert "if (isDragging) return;" in vrm_handle_start
+    assert "document.addEventListener('touchcancel', this._returnButtonDragHandlers.touchCancel);" in vrm_source
+    assert "document.removeEventListener('touchcancel', this._returnButtonDragHandlers.touchCancel);" in vrm_source
+
+
+def test_return_button_crop_ack_listener_is_removed_on_rebuild_and_cleanup():
+    return_source = (AVATAR_UI_BUTTONS_DIR / "methods-return.js").read_text(encoding="utf-8")
+    setup_source = (AVATAR_UI_BUTTONS_DIR / "methods-setup.js").read_text(encoding="utf-8")
+    cleanup_source = (AVATAR_UI_BUTTONS_DIR / "methods-state-and-cleanup.js").read_text(encoding="utf-8")
+    event_name = "'neko:niri-pet-physical-crop-state-applied'"
+
+    assert event_name in return_source
+    assert "this._returnButtonDragHandlers.cropStateApplied" in return_source
+    for source in (setup_source, cleanup_source):
+        assert (
+            "window.removeEventListener(\n"
+            "                    'neko:niri-pet-physical-crop-state-applied',\n"
+            "                    this._returnButtonDragHandlers.cropStateApplied\n"
+            "                );"
+        ) in source
+
+
+def test_return_button_drag_cleanup_cancels_delayed_release_before_rebuild_or_dom_removal():
+    return_source = (AVATAR_UI_BUTTONS_DIR / "methods-return.js").read_text(encoding="utf-8")
+    setup_source = (AVATAR_UI_BUTTONS_DIR / "methods-setup.js").read_text(encoding="utf-8")
+    cleanup_source = (AVATAR_UI_BUTTONS_DIR / "methods-state-and-cleanup.js").read_text(encoding="utf-8")
+
+    cleanup_drag = _source_slice_between(
+        return_source,
+        "const cleanupDragState = () => {",
+        "const buildDragPointSnapshot = (localX, localY, virtualX, virtualY) => ({",
+        "return button drag cleanup",
+    )
+    _assert_source_order(
+        cleanup_drag,
+        "return button cleanup silently invalidates delayed callbacks",
+        "dragSafetyToken += 1;",
+        "clearDragSafetyTimer();",
+        "stopDragCursorPolling();",
+        "clearDragReleasePending();",
+        "clearDragCropHoldPending();",
+        "dragActivity = null;",
+    )
+    assert "cancelDragState();" not in cleanup_drag
+    assert "cleanup: cleanupDragState," in return_source
+
+    setup_cleanup = _source_slice_between(
+        setup_source,
+        "if (this._returnButtonDragHandlers) {",
+        "this._returnButtonDragHandlers = null;",
+        "return button rebuild cleanup",
+    )
+    _assert_source_order(
+        setup_cleanup,
+        "return button rebuild cancels closure-owned work before dropping listeners",
+        "this._returnButtonDragHandlers.cleanup();",
+        "document.removeEventListener('mousemove', this._returnButtonDragHandlers.mouseMove);",
+    )
+
+    _assert_source_order(
+        cleanup_source,
+        "return button disposal cancels closure-owned work before removing the DOM",
+        "this._returnButtonDragHandlers.cleanup();",
+        "document.querySelectorAll(`#${opts.containerElementId}, #${opts.lockIconId}, #${opts.returnContainerId}`)",
+        "this._returnButtonDragHandlers = null;",
+    )
+
+
+def test_return_button_drag_publishes_token_before_synchronous_start_hooks_and_always_cleans():
+    source = _read_avatar_ui_buttons_source()
+    handle_start = _source_slice_between(
+        source,
+        "const handleStart = (clientX, clientY, pointerType = 'mouse', sourceEvent = null, startPoint = null) => {",
+        "const handleEnd = () => {",
+        "return button drag start handler",
+    )
+    _assert_source_order(
+        handle_start,
+        "return button drag publishes the token before synchronous start hooks",
+        "const safetyToken = dragSafetyToken + 1;",
+        "dragSafetyToken = safetyToken;",
+        "startDragActivity(safetyToken, rect.left, rect.top);",
+        "_restoreNekoIdleCat1EdgePeekBeforeDrag(container);",
+        "_dispatchNekoIdleReturnBallManualMove(container, 'return-ball-drag-start'",
+    )
+
+    finish_state = _source_slice_between(
+        source,
+        "const finishDragState = (moved, safetyToken, suppressClick = moved) => {",
+        "const resetDragStateAfterMissingEnd = (safetyToken) => {",
+        "return button drag finish state",
+    )
+    missing_activity_cleanup = _source_slice_between(
+        finish_state,
+        "if (!dragActivityFacts) {",
+        "if (moved) {",
+        "return button missing activity cleanup",
+    )
+    _assert_source_order(
+        missing_activity_cleanup,
+        "return button duplicate finish still clears blocking attributes",
+        "if (!dragActivityFacts) {",
+        "container.setAttribute('data-dragging', 'false');",
+        "setReturnClickSuppressed(false);",
+        "return;",
+    )
+
+
+def test_cat1_walk_cancels_when_virtual_container_rect_is_unavailable():
+    source = _read_avatar_ui_buttons_source()
+    step_walk = _source_slice_between(
+        source,
+        "function _stepNekoIdleCat1Walk(button, timestamp)",
+        "function _startNekoIdleCat1Walk(button, target)",
+        "cat1 walk step",
+    )
+    start_walk = _source_slice_between(
+        source,
+        "function _startNekoIdleCat1Walk(button, target)",
+        "function _scheduleNekoIdleCat1WalkStart(button, target)",
+        "cat1 walk start",
+    )
+    for block, name, rect_name in (
+        (step_walk, "cat1 walk step", "rect"),
+        (start_walk, "cat1 walk start", "currentRect"),
+    ):
+        rect_guard = _source_slice_between(
+            block,
+            f"const {rect_name} = _getNekoDesktopVirtualElementRect(",
+            "state.facingRight = _resolveNekoIdleCat1TargetFacing(",
+            f"{name} virtual rect guard",
+        )
+        _assert_source_order(
+            rect_guard,
+            name,
+            f"const {rect_name} = _getNekoDesktopVirtualElementRect(",
+            f"if (!{rect_name}) {{",
+            "_cancelNekoIdleCat1Journey(button, { resetArt: true, preserveObservers: true });",
+            "return;",
+        )
+
+
+def test_return_button_drag_reports_one_terminal_physical_activity_summary():
+    avatar_source = _read_avatar_ui_buttons_source()
+    app_ui_source = read_js_parts(APP_UI_PATH)
+
+    for source, start_name, record_name, finish_name in (
+        (
+            avatar_source,
+            "const startDragActivity = (safetyToken, left, top) => {",
+            "const recordDragActivityPoint = (left, top) => {",
+            "const finishDragActivity = (safetyToken) => {",
+        ),
+        (
+            app_ui_source,
+            "function startReturnBallDragActivity(dragToken, screenX, screenY)",
+            "function recordReturnBallDragActivityPoint(dragToken, screenX, screenY)",
+            "function finishReturnBallDragActivity(dragToken, screenX, screenY)",
+        ),
+    ):
+        assert start_name in source
+        assert record_name in source
+        assert finish_name in source
+        assert "pathDistancePx += Math.hypot" in source
+        assert "terminalReported = true" in source
+        assert "activityId:" in source
+        assert "pathDistancePx:" in source
+        assert "displacementPx:" in source
+        assert "durationMs:" in source
+
+    manual_finish = _source_slice_between(
+        avatar_source,
+        "const finishDragState = (moved, safetyToken, suppressClick = moved) => {",
+        "const resetDragStateAfterMissingEnd = (safetyToken) => {",
+        "manual drag terminal summary",
+    )
+    assert manual_finish.count("...dragActivityFacts") == 2
+    assert "'return-ball-drag-end'" in manual_finish
+    assert "'return-ball-drag-cancel'" in manual_finish
+    manual_motion = _source_slice_between(
+        avatar_source,
+        "const handleMove = (clientX, clientY, sourceEvent = null, movePoint = null) => {",
+        "const scheduleDragCursorPollFrame = () => {",
+        "manual drag motion",
+    )
+    assert "...dragActivityFacts" not in manual_motion
+
+    native_finish = _source_slice_between(
+        app_ui_source,
+        "async function finishDrag(screenX, screenY)",
+        "function isThoughtBubbleEventTarget(event) {",
+        "native drag terminal summary",
+    )
+    assert native_finish.count("...dragActivityFacts") == 3
+    assert "movedDistancePx: movedDistancePx" in native_finish
+    assert "movedDistancePx: 0" in native_finish
+    native_motion = _source_slice_between(
+        app_ui_source,
+        "function updateDrag(screenX, screenY, sourcePoint = null)",
+        "async function finishDrag(screenX, screenY)",
+        "native drag motion",
+    )
+    assert "...dragActivityFacts" not in native_motion
+
+
+def test_cat1_small_move_done_reports_plan_distance_duration_and_run_activity_id():
+    source = _read_avatar_ui_buttons_source()
+    finish_block = _source_slice_between(
+        source,
+        "function _finishNekoIdleCat1PairMove(button)",
+        "function _stepNekoIdleCat1PairMove(button, startedAt, timestamp)",
+        "cat1 small move completion",
+    )
+    _assert_source_order(
+        finish_block,
+        "cat1 small move snapshots its plan before clearing it",
+        "const completedPlan = state.pairMovePlan;",
+        "_applyNekoIdleCat1PairMovePlan(completedPlan, 1);",
+        "state.pairMovePlan = null;",
+        "activityId: completedPlan.activityId || state.catMindRunId || '',",
+        "distancePx: Math.hypot(completedPlan.dx, completedPlan.dy),",
+        "pathDistancePx: Math.hypot(completedPlan.dx, completedPlan.dy),",
+        "plannedDurationMs: completedPlan.durationMs",
+    )
+
+    start_block = _source_slice_between(
+        source,
+        "function _startNekoIdleCat1PairMove(button)",
+        "function _refreshNekoIdleCat1Observer(button)",
+        "cat1 small move start",
+    )
+    assert "plan.activityId = run && run.runId ? run.runId" in start_block
+
+
+def test_cat1_walk_done_near_chat_reports_actual_terminal_path_facts():
+    source = _read_avatar_ui_buttons_source()
+
+    assert "function _beginNekoIdleCat1WalkActivity(state, rect)" in source
+    assert "function _appendNekoIdleCat1WalkActivityPoint(state, left, top)" in source
+    assert "function _completeNekoIdleCat1WalkActivity(state)" in source
+    assert "_appendNekoIdleCat1WalkActivityPoint(state, nextLeft, nextTop);" in source
+
+    finish_block = _source_slice_between(
+        source,
+        "function _finishNekoIdleCat1Walk(button)",
+        "function _finishNekoIdleCat1CompactTopEdgeWalk(button)",
+        "cat1 walk completion",
+    )
+    _assert_source_order(
+        finish_block,
+        "cat1 walk publishes facts only with its existing terminal observation",
+        "const walkActivityFacts = typeof _completeNekoIdleCat1WalkActivity === 'function'",
+        "_NEKO_CAT_IDLE_OBSERVATION_TYPES.CAT1_WALK_DONE_NEAR_CHAT",
+        "}, walkActivityFacts || {}));",
+    )
 
 
 def test_return_button_idle_tier_switch_uses_crossfade_motion():
-    button_source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    button_source = _read_avatar_ui_buttons_source()
     css_source = INDEX_CSS_PATH.read_text(encoding="utf-8")
 
     assert '_NEKO_IDLE_RETURN_TRANSITION_MS = 820' in button_source
@@ -1915,7 +2301,7 @@ def test_return_button_idle_tier_switch_uses_crossfade_motion():
 
 
 def test_return_button_hover_click_gif_finishes_before_restore():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     assert '_NEKO_IDLE_RETURN_GIF_DURATION_CACHE = new Map()' in source
     assert '_NEKO_IDLE_RETURN_GIF_PLAYBACK_SOURCE_CACHE = new Map()' in source
@@ -1934,7 +2320,7 @@ def test_return_button_hover_click_gif_finishes_before_restore():
 
 
 def test_cat1_walk_hover_invalidates_pending_playback_rate_source():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     play_hover_block = source[
         source.index('function _playNekoIdleHoverArt'):
@@ -1952,8 +2338,8 @@ def test_cat1_walk_hover_invalidates_pending_playback_rate_source():
 
 
 def test_idle_thought_bubble_hides_during_drag_action():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
+    app_ui_source = read_js_parts(APP_UI_PATH)
     css_source = INDEX_CSS_PATH.read_text(encoding="utf-8")
 
     assert "_NEKO_IDLE_RETURN_DRAG_PENDING_CLASS = 'is-drag-action-pending'" in source
@@ -2016,7 +2402,7 @@ def test_idle_thought_bubble_hides_during_drag_action():
 
 
 def test_return_button_drag_randomizes_asset_once_per_drag_action():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     set_drag_art_block = _source_slice_between(
         source,
@@ -2079,8 +2465,8 @@ def test_return_button_drag_randomizes_asset_once_per_drag_action():
     )
 
 
-def test_local_return_button_drag_safety_timer_does_not_end_active_drag():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+def test_local_return_button_drag_safety_timer_waits_for_active_drag_inactivity():
+    source = _read_avatar_ui_buttons_source()
 
     safety_block = _source_slice_between(
         source,
@@ -2092,13 +2478,18 @@ def test_local_return_button_drag_safety_timer_does_not_end_active_drag():
         safety_block,
         "local return-ball drag safety timer",
         "const moved = container.getAttribute('data-dragging') === 'true';",
-        "if (moved) return;",
-        "finishDragState(moved, safetyToken);",
+        "const finishAsMoved = moved;",
+        "if (finishAsMoved) {",
+        "const inactiveMs = Math.max(0, Date.now() - lastMovedAt);",
+        "if (inactiveMs < ACTIVE_DRAG_STALE_MS) {",
+        "resetDragStateAfterMissingEnd(safetyToken);",
+        "finishDragState(finishAsMoved, safetyToken, moved);",
     )
+    assert "moved && !dragCropHoldPending" not in safety_block
 
 
 def test_local_return_button_drag_recovers_lost_release_without_active_timeout():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     drag_setup = _source_slice_between(
         source,
@@ -2126,14 +2517,18 @@ def test_local_return_button_drag_recovers_lost_release_without_active_timeout()
         mouse_move_block,
         "local return-ball lost mouseup recovery",
         "if (!isDragging) return;",
-        "if (dragPointerType === 'mouse' && e.buttons === 0) {",
+        "if (dragPointerType === 'mouse' &&",
+        "e.buttons === 0 &&",
+        "!shouldIgnoreMissingMouseButtons()) {",
         "handleEnd();",
-        "const point = getDragPoint(e, e.clientX, e.clientY);",
+        "const rawPoint = getDragPoint(e, e.clientX, e.clientY);",
+        "const point = getContinuousDomMouseDragPoint(rawPoint, e);",
         "handleMove(point.x, point.y, e, point);",
     )
     _assert_source_contains(
         mouse_move_block,
-        "if (dragPointerType === 'mouse' && e.buttons === 0) {\n"
+        "e.buttons === 0 &&\n"
+        "                        !shouldIgnoreMissingMouseButtons()) {\n"
         "                        handleEnd();\n"
         "                        return;\n"
         "                    }",
@@ -2143,17 +2538,34 @@ def test_local_return_button_drag_recovers_lost_release_without_active_timeout()
         drag_setup,
         "local return-ball cancel recovery",
         "touchCancel: cancelDragState,",
-        "windowBlur: cancelDragState,",
+        "windowBlur: () => {",
         "visibilityChange: () => {",
         "if (document.hidden) cancelDragState();",
     )
-    assert "_NEKO_IDLE_RETURN_BALL_ACTIVE_DRAG_STALE_MS" not in source
-    assert "scheduleActiveDragStaleRecovery" not in source
+    window_blur_block = _source_slice_between(
+        drag_setup,
+        "windowBlur: () => {",
+        "visibilityChange: () => {",
+        "local return-ball window blur handler",
+    )
+    _assert_source_order(
+        window_blur_block,
+        "local return-ball window blur recovery",
+        "if (isDragging &&",
+        "(dragCropHoldPending ||",
+        "dragReleasePending ||",
+        "shouldUseGlobalCursorForMouseDrag() ||",
+        "(dragActiveDispatched && shouldIgnoreMissingMouseButtons()))) {",
+        "return;",
+        "cancelDragState();",
+    )
+    assert "const ACTIVE_DRAG_STALE_MS = 30000;" in source
+    assert "dragActivity.lastMovedAt = Date.now();" in source
 
 
 def test_cat1_rapid_drag_reaction_is_same_drag_motion_only():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
+    app_ui_source = read_js_parts(APP_UI_PATH)
 
     assert "_NEKO_IDLE_CAT1_RAPID_DRAG_ASSET_URL = '/static/assets/neko-idle/cat-idle-cat-move-5.gif'" in source
     assert "_NEKO_IDLE_CAT1_RAPID_DRAG_SOUND_URL = '/static/assets/neko-idle/cat1-voice-funny.mp3'" in source
@@ -2363,7 +2775,8 @@ def test_cat1_rapid_drag_reaction_is_same_drag_motion_only():
     _assert_source_order(
         local_drag_setup,
         "return button drag setup",
-        "_dispatchNekoIdleReturnBallManualMove(container, 'return-ball-drag-active');",
+        "_dispatchNekoIdleReturnBallManualMove(container, 'return-ball-drag-active', {",
+        "dragSessionId: dragSafetyToken",
         "_dispatchNekoIdleReturnBallManualMove(container, 'return-ball-drag-motion'",
     )
     _assert_source_contains(
@@ -2397,6 +2810,53 @@ def test_cat1_rapid_drag_reaction_is_same_drag_motion_only():
     )
     _assert_source_contains(
         local_drag_setup,
+        "const isNiriReturnBallFullCropReady = (",
+        "return button drag setup",
+    )
+    _assert_source_contains(
+        local_drag_setup,
+        "state.geometryVerified !== true",
+        "return button drag setup",
+    )
+    _assert_source_contains(
+        local_drag_setup,
+        "dragPendingPoint = buildDragPointSnapshot(",
+        "return button drag setup",
+    )
+    _assert_source_contains(
+        local_drag_setup,
+        "'neko:niri-pet-physical-crop-state-applied'",
+        "return button drag setup",
+    )
+    crop_state_applied_block = _source_slice_between(
+        local_drag_setup,
+        "cropStateApplied: (event) => {",
+        "document.addEventListener('mousemove'",
+        "return button verified crop state handler",
+    )
+    _assert_source_order(
+        crop_state_applied_block,
+        "verified niri crop state refreshes the authoritative cursor before flushing",
+        "cropStateApplied: (event) => {",
+        "if (!isNiriReturnBallFullCropReady(detail, true, dragSafetyToken)) return;",
+        "const fallbackPoint = dragPendingPoint;",
+        "window.electronScreen.getCursorPoint()",
+        "const point = getDragPointFromScreenPoint(screenPoint);",
+        "flushPoint(isUsableDragPoint(point) ? point : fallbackPoint);",
+    )
+    _assert_source_order(
+        crop_state_applied_block,
+        "verified niri crop state releases a pending drag without requiring a final point",
+        "clearDragCropHoldPending();",
+        "if (isUsableDragPoint(point)) {",
+        "handleMove(point.localX, point.localY, null, point);",
+        "if (dragReleasePending && !dragCropHoldPending) {",
+        "clearDragReleasePending();",
+        "finishDragState(true, safetyToken);",
+    )
+    assert "if (!isUsableDragPoint(point)) return;" not in crop_state_applied_block
+    _assert_source_contains(
+        local_drag_setup,
         "cropApi.getEventCoordinates(sourceEvent)",
         "return button drag setup",
     )
@@ -2423,7 +2883,7 @@ def test_cat1_rapid_drag_reaction_is_same_drag_motion_only():
     )
     _assert_source_contains(
         local_drag_setup,
-        "left: (Number.isFinite(left) ? left : 0) + offset.x",
+        "left: Number.isFinite(left) ? left : 0",
         "return button drag setup",
     )
     _assert_source_contains(
@@ -2447,9 +2907,9 @@ def test_cat1_rapid_drag_reaction_is_same_drag_motion_only():
         "local return-ball drag motion emits client and screen coordinates",
         "const point = movePoint || getDragPoint(sourceEvent, clientX, clientY);",
         "const deltaX = point.virtualX - dragStartVirtualX;",
-        "const offset = isDragNiriCropCoordinateActive() ? getDragCropOffset() : { x: 0, y: 0 };",
-        "const nextVirtualLeft = Math.max(offset.x, Math.min(point.virtualX - dragGrabOffsetX, offset.x + window.innerWidth - w));",
-        "const nextLeft = nextVirtualLeft - offset.x;",
+        "const virtualViewport = _getNekoDesktopVirtualViewportSize();",
+        "Math.min(point.virtualX - dragGrabOffsetX, virtualViewport.width - w)",
+        "Math.min(point.virtualY - dragGrabOffsetY, virtualViewport.height - h)",
         "const screenPoint = getDragScreenPointFromVirtualPoint(nextVirtualLeft + w / 2, nextVirtualTop + h / 2, sourceEvent, clientX, clientY);",
         "clientX: point.localX,",
         "clientY: point.localY,",
@@ -2458,6 +2918,29 @@ def test_cat1_rapid_drag_reaction_is_same_drag_motion_only():
         "deltaX: deltaX,",
         "deltaY: deltaY,",
         "timestamp: Date.now()",
+    )
+    _assert_source_order(
+        handle_move_block,
+            "niri return-ball waits for verified full carrier before moving",
+            "const movedPastThreshold = Math.abs(deltaX) > 5 || Math.abs(deltaY) > 5;",
+            "if (!movedPastThreshold) return;",
+            "_dispatchNekoIdleReturnBallManualMove(container, 'return-ball-drag-active', {",
+            "dragSessionId: dragSafetyToken",
+            "!isNiriReturnBallFullCropReady(",
+        "dragCropHoldPending = true;",
+        "container.style.left = `${nextVirtualLeft}px`;",
+        "container.style.top = `${nextVirtualTop}px`;",
+    )
+    _assert_source_contains(
+        handle_move_block,
+        "dragPendingPoint = buildDragPointSnapshot(\n"
+        "                        point.localX,\n"
+        "                        point.localY,\n"
+        "                        point.virtualX,\n"
+        "                        point.virtualY\n"
+        "                    );\n"
+        "                    return;",
+        "niri return-ball caches the latest point while crop hold is pending",
     )
     _assert_source_contains(
         local_drag_setup,
@@ -2522,8 +3005,8 @@ def test_cat1_rapid_drag_reaction_is_same_drag_motion_only():
 
 
 def test_idle_thought_bubble_is_sound_triggered_with_fade():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
+    app_ui_source = read_js_parts(APP_UI_PATH)
     css_source = INDEX_CSS_PATH.read_text(encoding="utf-8")
 
     assert "_NEKO_IDLE_THOUGHT_BUBBLE_ACTIVE_CLASS = 'is-thought-bubble-active'" in source
@@ -2679,7 +3162,7 @@ def test_idle_thought_bubble_is_sound_triggered_with_fade():
     sleep_play_block = _source_slice_between(
         source,
         "function _playNekoIdleSleepSound(tier, token)",
-        "function _scheduleNekoIdleSleepSoundInterval(tier, intervalStartedAt)",
+        "function _syncNekoIdleSleepSoundForTier(tier)",
         "sleep sound playback",
     )
     _assert_source_order(
@@ -2694,7 +3177,7 @@ def test_idle_thought_bubble_is_sound_triggered_with_fade():
     ambient_play_block = _source_slice_between(
         source,
         "function _playNekoIdleCat1AmbientSound(token)",
-        "function _scheduleNekoIdleCat1AmbientSoundInterval(intervalStartedAt)",
+        "function _stopNekoIdleCat1AmbientSound(options = {})",
         "cat1 ambient sound playback",
     )
     _assert_source_order(
@@ -2818,6 +3301,20 @@ def test_idle_thought_bubble_is_sound_triggered_with_fade():
     )
     assert "returnBtn.addEventListener('mouseenter', (event) => {" in source
     assert "if (_isNekoIdleThoughtBubbleEventHit(returnBtn, event)) return;" in source
+    assert "_playNekoIdleHoverArt(returnArt, tier, { userInitiated: true });" in source
+    hover_leave_block = _source_slice_between(
+        source,
+        "returnBtn.addEventListener('mouseleave', () => {",
+        "returnBtn.addEventListener('click', (e) => {",
+        "return button hover leave completion",
+    )
+    assert "_isNekoIdleThoughtBubbleEventHit" not in hover_leave_block
+    _assert_source_order(
+        hover_leave_block,
+        "return button only completes an active hover",
+        "if (!returnArt.__nekoIdleHoverSrc) return;",
+        "_finishNekoIdleHoverArtAfterPlayback(returnArt, tier);",
+    )
     native_drag_block = _source_slice_between(
         app_ui_source,
         "function isThoughtBubbleEventTarget(event) {",
@@ -2906,7 +3403,7 @@ def test_idle_thought_bubble_is_sound_triggered_with_fade():
 
 
 def test_sleeping_cat_tiers_schedule_soft_random_sound_once_per_interval():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     assert "Dev-only short interval for CAT2/CAT3 sleep sounds and their thought bubble." not in source
     assert "window.nekoIdleCatAudio = Object.freeze({" in source
@@ -2945,7 +3442,7 @@ def test_sleeping_cat_tiers_schedule_soft_random_sound_once_per_interval():
         "sleep sound sync block",
     )
     assert "if (!isNekoIdleCatAudioEnabled()) {" in sleep_sync_block
-    assert "_stopNekoIdleSleepSound();" in sleep_sync_block
+    assert "_stopNekoIdleSleepSound({ reason: 'audio-disabled' });" in sleep_sync_block
     assert "[_NEKO_IDLE_TIER_CAT2]" in source
     assert "[_NEKO_IDLE_TIER_CAT3]" in source
     assert "srcs: Object.freeze([" in source
@@ -2959,15 +3456,14 @@ def test_sleeping_cat_tiers_schedule_soft_random_sound_once_per_interval():
     assert "audio.volume = Math.max(0, Math.min(1, Number(volume) || 0.2))" in source
     assert "audio.__nekoIdlePlayStarted = playStarted;" in source
     assert "audio.dispatchEvent(new Event('error'));" in source
-    assert "Math.random() * _NEKO_IDLE_SLEEP_SOUND_INTERVAL_MS" in source
-    assert "_scheduleNekoIdleSleepSoundInterval(tier, startedAt + _NEKO_IDLE_SLEEP_SOUND_INTERVAL_MS)" in source
+    assert "function _scheduleNekoIdleSleepSoundInterval" not in source
     assert "_syncNekoIdleSleepSoundForTier(detail.tier)" in source
-    assert "_stopNekoIdleSleepSoundAudio()" in source
+    assert "_stopNekoIdleSleepSoundAudio({ reason: 'tier-change' });" in source
     assert "_clearNekoIdleSleepSoundTimer()" in source
 
 
 def test_cat1_voice_sounds_are_limited_to_non_drag_and_drag_states():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     assert "Dev-only short interval for tuning cat sounds and the linked thought bubble." not in source
     assert "_NEKO_IDLE_CAT1_AMBIENT_SOUND_INTERVAL_MS = 3 * 60 * 1000" in source
@@ -2982,17 +3478,17 @@ def test_cat1_voice_sounds_are_limited_to_non_drag_and_drag_states():
     assert "_NEKO_IDLE_CAT1_DRAG_SOUND_URL = '/static/assets/neko-idle/cat1-voice-click.mp3'" in source
     assert "_NEKO_IDLE_CAT1_RAPID_DRAG_SOUND_URL = '/static/assets/neko-idle/cat1-voice-funny.mp3'" in source
     assert "const _nekoIdleCat1RapidDragSoundState = {" in source
-    assert "Math.random() * _NEKO_IDLE_CAT1_AMBIENT_SOUND_INTERVAL_MS" in source
+    assert "function _scheduleNekoIdleCat1AmbientSoundInterval" not in source
     assert "urls[Math.floor(Math.random() * urls.length)]" in source
-    assert "_scheduleNekoIdleCat1AmbientSoundInterval(startedAt + _NEKO_IDLE_CAT1_AMBIENT_SOUND_INTERVAL_MS)" in source
     assert "normalizedTier !== _NEKO_IDLE_TIER_CAT1 || _isAnyNekoIdleReturnDragActionActive()" in source
     assert "_playNekoIdleCat1SoundReaction()" in source
     assert "state.targetKind !== _NEKO_IDLE_CAT1_TARGET_KIND_COMPACT_TOP_EDGE" in source
     assert "_playNekoIdleHoverArt(art, _NEKO_IDLE_TIER_CAT1);" in source
+    assert "if (options.userInitiated !== true) return;" in source
     assert "const reactionSrc = art.__nekoIdleHoverSrc;" in source
     assert "const reactionStartedAt = Math.max(0, Number(art.__nekoIdleHoverStartedAt) || Date.now());" in source
     assert "_finishNekoIdleHoverArtAfterPlayback(art, _NEKO_IDLE_TIER_CAT1);" in source
-    assert "_playNekoIdleCat1DragSound(tier)" in source
+    assert "_playNekoIdleCat1DragSound(tier, { reason: 'return-ball-drag-active' })" in source
     assert "_fadeOutNekoIdleCat1DragSound()" in source
     assert "_fadeOutNekoIdleSoundAudio(_nekoIdleCat1DragSoundState, _NEKO_IDLE_CAT1_DRAG_SOUND_FADE_OUT_MS)" in source
     assert "_fadeOutNekoIdleSoundAudio(_nekoIdleCat1RapidDragSoundState, _NEKO_IDLE_CAT1_DRAG_SOUND_FADE_OUT_MS)" in source
@@ -3014,15 +3510,15 @@ def test_cat1_voice_sounds_are_limited_to_non_drag_and_drag_states():
     ambient_sync_block = _source_slice_between(
         source,
         "function _syncNekoIdleCat1AmbientSoundForTier(tier)",
-        "function _playNekoIdleCat1DragSound(tier)",
+        "function _playNekoIdleCat1DragSound(tier, options = {})",
         "cat1 ambient sync block",
     )
     assert "if (!isNekoIdleCatAudioEnabled()) {" in ambient_sync_block
-    assert "_stopNekoIdleCat1AmbientSound();" in ambient_sync_block
+    assert "_stopNekoIdleCat1AmbientSound({ reason: 'audio-disabled' });" in ambient_sync_block
 
     rapid_drag_sound_block = _source_slice_between(
         source,
-        "function _playNekoIdleCat1RapidDragSound(tier)",
+        "function _playNekoIdleCat1RapidDragSound(tier, options = {})",
         "function _fadeOutNekoIdleCat1DragSound()",
         "cat1 rapid drag sound",
     )
@@ -3037,8 +3533,8 @@ def test_cat1_voice_sounds_are_limited_to_non_drag_and_drag_states():
 
     normal_drag_sound_block = _source_slice_between(
         source,
-        "function _playNekoIdleCat1DragSound(tier)",
-        "function _playNekoIdleCat1RapidDragSound(tier)",
+        "function _playNekoIdleCat1DragSound(tier, options = {})",
+        "function _playNekoIdleCat1RapidDragSound(tier, options = {})",
         "cat1 normal drag sound",
     )
     _assert_source_order(
@@ -3052,13 +3548,13 @@ def test_cat1_voice_sounds_are_limited_to_non_drag_and_drag_states():
 
 
 def test_cat1_walk_to_minimized_chat_contract_is_present():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
-    app_ui_source = (PROJECT_ROOT / "static" / "app" / "app-ui.js").read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
+    app_ui_source = read_js_parts(PROJECT_ROOT / "static" / "app" / "app-ui")
 
     assert "_NEKO_IDLE_CAT1_SUBSTATE_WALKING = 'walking-to-chat'" in source
-    assert "_NEKO_IDLE_CAT1_SUBSTATE_STRETCH = 'stretch-near-chat'" in source
-    assert '_NEKO_IDLE_CAT1_CHAT_GAP_PX = -5' in source
-    assert '_NEKO_IDLE_CAT1_MINIMIZED_RIGHT_TO_LEFT_APPROACH_PX = 35' in source
+    assert "_NEKO_IDLE_CAT1_SUBSTATE_STRETCH" not in source
+    assert '_NEKO_IDLE_CAT1_CHAT_GAP_PX = 24' in source
+    assert '_NEKO_IDLE_CAT1_MINIMIZED_RIGHT_TO_LEFT_APPROACH_PX = 0' in source
     assert 'function _getNekoIdleCat1MinimizedSideApproachOffsetPx(facingRight, chatRect)' in source
     assert 'if (facingRight) return 0;' in source
     assert 'chatRect.right + profile.target.gapPx - approachOffsetPx' in source
@@ -3069,7 +3565,7 @@ def test_cat1_walk_to_minimized_chat_contract_is_present():
     assert '_NEKO_IDLE_CAT1_WALK_DISTANCE_INCREASE_THRESHOLD_PX' in source
     assert '_NEKO_IDLE_CAT1_WALK_DISTANCE_GROWTH_FOR_MAX_RATE_PX' in source
     assert '_NEKO_IDLE_CAT1_STRETCH_FINAL_HOLD_MS = 700' in source
-    assert '_NEKO_IDLE_CAT1_WALK_ENTER_DISTANCE_PX' in source
+    assert '_NEKO_IDLE_CAT1_WALK_ENTER_DISTANCE_PX = 180' in source
     assert '_NEKO_IDLE_CAT1_WALK_EXIT_DISTANCE_PX' in source
     assert '_NEKO_IDLE_CAT1_RECHECK_MOVE_DISTANCE_PX' in source
     assert '_NEKO_IDLE_CAT1_COMPACT_TOP_EDGE_STICK_MAX_SPEED_PX_PER_SEC = 1100' in source
@@ -3138,7 +3634,7 @@ def test_cat1_walk_to_minimized_chat_contract_is_present():
     assert 'pairMoveTimer' in source
     assert 'pairMoveFrame' in source
     assert 'pairMovePlan' in source
-    assert '_scheduleNekoIdleCat1PairMove' in source
+    assert 'function _scheduleNekoIdleCat1PairMove' not in source
     assert '_startNekoIdleCat1PairMove' in source
     assert '_stepNekoIdleCat1PairMove' in source
     assert '_finishNekoIdleCat1PairMove' in source
@@ -3177,7 +3673,7 @@ def test_cat1_walk_to_minimized_chat_contract_is_present():
     assert "_isAnyNekoIdleCat1PlaygroundDropLifecycleActive()" in minimized_state_block
     assert "_isNekoIdleCat1PlaygroundPairMoveFeedback(detail)" in minimized_state_block
     assert "const pairMoveFeedback = _isNekoIdleCat1PlaygroundPairMoveFeedback(detail);" in minimized_state_block
-    react_chat_source = (PROJECT_ROOT / "static" / "app" / "app-react-chat-window.js").read_text(encoding="utf-8")
+    react_chat_source = read_js_parts(PROJECT_ROOT / "static" / "app" / "app-react-chat-window")
     assert "async function applyElectronCat1PairMoveBounds(bounds, options)" in react_chat_source
     assert "function scheduleElectronCat1PairMoveBounds(bounds, options)" in react_chat_source
     assert "if (isElectronLinuxRuntime() && !force) return;" in react_chat_source
@@ -3195,18 +3691,23 @@ def test_cat1_walk_to_minimized_chat_contract_is_present():
     assert '_applyNekoIdleCat1PairMovePlan(plan, progress)' in source
     assert 'plan.catStartTop + offsetY' in source
     assert 'plan.chatStartScreenTop + offsetY' in source
-    assert 'if (!_startNekoIdleCat1PairMove(button))' in source
+    assert "const isCatMindRun = catMindRunOptions.source === 'cat_mind';" in source
+    assert "if (!isCatMindRun) return false;" in source
     assert '_finishNekoIdleHoverArtAfterPlayback(art, profile.tier)' in source
     assert '_setNekoIdleReturnArtSource(art, state.profile.assets.walking()' in source
     assert 'state.substate === profile.idleSubstate && state.actionSettled' in source
     assert 'state.substate === profile.idleSubstate && !state.actionSettled' in source
     assert 'state.actionSettled = true' in source
     assert 'state.substate === profile.walkingSubstate && target.distance > profile.target.exitDistancePx' in source
-    assert '_scheduleNekoIdleReturnSubactionSettle' in source
-    assert '_settleNekoIdleReturnSubactionToIdle' in source
-    assert 'durationMs - elapsedMs) + profile.settle.finalHoldMs' in source
+    assert 'function _playNekoIdleCat1StretchAction(button, options = {})' in source
+    assert '_scheduleNekoIdleReturnSubactionSettle' not in source
+    assert '_settleNekoIdleReturnSubactionToIdle' not in source
+    assert '_NEKO_IDLE_CAT1_STRETCH_FINAL_HOLD_MS' in source
     assert 'containerObserver' in source
-    assert "attributeFilter: ['style', 'data-dragging']" in source
+    assert (
+        "attributeFilter: ['style', 'data-dragging', 'data-neko-live2d-peek-anchor']"
+        in source
+    )
     assert '_scheduleNekoIdleCat1JourneySyncForContainer' in source
     assert '_shouldRecheckNekoIdleCat1AfterManualMove' in source
     assert '_getNekoIdleRectCenterMoveDistance' in source
@@ -3258,12 +3759,17 @@ def test_cat1_walk_to_minimized_chat_contract_is_present():
 
 
 def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     assert "_NEKO_IDLE_RETURN_DRAG_LONG_PRESS_MS" not in source
     assert "_NEKO_IDLE_RETURN_LONG_PRESS_PENDING_ATTR" not in source
     assert "returnButtonContainer.getAttribute('data-neko-return-click-suppressed') === 'true'" in source
     assert "returnButtonContainer.getAttribute('data-dragging') === 'pending'" in source
+    assert (
+        "function _canNekoIdleReturnDragUseGlobalCursor("
+        "runtime, electronScreen, cropCoordinateActive)"
+    ) in source
+    assert "typeof electronScreen.getCursorPoint === 'function'" in source
 
     drag_setup = _source_slice_between(
         source,
@@ -3288,27 +3794,61 @@ def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
         "let dragSafetyTimer = 0;",
         "let dragSafetyToken = 0;",
         "let dragStartVirtualX = 0, dragStartVirtualY = 0;",
+        "let dragVisualWidth = 64, dragVisualHeight = 64;",
         "let dragCursorPollFrame = 0;",
         "const getDragPoint = (sourceEvent, fallbackX, fallbackY) => {",
         "cropApi.getEventCoordinates(sourceEvent)",
         "const getDragContainerVirtualRect = () => {",
-        "left: (Number.isFinite(left) ? left : 0) + offset.x",
+        "left: Number.isFinite(left) ? left : 0",
         "left: Number(rect.left) + offset.x",
         "const getDragScreenPointFromVirtualPoint = (virtualX, virtualY, sourceEvent = null, fallbackX = virtualX, fallbackY = virtualY) => {",
         "const getDragPointFromScreenPoint = (screenPoint) => {",
+        "const globalPoint = _getNekoIdleReturnDragGlobalScreenPoint(screenPoint, cropState);",
         "const canPollNiriDragCursor = () => {",
-        "typeof window.electronScreen.getCursorPoint === 'function'",
+        "_canNekoIdleReturnDragUseGlobalCursor(",
+        "window.electronScreen,",
+        "isDragNiriCropCoordinateActive()",
         "const stopDragCursorPolling = () => {",
         "const isUsableDragPoint = (point) => {",
         "const clearDragSafetyTimer = () => {",
         "const resetDragStateAfterMissingEnd = (safetyToken) => {",
         "if (dragSafetyToken !== safetyToken || !isDragging) return;",
-        "const finishDragState = (moved, safetyToken) => {",
+        "const finishDragState = (moved, safetyToken, suppressClick = moved) => {",
         "if (safetyToken !== dragSafetyToken) return;",
         "container.setAttribute('data-dragging', 'false');",
         "_dispatchNekoIdleReturnBallManualMove(container, 'return-ball-drag-end'",
     ):
         _assert_source_contains(drag_setup, expected, "return button drag setup")
+    _assert_source_order(
+        drag_setup,
+        "return button cursor polling converts the IPC global point before virtual coordinates",
+        "const getDragPointFromScreenPoint = (screenPoint) => {",
+        "const cropState = getDragCropState();",
+        "const globalPoint = _getNekoIdleReturnDragGlobalScreenPoint(screenPoint, cropState);",
+        "const screenX = globalPoint.x;",
+        "const virtualX = screenX - origin.x;",
+        "virtualX - offset.x,",
+    )
+    _assert_source_contains(
+        handle_start,
+        "const useLocalGrabAnchor = dragUsesGlobalCursor && localRect;",
+        "return button drag start handler",
+    )
+    _assert_source_order(
+        handle_start,
+        "niri return-button drag keeps the exact raw local pointer grab point",
+        "const point = startPoint || getDragPoint(sourceEvent, clientX, clientY);",
+        "const rect = getDragContainerVirtualRect();",
+        "const localRect = container.getBoundingClientRect && container.getBoundingClientRect();",
+        "dragUsesGlobalCursor = pointerType === 'mouse' && canPollNiriDragCursor();",
+        "const useLocalGrabAnchor = dragUsesGlobalCursor && localRect;",
+        "const grabOffset = _getNekoIdleReturnDragGrabOffset(",
+        "useLocalGrabAnchor ? localRect : rect,",
+        "useLocalGrabAnchor ? 'local' : 'virtual'",
+        "containerStartX = rect.left;",
+        "dragGrabOffsetX = grabOffset.x;",
+        "container.style.left = `${containerStartX}px`;",
+    )
     _assert_source_order(
         drag_setup,
         "plain return-button drag bypasses niri crop point conversion",
@@ -3338,9 +3878,9 @@ def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
     _assert_source_order(
         drag_setup,
         "return button drag setup helpers",
-        "const finishDragState = (moved, safetyToken) => {",
+        "const finishDragState = (moved, safetyToken, suppressClick = moved) => {",
         "const resetDragStateAfterMissingEnd = (safetyToken) => {",
-        "finishDragState(moved, safetyToken);",
+        "finishDragState(finishAsMoved, safetyToken, moved);",
     )
     assert "const scheduleLongPressDrag" not in drag_setup
     assert "const updatePendingLongPressDrag" not in drag_setup
@@ -3374,6 +3914,13 @@ def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
         "container.setAttribute('data-dragging', 'pending')",
         "return button drag start handler",
     )
+    _assert_source_order(
+        handle_start,
+        "return button drag start re-entry guard",
+        "if (isDragging) return;",
+        "clearDragSafetyTimer();",
+        "startDragActivity(safetyToken, rect.left, rect.top);",
+    )
     _assert_source_contains(handle_start, "const safetyToken = dragSafetyToken + 1", "return button drag start handler")
     _assert_source_contains(handle_start, "dragSafetyTimer = setTimeout(() => {", "return button drag start handler")
     _assert_source_contains(
@@ -3393,24 +3940,63 @@ def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
     )
     _assert_source_contains(handle_end, "clearDragSafetyTimer();", "return button drag end handler")
     _assert_source_contains(handle_end, "stopDragCursorPolling();", "return button drag end handler")
+    _assert_source_contains(handle_end, "if (!isDragging || dragReleasePending) return;", "return button drag end handler")
+    _assert_source_contains(
+        source,
+        "windowBlur: () => {\n"
+        "                    // Niri can briefly blur the compact Pet window while applying\n"
+        "                    // the full drag carrier.",
+        "niri return button drag blur guard",
+    )
+    _assert_source_contains(
+        source,
+        "if (isDragging &&\n"
+        "                        (dragCropHoldPending ||\n"
+        "                            dragReleasePending ||\n"
+        "                            shouldUseGlobalCursorForMouseDrag() ||\n"
+        "                            (dragActiveDispatched && shouldIgnoreMissingMouseButtons()))) {\n"
+        "                        return;\n"
+        "                    }\n"
+        "                    cancelDragState();",
+        "niri return button drag blur guard",
+    )
+    _assert_source_order(
+        handle_start,
+        "invalid return button drag coordinates do not leave click suppression active",
+        "const point = startPoint || getDragPoint(sourceEvent, clientX, clientY);",
+        "if (!isUsableDragPoint(point)) return;",
+        "setReturnClickSuppressed(true);",
+    )
     _assert_source_contains(handle_end, "const safetyToken = dragSafetyToken;", "return button drag end handler")
+    _assert_source_contains(handle_end, "if (movedPastThreshold && dragCropHoldPending) {", "return button drag end handler")
+    _assert_source_contains(handle_end, "dragReleasePending = true;", "return button drag end handler")
     _assert_source_contains(
         handle_end,
-        "finishDragState(moved, safetyToken);",
-        "return button drag end handler",
+        "finishDragState(true, safetyToken, true);",
+        "crop hold timeout preserves the completed drag terminal event",
     )
     _assert_source_contains(
         handle_end,
-        "if (moved) {\n                        setTimeout(() => {\n                            finishDragState(moved, safetyToken);\n                        }, 10);\n                    } else {\n                        finishDragState(moved, safetyToken);\n                    }",
+        "finishDragState(true, safetyToken);",
+        "return button drag end handler",
+    )
+    _assert_source_order(
+        handle_end,
         "no-move return click clears pending state before browser click",
+        "requestAnimationFrame(() => {",
+        "requestAnimationFrame(() => {",
+        "finishDragState(true, safetyToken);",
     )
     _assert_source_order(
         handle_end,
         "return button drag end handler",
         "clearDragSafetyTimer();",
-        "if (isDragging) {",
+        "if (!isDragging || dragReleasePending) return;",
         "const safetyToken = dragSafetyToken;",
-        "finishDragState(moved, safetyToken);",
+        "if (movedPastThreshold && dragCropHoldPending) {",
+        "dragReleasePending = true;",
+        "}, 600);\n                    return;\n                }\n                isDragging = false;",
+        "finishDragState(true, safetyToken);",
     )
     mouse_move_block = _source_slice_between(
         source,
@@ -3420,31 +4006,38 @@ def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
     )
     _assert_source_order(
         mouse_move_block,
-        "local return-ball mousemove recovers released mouse before moving",
+        "niri return-ball ignores unreliable renderer button state before local release recovery",
         "if (!isDragging) return;",
-        "if (dragPointerType === 'mouse' && e.buttons === 0) {",
+        "if (shouldUseGlobalCursorForMouseDrag()) return;",
+        "if (dragPointerType === 'mouse' &&",
+        "e.buttons === 0 &&",
+        "!shouldIgnoreMissingMouseButtons()) {",
         "handleEnd();",
-        "const point = getDragPoint(e, e.clientX, e.clientY);",
+        "const rawPoint = getDragPoint(e, e.clientX, e.clientY);",
+        "const point = getContinuousDomMouseDragPoint(rawPoint, e);",
         "handleMove(point.x, point.y, e, point);",
     )
     _assert_source_contains(
         mouse_move_block,
-        "if (dragPointerType === 'mouse' && e.buttons === 0) {\n"
+        "if (dragPointerType === 'mouse' &&\n"
+        "                        e.buttons === 0 &&\n"
+        "                        !shouldIgnoreMissingMouseButtons()) {\n"
         "                        handleEnd();\n"
         "                        return;\n"
         "                    }",
         "local return-ball mousemove ends released drag without moving",
     )
+
     finish_drag_state_block = _source_slice_between(
         drag_setup,
-        "const finishDragState = (moved, safetyToken) => {",
+        "const finishDragState = (moved, safetyToken, suppressClick = moved) => {",
         "const resetDragStateAfterMissingEnd = (safetyToken) => {",
         "return button drag finish state",
     )
     _assert_source_contains(
         finish_drag_state_block,
-        "if (moved) {\n                    setTimeout(() => setReturnClickSuppressed(false), 120);\n                } else {\n                    setReturnClickSuppressed(false);\n                }",
-        "drag suppresses click briefly while no-move click is restored immediately",
+        "if (suppressClick) {\n                    setTimeout(() => setReturnClickSuppressed(false), 120);\n                } else {\n                    setReturnClickSuppressed(false);\n                }",
+        "completed or safely cancelled drag suppresses click while a no-move release restores it immediately",
     )
 
     sync_block = _source_slice_between(
@@ -3469,9 +4062,17 @@ def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
 
     container_observer = _source_slice_between(
         source,
-        "state.containerObserver = new MutationObserver(() => {",
+        "state.containerObserver = new MutationObserver((mutations) => {",
         "state.containerObserver.observe(container",
         "cat1 container observer",
+    )
+    _assert_source_order(
+        container_observer,
+        "transferred anchor interrupts a running walk through the existing sync gate",
+        "const transferredAnchorChanged = mutations.some((mutation) =>",
+        "mutation.attributeName === 'data-neko-live2d-peek-anchor');",
+        "if (currentState.substate === currentState.profile.walkingSubstate && !transferredAnchorChanged) return;",
+        "_scheduleNekoIdleCat1JourneySync(button);",
     )
     _assert_source_contains(
         container_observer,
@@ -3481,6 +4082,11 @@ def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
     _assert_source_contains(
         container_observer,
         "if (observerDragging && observerDragging !== 'false') return;",
+        "cat1 container observer",
+    )
+    _assert_source_contains(
+        source,
+        "attributeFilter: ['style', 'data-dragging', 'data-neko-live2d-peek-anchor']",
         "cat1 container observer",
     )
 
@@ -3506,8 +4112,29 @@ def test_cat1_walk_is_blocked_while_return_ball_drag_is_active_or_pending():
     )
 
 
+def test_desktop_welcome_back_toast_routes_through_host_bridge():
+    source = (APP_UI_PATH / "surface-floating-controls.js").read_text(encoding="utf-8")
+    welcome_toast = _source_slice_between(
+        source,
+        "const welcomeBackText = window.t",
+        "// 恢复主动搭话与主动视觉调度",
+        "desktop welcome-back toast",
+    )
+
+    _assert_source_order(
+        welcome_toast,
+        "desktop welcome-back toast routes through the host bridge instead of the cropped Pet DOM",
+        "const welcomeBackText = window.t",
+        "if (typeof window.showStatusToast === 'function') {",
+        "window.showStatusToast(welcomeBackText, 3000);",
+        "} else if (typeof I.showStatusToast === 'function') {",
+        "I.showStatusToast(welcomeBackText, 3000);",
+    )
+    assert "const showWelcomeBackToast" not in source
+
+
 def test_return_button_local_no_move_release_clears_pending_drag_state():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     drag_setup = _source_slice_between(
         source,
@@ -3517,7 +4144,7 @@ def test_return_button_local_no_move_release_clears_pending_drag_state():
     )
     finish_drag_state = _source_slice_between(
         drag_setup,
-        "const finishDragState = (moved, safetyToken) => {",
+        "const finishDragState = (moved, safetyToken, suppressClick = moved) => {",
         "const resetDragStateAfterMissingEnd = (safetyToken) => {",
         "return button drag finish helper",
     )
@@ -3535,7 +4162,7 @@ def test_return_button_local_no_move_release_clears_pending_drag_state():
 def test_live2d_renderer_ignores_and_recovers_return_ball_viewport_size():
     core_source = LIVE2D_CORE_PATH.read_text(encoding="utf-8")
     interaction_source = LIVE2D_INTERACTION_PATH.read_text(encoding="utf-8")
-    app_ui_source = APP_UI_PATH.read_text(encoding="utf-8")
+    app_ui_source = read_js_parts(APP_UI_PATH)
 
     assert "const LIVE2D_RETURN_BALL_VIEWPORT_MAX_SIZE = 200;" in core_source
     assert "function isLive2DReturnBallViewportSize(width, height)" in core_source
@@ -3549,12 +4176,14 @@ def test_live2d_renderer_ignores_and_recovers_return_ball_viewport_size():
         "live2d renderer resize",
     )
     resize_guard_block = resize_block[
-        resize_block.index("const newW = Math.max(window.innerWidth || window.screen.width || 1, 1);"):
+        resize_block.index("const niriVirtualViewport = getLive2DNiriPetVirtualViewportSize();"):
     ]
     _assert_source_order(
         resize_guard_block,
         "live2d renderer skips temporary return-ball viewport before resize",
-        "const newW = Math.max(window.innerWidth || window.screen.width || 1, 1);",
+        "const niriVirtualViewport = getLive2DNiriPetVirtualViewportSize();",
+        "niriVirtualViewport?.width || window.innerWidth",
+        "niriVirtualViewport?.height || window.innerHeight",
         "if (isLive2DReturnBallViewportSize(newW, newH)) {",
         "return;",
         "renderer.resize(newW, newH);",
@@ -3567,15 +4196,17 @@ def test_live2d_renderer_ignores_and_recovers_return_ball_viewport_size():
         "live2d renderer recovers polluted viewport before pending-display branch",
         "const restoringFromReturnBallViewport =",
         "renderer.resize(newW, newH);",
-        "if (this._pendingDisplaySwitch || restoringFromReturnBallViewport) {",
+        "if (this._pendingDisplaySwitch || restoringFromReturnBallViewport || niriPhysicalCropActive) {",
     )
     pending_branch_block = resize_block[
-        resize_block.index("if (this._pendingDisplaySwitch || restoringFromReturnBallViewport) {"):
+        resize_block.index(
+            "if (this._pendingDisplaySwitch || restoringFromReturnBallViewport || niriPhysicalCropActive) {"
+        ):
     ]
     _assert_source_order(
         pending_branch_block,
         "live2d renderer skips model scaling after return-ball recovery",
-        "if (this._pendingDisplaySwitch || restoringFromReturnBallViewport) {",
+        "if (this._pendingDisplaySwitch || restoringFromReturnBallViewport || niriPhysicalCropActive) {",
         "restoringFromReturnBallViewport",
         "return;",
         "this.currentModel.x *= wRatio;",
@@ -3622,7 +4253,7 @@ def test_live2d_renderer_ignores_and_recovers_return_ball_viewport_size():
 
     save_block = _source_slice_between(
         interaction_source,
-        "Live2DManager.prototype._savePositionAfterInteraction = async function () {",
+        "Live2DManager.prototype._savePositionAfterInteraction = async function (options = {}) {",
         "// 防抖动保存位置的辅助函数",
         "live2d save position",
     )
@@ -3649,7 +4280,7 @@ def test_live2d_renderer_ignores_and_recovers_return_ball_viewport_size():
 
 
 def test_cat1_minimized_ball_inside_cat_finishes_without_side_retarget_jitter():
-    source = AVATAR_UI_BUTTONS_PATH.read_text(encoding="utf-8")
+    source = _read_avatar_ui_buttons_source()
 
     assert "function _isNekoIdleRectCenterInsideRect(innerRect, outerRect)" in source
     assert "function _makeNekoIdleCat1CurrentSideTarget(rect, chatRect, options)" in source
@@ -3714,13 +4345,21 @@ def test_return_button_idle_tier_assets_are_version_tracked():
                  THOUGHT_BUBBLE_ASSET_PATH, THOUGHT_BUBBLE_POP_ASSET_PATH,
                  SLEEPING_THOUGHT_BUBBLE_ASSET_PATH,
                  *THOUGHT_BUBBLE_ITEM_ASSET_PATHS):
-        assert path in pages_router._YUI_GUIDE_ASSET_VERSION_PATHS
-        assert path.is_file()
+        if path.is_dir():
+            part_paths = tuple(sorted(path.glob("*.js")))
+            assert part_paths
+            assert all(part_path in pages_router._YUI_GUIDE_ASSET_VERSION_PATHS for part_path in part_paths)
+            assert all(part_path.is_file() for part_path in part_paths)
+        else:
+            assert path in pages_router._YUI_GUIDE_ASSET_VERSION_PATHS
+            assert path.is_file()
 
-    # app-interpage.js follows the static/tutorial asset version because it owns tutorial bridges.
-    assert APP_INTERPAGE_PATH in pages_router._YUI_GUIDE_ASSET_VERSION_PATHS
+    # app-interpage follows the static/tutorial asset version because it owns tutorial bridges.
+    interpage_parts = tuple(sorted(APP_INTERPAGE_PATH.glob("*.js")))
+    assert interpage_parts
+    assert all(part_path in pages_router._YUI_GUIDE_ASSET_VERSION_PATHS for part_path in interpage_parts)
     assert APP_INTERPAGE_PATH not in pages_router._REACT_CHAT_ASSET_VERSION_PATHS
-    assert APP_INTERPAGE_PATH.is_file()
+    assert all(part_path.is_file() for part_path in interpage_parts)
 
 
 def test_sleep_sound_assets_match_current_tier_assignment():

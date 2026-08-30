@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -16,13 +17,8 @@ REQUIRED_KEYS = (
     "autostartPrompt.later",
     "autostartPrompt.never",
     "autostartPrompt.requiresApproval",
-    "tutorialPrompt.title",
-    "tutorialPrompt.message",
-    "tutorialPrompt.note",
-    "tutorialPrompt.startNow",
-    "tutorialPrompt.later",
-    "tutorialPrompt.never",
-    "tutorialPrompt.startFailed",
+    "api.ttsProtocolHintOpenAI",
+    "api.ttsProtocolHintVllmOmni",
 )
 
 CHARACTER_MANAGER_VOICE_KEYS = (
@@ -37,7 +33,12 @@ CHARACTER_MANAGER_VOICE_KEYS = (
     "voice.nativeVoice.wenrounansheng",
 )
 
-CHARACTER_MANAGER_JS = REPO_ROOT / "static" / "js" / "character_card_manager.js"
+VOICE_DESIGN_ERROR_KEYS = (
+    "errors.VOICE_DESIGN_PROMPT_TOO_SHORT",
+    "errors.VOICE_DESIGN_PROMPT_TOO_LONG",
+)
+
+CHARACTER_MANAGER_JS_DIR = REPO_ROOT / "static" / "js" / "character_card_manager"
 
 PNG_TUBER_PREVIEW_LABELS = {
     "zh-CN.json": ("测试说话", "状态预览"),
@@ -61,6 +62,51 @@ PNG_TUBER_UPLOAD_LABELS = {
     "pt.json": ("Importar arquivo de projeto", "Importar pasta"),
 }
 
+RPS_UI_KEYS = (
+    "chat.toolRps",
+    "chat.avatarToolRpsGestureRock",
+    "chat.avatarToolRpsGestureScissors",
+    "chat.avatarToolRpsGesturePaper",
+    "chat.avatarToolRpsResultUserWin",
+    "chat.avatarToolRpsResultAvatarWin",
+    "chat.avatarToolRpsResultDraw",
+    "chat.avatarToolRpsRoundAnnouncement",
+)
+RPS_LOCALE_FILES = {
+    "en.json", "es.json", "ja.json", "ko.json",
+    "pt.json", "ru.json", "zh-CN.json", "zh-TW.json",
+}
+RPS_ANNOUNCEMENT_KEY = "chat.avatarToolRpsRoundAnnouncement"
+RPS_AVATAR_WIN_KEY = "chat.avatarToolRpsResultAvatarWin"
+RPS_AVATAR_WIN_PLACEHOLDERS = ["name"]
+RPS_ANNOUNCEMENT_PLACEHOLDERS = ["userGesture", "name", "avatarGesture", "result"]
+
+# Backend status codes reach the user through translateStatusMessage in
+# static/i18n-i18next.js, and i18next falls back to echoing the key when a
+# translation is missing. A code with no errors.<CODE> entry therefore shows the
+# raw token "errors.TURN_IMAGES_TRIMMED" in the toast instead of a sentence, in
+# every language at once. Pinning individual codes by hand never kept up, so the
+# scan below reads the emit sites straight out of the source tree.
+STATUS_CODE_SOURCE_ROOTS = ("main_logic", "app")
+# The two coroutines that carry a status payload to the websocket. Anything
+# json.dumps-ed into one of them lands in translateStatusMessage.
+STATUS_MESSAGE_SINKS = frozenset({"on_status_message", "send_status"})
+# A scanner that quietly matches nothing is the dangerous failure mode here: it
+# would keep this file green while every future status code ships untranslated.
+# The floor is well under the count at the time of writing (30) so that ordinary
+# churn does not trip it, but far above zero so a broken matcher cannot hide.
+MIN_DISCOVERED_STATUS_CODES = 25
+# Sentinels covering both call shapes the scanner has to understand: an awaited
+# ``self.on_status_message(json.dumps({...}))`` and a plain
+# ``await self.send_status(json.dumps({...}))``, in two different packages. A
+# matcher that only handles one of them still clears the floor above.
+EXPECTED_DISCOVERED_STATUS_CODES = frozenset({
+    "TURN_IMAGES_TRIMMED",
+    "API_KEY_REJECTED",
+    "ASR_MULTIMODAL_TURN_FAILED",
+    "OPENCLAW_COMMAND_DISPATCH_FAILED",
+})
+
 
 @pytest.fixture(scope="session", autouse=True)
 def mock_memory_server():
@@ -68,6 +114,79 @@ def mock_memory_server():
     yield
 
 
+
+
+def _status_sink_name(node: ast.Call) -> str | None:
+    """Return the bare callee name of a call, ignoring whatever it hangs off."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def _literal_status_code(node) -> str | None:
+    """Pull the literal "code" value out of a dict display, if there is one."""
+    if not isinstance(node, ast.Dict):
+        return None
+    for key, value in zip(node.keys, node.values):
+        if (
+            isinstance(key, ast.Constant)
+            and key.value == "code"
+            and isinstance(value, ast.Constant)
+            and isinstance(value.value, str)
+        ):
+            return value.value
+    return None
+
+
+def _iter_status_source_files():
+    ignored_dirs = {"__pycache__", "node_modules", "dist", "build"}
+    for root_name in STATUS_CODE_SOURCE_ROOTS:
+        source_root = REPO_ROOT / root_name
+        if not source_root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(source_root):
+            dirnames[:] = [name for name in dirnames if name not in ignored_dirs]
+            for filename in filenames:
+                if filename.endswith(".py"):
+                    yield Path(dirpath) / filename
+
+
+def _discover_emitted_status_codes() -> dict[str, list[str]]:
+    """Map every literal status code emitted toward the frontend to its sites.
+
+    Only literal payloads are collected. A code assembled at runtime cannot be
+    resolved statically, and guessing at one would produce false failures that
+    train people to add exemptions instead of translations.
+    """
+    discovered: dict[str, list[str]] = {}
+
+    for path in _iter_status_source_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if _status_sink_name(node) not in STATUS_MESSAGE_SINKS:
+                continue
+            # The payload is normally the first positional argument, but walk
+            # every argument sub-tree so a keyword form or a wrapped call is
+            # still seen.
+            arguments = list(node.args) + [keyword.value for keyword in node.keywords]
+            for argument in arguments:
+                for inner in ast.walk(argument):
+                    if not isinstance(inner, ast.Call):
+                        continue
+                    if _status_sink_name(inner) != "dumps":
+                        continue
+                    for payload in inner.args:
+                        code = _literal_status_code(payload)
+                        if code:
+                            location = f"{path.relative_to(REPO_ROOT).as_posix()}:{inner.lineno}"
+                            discovered.setdefault(code, []).append(location)
+
+    return discovered
 
 
 def _flatten_leaf_strings(payload, prefix=""):
@@ -135,7 +254,28 @@ def _has_nested_key(data: dict, dotted_key: str) -> bool:
 
 
 @pytest.mark.unit
-def test_tutorial_prompt_locale_keys_exist_in_all_locales():
+def test_locale_json_objects_do_not_contain_duplicate_keys():
+    duplicates: list[str] = []
+
+    for locale_path in sorted(LOCALES_DIR.glob("*.json")):
+        def reject_duplicates(pairs, *, locale_name=locale_path.name):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    duplicates.append(f"{locale_name}: {key}")
+                result[key] = value
+            return result
+
+        json.loads(
+            locale_path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicates,
+        )
+
+    assert duplicates == []
+
+
+@pytest.mark.unit
+def test_required_locale_keys_exist_in_all_locales():
     missing_by_locale: dict[str, list[str]] = {}
 
     for locale_path in sorted(LOCALES_DIR.glob("*.json")):
@@ -145,6 +285,79 @@ def test_tutorial_prompt_locale_keys_exist_in_all_locales():
             missing_by_locale[locale_path.name] = missing
 
     assert missing_by_locale == {}
+
+
+@pytest.mark.unit
+def test_avatar_tool_rps_ui_keys_exist_in_all_locales():
+    invalid_by_locale: dict[str, list[str]] = {}
+    locale_paths = sorted(LOCALES_DIR.glob("*.json"))
+    assert {path.name for path in locale_paths} == RPS_LOCALE_FILES
+
+    for locale_path in locale_paths:
+        data = json.loads(locale_path.read_text(encoding="utf-8"))
+        invalid = []
+        for key in RPS_UI_KEYS:
+            if not _has_nested_key(data, key):
+                invalid.append(key)
+                continue
+            current = data
+            for part in key.split("."):
+                current = current[part]
+            if not isinstance(current, str) or not current.strip():
+                invalid.append(key)
+        if invalid:
+            invalid_by_locale[locale_path.name] = invalid
+
+    assert invalid_by_locale == {}
+
+
+@pytest.mark.unit
+def test_avatar_tool_rps_uses_the_confirmed_chinese_name():
+    for locale_name in ("zh-CN.json", "zh-TW.json"):
+        data = json.loads((LOCALES_DIR / locale_name).read_text(encoding="utf-8"))
+        assert data["chat"]["toolRps"] == "猜拳"
+
+
+@pytest.mark.unit
+def test_avatar_tool_rps_announcement_placeholders_are_consistent():
+    mismatches: dict[str, dict[str, list[str]]] = {}
+
+    for locale_path in sorted(LOCALES_DIR.glob("*.json")):
+        data = json.loads(locale_path.read_text(encoding="utf-8"))
+        chat = data.get("chat", {})
+        avatar_win_placeholders = re.findall(
+            r"{{\s*([A-Za-z][A-Za-z0-9]*)\s*}}",
+            chat.get("avatarToolRpsResultAvatarWin", ""),
+        )
+        announcement_placeholders = re.findall(
+            r"{{\s*([A-Za-z][A-Za-z0-9]*)\s*}}",
+            chat.get("avatarToolRpsRoundAnnouncement", ""),
+        )
+        invalid = {}
+        if avatar_win_placeholders != RPS_AVATAR_WIN_PLACEHOLDERS:
+            invalid[RPS_AVATAR_WIN_KEY] = avatar_win_placeholders
+        if announcement_placeholders != RPS_ANNOUNCEMENT_PLACEHOLDERS:
+            invalid[RPS_ANNOUNCEMENT_KEY] = announcement_placeholders
+        if invalid:
+            mismatches[locale_path.name] = invalid
+
+    assert mismatches == {}
+
+
+@pytest.mark.unit
+def test_locale_leaf_key_sets_are_consistent():
+    key_sets = {
+        locale_path.name: {
+            key for key, _value in _flatten_leaf_strings(
+                json.loads(locale_path.read_text(encoding="utf-8"))
+            )
+        }
+        for locale_path in sorted(LOCALES_DIR.glob("*.json"))
+    }
+
+    assert "en.json" in key_sets
+    baseline = key_sets["en.json"]
+    assert {name: sorted(keys ^ baseline) for name, keys in key_sets.items() if keys != baseline} == {}
 
 
 @pytest.mark.unit
@@ -161,8 +374,24 @@ def test_character_manager_voice_source_labels_exist_in_all_locales():
 
 
 @pytest.mark.unit
+def test_voice_design_constraint_errors_exist_in_all_locales():
+    missing_by_locale: dict[str, list[str]] = {}
+
+    for locale_path in sorted(LOCALES_DIR.glob("*.json")):
+        data = json.loads(locale_path.read_text(encoding="utf-8"))
+        missing = [key for key in VOICE_DESIGN_ERROR_KEYS if not _has_nested_key(data, key)]
+        if missing:
+            missing_by_locale[locale_path.name] = missing
+
+    assert missing_by_locale == {}
+
+
+@pytest.mark.unit
 def test_character_manager_voice_source_labels_do_not_use_cjk_fallbacks():
-    source = CHARACTER_MANAGER_JS.read_text(encoding="utf-8")
+    source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(CHARACTER_MANAGER_JS_DIR.glob("*.js"))
+    )
     relevant_start = source.index("function _panelVoiceProviderShortName(provider)")
     relevant_end = source.index("function _panelCreateVoiceSelectUi(selectEl)", relevant_start)
     relevant_source = source[relevant_start:relevant_end]
@@ -236,3 +465,43 @@ def test_error_placeholder_i18n_calls_pass_error_params():
                     missing_error_params.append(f"{path.relative_to(REPO_ROOT)}:{line}: {key}")
 
     assert missing_error_params == []
+
+
+@pytest.mark.unit
+def test_status_code_scanner_actually_finds_the_known_emitters():
+    """Guard the guard: a scanner that matches nothing must not pass as clean."""
+    missing_roots = [
+        root_name
+        for root_name in STATUS_CODE_SOURCE_ROOTS
+        if not (REPO_ROOT / root_name).is_dir()
+    ]
+    assert missing_roots == []
+
+    discovered = _discover_emitted_status_codes()
+
+    assert len(discovered) >= MIN_DISCOVERED_STATUS_CODES, (
+        f"only {len(discovered)} status code(s) discovered under "
+        f"{list(STATUS_CODE_SOURCE_ROOTS)}; the scanner is probably no longer "
+        f"matching the emit sites: {sorted(discovered)}"
+    )
+    assert EXPECTED_DISCOVERED_STATUS_CODES - set(discovered) == set()
+
+
+@pytest.mark.unit
+def test_emitted_status_codes_are_translated_in_all_locales():
+    discovered = _discover_emitted_status_codes()
+    locale_paths = sorted(LOCALES_DIR.glob("*.json"))
+    assert {path.name for path in locale_paths} == RPS_LOCALE_FILES
+
+    untranslated: dict[str, list[str]] = {}
+    for locale_path in locale_paths:
+        errors = json.loads(locale_path.read_text(encoding="utf-8")).get("errors", {})
+        missing = [
+            f"{code} (emitted at {', '.join(sorted(sites))})"
+            for code, sites in sorted(discovered.items())
+            if not isinstance(errors.get(code), str) or not errors[code].strip()
+        ]
+        if missing:
+            untranslated[locale_path.name] = missing
+
+    assert untranslated == {}

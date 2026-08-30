@@ -60,7 +60,15 @@ function getCssRuleBlock(source, selector) {
 test('Day1 tutorial end schedules the system tray intro for complete, skip and angry exit paths', () => {
   const onTutorialEndBlock = getMethodBlock(universalManagerSource, 'onTutorialEnd');
 
-  assert.match(onTutorialEndBlock, /const day1SystrayIntroPromise = this\.scheduleDay1SystrayIntroAfterTeardown\(/);
+  assert.match(onTutorialEndBlock, /const scheduledDay1SystrayIntroPromise = this\.scheduleDay1SystrayIntroAfterTeardown\(/);
+  const promiseAllMatch = onTutorialEndBlock.match(
+    /const day1SystrayIntroPromise = Promise\.all\(\[([\s\S]*?)\]\)/
+  );
+  assert.ok(promiseAllMatch, 'expected day1SystrayIntroPromise to be created with Promise.all');
+  assert.match(
+    promiseAllMatch[1],
+    /scheduledDay1SystrayIntroPromise[\s\S]*stateFlushPromise/
+  );
   assert.match(onTutorialEndBlock, /return day1SystrayIntroPromise;/);
   assert.match(onTutorialEndBlock, /endMeta\.rawReason/);
   assert.match(onTutorialEndBlock, /avatarFloatingEndState/);
@@ -122,7 +130,7 @@ test('Day1 system tray intro modal combines the tray location and menu guidance'
     /box-shadow/
   );
   assert.match(yuiGuideCssSource, /@media \(max-width: 620px\)/);
-  assert.match(launcherSpecSource, /add_data\('static\/assets', 'static\/assets'\)/);
+  assert.match(launcherSpecSource, /add_data\('static', 'static'\)/);
 
   const zhCn = JSON.parse(zhCnLocaleSource);
   assert.equal(zhCn.tutorial.systray.location.title, '📍 托盘图标位置');
@@ -133,7 +141,19 @@ test('Day1 system tray intro modal combines the tray location and menu guidance'
   assert.equal(zhCn.tutorial.systray.location.alt, '系统托盘位置示意图');
   assert.equal(zhCn.tutorial.systray.menu.title, '📋 托盘菜单');
   assert.equal(zhCn.tutorial.systray.resetPosition, '重置角色位置');
-  assert.match(i18nBootstrapSource, /LOCALE_VERSION = '2026-07-08-model-type-3d-label-i18n'/);
+  // 这条断言真正要保的是：day1 systray 教程文案落地时 locale 缓存键跟着递增过，
+  // 老客户端不会拿旧语言包把新 key 渲染成字面量。原来的写法把当时的版本串钉死，
+  // 于是每一次与 systray 无关的递增都要顺手来改这一行（#2882 就被迫改过一次），
+  // 和 tests/unit/test_window_pin_static_contracts.py 里记下的那次同款腐烂。
+  // 版本串固定是 YYYY-MM-DD- 前缀，比日期前缀即可表达“不早于本文案落地的那次递增”。
+  const localeVersionMatch = i18nBootstrapSource.match(/LOCALE_VERSION = '([^']+)'/);
+  assert.ok(localeVersionMatch, 'i18n-i18next.js 必须声明 LOCALE_VERSION');
+  const localeVersion = localeVersionMatch[1];
+  assert.match(localeVersion, /^\d{4}-\d{2}-\d{2}-/, `LOCALE_VERSION 需带日期前缀: ${localeVersion}`);
+  assert.ok(
+    localeVersion.slice(0, 10) >= '2026-07-06',
+    `LOCALE_VERSION 早于 day1 systray 文案落地的 2026-07-06-day1-systray-intro-i18n: ${localeVersion}`
+  );
 
   for (const [code, source] of Object.entries(localeSources)) {
     const locale = JSON.parse(source);

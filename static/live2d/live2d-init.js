@@ -138,6 +138,14 @@ function _nekoIsLive2DContainerHidden() {
 function ensureLive2DVisibleOnce(reason) {
     try {
         if (window.nekoYuiGuideAvatarCornerPeekActive === true) return;
+        if (
+            window.nekoYuiGuideLive2dPreparing === true
+            || (
+                document.body
+                && document.body.classList
+                && document.body.classList.contains('yui-guide-live2d-preparing')
+            )
+        ) return;
         if (!_nekoShouldSelfHealLive2D()) return;
         // goodbye / 切换中属于合法隐藏，交给各自链路，不打扰。
         if (window.live2dManager && window.live2dManager._goodbyeClicked) return;
@@ -165,9 +173,31 @@ function ensureLive2DVisibleSoon(reason) {
 
 function revealInitialLive2DModelWhenUiReady(reason) {
     let revealed = false;
-    const reveal = () => {
+    let preparingObserver = null;
+    function revealAfterPreparing() {
+        reveal();
+    }
+    function clearPreparingRevealWatch() {
+        window.removeEventListener('neko:yui-guide:live2d-prepared-revealed', revealAfterPreparing);
+        window.removeEventListener('neko:yui-guide:tutorial-lifecycle-ended', revealAfterPreparing);
+        if (preparingObserver) {
+            preparingObserver.disconnect();
+            preparingObserver = null;
+        }
+    }
+    function reveal() {
         if (revealed) {
             return true;
+        }
+        if (
+            window.nekoYuiGuideLive2dPreparing === true
+            || (
+                document.body
+                && document.body.classList
+                && document.body.classList.contains('yui-guide-live2d-preparing')
+            )
+        ) {
+            return false;
         }
         if (typeof window.showLive2d !== 'function') {
             return false;
@@ -179,8 +209,9 @@ function revealInitialLive2DModelWhenUiReady(reason) {
             return false;
         }
         revealed = true;
+        clearPreparingRevealWatch();
         return true;
-    };
+    }
 
     if (reveal()) {
         return;
@@ -191,6 +222,16 @@ function revealInitialLive2DModelWhenUiReady(reason) {
             reveal();
         }, delayMs);
     });
+
+    window.addEventListener('neko:yui-guide:live2d-prepared-revealed', revealAfterPreparing);
+    window.addEventListener('neko:yui-guide:tutorial-lifecycle-ended', revealAfterPreparing);
+    if (typeof MutationObserver === 'function' && document.body) {
+        preparingObserver = new MutationObserver(revealAfterPreparing);
+        preparingObserver.observe(document.body, {
+            attributes: true,
+            attributeFilter: ['class']
+        });
+    }
 
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', reveal, { once: true });
@@ -430,6 +471,10 @@ async function _initLive2DModelInner() {
             console.warn('[Live2D Init] 存储位置哨兵被拒绝，中止本次 Live2D 初始化');
             return;
         }
+    }
+    if (window.__nekoSevenDayTutorialStateReady
+        && typeof window.__nekoSevenDayTutorialStateReady.then === 'function') {
+        await window.__nekoSevenDayTutorialStateReady;
     }
 
     if (window.NekoAvatarFloatingBoot && typeof window.NekoAvatarFloatingBoot.shouldSkipUserModelBoot === 'function'
@@ -721,10 +766,11 @@ async function _initLive2DModelInner() {
                 isMobile: typeof window.isMobileWidth === 'function' ? window.isMobileWidth() : (window.innerWidth <= 768),
                 // 在常驻表情应用完成后应用参数（事件驱动，替代不可靠的 setTimeout）
                 onResidentExpressionApplied: (model) => {
-                    if (modelPreferences && modelPreferences.parameters &&
+                    const effectiveParameters = window.live2dManager.effectiveModelParameters;
+                    if (effectiveParameters && Object.keys(effectiveParameters).length > 0 &&
                         model && model.internalModel && model.internalModel.coreModel) {
-                        window.live2dManager.applyModelParameters(model, modelPreferences.parameters);
-                        console.log('[Live2D Init] 在常驻表情应用后已重新应用用户偏好参数');
+                        window.live2dManager.applyModelParameters(model, effectiveParameters);
+                        console.log('[Live2D Init] 在常驻表情应用后已重新应用规范化有效参数');
                     }
                 },
                 // 模型完全就绪后恢复待机动作（延迟 500ms 确保模型完全稳定）

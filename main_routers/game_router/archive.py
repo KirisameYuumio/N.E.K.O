@@ -29,7 +29,7 @@ from ._shared import (
     _strip_json_fence,
     logger,
 )
-from .char_info import _get_game_route_summary_llm_info, _resolve_game_prompt_language
+from .char_info import _get_game_route_summary_llm_info
 from .game_context import (
     _dialog_memory_line,
     _extract_score_text,
@@ -54,7 +54,11 @@ from config.prompts.prompts_minigame_route import (
     get_game_archive_memory_text_labels,
 )
 from ..shared_state import get_session_manager
-from utils.language_utils import normalize_language_code
+from utils.language_utils import (
+    get_global_language_full,
+    is_supported_language_code,
+    normalize_language_code,
+)
 
 
 def _route_game_started_elapsed_ms(state: dict, *, prefer_exit_elapsed: bool = False) -> float | None:
@@ -120,11 +124,13 @@ def _build_game_archive(state: dict) -> dict:
     if not final_score and isinstance(last_state.get("score"), dict):
         final_score = dict(last_state.get("score") or {})
     organizer = _normalize_game_context_organizer_state(state.get("game_context_organizer"))
+    archive_language, archive_language_source = _current_route_prompt_language_with_source(state)
     return {
         "game_type": state.get("game_type"),
         "session_id": state.get("session_id"),
         "lanlan_name": state.get("lanlan_name"),
-        "user_language": _resolve_game_prompt_language(str(state.get("lanlan_name") or "")),
+        "user_language": archive_language,
+        "user_language_source": archive_language_source,
         "dialog_count": len(dialog),
         "full_dialogues": dialog,
         "last_full_dialogues": dialog[-keep_last:],
@@ -144,6 +150,7 @@ def _build_game_archive(state: dict) -> dict:
         ],
         "game_context_organizer": organizer,
         "game_context_degraded": organizer.get("degraded") is True,
+        "sdk_memory_submissions": list(state.get("_sdk_memory_submissions") or [])[-16:],
         "preGameContext": state.get("preGameContext") if isinstance(state.get("preGameContext"), dict) else {},
         "pre_game_context_source": str(state.get("pre_game_context_source") or ""),
         "pre_game_context_error": str(state.get("pre_game_context_error") or ""),
@@ -164,19 +171,66 @@ def _archive_game_context_degraded(archive: dict) -> bool:
 def _archive_prompt_language(archive: dict) -> str:
     language = str(archive.get("user_language") or "").strip()
     if language:
-        return language
+        return normalize_language_code(language, format="full") or language
     lanlan_name = str(archive.get("lanlan_name") or "").strip()
     if not lanlan_name:
-        return ""
+        return get_global_language_full()
     try:
         session_manager = get_session_manager()
         manager = session_manager.get(lanlan_name) if hasattr(session_manager, "get") else None
         language = str(getattr(manager, "user_language", "") or "").strip()
         if language:
-            return normalize_language_code(language, format="short") or language
+            return normalize_language_code(language, format="full") or language
     except Exception:
         logger.debug("赛后归档语言解析失败，使用默认 prompt 语言", exc_info=True)
-    return ""
+    return get_global_language_full()
+
+
+def _current_route_prompt_language_with_source(state: dict) -> tuple[str, str]:
+    lanlan_name = str(state.get("lanlan_name") or "").strip()
+    if lanlan_name:
+        try:
+            session_manager = get_session_manager()
+            manager = (
+                session_manager.get(lanlan_name)
+                if hasattr(session_manager, "get")
+                else None
+            )
+            language = str(getattr(manager, "user_language", "") or "").strip()
+            if getattr(manager, "_user_language_explicit", False) and language:
+                return normalize_language_code(language, format="full") or language, "session"
+        except Exception:
+            logger.debug("赛后归档实时语言解析失败，使用路由状态语言", exc_info=True)
+    language = str(state.get("user_language") or "").strip()
+    if language:
+        source = str(state.get("user_language_source") or "route").strip()
+        return normalize_language_code(language, format="full") or language, source
+    return get_global_language_full(), "global"
+
+
+def _current_route_prompt_language(state: dict) -> str:
+    """Resolve the live session locale before freezing a game archive."""
+    return _current_route_prompt_language_with_source(state)[0]
+
+
+def _archive_memory_language(archive: dict) -> str | None:
+    if archive.get("user_language_source") in {"global", "render"}:
+        return None
+    language = str(archive.get("user_language") or "").strip()
+    if language:
+        return normalize_language_code(language, format="full") or language
+    lanlan_name = str(archive.get("lanlan_name") or "").strip()
+    if not lanlan_name:
+        return None
+    try:
+        session_manager = get_session_manager()
+        manager = session_manager.get(lanlan_name) if hasattr(session_manager, "get") else None
+        language = str(getattr(manager, "user_language", "") or "").strip()
+        if getattr(manager, "_user_language_explicit", False) and language:
+            return normalize_language_code(language, format="full") or language
+    except Exception:
+        logger.debug("赛后归档记忆语言解析失败，省略持久化语言", exc_info=True)
+    return None
 
 
 def _build_game_archive_memory_text(archive: dict) -> str:
@@ -334,6 +388,56 @@ def _normalize_game_archive_memory_highlights(value: Any) -> dict:
     }
 
 
+def _sdk_memory_submission_fallback_highlights(archive: dict) -> dict:
+    """Convert accepted SDK submissions into a compact deterministic fallback."""
+    submissions = archive.get("sdk_memory_submissions")
+    if not isinstance(submissions, list):
+        submissions = []
+
+    def compact(value: Any, *, max_chars: int) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                return ""
+        return _normalize_memory_highlight_text(text)[:max_chars]
+
+    summaries: list[str] = []
+    events: list[str] = []
+    latest_state = ""
+    latest_result = ""
+    for submission in reversed(submissions[-16:]):
+        if not isinstance(submission, dict):
+            continue
+        summary = compact(submission.get("summary"), max_chars=220)
+        if summary and summary not in summaries and len(summaries) < 3:
+            summaries.append(summary)
+        if not latest_result:
+            latest_result = compact(submission.get("result"), max_chars=180)
+        if not latest_state:
+            latest_state = compact(submission.get("state"), max_chars=180)
+        raw_events = submission.get("events")
+        if isinstance(raw_events, list):
+            for event in reversed(raw_events[-64:]):
+                event_text = compact(event, max_chars=180)
+                if event_text and event_text not in events and len(events) < 3:
+                    events.append(event_text)
+
+    important_events = list(reversed(events[:2]))
+    if latest_result and latest_result not in important_events:
+        important_events.append(latest_result)
+    return _normalize_game_archive_memory_highlights({
+        "important_records": list(reversed(summaries)),
+        "important_game_events": important_events,
+        "state_carryback": latest_state,
+        "memory_summary": summaries[0] if summaries else "",
+    })
+
+
 def _fallback_game_archive_memory_highlights(archive: dict) -> dict:
     language = _archive_prompt_language(archive)
     labels = get_game_archive_fallback_highlight_labels(language)
@@ -364,12 +468,13 @@ def _fallback_game_archive_memory_highlights(archive: dict) -> dict:
             break
     event_records.reverse()
 
+    sdk_highlights = _sdk_memory_submission_fallback_highlights(archive)
     return {
-        "important_records": records[:3],
-        "important_game_events": event_records[:3],
-        "state_carryback": "",
+        "important_records": (sdk_highlights["important_records"] + records)[:3],
+        "important_game_events": (sdk_highlights["important_game_events"] + event_records)[:3],
+        "state_carryback": sdk_highlights["state_carryback"],
         "postgame_tone": "",
-        "memory_summary": "",
+        "memory_summary": sdk_highlights["memory_summary"],
     }
 
 
@@ -410,6 +515,10 @@ def _build_game_archive_memory_highlight_source(archive: dict) -> str:
             lines.append(labels["grouped_signals"].format(signals=signals_text))
         if context_summary or signals_text:
             lines.append(labels["selection_priority"])
+    sdk_memory_submissions = archive.get("sdk_memory_submissions")
+    if isinstance(sdk_memory_submissions, list) and sdk_memory_submissions:
+        lines.append(labels["sdk_memory_submissions"])
+        lines.append(json.dumps(sdk_memory_submissions[-16:], ensure_ascii=False))
     lines.append(labels["full_dialogues"])
     lines.extend(
         f"- {_dialog_memory_line(item, language)}"
@@ -477,7 +586,7 @@ async def _select_game_archive_memory_highlights(archive: dict) -> dict:
 
 async def _ensure_game_archive_memory_highlights(archive: dict) -> dict:
     if _archive_game_context_degraded(archive):
-        highlights = _normalize_game_archive_memory_highlights({})
+        highlights = _sdk_memory_submission_fallback_highlights(archive)
         highlights["source"] = {"provider": "game_context_organizer", "method": "degraded_minimal_facts"}
         archive["memory_highlights"] = highlights
         return highlights
@@ -557,24 +666,29 @@ def _build_game_archive_memory_summary_text(archive: dict, *, tail_count: int | 
         lines.append(labels["score"].format(score_text=score_text))
     else:
         lines.append(labels["no_score"])
+
+    def append_highlights() -> None:
+        if highlights["important_records"]:
+            lines.append(labels["important_records"])
+            lines.extend(f"- {item}" for item in highlights["important_records"])
+        if highlights["important_game_events"]:
+            lines.append(labels["important_game_events"])
+            lines.extend(f"- {item}" for item in highlights["important_game_events"])
+        if highlights["state_carryback"]:
+            lines.append(labels["state_carryback"].format(value=highlights["state_carryback"]))
+        if highlights["postgame_tone"]:
+            lines.append(labels["postgame_tone"].format(value=highlights["postgame_tone"]))
+        if highlights["memory_summary"]:
+            lines.append(labels["memory_summary"].format(value=highlights["memory_summary"]))
+
     if degraded:
         lines.append(labels["degraded"])
         lines.append(labels["degraded_no_tail"])
         lines.append(labels["degraded_followup"])
+        append_highlights()
         return "\n".join(lines)
 
-    if highlights["important_records"]:
-        lines.append(labels["important_records"])
-        lines.extend(f"- {item}" for item in highlights["important_records"])
-    if highlights["important_game_events"]:
-        lines.append(labels["important_game_events"])
-        lines.extend(f"- {item}" for item in highlights["important_game_events"])
-    if highlights["state_carryback"]:
-        lines.append(labels["state_carryback"].format(value=highlights["state_carryback"]))
-    if highlights["postgame_tone"]:
-        lines.append(labels["postgame_tone"].format(value=highlights["postgame_tone"]))
-    if highlights["memory_summary"]:
-        lines.append(labels["memory_summary"].format(value=highlights["memory_summary"]))
+    append_highlights()
     lines.append(labels["tail_rule"].format(tail_count=normalized_tail_count))
     return "\n".join(lines)
 
@@ -638,9 +752,20 @@ async def _submit_game_archive_to_memory(archive: dict) -> dict:
             source="memory_server_cache",
         )
         client = get_internal_http_client()
+        payload = {"input_history": json.dumps(messages, ensure_ascii=False)}
+        memory_language = _archive_memory_language(archive)
+        if memory_language:
+            payload["language"] = memory_language
+        elif archive.get("user_language_source") == "render":
+            render_language = str(archive.get("user_language") or "").strip()
+            if is_supported_language_code(render_language):
+                payload["render_language"] = normalize_language_code(
+                    render_language,
+                    format="full",
+                )
         response = await client.post(
             f"http://127.0.0.1:{MEMORY_SERVER_PORT}/cache/{lanlan_name}",
-            json={"input_history": json.dumps(messages, ensure_ascii=False)},
+            json=payload,
             timeout=8.0,
         )
         data = response.json() if response.content else {}

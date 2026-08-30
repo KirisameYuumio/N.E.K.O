@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 from queue import Queue
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -21,7 +22,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from config.prompts.prompts_proactive import build_proactive_action_note
 from main_logic.core import LLMSessionManager
+from main_logic.proactive_chat import delivery as proactive_delivery
+from main_logic.proactive_chat.delivery import (
+    CommittedDelivery,
+    _record_committed_delivery,
+)
 from main_logic.session_state import SessionStateMachine
+from main_routers.system_router.proactive_parsing import _extract_links_from_raw
 
 # 测试公用 master_name —— 任何字符串都行，关键是验证它会被原样展开进 note，
 # 而不是被替换成"主人/master/ご主人さま"等物化称呼。
@@ -76,6 +83,76 @@ def test_action_note_chat_channel_with_music_fallback_uses_music_note():
     assert '稻香' in note
     assert '周杰伦' in note
     assert MASTER in note
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('primary_channel', 'expected_source_mode'),
+    [('chat', 'music'), ('music', 'music'), ('both', 'both')],
+)
+async def test_music_delivery_reports_effective_source_mode(
+    monkeypatch,
+    primary_channel,
+    expected_source_mode,
+):
+    """Promote a CHAT fallback while preserving native player modes."""
+    music_link = {
+        'title': '稻香',
+        'artist': '周杰伦',
+        'url': 'https://example.com/track.mp3',
+        'source': '音乐推荐',
+        'type': 'music',
+    }
+    delivery = CommittedDelivery(
+        primary_channel=primary_channel,
+        source_links=[music_link],
+        delivered_tag='MUSIC',
+        delivered_music_link=music_link,
+        is_music_used=True,
+        action_note='[已分享音乐]',
+        vision_screenshot_b64=None,
+    )
+
+    monkeypatch.setattr(proactive_delivery, '_record_proactive_chat', MagicMock())
+    monkeypatch.setattr(proactive_delivery, '_record_proactive_material', MagicMock())
+    monkeypatch.setattr(
+        proactive_delivery,
+        '_mini_game_invite_count_post_response_chat',
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        proactive_delivery,
+        '_increment_proactive_chat_total',
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        proactive_delivery,
+        '_get_internal_http_client',
+        MagicMock(return_value=MagicMock()),
+    )
+
+    result = await _record_committed_delivery(
+        mgr=SimpleNamespace(current_speech_id='turn-1'),
+        delivery=delivery,
+        lanlan_name='Neko',
+        response_text='这首歌分享给你。',
+        source_tag='CHAT',
+        active_channels=['music'],
+        has_unfinished_thread=False,
+        surfaced_reflection_ids=[],
+        selected_web_link=None,
+        selected_web_topic_key=None,
+        web_parsed=None,
+        selected_music_link=music_link,
+        selected_music_topic_key=None,
+        selected_meme_link=None,
+        selected_meme_topic_key=None,
+        meme_content=None,
+    )
+
+    assert result.body['source_mode'] == expected_source_mode
+    assert result.body['source_tag'] == 'CHAT'
+    assert result.body['source_links'] == [music_link]
 
 
 def test_action_note_unknown_channel_falls_back_to_source_links():
@@ -210,6 +287,64 @@ def test_action_note_web_subchannels_all_route_to_web_template():
         note = build_proactive_action_note(ch, [link], 'zh', master_name=MASTER)
         assert note != '', f'channel={ch} 漏到 fallback'
         assert 'foo' in note and 'bar' in note
+
+
+def test_extract_links_from_news_raw_data_includes_tieba_material():
+    raw = {
+        'region': 'china',
+        'news': {
+            'success': True,
+            'trending': [
+                {'word': '\u5fae\u535a\u70ed\u641c', 'url': 'https://s.weibo.com/weibo?q=x'},
+            ],
+        },
+        'tieba': {
+            'posts': [
+                {
+                    'title': '\u8d34\u5427\u70ed\u95e8\u5e16\u5b50',
+                    'url': 'https://tieba.baidu.com/p/1',
+                    'abstract': '\u793e\u533a\u8ba8\u8bba',
+                },
+                {
+                    'title': '\u8d34\u5427\u5019\u8865\u5e16\u5b50',
+                    'url': 'https://tieba.baidu.com/p/2',
+                    'abstract': '\u6269\u5927\u5019\u9009\u6c60\u540e\u4f9b\u73b0\u6709\u53bb\u91cd\u9009\u7528',
+                },
+                {'title': '\u7f3a\u94fe\u63a5', 'url': ''},
+            ],
+            'topics': [
+                {
+                    'title': '\u8d34\u5427\u70ed\u699c\u8bdd\u9898',
+                    'url': 'https://tieba.baidu.com/hottopic/browse/hottopic?topic_id=1',
+                },
+            ],
+        },
+    }
+
+    links = _extract_links_from_raw('news', raw)
+
+    assert links == [
+        {
+            'title': '\u5fae\u535a\u70ed\u641c',
+            'url': 'https://s.weibo.com/weibo?q=x',
+            'source': '\u5fae\u535a',
+        },
+        {
+            'title': '\u8d34\u5427\u70ed\u95e8\u5e16\u5b50',
+            'url': 'https://tieba.baidu.com/p/1',
+            'source': '\u8d34\u5427',
+        },
+        {
+            'title': '\u8d34\u5427\u5019\u8865\u5e16\u5b50',
+            'url': 'https://tieba.baidu.com/p/2',
+            'source': '\u8d34\u5427',
+        },
+        {
+            'title': '\u8d34\u5427\u70ed\u699c\u8bdd\u9898',
+            'url': 'https://tieba.baidu.com/hottopic/browse/hottopic?topic_id=1',
+            'source': '\u8d34\u5427',
+        },
+    ]
 
 
 def test_action_note_window_channel_with_music_recs_does_not_pick_music():

@@ -29,6 +29,7 @@ def _mock_cm(tmpdir: str):
     cm.get_model_api_config = MagicMock(return_value={
         "model": "fake", "base_url": "http://fake", "api_key": "sk-fake",
     })
+    cm.aget_model_api_config = AsyncMock(side_effect=lambda mt, **_: cm.get_model_api_config(mt))
     return cm
 
 
@@ -41,8 +42,8 @@ def _install(tmpdir: str):
     cm = _mock_cm(tmpdir)
     with patch("memory.event_log.get_config_manager", return_value=cm), \
          patch("memory.facts.get_config_manager", return_value=cm), \
-         patch("memory.persona.get_config_manager", return_value=cm), \
-         patch("memory.reflection.get_config_manager", return_value=cm):
+         patch("memory.persona.manager.get_config_manager", return_value=cm), \
+         patch("memory.reflection.manager.get_config_manager", return_value=cm):
         event_log = EventLog()
         event_log._config_manager = cm
         fs = FactStore()

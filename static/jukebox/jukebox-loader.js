@@ -1,6 +1,21 @@
 (function() {
   'use strict';
 
+  var COMPRESSED_BUNDLED_VRM_IDLE_NAMES = new Set([
+    'liked', 'wait01', 'wait02', 'wait03', 'wait04', 'wait05',
+    '全身展示', '射击姿态', '屈伸运动', '旋转', '模特姿势', '比 V 手势', '致意问候'
+  ]);
+
+  function normalizeBundledVrmIdleUrl(url) {
+    var value = String(url || '');
+    var match = value.match(/^\/static\/vrm\/animation\/([^/?#]+)\.vrma(?:[?#]|$)/i);
+    if (!match) return url;
+    var assetName = match[1];
+    try { assetName = decodeURIComponent(assetName); } catch (_) {}
+    if (!COMPRESSED_BUNDLED_VRM_IDLE_NAMES.has(assetName)) return url;
+    return value.replace(/\.vrma(?=[?#]|$)/i, '.vrma.gz');
+  }
+
   function ensureNativeJukeboxFacade() {
     if (window.Jukebox) return;
 
@@ -83,12 +98,12 @@
 
         try {
           facade.stopVMD(true);
-          await window.vrmManager.playVRMAAnimation(vrmaPath, {
+          var played = await window.vrmManager.playVRMAAnimation(vrmaPath, {
             loop: false,
             fadeInDuration: 0.5,
             fadeOutDuration: 0.5
           });
-          if (playRequestId !== state.playRequestId) return;
+          if (played !== true || playRequestId !== state.playRequestId) return;
           state.isVMDPlaying = true;
           state.isPaused = false;
           state.isPlaying = true;
@@ -133,9 +148,15 @@
             if (!vrmIdleUrl) {
               vrmIdleUrl = window.lanlan_config && window.lanlan_config.vrmIdleAnimation;
             }
-            await window.vrmManager.playVRMAAnimation(vrmIdleUrl || '/static/vrm/animation/wait03.vrma', {
+            vrmIdleUrl = normalizeBundledVrmIdleUrl(
+              vrmIdleUrl || '/static/vrm/animation/wait03.vrma.gz'
+            );
+            await window.vrmManager.playVRMAAnimation(vrmIdleUrl, {
               loop: true,
-              isIdle: true
+              isIdle: true,
+              shouldApply: function() {
+                return restoreRequestId === state.playRequestId;
+              }
             });
           } catch (error) {
             console.warn('[Jukebox] VRM 待机动画恢复失败:', error);
@@ -227,7 +248,17 @@
     window.Jukebox_togglePause = facade.togglePause;
   }
 
-  var SCRIPT_ID = 'neko-jukebox-script';
+  // 原生桥（Electron）下不再提前 return：AI 控制面需要惰性门面在任何形态下都存在，
+  // 文件尾部只有在 __nekoJukeboxToggle 缺席时才会接管它。
+  var SCRIPT_ID_PREFIX = 'neko-jukebox-part-';
+  var SCRIPT_PATHS = [
+    '/static/jukebox/jukebox/bootstrap.js',
+    '/static/jukebox/jukebox/core.js',
+    '/static/jukebox/jukebox/manager.js',
+    '/static/jukebox/jukebox/shell.js',
+    '/static/jukebox/jukebox/transport.js',
+    '/static/jukebox/jukebox/wiring.js'
+  ];
   var TOAST_ID = 'neko-jukebox-loader-toast';
   var STYLE_ID = 'neko-jukebox-loader-style';
   var REQUIRED_CONTROL_API_VERSION = 3;
@@ -272,9 +303,9 @@
     }
   }
 
-  function buildJukeboxScriptSrc() {
+  function buildJukeboxPartSrc(scriptPath) {
     try {
-      var url = new URL('/static/jukebox/Jukebox.js', window.location.href);
+      var url = new URL(scriptPath, window.location.href);
       if (assetQuery) {
         var inherited = new URLSearchParams(assetQuery.replace(/^\?/, ''));
         inherited.forEach(function(value, key) {
@@ -286,7 +317,7 @@
     } catch (_) {
       var query = assetQuery || '';
       var separator = query ? '&' : '?';
-      return '/static/jukebox/Jukebox.js' + query + separator + 'jukebox_control_api=' + encodeURIComponent(String(REQUIRED_CONTROL_API_VERSION));
+      return scriptPath + query + separator + 'jukebox_control_api=' + encodeURIComponent(String(REQUIRED_CONTROL_API_VERSION));
     }
   }
 
@@ -484,34 +515,62 @@
     return window.Jukebox;
   }
 
+  function getJukeboxPartScriptId(scriptPath) {
+    var fileName = scriptPath.split('/').pop() || 'part';
+    return SCRIPT_ID_PREFIX + fileName.replace(/\.js$/, '');
+  }
+
+  function removeJukeboxScripts() {
+    document.querySelectorAll('script[data-neko-jukebox-part="true"]').forEach(function(script) {
+      script.remove();
+    });
+  }
+
+  function loadJukeboxPart(scriptPath) {
+    return new Promise(function(resolve, reject) {
+      var script = document.createElement('script');
+      script.id = getJukeboxPartScriptId(scriptPath);
+      script.src = buildJukeboxPartSrc(scriptPath);
+      script.async = false;
+      script.dataset.nekoJukeboxPart = 'true';
+      script.dataset.nekoJukeboxLazy = 'true';
+      script.onload = function() {
+        resolve();
+      };
+      script.onerror = function() {
+        script.remove();
+        reject(new Error('Failed to load Jukebox part: ' + scriptPath));
+      };
+      document.body.appendChild(script);
+    });
+  }
+
   function loadJukeboxScript() {
     if (isLoadedJukebox(window.Jukebox)) return Promise.resolve(window.Jukebox);
     if (loadPromise) return loadPromise;
 
-    loadPromise = new Promise(function(resolve, reject) {
-      var existingScript = document.getElementById(SCRIPT_ID);
-      if (existingScript) existingScript.remove();
-
-      var script = document.createElement('script');
-      script.id = SCRIPT_ID;
-      script.src = buildJukeboxScriptSrc();
-      script.async = true;
-      script.dataset.nekoJukeboxLazy = 'true';
-      script.onload = function() {
-        if (window.Jukebox) {
-          console.log('[JukeboxLoader] 点歌台资源已加载');
-          resolve(window.Jukebox);
-        } else {
-          reject(new Error('Jukebox global missing after script load'));
-        }
-      };
-      script.onerror = function() {
-        script.remove();
-        loadPromise = null;
-        reject(new Error('Failed to load Jukebox.js'));
-      };
-      console.log('[JukeboxLoader] 按需加载点歌台资源');
-      document.body.appendChild(script);
+    removeJukeboxScripts();
+    console.log('[JukeboxLoader] 按需加载点歌台资源');
+    loadPromise = SCRIPT_PATHS.reduce(function(sequence, scriptPath) {
+      return sequence.then(function() {
+        return loadJukeboxPart(scriptPath);
+      });
+    }, Promise.resolve()).then(function() {
+      if (!isLoadedJukebox(window.Jukebox)) {
+        throw new Error('Jukebox global missing after parts loaded');
+      }
+      console.log('[JukeboxLoader] 点歌台资源已加载');
+      return window.Jukebox;
+    }).catch(function(error) {
+      removeJukeboxScripts();
+      try {
+        delete window.Jukebox;
+      } catch (_) {
+        window.Jukebox = undefined;
+      }
+      loadPromise = null;
+      ensureLazyJukeboxFacade();
+      throw error;
     });
 
     return loadPromise;
@@ -620,8 +679,7 @@
     toggleInFlight = false;
     console.log('[JukeboxLoader] 点歌台完全关闭，准备卸载资源');
 
-    var script = document.getElementById(SCRIPT_ID);
-    if (script) script.remove();
+    removeJukeboxScripts();
 
     if (unloadTimer) clearTimeout(unloadTimer);
     unloadTimer = setTimeout(finalizeUnload, 3000);
@@ -631,7 +689,7 @@
     var jukebox = window.Jukebox;
     return {
       hasJukeboxGlobal: !!jukebox,
-      hasScriptTag: !!document.getElementById(SCRIPT_ID),
+      hasScriptTag: !!document.querySelector('script[data-neko-jukebox-part="true"]'),
       hasUi: !!document.querySelector('.jukebox-wrapper'),
       isOpen: !!(jukebox && jukebox.State && jukebox.State.isOpen),
       isHidden: !!(jukebox && jukebox.State && jukebox.State.isHidden),

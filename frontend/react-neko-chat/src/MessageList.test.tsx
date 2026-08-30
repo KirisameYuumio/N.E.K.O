@@ -1,5 +1,6 @@
-import { render } from '@testing-library/react';
+import { fireEvent, render } from '@testing-library/react';
 import MessageList from './MessageList';
+import { MEME_IMAGE_LOAD_FAILED_STICKER_URL } from './memeImageFallback';
 import { parseChatMessage } from './message-schema';
 
 const message = parseChatMessage({
@@ -33,5 +34,109 @@ describe('MessageList 凝神 thinking-dots', () => {
     const row = container.querySelector('.focus-thinking-row');
     expect(row).not.toBeNull();
     expect(row?.querySelectorAll('.focus-thinking-dot').length).toBe(3);
+  });
+});
+
+describe('MessageList image fallback', () => {
+  it('keeps a normal image URL until the browser reports a load error', () => {
+    const imageMessage = parseChatMessage({
+      id: 'img-1',
+      role: 'assistant',
+      author: 'Neko',
+      time: '10:01',
+      createdAt: 2,
+      blocks: [{ type: 'image', url: '/api/meme/proxy-image?url=ok', alt: 'ok meme' }],
+      status: 'sent',
+    });
+    const { container } = render(<MessageList messages={[imageMessage]} />);
+    const img = container.querySelector<HTMLImageElement>('.message-block-image img');
+
+    expect(img).not.toBeNull();
+    expect(img).toHaveAttribute('src', '/api/meme/proxy-image?url=ok');
+    expect(img).toHaveAttribute('loading', 'eager');
+    expect(img).toHaveAttribute('fetchpriority', 'high');
+    expect(img).not.toHaveAttribute('data-neko-image-load-failed-sticker');
+
+    fireEvent.error(img as HTMLImageElement);
+
+    expect(img).toHaveAttribute('src', MEME_IMAGE_LOAD_FAILED_STICKER_URL);
+    expect(img).toHaveAttribute('data-neko-image-load-failed-sticker', 'true');
+  });
+
+  it('does not use the meme failed sticker for non-meme images', () => {
+    const imageMessage = parseChatMessage({
+      id: 'img-2',
+      role: 'assistant',
+      author: 'Neko',
+      time: '10:02',
+      createdAt: 3,
+      blocks: [{ type: 'image', url: '/static/icons/cat_icon.png', alt: 'regular image' }],
+      status: 'sent',
+    });
+    const { container } = render(<MessageList messages={[imageMessage]} />);
+    const img = container.querySelector<HTMLImageElement>('.message-block-image img');
+
+    expect(img).not.toBeNull();
+    expect(img).toHaveAttribute('src', '/static/icons/cat_icon.png');
+    expect(img).toHaveAttribute('loading', 'lazy');
+    expect(img).not.toHaveAttribute('fetchpriority');
+
+    fireEvent.error(img as HTMLImageElement);
+
+    expect(img).toHaveAttribute('src', '/static/icons/cat_icon.png');
+    expect(img).not.toHaveAttribute('src', MEME_IMAGE_LOAD_FAILED_STICKER_URL);
+    expect(img).not.toHaveAttribute('data-neko-image-load-failed-sticker');
+  });
+});
+
+describe('plugin system bubble', () => {
+  const pluginMessage = parseChatMessage({
+    id: 'plugin-1',
+    role: 'system',
+    author: 'LifeKit',
+    time: '10:05',
+    createdAt: 2,
+    blocks: [{ type: 'text', text: '哇你被打下来了！' }],
+    status: 'sent',
+  });
+
+  it('names its source instead of wearing the character identity', () => {
+    const { container } = render(<MessageList messages={[pluginMessage]} />);
+
+    // A plugin may phrase its text in her voice — warthunder does, for
+    // latency — so the source label is the only thing telling the reader
+    // these words are not hers. For blind pushes she has no memory of them.
+    const source = container.querySelector('.system-chip-source');
+    expect(source?.textContent).toBe('LifeKit');
+    expect(container.querySelector('.system-chip-content')?.textContent).toContain(
+      '哇你被打下来了！',
+    );
+
+    // None of the character's identity may leak in.
+    expect(container.querySelector('.avatar-assistant')).toBeNull();
+    expect(container.querySelector('.message-bubble-assistant')).toBeNull();
+    expect(container.querySelector('.message-row-system')).not.toBeNull();
+  });
+
+  it('falls back to the source kind when the plugin gave no name', () => {
+    const unlabelled = parseChatMessage({
+      id: 'plugin-2',
+      role: 'system',
+      // The schema requires a NON-EMPTY author, so the adapter substitutes the
+      // source kind rather than leaving it blank — every plugin bubble is
+      // labelled, none silently fails validation.
+      author: 'plugin',
+      time: '10:06',
+      createdAt: 3,
+      blocks: [{ type: 'text', text: 'session started' }],
+      status: 'sent',
+    });
+
+    const { container } = render(<MessageList messages={[unlabelled]} />);
+
+    expect(
+      container.querySelector('.system-chip-source')?.textContent,
+    ).toBe('plugin');
+    expect(container.querySelector('.system-chip')).not.toBeNull();
   });
 });

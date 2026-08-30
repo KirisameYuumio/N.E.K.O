@@ -1,6 +1,8 @@
 import os
 import sys
 
+import pytest
+
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -21,6 +23,9 @@ from utils.stepfun_tts_voices import (
     get_stepfun_tts_default_voice,
     normalize_stepfun_tts_voice,
 )
+from utils.tts.providers import stepfun as stepfun_provider
+import main_logic.tts_client as tts_client
+from main_logic.tts_client.workers import free as free_worker_module
 
 
 def test_stepfun_and_free_catalogs_are_registered():
@@ -31,6 +36,51 @@ def test_stepfun_and_free_catalogs_are_registered():
     assert is_native_voice(STEPFUN_TTS_DEFAULT_VOICE, provider_key="free") is True
     assert is_native_voice("青春少女", provider_key="step") is True
     assert is_native_voice("中文男", provider_key="free") is True
+
+
+def test_stepfun_and_free_dispatch_to_dedicated_workers(monkeypatch):
+    class EmptyConfigManager:
+        def get_core_config(self):
+            return {}
+
+    monkeypatch.setattr(
+        tts_client,
+        "get_config_manager",
+        lambda: EmptyConfigManager(),
+    )
+
+    free_worker, free_key, free_provider = tts_client.get_tts_worker(core_api_type="free")
+    step_worker, step_key, step_provider = tts_client.get_tts_worker(core_api_type="step")
+
+    assert free_worker is tts_client.free_realtime_tts_worker
+    assert step_worker is tts_client.step_realtime_tts_worker
+    assert free_worker is not step_worker
+    assert (free_key, free_provider) == (None, "free")
+    assert (step_key, step_provider) == (None, "step")
+
+
+def test_legacy_step_worker_free_mode_delegates_to_free_worker(monkeypatch):
+    calls = []
+
+    def fake_free_worker(*args):
+        calls.append(args)
+
+    monkeypatch.setattr(
+        free_worker_module,
+        "free_realtime_tts_worker",
+        fake_free_worker,
+    )
+
+    result = tts_client.step_realtime_tts_worker(
+        "requests",
+        "responses",
+        "api-key",
+        "voice-id",
+        free_mode=True,
+    )
+
+    assert result is None
+    assert calls == [("requests", "responses", "api-key", "voice-id")]
 
 
 def test_stepfun_native_voice_aliases_route_to_canonical_ids():
@@ -108,3 +158,73 @@ def test_stepfun_catalog_is_loaded_from_api_providers_config():
     assert free_cfg["voices"] == step_cfg["voices"]
     assert free_cfg["catalog_prefix"] == "免费 API"
     assert free_cfg["catalog_value_is_display_name"] is True
+
+
+def test_missing_configs_use_symmetric_routable_fallbacks(monkeypatch):
+    monkeypatch.setattr(
+        stepfun_provider,
+        "_load_stepfun_provider_config",
+        lambda _provider_key: {},
+    )
+
+    step_provider = stepfun_provider._create_provider("step")
+    free_provider = stepfun_provider._create_provider("free")
+
+    for provider in (step_provider, free_provider):
+        assert provider.default_voice == FALLBACK_STEPFUN_TTS_DEFAULT_VOICE
+        assert provider.default_voice in provider.catalog
+        assert provider.default_male_voice in provider.catalog
+        assert provider.normalize("default") == (
+            FALLBACK_STEPFUN_TTS_DEFAULT_VOICE,
+            True,
+        )
+    assert step_provider.catalog == free_provider.catalog
+    assert step_provider.catalog_prefix == "StepFun"
+    assert free_provider.catalog_prefix == "免费 API"
+
+
+@pytest.mark.parametrize(
+    "broken_cfg",
+    [
+        {"voices": {"configured": "Configured Voice"}},
+        {
+            "voices": {"configured": "Configured Voice"},
+            "default_voice": "missing-from-catalog",
+        },
+    ],
+)
+def test_invalid_configs_use_routable_fallbacks(monkeypatch, broken_cfg):
+    monkeypatch.setattr(
+        stepfun_provider,
+        "_load_stepfun_provider_config",
+        lambda _provider_key: broken_cfg,
+    )
+
+    provider = stepfun_provider._create_provider("step")
+
+    assert provider.default_voice == FALLBACK_STEPFUN_TTS_DEFAULT_VOICE
+    assert provider.default_voice in provider.catalog
+    assert provider.default_male_voice in provider.catalog
+
+
+def test_valid_stepfun_config_still_has_priority(monkeypatch):
+    cfg = {
+        "voices": {"configured": "Configured Voice"},
+        "aliases": {"default": "configured"},
+        "default_voice": "configured",
+        "default_male_voice": "configured",
+        "catalog_prefix": "Configured StepFun",
+        "catalog_value_is_display_name": True,
+    }
+    monkeypatch.setattr(
+        stepfun_provider,
+        "_load_stepfun_provider_config",
+        lambda _provider_key: cfg,
+    )
+
+    provider = stepfun_provider._create_provider("step")
+
+    assert provider.catalog == cfg["voices"]
+    assert provider.default_voice == "configured"
+    assert provider.normalize("default") == ("configured", True)
+    assert provider.catalog_prefix == "Configured StepFun"

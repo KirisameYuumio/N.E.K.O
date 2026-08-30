@@ -2,12 +2,14 @@
 import sys
 import os
 import platform
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 from PyInstaller.building.build_main import Tree
 
 # 获取 spec 文件所在目录和项目根目录
 SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
 PROJECT_ROOT = os.path.dirname(SPEC_DIR)
+VERSION_INFO_PATH = os.path.join(PROJECT_ROOT, 'version_info.txt')
+ICON_PATH = os.path.join(PROJECT_ROOT, 'assets', 'icon.ico')
 
 # 切换到项目根目录，以便所有路径都是相对于根目录
 original_dir = os.getcwd()
@@ -21,6 +23,7 @@ print(f"[Build] Working from: {os.getcwd()}")
 datas = []
 binaries = []
 hiddenimports = []
+hiddenimports += collect_submodules('plugin.sdk', on_error='raise')
 
 # 收集关键包的所有内容（根据实际 import 检查）
 critical_packages = [
@@ -59,6 +62,24 @@ embedding_runtime_packages = {'onnxruntime', 'tokenizers'}
 embedding_assets_present = os.path.isdir(
     os.path.join(PROJECT_ROOT, 'data', 'embedding_models')
 )
+voice_turn_assets_present = os.path.isdir(
+    os.path.join(
+        PROJECT_ROOT,
+        'main_logic',
+        'asr_client',
+        'endpointing',
+        'models',
+    )
+)
+speaker_shadow_assets_present = os.path.isdir(
+    os.path.join(
+        PROJECT_ROOT,
+        'main_logic',
+        'asr_client',
+        'speaker_shadow',
+        'models',
+    )
+)
 
 # galgame OCR deps: bundling is the ONLY path post-refactor (in-app install
 # routes were removed). Two distinct failure modes get distinct diagnostics:
@@ -93,12 +114,16 @@ for pkg in critical_packages:
         binaries += tmp_ret[1]
         hiddenimports += tmp_ret[2]
     except Exception as e:
-        if pkg in embedding_runtime_packages and embedding_assets_present:
+        if pkg in embedding_runtime_packages and (
+            embedding_assets_present
+            or (pkg == 'onnxruntime' and voice_turn_assets_present)
+            or (pkg == 'onnxruntime' and speaker_shadow_assets_present)
+        ):
             raise RuntimeError(
-                f"Cannot collect {pkg!r}, but data/embedding_models is "
-                "present and will be bundled. Install with "
+                f"Cannot collect {pkg!r}, but packaged model assets require it. "
+                "Install with "
                 "`uv sync` or remove the embedding "
-                "assets directory before building."
+                "voice-turn, or speaker-shadow assets directory before building."
             ) from e
         if pkg in galgame_group_packages:
             raise RuntimeError(
@@ -168,6 +193,14 @@ add_data('data/browser_use_prompts', 'data/browser_use_prompts')
 # packaging; for local source builds add_data warns and skips silently.
 add_data('data/tiktoken_cache', 'data/tiktoken_cache')
 add_data('data/embedding_models', 'data/embedding_models')
+add_data(
+    'main_logic/asr_client/endpointing/models',
+    'main_logic/asr_client/endpointing/models',
+)
+add_data(
+    'main_logic/asr_client/speaker_shadow/models',
+    'main_logic/asr_client/speaker_shadow/models',
+)
 add_data('steam_appid.txt', '.')
 
 # 添加 Steam 相关的 DLL 和库文件（源文件位于 steamworks/，打包后放在根目录）
@@ -277,6 +310,7 @@ hiddenimports += [
     
     # main_logic 子模块
     'main_logic',
+    'main_logic._module_state_proxy',
     'main_logic.core',
     'main_logic.cross_server',
     'main_logic.omni_offline_client',
@@ -310,7 +344,9 @@ hiddenimports += [
     'utils.config_manager',
     'utils.frontend_utils',
     'utils.logger_config',
+    'utils.parent_guard',
     'utils.preferences',
+    'utils.single_instance',
     'utils.web_scraper',
     
     # Steam 相关模块
@@ -345,11 +381,6 @@ hiddenimports += [
     'plugin.core.state',
     'plugin.runtime',
     'plugin.sdk',
-    'plugin.sdk.base',
-    'plugin.sdk.decorators',
-    'plugin.sdk.events',
-    'plugin.sdk.logger',
-    'plugin.sdk.version',
     'plugin.server',
     'plugin.server.exceptions',
     'plugin.server.lifecycle',
@@ -391,8 +422,9 @@ exe = EXE(
     target_arch=platform.machine() if sys.platform == 'darwin' else None,  # 自动检测 macOS 架构 (arm64/x86_64)
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/icon.ico' if sys.platform == 'win32' else None,  # macOS 暂不使用图标
-    version='version_info.txt' if sys.platform == 'win32' else None,  # 添加版本信息减少误报
+    icon=ICON_PATH if sys.platform == 'win32' else None,  # macOS 暂不使用图标
+    version=VERSION_INFO_PATH if sys.platform == 'win32' and os.path.isfile(VERSION_INFO_PATH) else None,
+    # 本地 version_info.txt 未生成时保持可构建；仅跳过 Windows 版本资源。
 )
 
 # 使用 COLLECT 创建目录模式分发包

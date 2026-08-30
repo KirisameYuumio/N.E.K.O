@@ -28,7 +28,7 @@ export interface PluginDependency {
   conflicts?: string[] | boolean
 }
 
-export type PluginType = 'plugin' | 'extension' | 'script' | 'adapter'
+export type PluginType = 'plugin' | 'adapter'
 
 export type PluginListActionKind = 'builtin' | 'ui' | 'route' | 'url'
 
@@ -77,6 +77,8 @@ export interface PluginUiSurface {
   context?: string
   permissions?: string[]
   available?: boolean
+  /** Host-generated static/index.html surface retained for legacy UI compatibility. */
+  legacy_static_compat?: boolean
 }
 
 export interface PluginUiWarning {
@@ -136,7 +138,6 @@ export interface PluginMeta {
   author?: PluginAuthor
   dependencies?: PluginDependency[]
   input_schema?: JSONSchema
-  host_plugin_id?: string
   i18n?: Record<string, any>
   status?: string
   list_actions?: PluginListAction[]

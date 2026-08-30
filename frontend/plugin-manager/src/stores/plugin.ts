@@ -9,17 +9,19 @@ import {
   startPlugin,
   stopPlugin,
   reloadPlugin,
-  disableExtension,
-  enableExtension,
   refreshPluginsRegistry,
 } from '@/api/plugins'
-import { getLocale } from '@/i18n'
+import { getLocale, i18n } from '@/i18n'
 import type { PluginMeta, PluginStatusData } from '@/types/api'
 import { PluginStatus as StatusEnum } from '@/utils/constants'
 
 type RegistrySyncResult = {
   registryRefreshed: boolean
   warningMessage: string | null
+}
+
+type RegistrySyncOptions = {
+  preserveMessagesOn404?: boolean
 }
 
 type PluginMutationOptions = {
@@ -55,24 +57,14 @@ export const usePluginStore = defineStore('plugin', () => {
     return plugins.value.map(plugin => {
       const enabled = plugin.runtime_enabled !== false
       const autoStart = plugin.runtime_auto_start !== false
-      const isExtension = plugin.type === 'extension'
-
-      // Extension 状态由后端 build_plugin_list 推导（injected/pending/disabled），
-      // 直接使用 GET /plugins 返回的 status 字段，因为 Extension 不是独立进程，
-      // pluginStatuses（GET /plugin/status）中不会有它的数据。
-      // 非 extension 不再把 `runtime_enabled=false` 提升成 DISABLED 状态：
+      // 不再把 `runtime_enabled=false` 提升成 DISABLED 状态：
       // 历史上 stop 写 `runtime_overrides.json[pid]=false`，下次启动 plugin
       // 不被 import，前端拿到 status=stopped 但又被 enabled=false 覆盖成
       // disabled，按钮被 isDisabled 拦截 → 用户"停过就再也开不起来"。
       // 现在直接信任 runtime status（stopped / running / load_failed），
       // start API 仍会把 override 翻回 true，所以"停过下次还停"的持久化
       // 行为不变，只是不再用一个独立的灰色 disabled 态遮蔽 start 按钮。
-      let displayStatus: string
-      if (isExtension) {
-        displayStatus = typeof plugin.status === 'string' ? plugin.status : StatusEnum.PENDING
-      } else {
-        displayStatus = typeof plugin.status === 'string' ? plugin.status : StatusEnum.STOPPED
-      }
+      const displayStatus = typeof plugin.status === 'string' ? plugin.status : StatusEnum.STOPPED
       
       return {
         ...plugin,
@@ -84,19 +76,11 @@ export const usePluginStore = defineStore('plugin', () => {
   })
 
   const normalPlugins = computed(() => {
-    return pluginsWithStatus.value.filter(p => p.type !== 'extension')
+    return pluginsWithStatus.value
   })
-
-  const extensions = computed(() => {
-    return pluginsWithStatus.value.filter(p => p.type === 'extension')
-  })
-
-  function getExtensionsForHost(hostPluginId: string) {
-    return extensions.value.filter(e => e.host_plugin_id === hostPluginId)
-  }
 
   // 操作
-  async function fetchPlugins(force = false) {
+  async function fetchPlugins(force = false, options: RegistrySyncOptions = {}) {
     // 防止请求堆积
     if (!force && pendingFetchPlugins) {
       return pendingFetchPlugins
@@ -117,7 +101,10 @@ export const usePluginStore = defineStore('plugin', () => {
     const seq = ++fetchPluginsSeq
     pendingFetchPlugins = (async () => {
       try {
-        const response = await getPlugins(getLocale())
+        const response = await getPlugins(
+          getLocale(),
+          options.preserveMessagesOn404 ? { preserveMessagesOn404: true } : undefined,
+        )
         // 忽略过期响应，防止旧数据覆盖新数据
         if (seq !== fetchPluginsSeq) return
         plugins.value = response.plugins || []
@@ -137,35 +124,50 @@ export const usePluginStore = defineStore('plugin', () => {
     return pendingFetchPlugins
   }
 
-  async function syncRegistryAndFetch(): Promise<RegistrySyncResult> {
+  async function syncRegistryAndFetch(options: RegistrySyncOptions = {}): Promise<RegistrySyncResult> {
     let registryRefreshed = false
     let warningMessage: string | null = null
 
     try {
-      const response = await refreshPluginsRegistry()
+      const response = await refreshPluginsRegistry(
+        options.preserveMessagesOn404 ? { preserveMessagesOn404: true } : undefined,
+      )
       registryRefreshed = true
       if (response.success === false) {
         const firstFailure = response.failed[0]
         if (firstFailure) {
           const failureTarget = firstFailure.plugin_id || firstFailure.config_path
-          warningMessage = response.failed.length > 1
-            ? `插件注册表刷新有 ${response.failed.length} 项失败，首项为 ${failureTarget}: ${firstFailure.error}`
-            : `插件注册表刷新失败: ${failureTarget}: ${firstFailure.error}`
+          if (!failureTarget) {
+            warningMessage = i18n.global.t('messages.pluginListRefreshPartialUnknown')
+          } else {
+            warningMessage = response.failed.length > 1
+              ? i18n.global.t('messages.pluginListRefreshPartialMultiple', {
+                  count: response.failed.length,
+                  target: failureTarget,
+                  error: firstFailure.error,
+                })
+              : i18n.global.t('messages.pluginListRefreshPartial', {
+                  target: failureTarget,
+                  error: firstFailure.error,
+                })
+          }
         } else {
-          warningMessage = '插件注册表刷新未完全成功'
+          warningMessage = i18n.global.t('messages.pluginListRefreshPartialUnknown')
         }
       }
     } catch (err: any) {
       const status = err?.response?.status
-      if (status !== 401 && status !== 403) {
+      if (status !== 401 && status !== 403 && status !== 404) {
         throw err
       }
       warningMessage = status === 403
-        ? '当前账号无权限刷新插件注册表，已仅重新拉取插件列表'
-        : '当前会话未认证，已仅重新拉取插件列表'
+        ? i18n.global.t('messages.pluginListRefreshForbidden')
+        : status === 404
+          ? i18n.global.t('messages.resourceNotFound')
+          : i18n.global.t('messages.pluginListRefreshUnauthenticated')
     }
 
-    await fetchPlugins(true)
+    await fetchPlugins(true, options)
     pluginListRegistrySynced.value = true
     return {
       registryRefreshed,
@@ -273,24 +275,6 @@ export const usePluginStore = defineStore('plugin', () => {
     }
   }
 
-  async function disableExt(extId: string) {
-    try {
-      await disableExtension(extId)
-      await fetchPlugins()
-    } catch (err: any) {
-      throw err
-    }
-  }
-
-  async function enableExt(extId: string) {
-    try {
-      await enableExtension(extId)
-      await fetchPlugins()
-    } catch (err: any) {
-      throw err
-    }
-  }
-
   function setSelectedPlugin(pluginId: string | null) {
     selectedPluginId.value = pluginId
   }
@@ -303,7 +287,6 @@ export const usePluginStore = defineStore('plugin', () => {
     selectedPlugin,
     pluginsWithStatus,
     normalPlugins,
-    extensions,
     pluginListRegistrySynced,
     loading,
     error,
@@ -315,9 +298,6 @@ export const usePluginStore = defineStore('plugin', () => {
     start,
     stop,
     reload,
-    disableExt,
-    enableExt,
-    getExtensionsForHost,
     setSelectedPlugin
   }
 })

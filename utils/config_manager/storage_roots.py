@@ -21,6 +21,7 @@ config/memory path lookups of :class:`ConfigManager`.
 """
 import json
 import os
+import secrets
 import sys
 import threading
 import uuid
@@ -29,6 +30,7 @@ from pathlib import Path
 
 from config import APP_NAME, CONFIG_FILES
 from utils.file_utils import atomic_write_json
+from utils.root_state_lock import root_state_transaction
 
 from ._shared import LocalStateDirectoryError, logger
 
@@ -52,7 +54,7 @@ class StorageRootsMixin:
             app_name: application name, defaults to APP_NAME from config
         """
         self.app_name = app_name if app_name is not None else APP_NAME
-        # 检测是否在子进程中，子进程静默初始化（通过 main_server.py 设置的环境变量）
+        # 检测是否在子进程中，子进程静默初始化（通过 main_server 设置的环境变量）
         self._verbose = '_NEKO_MAIN_SERVER_INITIALIZED' not in os.environ
         self.docs_dir = self._get_documents_directory()
         default_app_docs_dir = self.docs_dir / self.app_name
@@ -166,12 +168,17 @@ class StorageRootsMixin:
         self.mmd_dir = self.app_docs_dir / "mmd"
         self.mmd_animation_dir = self.mmd_dir / "animation"  # VMD动画文件目录
         self.pngtuber_dir = self.app_docs_dir / "pngtuber"
+        self.avatar_tools_dir = self.app_docs_dir / "avatar_tools"
         self.workshop_dir = self.app_docs_dir / "workshop"
         self._steam_workshop_path = None
         self._user_workshop_folder_persisted = False
         self.chara_dir = self.app_docs_dir / "character_cards"
         self.card_faces_dir = self.app_docs_dir / "card_faces"
-        self._workshop_config_lock = threading.Lock()
+        # RLock 而不是 Lock：workshop 配置的「整段事务」（读→合并→写→建目录，见
+        # main_routers/workshop_router/config_files.py）要持着它再调 load_workshop_config，
+        # 而 load 自己在某些分支也拿这把锁 —— 不可重入就是自死锁。可重入只放宽同线程
+        # 再取，跨线程仍然严格串行，对既有用法没有任何削弱。
+        self._workshop_config_lock = threading.RLock()
 
         self._characters_cache: dict | None = None
         self._characters_cache_mtime: float | None = None
@@ -290,14 +297,22 @@ class StorageRootsMixin:
         return str(self.committed_selected_root) in self.__class__._selected_root_unavailable_recovery_override_roots
 
     def _persist_selected_root_unavailable_recovery_state(self):
-        state: dict = {}
-        try:
-            loaded = self._load_json_file(self.root_state_path, default_value={})
-            if isinstance(loaded, dict):
-                state = loaded
-        except Exception:
-            state = {}
-        self.save_root_state(self._build_selected_root_unavailable_recovery_state(state))
+        # 读—改—写整段进锁，而且读必须在锁内。
+        #
+        # "跑在 __init__ 里所以是单线程"不成立：受限启动期 storage_location_router
+        # 会临时构造一个兜底 ConfigManager（get_runtime_config_manager(APP_NAME,
+        # migrate=False)），而那一刻变更路由的写序列已经在工作线程上跑了。拿锁外读到
+        # 的 pre-image 去存，会把它刚提交的 mode / current_root / 迁移字段整份盖掉。
+        with root_state_transaction():
+            state: dict = {}
+            try:
+                loaded = self._load_json_file(self.root_state_path, default_value={})
+                if isinstance(loaded, dict):
+                    state = loaded
+            except Exception:
+                # 读不出来就按空状态重建恢复态——这条路径本来就是给"root 不可用"兜底的
+                state = {}
+            self.save_root_state(self._build_selected_root_unavailable_recovery_state(state))
     
     def _log(self, msg):
         """Print debug info only in the main process"""
@@ -757,6 +772,17 @@ class StorageRootsMixin:
         except Exception as e:
             print(f"Warning: Failed to create pngtuber directory: {e}", file=sys.stderr)
             return False
+
+    def ensure_avatar_tools_directory(self):
+        """Ensure the private local avatar-tool store exists."""
+        try:
+            if not self._ensure_app_docs_directory():
+                return False
+            self.avatar_tools_dir.mkdir(parents=True, exist_ok=True)
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to create avatar tools directory: {e}", file=sys.stderr)
+            return False
         
     def ensure_chara_directory(self):
         """Ensure the character_cards directory under Documents exists"""
@@ -944,6 +970,7 @@ class StorageRootsMixin:
         return {
             "version": self.CLOUDSAVE_LOCAL_STATE_VERSION,
             "client_id": str(client_id or uuid.uuid4().hex),
+            "client_proof": secrets.token_urlsafe(32),
             "next_sequence_number": 1,
             "last_applied_manifest_fingerprint": "",
             "last_successful_export_at": "",
@@ -989,9 +1016,11 @@ class StorageRootsMixin:
 
     def save_root_state(self, data):
         """Save root_state."""
-        if not self.ensure_local_state_directory():
-            self._raise_local_state_directory_error("saving root_state")
-        self._save_local_state_json_file(self.root_state_path, data, "saving root_state")
+        # 注意 load_root_state 故意不拿这把锁，理由见 utils/root_state_lock.py。
+        with root_state_transaction():
+            if not self.ensure_local_state_directory():
+                self._raise_local_state_directory_error("saving root_state")
+            self._save_local_state_json_file(self.root_state_path, data, "saving root_state")
 
     def load_cloudsave_local_state(self, default_value=None):
         """Load cloudsave_local_state; returns a default with a stable field structure when missing."""
@@ -1012,6 +1041,55 @@ class StorageRootsMixin:
             data,
             "saving cloudsave_local_state",
         )
+
+    def ensure_cloudsave_client_credentials(self):
+        """Return a stable client id and secret, persisting either when missing."""
+        needs_persist = not self.cloudsave_local_state_path.exists()
+        state = self.load_cloudsave_local_state()
+        if isinstance(state, dict):
+            client_id = state.get("client_id")
+            client_proof = state.get("client_proof")
+            if (
+                not needs_persist
+                and isinstance(client_id, str)
+                and client_id
+                and isinstance(client_proof, str)
+                and 32 <= len(client_proof) <= 256
+            ):
+                return client_id, client_proof
+
+        # Credential creation/upgrades share the cloud-save cross-process fence.
+        # Re-read after acquiring it so a concurrent export/import cannot have
+        # its sequence number or manifest timestamps overwritten by a stale
+        # dictionary captured above.
+        from utils.cloudsave_runtime import cloud_apply_fence
+
+        with cloud_apply_fence(
+            self,
+            reason="ensure_cloudsave_client_credentials",
+        ):
+            needs_persist = not self.cloudsave_local_state_path.exists()
+            state = self.load_cloudsave_local_state()
+            if not isinstance(state, dict):
+                state = self.build_default_cloudsave_local_state()
+                needs_persist = True
+
+            client_id = state.get("client_id")
+            if not isinstance(client_id, str) or not client_id:
+                client_id = uuid.uuid4().hex
+                state["client_id"] = client_id
+                needs_persist = True
+
+            client_proof = state.get("client_proof")
+            if not isinstance(client_proof, str) or not 32 <= len(client_proof) <= 256:
+                client_proof = secrets.token_urlsafe(32)
+                state["client_proof"] = client_proof
+                state["version"] = self.CLOUDSAVE_LOCAL_STATE_VERSION
+                needs_persist = True
+
+            if needs_persist:
+                self.save_cloudsave_local_state(state)
+            return client_id, client_proof
 
     def load_character_tombstones_state(self, default_value=None):
         """Load per-character tombstone local state."""

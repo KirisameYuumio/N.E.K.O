@@ -12,16 +12,24 @@
     const S = window.appState;
     const C = window.appConst;
     const U = window.appUtils;
-    // 待发送图片编码后的字节上限：1MB。720p 截图通常 150~400KB，普通上传图压到
-    // 长边 1920 后也基本在此之下；超标才逐步降采样/降质。
-    const PENDING_IMAGE_MAX_ENCODED_BYTES = 1 * 1024 * 1024;
+    // 免费服务器实测在 Base64 约 1MiB（JPEG 约 768KiB）附近会拒绝请求。
+    // 统一把待发送 JPEG 控制在 700KiB，并显式约束实际传输的 Base64 字符数，
+    // 为 Data URL、JSON 包装和会话上下文留出余量。
+    const PENDING_IMAGE_MAX_JPEG_BYTES = 700 * 1024;
+    const PENDING_IMAGE_MAX_BASE64_CHARS = Math.ceil(PENDING_IMAGE_MAX_JPEG_BYTES / 3) * 4;
     const PENDING_IMAGE_MIN_LONG_SIDE = 320;
     // 手动上传图首次超出字节上限时，一步到位把长边压到 ≤1920px，再走后续逐步降采样。
     const PENDING_IMAGE_FIRST_STEP_LONG_SIDE = 1920;
     const PENDING_IMAGE_JPEG_QUALITIES = [0.92, 0.86, 0.78, 0.7, 0.62, 0.52, 0.42, 0.32];
     // 手动截图入列前压缩用的质量阶梯：主质量 0.8（与屏幕分享、后端 vision 分析一致），
-    // 720p 下若仍超 1MB 再逐步降质兜底。
+    // 720p 下若仍超出运输预算再逐步降质兜底。
     const SCREENSHOT_JPEG_QUALITIES = [0.8, 0.72, 0.64, 0.56, 0.48];
+
+    function getDesktopProvider() {
+        return typeof window.getDesktopCaptureProvider === 'function'
+            ? window.getDesktopCaptureProvider()
+            : null;
+    }
 
     let compactHistoryDropPayloadQueue = Promise.resolve();
 
@@ -271,7 +279,27 @@
         return dataUrl;
     }
 
-    function getDataUrlEncodedBytes(dataUrl) {
+    function getDataUrlBase64Chars(dataUrl) {
+        var text = String(dataUrl || '');
+        var commaIndex = text.indexOf(',');
+        if (commaIndex < 0) {
+            return 0;
+        }
+
+        return text.slice(commaIndex + 1).length;
+    }
+
+    function canonicalizeBase64DataUrl(dataUrl) {
+        var text = String(dataUrl || '');
+        var commaIndex = text.indexOf(',');
+        if (commaIndex < 0) {
+            return text;
+        }
+
+        return text.slice(0, commaIndex + 1) + text.slice(commaIndex + 1).replace(/\s/g, '');
+    }
+
+    function getDataUrlBinaryBytes(dataUrl) {
         var text = String(dataUrl || '');
         var commaIndex = text.indexOf(',');
         if (commaIndex < 0) {
@@ -281,6 +309,13 @@
         var base64Text = text.slice(commaIndex + 1).replace(/\s/g, '');
         var padding = base64Text.endsWith('==') ? 2 : (base64Text.endsWith('=') ? 1 : 0);
         return Math.max(0, Math.floor(base64Text.length * 3 / 4) - padding);
+    }
+
+    function isPendingImageWithinTransportBudget(dataUrl) {
+        var base64Chars = getDataUrlBase64Chars(dataUrl);
+        return base64Chars > 0
+            && base64Chars <= PENDING_IMAGE_MAX_BASE64_CHARS
+            && getDataUrlBinaryBytes(dataUrl) <= PENDING_IMAGE_MAX_JPEG_BYTES;
     }
 
     function compressLoadedImageToPendingDataUrl(image) {
@@ -298,7 +333,7 @@
             for (var i = 0; i < PENDING_IMAGE_JPEG_QUALITIES.length; i += 1) {
                 var dataUrl = drawImageToJpegDataUrl(image, width, height, PENDING_IMAGE_JPEG_QUALITIES[i]);
                 bestDataUrl = dataUrl;
-                if (getDataUrlEncodedBytes(dataUrl) <= PENDING_IMAGE_MAX_ENCODED_BYTES) {
+                if (isPendingImageWithinTransportBudget(dataUrl)) {
                     return dataUrl;
                 }
             }
@@ -315,7 +350,7 @@
                 }
             }
 
-            var ratio = Math.sqrt(PENDING_IMAGE_MAX_ENCODED_BYTES / Math.max(getDataUrlEncodedBytes(bestDataUrl), 1)) * 0.92;
+            var ratio = Math.sqrt(PENDING_IMAGE_MAX_JPEG_BYTES / Math.max(getDataUrlBinaryBytes(bestDataUrl), 1)) * 0.92;
             var longSide = Math.max(width, height);
             var nextLongSide = Math.max(PENDING_IMAGE_MIN_LONG_SIDE, Math.floor(longSide * ratio));
             var nextScale = nextLongSide / Math.max(longSide, 1);
@@ -328,7 +363,7 @@
             height = nextHeight;
         }
 
-        if (getDataUrlEncodedBytes(bestDataUrl) > PENDING_IMAGE_MAX_ENCODED_BYTES) {
+        if (!isPendingImageWithinTransportBudget(bestDataUrl)) {
             throw new Error('IMAGE_TOO_LARGE');
         }
         return bestDataUrl;
@@ -524,10 +559,13 @@
             throw new Error('INVALID_FILE');
         }
 
-        if (isLikelyJpegBlob(blob) && blob.size <= PENDING_IMAGE_MAX_ENCODED_BYTES) {
+        if (isLikelyJpegBlob(blob) && blob.size <= PENDING_IMAGE_MAX_JPEG_BYTES) {
             var originalDataUrl = await readBlobAsDataUrl(blob, 'image/jpeg');
-            await loadImageFromSource(originalDataUrl);
-            return originalDataUrl;
+            var originalImage = await loadImageFromSource(originalDataUrl);
+            if (isPendingImageWithinTransportBudget(originalDataUrl)) {
+                return originalDataUrl;
+            }
+            return compressLoadedImageToPendingDataUrl(originalImage);
         }
 
         var image = await loadImageFromBlob(blob);
@@ -540,16 +578,19 @@
             throw new Error('INVALID_IMAGE_DATA_URL');
         }
 
+        var isBase64Jpeg = /^data:image\/jpe?g;base64,/i.test(src);
+        if (isBase64Jpeg) {
+            src = canonicalizeBase64DataUrl(src);
+        }
         var image = await loadImageFromSource(src);
-        if (/^data:image\/jpe?g;base64,/i.test(src)
-                && getDataUrlEncodedBytes(src) <= PENDING_IMAGE_MAX_ENCODED_BYTES) {
+        if (isBase64Jpeg && isPendingImageWithinTransportBudget(src)) {
             return src;
         }
         return compressLoadedImageToPendingDataUrl(image);
     };
 
     // 手动截图入列前的压缩：捕获/裁剪叠层保留全分辨率（清晰），裁剪结束后调用这里统一
-    // 压成 720p / 0.8 JPEG，并保证编码字节 ≤ 1MB（与屏幕分享、后端 vision 分析口径一致）。
+    // 压成 720p / 0.8 JPEG，并保证二进制与 Base64 均不超过待发送运输预算。
     mod.compressScreenshotDataUrlTo720p = async function compressScreenshotDataUrlTo720p(dataUrl) {
         var src = String(dataUrl || '');
         if (!/^data:image\//i.test(src)) {
@@ -572,17 +613,16 @@
         for (var i = 0; i < SCREENSHOT_JPEG_QUALITIES.length; i += 1) {
             var encoded = drawImageToJpegDataUrl(image, width, height, SCREENSHOT_JPEG_QUALITIES[i]);
             bestDataUrl = encoded;
-            if (getDataUrlEncodedBytes(encoded) <= PENDING_IMAGE_MAX_ENCODED_BYTES) {
+            if (isPendingImageWithinTransportBudget(encoded)) {
                 return encoded;
             }
         }
-        // 720p 下极少触达这里；兜底返回最低质量结果，不再硬抛错以免阻塞发送。
-        // 真触达说明这张图异常难压，加条 warn 记录尺寸，方便事后发现"列表混入超 1MB"的个例。
+        // 720p 下极少触达这里；但不能把已知超预算图片继续入列，否则发送时仍会失败。
         console.warn(
-            '[截图] 720p 最低质量仍超出 1MB 上限（' +
-            Math.round(getDataUrlEncodedBytes(bestDataUrl) / 1024) + 'KB），仍按兜底入列'
+            '[截图] 720p 最低质量仍超出 ' + Math.round(PENDING_IMAGE_MAX_JPEG_BYTES / 1024) + 'KB 上限（' +
+            Math.round(getDataUrlBinaryBytes(bestDataUrl) / 1024) + 'KB），取消入列'
         );
-        return bestDataUrl;
+        throw new Error('IMAGE_TOO_LARGE');
     };
 
     mod.normalizePendingAttachmentItem = async function normalizePendingAttachmentItem(item) {
@@ -595,7 +635,7 @@
             throw new Error('INVALID_ATTACHMENT_IMAGE');
         }
 
-        // 截图入列前已压到 720p JPEG（≤1MB），这里会原样透传；上传图按字节上限压缩。
+        // 截图入列前已压到 720p JPEG 并满足运输预算，这里会原样透传；上传图按同一预算压缩。
         var normalized = await mod.normalizeImageDataUrlForPendingList(img.src);
         if (normalized && normalized !== img.src) {
             img.src = normalized;
@@ -706,6 +746,22 @@
     };
     // Backward compat
     window.addScreenshotToList = mod.addScreenshotToList;
+
+    // 按钮截图与多窗口/F4 代理回传共用同一条入列路径，保证都在裁剪完成后才压缩，
+    // 也避免独立 Chat 把全分辨率 data URL 长期留在附件列表中。
+    mod.enqueueCapturedScreenshotResult = async function enqueueCapturedScreenshotResult(result) {
+        if (!result || !result.dataUrl) return false;
+        var avatarPos = result.dataUrl === result.originalDataUrl ? result.avatarPos : null;
+        var compactDataUrl = await mod.compressScreenshotDataUrlTo720p(result.dataUrl);
+        mod.addScreenshotToList(compactDataUrl, avatarPos, { source: 'screenshot' });
+        if (typeof window.showStatusToast === 'function') {
+            window.showStatusToast(
+                window.t ? window.t('app.screenshotAdded') : '\u622A\u56FE\u5DF2\u6DFB\u52A0\uFF0C\u70B9\u51FB\u53D1\u9001\u4E00\u8D77\u53D1\u9001',
+                3000
+            );
+        }
+        return true;
+    };
 
     /**
      * Remove a screenshot item from the list with animation.
@@ -1116,6 +1172,20 @@
      * @param {string} emotion
      */
     mod.applyEmotion = function applyEmotion(emotion) {
+        var modelType = String(window.lanlan_config && window.lanlan_config.model_type || '').toLowerCase();
+        if (modelType === 'pngtuber') {
+            if (window.pngtuberManager && typeof window.pngtuberManager.setEmotion === 'function') {
+                var pngtuberApplied = window.pngtuberManager.setEmotion(emotion);
+                if (pngtuberApplied) return;
+                var debugState = typeof window.pngtuberManager.getDebugState === 'function'
+                    ? window.pngtuberManager.getDebugState()
+                    : null;
+                console.warn('[PNGTuber] emotion unavailable:', emotion, debugState);
+                return;
+            }
+            console.warn('[PNGTuber] emotion runtime unavailable');
+            return;
+        }
         if (window.LanLan1 && window.LanLan1.setEmotion) {
             console.log('\u8C03\u7528window.LanLan1.setEmotion:', emotion);
             window.LanLan1.setEmotion(emotion);
@@ -1125,62 +1195,61 @@
     };
     window.applyEmotion = mod.applyEmotion;
 
-    var AVATAR_INTERACTION_ALLOWED_ACTIONS = Object.freeze({
-        lollipop: Object.freeze(['offer', 'tease', 'tap_soft']),
-        fist: Object.freeze(['poke']),
-        hammer: Object.freeze(['bonk'])
-    });
-    var AVATAR_INTERACTION_ALLOWED_INTENSITIES = Object.freeze(['normal', 'rapid', 'burst', 'easter_egg']);
-    var AVATAR_INTERACTION_ALLOWED_TOUCH_ZONES = Object.freeze(['ear', 'head', 'face', 'body']);
-    var AVATAR_INTERACTION_SEED_FALLBACK_MS = 2200;
-    var AVATAR_INTERACTION_ACK_TIMEOUT_MS = 8000;
-    var AVATAR_INTERACTION_TURN_START_TIMEOUT_MS = 5000;
-    var AVATAR_INTERACTION_TURN_COMPLETION_TIMEOUT_MS = 15000;
-    var AVATAR_INTERACTION_HOST_COOLDOWN_MS = 600;
-    var AVATAR_INTERACTION_HOST_SPEAK_COOLDOWN_MS = 1500;
-    var AVATAR_INTERACTION_SEED_EMOTIONS = Object.freeze({
-        lollipop: Object.freeze({
-            offer: Object.freeze({
-                normal: 'happy'
+    var AVATAR_INTERACTION_CONTRACT = Object.freeze({
+        touchZones: Object.freeze(['ear', 'head', 'face', 'body']),
+        tools: Object.freeze({
+            lollipop: Object.freeze({
+                actions: Object.freeze({
+                    offer: Object.freeze(['normal']),
+                    tease: Object.freeze(['normal']),
+                    tap_soft: Object.freeze(['rapid', 'burst'])
+                }),
+                acceptsTouchZone: false,
+                booleanField: null,
+                roundChoice: false
             }),
-            tease: Object.freeze({
-                normal: 'surprised'
+            fist: Object.freeze({
+                actions: Object.freeze({
+                    poke: Object.freeze(['normal', 'rapid'])
+                }),
+                acceptsTouchZone: true,
+                booleanField: Object.freeze({ input: 'rewardDrop', output: 'reward_drop' }),
+                roundChoice: false
             }),
-            tap_soft: Object.freeze({
-                rapid: 'happy',
-                burst: 'happy'
-            })
-        }),
-        fist: Object.freeze({
-            poke: Object.freeze({
-                normal: 'happy',
-                rapid: 'surprised',
-                reward_drop: 'happy'
-            })
-        }),
-        hammer: Object.freeze({
-            bonk: Object.freeze({
-                normal: 'surprised',
-                rapid: 'angry',
-                burst: 'angry',
-                easter_egg: 'angry'
+            hammer: Object.freeze({
+                actions: Object.freeze({
+                    bonk: Object.freeze(['normal', 'rapid', 'burst', 'easter_egg'])
+                }),
+                acceptsTouchZone: true,
+                booleanField: Object.freeze({ input: 'easterEgg', output: 'easter_egg' }),
+                roundChoice: false
+            }),
+            rps: Object.freeze({
+                actions: Object.freeze({}),
+                acceptsTouchZone: false,
+                booleanField: null,
+                roundChoice: true
             })
         })
     });
-    var avatarInteractionSeedState = {
-        interactionId: '',
-        timerId: 0,
-        previousEmotion: null,
-        seedEmotion: null
-    };
+    var LOCAL_AVATAR_TOOL_ID_PATTERN = /^local-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    var LOCAL_AVATAR_TOOL_REVISION_PATTERN = /^[0-9]+-[0-9]+$/;
+    // The backend sends the final ack only after prompt_ephemeral has completed
+    // the visible assistant turn. Keep separate fail-safes for no reply signal
+    // and a started turn whose end event is lost, then allow a short grace period
+    // for the final ack after the matching turn ends.
+    var AVATAR_INTERACTION_RESULT_TIMEOUT_MS = 60000;
+    var AVATAR_INTERACTION_ACTIVE_TURN_TIMEOUT_MS = 600000;
+    var AVATAR_INTERACTION_FINAL_ACK_GRACE_MS = 2000;
+    var AVATAR_INTERACTION_HOST_COOLDOWN_MS = 600;
+    var AVATAR_INTERACTION_HOST_SPEAK_COOLDOWN_MS = 1500;
     var avatarInteractionTextContinuationState = {
         interactionId: '',
-        expectedTurnId: '',
         activeTurnId: '',
         phase: 'idle',
-        ackTimerId: 0,
-        turnStartTimerId: 0,
-        completionTimerId: 0,
+        resultTimerId: 0,
+        activeTurnTimerId: 0,
+        finalAckTimerId: 0,
         deferredTextSubmissions: [],
         deferredSendHandler: null,
         drainingDeferredTextSubmissions: false
@@ -1272,9 +1341,9 @@
     }
 
     function clearAvatarInteractionContinuationTimers() {
-        clearAvatarInteractionContinuationTimer('ackTimerId');
-        clearAvatarInteractionContinuationTimer('turnStartTimerId');
-        clearAvatarInteractionContinuationTimer('completionTimerId');
+        clearAvatarInteractionContinuationTimer('resultTimerId');
+        clearAvatarInteractionContinuationTimer('activeTurnTimerId');
+        clearAvatarInteractionContinuationTimer('finalAckTimerId');
     }
 
     function hasPendingAvatarInteractionContinuation() {
@@ -1343,7 +1412,6 @@
         releaseAvatarInteractionDispatchReservation();
         clearActiveAvatarInteractionDispatch();
         avatarInteractionTextContinuationState.interactionId = '';
-        avatarInteractionTextContinuationState.expectedTurnId = '';
         avatarInteractionTextContinuationState.activeTurnId = '';
         avatarInteractionTextContinuationState.phase = 'idle';
         flushDeferredTextSubmissions();
@@ -1356,65 +1424,82 @@
 
         clearAvatarInteractionContinuationTimers();
         avatarInteractionTextContinuationState.interactionId = interactionId;
-        avatarInteractionTextContinuationState.expectedTurnId = '';
         avatarInteractionTextContinuationState.activeTurnId = '';
-        avatarInteractionTextContinuationState.phase = 'awaiting_ack';
-        avatarInteractionTextContinuationState.ackTimerId = window.setTimeout(function () {
-            if (avatarInteractionTextContinuationState.phase !== 'awaiting_ack'
+        avatarInteractionTextContinuationState.phase = 'awaiting_result';
+        avatarInteractionTextContinuationState.resultTimerId = window.setTimeout(function () {
+            if (avatarInteractionTextContinuationState.phase !== 'awaiting_result'
                     || avatarInteractionTextContinuationState.interactionId !== interactionId) {
                 return;
             }
             releaseDeferredTextAfterAvatarInteraction();
-        }, AVATAR_INTERACTION_ACK_TIMEOUT_MS);
+        }, AVATAR_INTERACTION_RESULT_TIMEOUT_MS);
     }
 
-    function markAvatarInteractionAccepted(interactionId, turnId) {
-        if (!interactionId || avatarInteractionTextContinuationState.interactionId !== interactionId) {
-            return;
+    function isMatchingAvatarInteractionTurnMeta(meta) {
+        if (!meta || typeof meta !== 'object') {
+            return false;
         }
-
-        clearAvatarInteractionContinuationTimer('ackTimerId');
-        if (avatarInteractionTextContinuationState.phase === 'active_turn') {
-            return;
-        }
-
-        avatarInteractionTextContinuationState.expectedTurnId = String(turnId || '').trim();
-        avatarInteractionTextContinuationState.activeTurnId = '';
-        avatarInteractionTextContinuationState.phase = 'awaiting_turn';
-        clearAvatarInteractionContinuationTimer('turnStartTimerId');
-        avatarInteractionTextContinuationState.turnStartTimerId = window.setTimeout(function () {
-            if (avatarInteractionTextContinuationState.phase !== 'awaiting_turn'
-                    || avatarInteractionTextContinuationState.interactionId !== interactionId) {
-                return;
-            }
-            releaseDeferredTextAfterAvatarInteraction();
-        }, AVATAR_INTERACTION_TURN_START_TIMEOUT_MS);
+        return String(meta.kind || '').trim() === 'avatar_interaction'
+            && String(meta.interaction_id || '').trim()
+                === avatarInteractionTextContinuationState.interactionId;
     }
 
-    function markAvatarInteractionTurnStarted(turnId) {
+    function markAvatarInteractionTurnStarted(turnId, meta) {
         if (!hasPendingAvatarInteractionContinuation()) {
             return;
         }
         var normalizedTurnId = String(turnId || '').trim();
-        if (!normalizedTurnId || avatarInteractionTextContinuationState.phase !== 'awaiting_turn') {
+        if (!normalizedTurnId
+                || !isMatchingAvatarInteractionTurnMeta(meta)
+                || avatarInteractionTextContinuationState.phase !== 'awaiting_result') {
             return;
         }
-        if (avatarInteractionTextContinuationState.expectedTurnId
-                && avatarInteractionTextContinuationState.expectedTurnId !== normalizedTurnId) {
-            return;
-        }
-
-        clearAvatarInteractionContinuationTimer('ackTimerId');
-        clearAvatarInteractionContinuationTimer('turnStartTimerId');
+        var interactionId = avatarInteractionTextContinuationState.interactionId;
+        clearAvatarInteractionContinuationTimer('resultTimerId');
+        clearAvatarInteractionContinuationTimer('activeTurnTimerId');
         avatarInteractionTextContinuationState.activeTurnId = normalizedTurnId;
         avatarInteractionTextContinuationState.phase = 'active_turn';
-        clearAvatarInteractionContinuationTimer('completionTimerId');
-        avatarInteractionTextContinuationState.completionTimerId = window.setTimeout(function () {
-            if (avatarInteractionTextContinuationState.phase !== 'active_turn') {
+        avatarInteractionTextContinuationState.activeTurnTimerId = window.setTimeout(function () {
+            if (avatarInteractionTextContinuationState.phase !== 'active_turn'
+                    || avatarInteractionTextContinuationState.interactionId !== interactionId
+                    || avatarInteractionTextContinuationState.activeTurnId !== normalizedTurnId) {
                 return;
             }
             releaseDeferredTextAfterAvatarInteraction();
-        }, AVATAR_INTERACTION_TURN_COMPLETION_TIMEOUT_MS);
+        }, AVATAR_INTERACTION_ACTIVE_TURN_TIMEOUT_MS);
+    }
+
+    function markAvatarInteractionTurnFinished(turnId, meta) {
+        if (!hasPendingAvatarInteractionContinuation()) {
+            return;
+        }
+        var normalizedTurnId = String(turnId || '').trim();
+        if (!normalizedTurnId || !isMatchingAvatarInteractionTurnMeta(meta)) {
+            return;
+        }
+
+        // The established backend contract attaches avatar interaction meta
+        // atomically to turn end. A streamed start may therefore have no meta;
+        // let the matching end establish and finish that same turn in one step.
+        if (avatarInteractionTextContinuationState.phase === 'awaiting_result') {
+            markAvatarInteractionTurnStarted(normalizedTurnId, meta);
+        }
+        if (avatarInteractionTextContinuationState.phase !== 'active_turn'
+                || avatarInteractionTextContinuationState.activeTurnId !== normalizedTurnId) {
+            return;
+        }
+        var interactionId = avatarInteractionTextContinuationState.interactionId;
+        avatarInteractionTextContinuationState.phase = 'awaiting_final_ack';
+        clearAvatarInteractionContinuationTimer('resultTimerId');
+        clearAvatarInteractionContinuationTimer('activeTurnTimerId');
+        clearAvatarInteractionContinuationTimer('finalAckTimerId');
+        avatarInteractionTextContinuationState.finalAckTimerId = window.setTimeout(function () {
+            if (avatarInteractionTextContinuationState.phase !== 'awaiting_final_ack'
+                    || avatarInteractionTextContinuationState.interactionId !== interactionId) {
+                return;
+            }
+            releaseDeferredTextAfterAvatarInteraction();
+        }, AVATAR_INTERACTION_FINAL_ACK_GRACE_MS);
     }
 
     function bindAvatarInteractionTextContinuationLifecycle() {
@@ -1426,18 +1511,11 @@
         window.addEventListener('neko-avatar-interaction-ack', function (event) {
             var detail = event && event.detail ? event.detail : {};
             var interactionId = String(detail.interactionId || detail.interaction_id || '').trim();
-            var turnId = String(detail.turnId || detail.turn_id || '').trim();
             if (!interactionId || avatarInteractionTextContinuationState.interactionId !== interactionId) {
                 return;
             }
             if (detail.accepted === true) {
                 noteAvatarInteractionSpeakCooldown(interactionId);
-                if (String(detail.reason || '').trim() === 'delivered') {
-                    releaseDeferredTextAfterAvatarInteraction();
-                    return;
-                }
-                markAvatarInteractionAccepted(interactionId, turnId);
-                return;
             }
             releaseDeferredTextAfterAvatarInteraction();
         });
@@ -1447,7 +1525,10 @@
                 return;
             }
             var detail = event && event.detail ? event.detail : {};
-            markAvatarInteractionTurnStarted(detail.turnId || detail.turn_id || '');
+            markAvatarInteractionTurnStarted(
+                detail.turnId || detail.turn_id || '',
+                detail.meta
+            );
         });
 
         window.addEventListener('neko-assistant-turn-end', function (event) {
@@ -1456,22 +1537,7 @@
             }
             var detail = event && event.detail ? event.detail : {};
             var turnId = String(detail.turnId || detail.turn_id || '').trim();
-            if (!turnId || avatarInteractionTextContinuationState.activeTurnId !== turnId) {
-                return;
-            }
-            releaseDeferredTextAfterAvatarInteraction();
-        });
-
-        window.addEventListener('neko-assistant-speech-cancel', function (event) {
-            if (!hasPendingAvatarInteractionContinuation()) {
-                return;
-            }
-            var detail = event && event.detail ? event.detail : {};
-            var turnId = String(detail.turnId || detail.turn_id || '').trim();
-            if (!turnId || avatarInteractionTextContinuationState.activeTurnId !== turnId) {
-                return;
-            }
-            releaseDeferredTextAfterAvatarInteraction();
+            markAvatarInteractionTurnFinished(turnId, detail.meta);
         });
     }
 
@@ -1481,17 +1547,71 @@
         return text.length > 80 ? text.slice(0, 80).trimEnd() : text;
     }
 
+    function getAvatarInteractionPayloadValue(payload, snakeKey, camelKey, fallback) {
+        if (Object.prototype.hasOwnProperty.call(payload, snakeKey)
+                && payload[snakeKey] !== null
+                && payload[snakeKey] !== undefined) {
+            return payload[snakeKey];
+        }
+        if (Object.prototype.hasOwnProperty.call(payload, camelKey)
+                && payload[camelKey] !== null
+                && payload[camelKey] !== undefined) {
+            return payload[camelKey];
+        }
+        return fallback;
+    }
+
+    function parseAvatarInteractionBool(value) {
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'number') {
+            if (value === 1) return true;
+            if (value === 0) return false;
+            return null;
+        }
+        if (typeof value === 'string') {
+            var normalized = value.trim().toLowerCase();
+            if (normalized === 'true' || normalized === '1') return true;
+            if (normalized === 'false' || normalized === '0') return false;
+        }
+        return null;
+    }
+
+    function resolveAvatarInteractionRoundResult(userGesture, avatarGesture) {
+        var gestures = ['rock', 'scissors', 'paper'];
+        if (userGesture === avatarGesture && gestures.indexOf(userGesture) !== -1) return 'draw';
+        if ((userGesture === 'rock' && avatarGesture === 'scissors')
+                || (userGesture === 'scissors' && avatarGesture === 'paper')
+                || (userGesture === 'paper' && avatarGesture === 'rock')) {
+            return 'user_win';
+        }
+        if ((avatarGesture === 'rock' && userGesture === 'scissors')
+                || (avatarGesture === 'scissors' && userGesture === 'paper')
+                || (avatarGesture === 'paper' && userGesture === 'rock')) {
+            return 'avatar_win';
+        }
+        return '';
+    }
+
     function normalizeAvatarInteractionPayload(payload) {
         if (!payload || typeof payload !== 'object') {
             console.warn('[AvatarInteraction] ignored invalid payload:', payload);
             return null;
         }
 
-        var toolId = String(payload.toolId || '').trim().toLowerCase();
-        var actionId = String(payload.actionId || '').trim().toLowerCase();
-        var allowedActions = AVATAR_INTERACTION_ALLOWED_ACTIONS[toolId];
-        if (!allowedActions || allowedActions.indexOf(actionId) === -1) {
-            console.warn('[AvatarInteraction] ignored unsupported tool/action:', toolId, actionId);
+        var toolId = String(payload.tool_id || payload.toolId || '').trim().toLowerCase();
+        var actionId = String(payload.action_id || payload.actionId || '').trim().toLowerCase();
+        var toolContract = AVATAR_INTERACTION_CONTRACT.tools[toolId];
+        var localTool = LOCAL_AVATAR_TOOL_ID_PATTERN.test(toolId);
+        if (!toolContract && localTool) {
+            toolContract = {
+                actions: { interact: ['normal', 'rapid'] },
+                acceptsTouchZone: true,
+                booleanField: { input: 'specialTriggered', output: 'special_triggered' },
+                roundChoice: false
+            };
+        }
+        if (!toolContract) {
+            console.warn('[AvatarInteraction] ignored unsupported tool:', toolId);
             return null;
         }
 
@@ -1500,7 +1620,7 @@
             return null;
         }
 
-        var interactionId = String(payload.interactionId || '').trim();
+        var interactionId = String(payload.interaction_id || payload.interactionId || '').trim();
         if (!interactionId) {
             console.warn('[AvatarInteraction] ignored payload without interactionId');
             return null;
@@ -1509,21 +1629,46 @@
         var timestamp = Number(payload.timestamp);
         if (!Number.isFinite(timestamp) || timestamp <= 0) {
             timestamp = Date.now();
+        } else {
+            timestamp = Math.trunc(timestamp);
         }
 
         var normalized = {
             action: 'avatar_interaction',
             interaction_id: interactionId,
             tool_id: toolId,
-            action_id: actionId,
             target: 'avatar',
             timestamp: timestamp
         };
 
+        if (localTool) {
+            var allowedLocalFields = [
+                'action', 'interaction_id', 'interactionId', 'tool_id', 'toolId',
+                'action_id', 'actionId', 'target', 'pointer', 'timestamp',
+                'text_context', 'textContext', 'intensity', 'touch_zone', 'touchZone',
+                'change_index', 'changeIndex',
+                'tool_revision', 'toolRevision',
+                'special_triggered', 'specialTriggered'
+            ];
+            if (Object.keys(payload).some(function (field) {
+                return allowedLocalFields.indexOf(field) === -1;
+            })) {
+                console.warn('[AvatarInteraction] ignored undeclared local tool facts');
+                return null;
+            }
+        }
+
         if (payload.pointer && typeof payload.pointer === 'object') {
-            var clientX = Number(payload.pointer.clientX);
-            var clientY = Number(payload.pointer.clientY);
-            if (Number.isFinite(clientX) && Number.isFinite(clientY)) {
+            var rawClientX = getAvatarInteractionPayloadValue(
+                payload.pointer, 'client_x', 'clientX', null
+            );
+            var rawClientY = getAvatarInteractionPayloadValue(
+                payload.pointer, 'client_y', 'clientY', null
+            );
+            var clientX = Number(rawClientX);
+            var clientY = Number(rawClientY);
+            if (rawClientX !== null && rawClientY !== null
+                    && Number.isFinite(clientX) && Number.isFinite(clientY)) {
                 normalized.pointer = {
                     clientX: clientX,
                     clientY: clientY
@@ -1531,127 +1676,125 @@
             }
         }
 
-        var touchZone = String(payload.touchZone || payload.touch_zone || '').trim().toLowerCase();
-        if (AVATAR_INTERACTION_ALLOWED_TOUCH_ZONES.indexOf(touchZone) !== -1) {
+        if (toolContract.roundChoice) {
+            var allowedRoundFields = [
+                'interaction_id', 'interactionId', 'tool_id', 'toolId', 'target',
+                'pointer', 'timestamp', 'text_context', 'textContext',
+                'user_gesture', 'userGesture', 'avatar_gesture', 'avatarGesture',
+                'round_result', 'roundResult'
+            ];
+            if (Object.keys(payload).some(function (field) {
+                return allowedRoundFields.indexOf(field) === -1;
+            })) {
+                console.warn('[AvatarInteraction] ignored undeclared round choice facts');
+                return null;
+            }
+            var userGesture = String(getAvatarInteractionPayloadValue(
+                payload, 'user_gesture', 'userGesture', ''
+            ) || '').trim().toLowerCase();
+            var avatarGesture = String(getAvatarInteractionPayloadValue(
+                payload, 'avatar_gesture', 'avatarGesture', ''
+            ) || '').trim().toLowerCase();
+            var roundResult = String(getAvatarInteractionPayloadValue(
+                payload, 'round_result', 'roundResult', ''
+            ) || '').trim().toLowerCase();
+            var expectedResult = resolveAvatarInteractionRoundResult(userGesture, avatarGesture);
+            if (!expectedResult || roundResult !== expectedResult) {
+                console.warn('[AvatarInteraction] ignored invalid round choice facts');
+                return null;
+            }
+            normalized.user_gesture = userGesture;
+            normalized.avatar_gesture = avatarGesture;
+            normalized.round_result = roundResult;
+            var roundTextContext = sanitizeAvatarInteractionTextContext(getAvatarInteractionPayloadValue(
+                payload, 'text_context', 'textContext', ''
+            ));
+            if (roundTextContext) normalized.text_context = roundTextContext;
+            return normalized;
+        }
+
+        var allowedIntensities = toolContract.actions[actionId];
+        if (!allowedIntensities) {
+            console.warn('[AvatarInteraction] ignored unsupported tool/action:', toolId, actionId);
+            return null;
+        }
+        normalized.action_id = actionId;
+
+        var rawTouchZone = getAvatarInteractionPayloadValue(
+            payload, 'touch_zone', 'touchZone', null
+        );
+        var carriesTouchZone = Object.prototype.hasOwnProperty.call(payload, 'touch_zone')
+            || Object.prototype.hasOwnProperty.call(payload, 'touchZone');
+        var touchZone = String(rawTouchZone || '').trim().toLowerCase();
+        if (toolContract.acceptsTouchZone) {
+            if (AVATAR_INTERACTION_CONTRACT.touchZones.indexOf(touchZone) === -1) {
+                console.warn('[AvatarInteraction] ignored missing or unsupported touch zone:', toolId, touchZone);
+                return null;
+            }
             normalized.touch_zone = touchZone;
+        } else if (carriesTouchZone) {
+            console.warn('[AvatarInteraction] ignored undeclared touch zone:', toolId);
+            return null;
         }
 
         var intensity = String(payload.intensity || '').trim().toLowerCase();
-        if (AVATAR_INTERACTION_ALLOWED_INTENSITIES.indexOf(intensity) !== -1) {
-            if (toolId === 'hammer' || intensity !== 'easter_egg') {
-                normalized.intensity = intensity;
+        if (allowedIntensities.indexOf(intensity) === -1) {
+            console.warn('[AvatarInteraction] ignored missing or unsupported intensity:', toolId, actionId, intensity);
+            return null;
+        }
+        normalized.intensity = intensity;
+
+        if (localTool) {
+            var toolRevision = String(getAvatarInteractionPayloadValue(
+                payload, 'tool_revision', 'toolRevision', ''
+            ) || '').trim();
+            if (toolRevision.length > 128 || !LOCAL_AVATAR_TOOL_REVISION_PATTERN.test(toolRevision)) {
+                console.warn('[AvatarInteraction] ignored invalid local tool revision');
+                return null;
             }
+            var rawChangeIndex = getAvatarInteractionPayloadValue(
+                payload, 'change_index', 'changeIndex', null
+            );
+            if (!Number.isSafeInteger(rawChangeIndex) || rawChangeIndex < 0) {
+                console.warn('[AvatarInteraction] ignored invalid local change index');
+                return null;
+            }
+            normalized.tool_revision = toolRevision;
+            normalized.change_index = rawChangeIndex;
         }
 
-        var textContext = sanitizeAvatarInteractionTextContext(payload.textContext);
+        var textContext = sanitizeAvatarInteractionTextContext(getAvatarInteractionPayloadValue(
+            payload, 'text_context', 'textContext', ''
+        ));
         if (textContext) {
             normalized.text_context = textContext;
         }
 
-        if (toolId === 'fist' && payload.rewardDrop === true) {
-            normalized.reward_drop = true;
+        var booleanField = toolContract.booleanField;
+        if (booleanField) {
+            var carriesBooleanField = Object.prototype.hasOwnProperty.call(payload, booleanField.output)
+                || Object.prototype.hasOwnProperty.call(payload, booleanField.input);
+            if (carriesBooleanField) {
+                var parsedBoolean = parseAvatarInteractionBool(getAvatarInteractionPayloadValue(
+                    payload, booleanField.output, booleanField.input, null
+                ));
+                if (parsedBoolean === null) {
+                    console.warn('[AvatarInteraction] ignored invalid boolean field:', booleanField.output);
+                    return null;
+                }
+                if (parsedBoolean || localTool) {
+                    normalized[booleanField.output] = parsedBoolean;
+                }
+            }
         }
 
-        if (toolId === 'hammer' && payload.easterEgg === true) {
-            normalized.easter_egg = true;
+        if (toolId === 'hammer'
+                && (normalized.intensity === 'easter_egg') !== (normalized.easter_egg === true)) {
+            console.warn('[AvatarInteraction] ignored contradictory hammer easter-egg facts');
+            return null;
         }
 
         return normalized;
-    }
-
-    function getCurrentAvatarEmotion() {
-        try {
-            if (window.live2dManager && typeof window.live2dManager.currentEmotion === 'string' && window.live2dManager.currentEmotion) {
-                return window.live2dManager.currentEmotion;
-            }
-            if (window.mmdManager && window.mmdManager.expression && typeof window.mmdManager.expression.currentMood === 'string' && window.mmdManager.expression.currentMood) {
-                return window.mmdManager.expression.currentMood;
-            }
-            if (window.vrmManager && window.vrmManager.expression && typeof window.vrmManager.expression.currentMood === 'string' && window.vrmManager.expression.currentMood) {
-                return window.vrmManager.expression.currentMood;
-            }
-        } catch (_error) {
-            return 'neutral';
-        }
-        return 'neutral';
-    }
-
-    function clearAvatarInteractionSeedTimer() {
-        if (avatarInteractionSeedState.timerId) {
-            window.clearTimeout(avatarInteractionSeedState.timerId);
-            avatarInteractionSeedState.timerId = 0;
-        }
-    }
-
-    function resolveAvatarInteractionSeedEmotion(payload) {
-        if (!payload || typeof payload !== 'object') {
-            return null;
-        }
-
-        var toolId = String(payload.tool_id || payload.toolId || '').trim().toLowerCase();
-        var actionId = String(payload.action_id || payload.actionId || '').trim().toLowerCase();
-        var intensity = String(payload.intensity || '').trim().toLowerCase() || 'normal';
-        var toolMap = AVATAR_INTERACTION_SEED_EMOTIONS[toolId];
-        var actionMap = toolMap && toolMap[actionId];
-        if (!actionMap) {
-            return null;
-        }
-        if (toolId === 'fist' && payload.reward_drop === true) {
-            return actionMap.reward_drop || actionMap.normal || null;
-        }
-        if (toolId === 'hammer' && payload.easter_egg === true) {
-            return actionMap.easter_egg || actionMap[intensity] || actionMap.normal || null;
-        }
-        return actionMap[intensity] || actionMap.normal || null;
-    }
-
-    function clearAvatarInteractionSeedState() {
-        clearAvatarInteractionSeedTimer();
-        avatarInteractionSeedState.interactionId = '';
-        avatarInteractionSeedState.seedEmotion = null;
-        avatarInteractionSeedState.previousEmotion = null;
-    }
-
-    function applyAvatarInteractionSeedEmotion(payload) {
-        var interactionId = String(payload && (payload.interaction_id || payload.interactionId) || '').trim();
-        var seedEmotion = resolveAvatarInteractionSeedEmotion(payload);
-        if (!interactionId || !seedEmotion || typeof window.applyEmotion !== 'function') {
-            return;
-        }
-
-        var previousEmotion = avatarInteractionSeedState.previousEmotion;
-        if (!avatarInteractionSeedState.interactionId) {
-            previousEmotion = getCurrentAvatarEmotion();
-        }
-
-        clearAvatarInteractionSeedTimer();
-        avatarInteractionSeedState.interactionId = interactionId;
-        avatarInteractionSeedState.seedEmotion = seedEmotion;
-        avatarInteractionSeedState.previousEmotion = previousEmotion || 'neutral';
-
-        window.applyEmotion(seedEmotion);
-
-        avatarInteractionSeedState.timerId = window.setTimeout(function () {
-            if (avatarInteractionSeedState.interactionId !== interactionId) {
-                return;
-            }
-            var fallbackEmotion = avatarInteractionSeedState.previousEmotion || 'neutral';
-            clearAvatarInteractionSeedState();
-            if (typeof window.applyEmotion === 'function') {
-                window.applyEmotion(fallbackEmotion);
-            }
-        }, AVATAR_INTERACTION_SEED_FALLBACK_MS);
-    }
-
-    function bindAvatarInteractionSeedLifecycle() {
-        if (mod._avatarInteractionSeedLifecycleBound) {
-            return;
-        }
-        mod._avatarInteractionSeedLifecycleBound = true;
-
-        window.addEventListener('neko-assistant-emotion-ready', function () {
-            clearAvatarInteractionSeedState();
-        });
     }
 
     async function sendAvatarInteractionPayload(payload) {
@@ -1684,8 +1827,14 @@
                 throw new Error('WEBSOCKET_NOT_CONNECTED');
             }
             S.socket.send(JSON.stringify(normalized));
+            window.dispatchEvent(new CustomEvent('neko:avatar-interaction-sent', {
+                detail: {
+                    requestId: normalized.interaction_id,
+                    interactionId: normalized.interaction_id,
+                    source: 'avatar-tool'
+                }
+            }));
             setActiveAvatarInteractionDispatch(normalized.interaction_id, Date.now());
-            applyAvatarInteractionSeedEmotion(normalized);
             return true;
         } catch (error) {
             console.error('[AvatarInteraction] send failed:', error);
@@ -1698,6 +1847,8 @@
         }
     }
 
+    mod.avatarInteractionContract = AVATAR_INTERACTION_CONTRACT;
+    mod.ensureAvatarInteractionTextContinuationLifecycle = bindAvatarInteractionTextContinuationLifecycle;
     mod.normalizeAvatarInteractionPayload = normalizeAvatarInteractionPayload;
     mod.sendAvatarInteractionPayload = sendAvatarInteractionPayload;
 
@@ -1871,8 +2022,7 @@
     // ======================== init — wire up all event listeners ========================
 
     mod.init = function init() {
-        bindAvatarInteractionSeedLifecycle();
-        bindAvatarInteractionTextContinuationLifecycle();
+        mod.ensureAvatarInteractionTextContinuationLifecycle();
 
         // Cache DOM references
         var micButton            = S.dom.micButton            = document.getElementById('micButton');
@@ -2000,20 +2150,11 @@
                 ensureVoiceStartCurrent();
             }
 
-            // Deactivate tool cursor mode (lollipop/cat paw/hammer)
-            // Prefer the React host cleanup path so cursor teardown stays in one place.
-            if (window.reactChatWindowHost && typeof window.reactChatWindowHost.deactivateToolCursor === 'function') {
-                window.reactChatWindowHost.deactivateToolCursor();
+            // Deactivate the selected avatar tool (lollipop/cat paw/hammer).
+            if (window.reactChatWindowHost && typeof window.reactChatWindowHost.deactivateAvatarTool === 'function') {
+                window.reactChatWindowHost.deactivateAvatarTool();
             } else {
-                window.dispatchEvent(new CustomEvent('neko:deactivate-tool-cursor'));
-                var _body = document.body;
-                var _root = document.documentElement;
-                _root.style.setProperty('cursor', 'auto', 'important');
-                if (_body) {
-                    _body.style.setProperty('cursor', 'auto', 'important');
-                }
-                _root.classList.remove('neko-tool-cursor-active');
-                _root.style.removeProperty('--neko-chat-tool-cursor');
+                window.dispatchEvent(new CustomEvent('neko:deactivate-avatar-tool'));
             }
 
             // Hide text input area (desktop only) + React composer + IPC
@@ -2034,6 +2175,73 @@
 
             window.showStatusToast(window.t ? window.t('app.initializingVoice') : '\u6B63\u5728\u521D\u59CB\u5316\u8BED\u97F3\u5BF9\u8BDD...', 3000);
             window.showVoicePreparingToast(window.t ? window.t('app.connectingToServer') : '\u6B63\u5728\u8FDE\u63A5\u670D\u52A1\u5668...');
+
+            var micStartOwner = null;
+
+            // Every point this handler resumes from an await asks the same
+            // question, and each await is wide open: on mobile the composer
+            // stays visible during an audio session, so a text send can claim
+            // the slot inside the ack's 500ms settle window, inside
+            // showCurrentModel, or inside getUserMedia. Returns true when this
+            // start must stand down -- and unwinds the shared voice-start UI on
+            // its way out UNLESS a newer audio start is driving that very state,
+            // because the unwind is global (it bumps the mic generation and
+            // clears window.isMicStarting) and would make that start abandon
+            // capture. A text start touches none of it and would instead leave
+            // the mic button stranded, so there the unwind must run.
+            function micStartMustStandDown() {
+                if (!window.sessionStartSuperseded(micStartOwner)
+                        && !(S._pendingSessionStartMode
+                            && S._pendingSessionStartMode !== 'audio')) {
+                    return false;
+                }
+                if (!window.supersededByAudioStart(micStartOwner)) {
+                    // This flow may have set S.isSwitchingMode when it began
+                    // from a live text session, and standing down returns past
+                    // both places that normally clear it. Left true it is
+                    // permanent: CHARACTER_LEFT handling stays suppressed and
+                    // auto-goodbye keeps treating the app as mid-switch (codex
+                    // P2). Only in this branch -- a newer audio start clears it
+                    // through its own success or failure path.
+                    S.isSwitchingMode = false;
+
+                    // Cancellation outranks the takeover. If the user hit
+                    // goodbye or reset after the takeover, that is the LATER
+                    // intent and it has already put its own UI on screen --
+                    // unwinding now would re-enable the mic button and unhide
+                    // the composer on top of it, and returning skips the
+                    // catch's preserveGoodbyeUi handling that would have put it
+                    // back (codex P2). The claim sequence cannot see this: a
+                    // cancellation clears the slot without claiming, so we stay
+                    // superseded by whoever came before it.
+                    if ((typeof window.isNekoGoodbyeModeActive === 'function'
+                            && window.isNekoGoodbyeModeActive())
+                            || !window.voiceStartEpochIsCurrent(voiceStartEpoch)) {
+                        return true;
+                    }
+
+                    // If capture already COMMITTED, the unwind alone leaks the
+                    // hardware microphone: abortVoiceStartForBlockedRoute sets
+                    // S.isRecording = false without stopping the stream, closing
+                    // the audio context or disconnecting the worklet, and the
+                    // text session_started handler only runs that teardown while
+                    // S.isRecording is still true -- so aborting first makes it
+                    // skip the sole pipeline teardown and the mic stays live
+                    // after the user switched to text (codex P1). Stop first,
+                    // while the flag still says there is something to stop.
+                    //
+                    // notifyServer:false: the newer start owns the socket now,
+                    // and a pause_session from a superseded flow is read as a
+                    // character switch, closing the socket out from under it.
+                    if (S.isRecording === true && typeof window.stopRecording === 'function') {
+                        window.stopRecording({ notifyServer: false });
+                    }
+                    if (typeof window.abortVoiceStartForBlockedRoute === 'function') {
+                        window.abortVoiceStartForBlockedRoute();
+                    }
+                }
+                return true;
+            }
 
             try {
                 if (typeof window.waitForVoiceConfigSwitchReady === 'function') {
@@ -2057,31 +2265,75 @@
 
                 // Create a promise for session_started
                 var sessionStartPromise = new Promise(function (resolve, reject) {
-                    S.sessionStartedResolver = resolve;
-                    S.sessionStartedRejecter = reject;
-                    S._pendingSessionStartMode = 'audio';
+                    // Claim the shared slot and keep the owner token (the
+                    // resolver itself). Every release below is gated on it, so
+                    // this flow can never clear a slot that a newer start owns.
+                    micStartOwner = window.claimSessionStart('audio', resolve, reject);
+                    // Re-arm the fail-closed voice latch on user intent, strictly
+                    // before start_session goes out and therefore before any route
+                    // verdict for this session can arrive.
+                    //
+                    // This assignment was MISSING while the comment describing it
+                    // was not: the automatic-restart path in app-websocket.js has
+                    // it, this one did not, so a latch set by one failed session
+                    // survived into the next explicit attempt and the mic refused
+                    // with nothing on screen to explain it. Restoring it is safe
+                    // now that session_started carries `microphone_route`: if the
+                    // route really is still blocked, the ack re-sets the latch
+                    // before the promise settles, so clearing it here can no
+                    // longer open the mic onto a dead route.
+                    S.voiceInputRouteBlocked = false;
 
                     if (window.sessionTimeoutId) {
                         clearTimeout(window.sessionTimeoutId);
                         window.sessionTimeoutId = null;
                     }
                 });
+                // Consume the rejection up front. claimSessionStart settles the start it
+                // displaces, and that can land while this flow is still inside
+                // ensureWebSocketOpen -- before it reaches the await, and possibly before a
+                // stand-down returns without ever awaiting at all. Without a handler on the
+                // promise itself a routine takeover surfaces as an unhandledrejection and
+                // the health diagnostics log it as a runtime error. `await` below still sees
+                // the rejection: this attaches a handler, it does not swallow one.
+                sessionStartPromise.catch(function () { });
 
-                // Send start session (ensure WS open)
+                // Send start session (ensure WS open).
+                //
+                // The reconnect is an await like any other, and a text send
+                // inside it displaces this flow's claim -- hence the stand-down
+                // between the two lines below. Sending anyway is the worst
+                // outcome available: the backend gets a stale audio
+                // start_session, and this flow then waits forever on a promise
+                // whose resolver has been replaced -- its own timeout returns
+                // early because it is no longer current, so none of the
+                // stand-downs further down are ever reached (codex P2).
                 await window.ensureWebSocketOpen();
                 ensureVoiceStartCurrent();
+                if (micStartMustStandDown()) return;
                 S.socket.send(JSON.stringify({
                     action: 'start_session',
-                    input_type: 'audio'
+                    input_type: 'audio',
+                    // Read off OUR owner token, not the shared slot: a start
+                    // that displaced us during ensureWebSocketOpen above would
+                    // otherwise get its id stamped on this stale request, and
+                    // the ack for it would settle a promise it does not answer.
+                    request_id: window.sessionStartRequestId(micStartOwner)
                 }));
 
                 // Timeout (15s)
                 window.sessionTimeoutId = setTimeout(function () {
+                    // Only fire for the start this timer was armed for: a newer
+                    // start may own the slot by now, and rejecting/clearing it
+                    // here would strand the promise its awaiter is holding.
+                    // Settling a displaced start is claimSessionStart's job, not
+                    // this timer's: the flow that displaces us clears the shared
+                    // window.sessionTimeoutId in its own claim setup, so by the
+                    // time it matters this callback no longer runs at all.
+                    if (!window.sessionStartIsCurrent(micStartOwner)) return;
                     if (S.sessionStartedRejecter) {
                         var rejecter = S.sessionStartedRejecter;
-                        S.sessionStartedResolver = null;
-                        S.sessionStartedRejecter = null;
-                        S._pendingSessionStartMode = null;
+                        window.releaseSessionStart(micStartOwner);
                         window.sessionTimeoutId = null;
 
                         if (S.socket && S.socket.readyState === WebSocket.OPEN) {
@@ -2109,6 +2361,43 @@
                     // 之后才 settle、把 UI 写回录音中"的竞态，也就不需要 token / 补充
                     // teardown 去追平它。
                     await sessionStartPromise;
+
+                    // A DIFFERENT start took over while this one was waiting.
+                    // On mobile the composer stays visible during an audio
+                    // session, so the user can send text inside the ack's 500ms
+                    // settle window; app-websocket.js then leaves
+                    // _pendingSessionStartMode owned by that newer text start
+                    // and settles this promise anyway (it has no timeout left,
+                    // so nothing else ever would). Opening the microphone now
+                    // would reclaim a lease onto the text session's blocked
+                    // route -- and NONE of the guards below can see it: the
+                    // text ack changes neither voiceSessionStartEpoch nor
+                    // isMicStarting, so ensureVoiceStartCurrent passes, and it
+                    // never sets voiceInputRouteBlocked either (Codex P2).
+                    //
+                    // abortVoiceStartForBlockedRoute rather than throwing: the
+                    // generic catch clears S.sessionStartedResolver /
+                    // Rejecter / _pendingSessionStartMode unconditionally,
+                    // which would tear down the very start that superseded us.
+                    //
+                    // The test is OWNERSHIP, not mode. A newer AUDIO start --
+                    // the CHARACTER_DISCONNECTED automatic restart in
+                    // app-websocket.js claims 'audio' too -- passes a
+                    // `mode !== 'audio'` test, falls through to the timeout
+                    // clear below and cancels the 15s timer that newer start
+                    // is relying on; with its ack lost as well, it then stays
+                    // pending forever. The mode check survives inside
+                    // micStartMustStandDown as an OR because the disconnect
+                    // cleanup nulls the resolver but leaves
+                    // _pendingSessionStartMode set, so neither test subsumes
+                    // the other.
+                    //
+                    // Standing down here deliberately does NOT clear
+                    // window.sessionTimeoutId: that timer belongs to the newer
+                    // start now, and cancelling it is the same cross-start
+                    // damage in miniature.
+                    if (micStartMustStandDown()) return;
+
                     ensureVoiceStartCurrent();
 
                     if (window.sessionTimeoutId) {
@@ -2116,10 +2405,46 @@
                         window.sessionTimeoutId = null;
                     }
 
-                    await window.startMicCapture();
+                    if (S.voiceInputRouteBlocked === true) {
+                        // The route came back fail-closed (independent ASR was
+                        // enabled and failed to start). Do not open the mic;
+                        // unwind the starting-voice UI so the button is usable
+                        // again, and let the ASR failure toast stand.
+                        if (typeof window.abortVoiceStartForBlockedRoute === 'function') {
+                            window.abortVoiceStartForBlockedRoute();
+                        }
+                        return;
+                    }
+                    var microphoneStarted = await window.startMicCapture();
+                    if (microphoneStarted !== true) {
+                        var microphoneStartCancelled = new Error(
+                            'Microphone start cancelled before capture committed'
+                        );
+                        microphoneStartCancelled.microphoneStartCancelled = true;
+                        throw microphoneStartCancelled;
+                    }
                     ensureVoiceStartCurrent();
+
+                    // getUserMedia and the worklet setup are another wide-open
+                    // await, and a text takeover inside it is invisible to
+                    // everything above: startMicCapture's own cancellation path
+                    // returns normally rather than throwing, and a text ack
+                    // moves neither voiceSessionStartEpoch nor isMicStarting, so
+                    // ensureVoiceStartCurrent passes. Without this the handler
+                    // walks into its success path -- neko:voice-session-started,
+                    // silence detection, "ready to speak" -- on top of the text
+                    // session that took over (codex P2).
+                    if (micStartMustStandDown()) return;
                 } catch (error) {
-                    if (window.sessionTimeoutId) {
+                    // Same ownership gate as the success path above: this
+                    // failure can arrive after a newer start has claimed the
+                    // slot and armed its own timer (startMicCapture rejecting
+                    // on a denied getUserMedia is the easy way in), and the
+                    // timer would then be the newer start's. Refuse only in
+                    // that case -- an empty slot still means the timer is ours
+                    // to clear.
+                    if (window.sessionTimeoutId
+                            && !window.sessionStartSuperseded(micStartOwner)) {
                         clearTimeout(window.sessionTimeoutId);
                         window.sessionTimeoutId = null;
                     }
@@ -2137,6 +2462,22 @@
                 } catch (e) {
                     console.warn(window.t('console.startVoiceActiveVisionFailed'), e);
                 }
+
+                // acquireProactiveVisionStream awaits a backend request AND a
+                // display-capture prompt, so this is the longest window of all
+                // -- and the last one before the success path commits. A text
+                // send completing inside it would otherwise get proactive
+                // vision started, ready-to-speak scheduled and
+                // neko:voice-session-started dispatched over its session
+                // (codex P2).
+                //
+                // BOTH questions here. A goodbye or reset inside that same
+                // window goes through cancelPendingSessionStart, which moves the
+                // epoch and clears isMicStarting WITHOUT claiming anything, so
+                // the stand-down alone cannot see it and this handler would
+                // announce a voice session the user just ended (codex P2).
+                ensureVoiceStartCurrent();
+                if (micStartMustStandDown()) return;
 
                 // Success — hide preparing toast, show ready
                 window.hideVoicePreparingToast();
@@ -2156,22 +2497,42 @@
             } catch (error) {
                 var voiceStartErrorMessage = getVoiceStartErrorMessage(error);
                 var isVoiceStartCancelled = !!(error && error.voiceStartCancelled);
+                var isMicrophoneStartCancelled = !!(
+                    error && error.microphoneStartCancelled
+                );
                 var preserveGoodbyeUi = isVoiceStartCancelled
                     && typeof window.isNekoGoodbyeModeActive === 'function'
                     && window.isNekoGoodbyeModeActive();
-                if (!isVoiceStartCancelled) {
+                if (!isVoiceStartCancelled && !isMicrophoneStartCancelled) {
                     console.error(window.t('console.startVoiceSessionFailed'), error);
                 }
 
-                // Cleanup
-                if (window.sessionTimeoutId) {
-                    clearTimeout(window.sessionTimeoutId);
-                    window.sessionTimeoutId = null;
+                // Cleanup -- but only of THIS start. This handler is the most
+                // damaging of the unconditional clears: it wiped the shared
+                // resolver/rejecter/mode and rejected the pending text start,
+                // so a mic start failing while the user had already switched to
+                // typing tore down the text session that had superseded it.
+                var micStartStillOurs = window.sessionStartIsCurrent(micStartOwner);
+                if (micStartStillOurs) {
+                    if (window.sessionTimeoutId) {
+                        clearTimeout(window.sessionTimeoutId);
+                        window.sessionTimeoutId = null;
+                    }
+                    rejectPendingTextSessionStart(error);
+                    window.releaseSessionStart(micStartOwner);
                 }
-                rejectPendingTextSessionStart(error);
-                S.sessionStartedResolver = null;
-                S.sessionStartedRejecter = null;
-                S._pendingSessionStartMode = null;
+
+                // Gating the slot was not enough: everything below is just as
+                // cross-start destructive. A newer start owns the session by
+                // now, so the end_session send would tear ITS session down, and
+                // stopRecording / the button row / the failure toast would
+                // rewrite the UI it is driving -- all to report a failure the
+                // user has already moved on from (codex P2). Note the takeover
+                // is frequently what CAUSED this error, and just as frequently
+                // has finished by the time we get here: the text ack that
+                // invalidated our getUserMedia also released the slot, which is
+                // why this asks the claim sequence and not who holds it now.
+                if (micStartMustStandDown()) return;
 
                 if (!isVoiceStartCancelled && !(error && error.voiceConfigSwitchTimedOut) && S.socket && S.socket.readyState === WebSocket.OPEN) {
                     S.socket.send(JSON.stringify({ action: 'end_session' }));
@@ -2216,7 +2577,7 @@
                     window.showStatusToast('', 0);
                 } else if (error && error.voiceConfigSwitchTimedOut) {
                     window.showStatusToast(voiceStartErrorMessage, 5000);
-                } else {
+                } else if (!isMicrophoneStartCancelled) {
                     window.showStatusToast(window.t ? window.t('app.startFailed', { error: voiceStartErrorMessage }) : '\u542F\u52A8\u5931\u8D25: ' + voiceStartErrorMessage, 5000);
                 }
 
@@ -2426,10 +2787,11 @@
                 window.showStatusToast(window.t ? window.t('app.initializingText') : '\u6B63\u5728\u521D\u59CB\u5316\u6587\u672C\u5BF9\u8BDD...', initToastMs1);
 
                 // Wait for session_started
+                var textStartOwner = null;
                 var sessionStartPromise = new Promise(function (resolve, reject) {
-                    S.sessionStartedResolver = resolve;
-                    S.sessionStartedRejecter = reject;
-                    S._pendingSessionStartMode = 'text';
+                    // Owner token for every release in this flow; see
+                    // window.claimSessionStart in app-state.js.
+                    textStartOwner = window.claimSessionStart('text', resolve, reject);
 
                     if (window.sessionTimeoutId) {
                         clearTimeout(window.sessionTimeoutId);
@@ -2437,11 +2799,11 @@
                     }
 
                     window.sessionTimeoutId = setTimeout(function () {
+                        // Only for the start this timer was armed for.
+                        if (!window.sessionStartIsCurrent(textStartOwner)) return;
                         if (S.sessionStartedRejecter) {
                             var rejecter = S.sessionStartedRejecter;
-                            S.sessionStartedResolver = null;
-                            S.sessionStartedRejecter = null;
-                            S._pendingSessionStartMode = null;
+                            window.releaseSessionStart(textStartOwner);
                             window.sessionTimeoutId = null;
 
                             if (S.socket && S.socket.readyState === WebSocket.OPEN) {
@@ -2454,13 +2816,22 @@
                         }
                     }, 15000);
                 });
+                // Consume the rejection up front. claimSessionStart settles the start it
+                // displaces, and that can land while this flow is still inside
+                // ensureWebSocketOpen -- before it reaches the await, and possibly before a
+                // stand-down returns without ever awaiting at all. Without a handler on the
+                // promise itself a routine takeover surfaces as an unhandledrejection and
+                // the health diagnostics log it as a runtime error. `await` below still sees
+                // the rejection: this attaches a handler, it does not swallow one.
+                sessionStartPromise.catch(function () { });
 
                 // Start text session
                 await window.ensureWebSocketOpen();
                 S.socket.send(JSON.stringify({
                     action: 'start_session',
                     input_type: 'text',
-                    new_session: true
+                    new_session: true,
+                    request_id: window.sessionStartRequestId(textStartOwner)
                 }));
 
                 await sessionStartPromise;
@@ -2524,6 +2895,17 @@
                 );
 
             } catch (error) {
+                // Displaced by a newer start rather than failed: claimSessionStart
+                // settles the start it takes over from, and reporting that as
+                // "\u56DE\u6765\u5931\u8D25" would blame the user's own next action -- with an
+                // internal English reason string, at that.
+                if (error && error.sessionStartCancelled
+                        && !window.sessionStartIsCurrent(textStartOwner)) {
+                    window.hideVoicePreparingToast();
+                    returnSessionButton.disabled = false;
+                    return;
+                }
+
                 console.error(window.t('console.askHerBackFailed'), error);
                 window.hideVoicePreparingToast();
                 window.showStatusToast(
@@ -2533,13 +2915,16 @@
                     5000
                 );
 
-                if (window.sessionTimeoutId) {
-                    clearTimeout(window.sessionTimeoutId);
-                    window.sessionTimeoutId = null;
+                // Only tear down THIS start: a newer one may own the slot by
+                // now, and clearing it would strand its awaiter.
+                if (window.sessionStartIsCurrent(textStartOwner)) {
+                    if (window.sessionTimeoutId) {
+                        clearTimeout(window.sessionTimeoutId);
+                        window.sessionTimeoutId = null;
+                    }
+                    rejectPendingTextSessionStart(error);
+                    window.releaseSessionStart(textStartOwner);
                 }
-                rejectPendingTextSessionStart(error);
-                S.sessionStartedResolver = null;
-                S.sessionStartedRejecter = null;
 
                 returnSessionButton.disabled = false;
             } finally {
@@ -2567,6 +2952,21 @@
             if (isHomeTutorialInteractionLocked()) {
                 showHomeTutorialLockedToast();
                 return false;
+            }
+
+            if (hasExtraImages) {
+                try {
+                    extraImageDataUrls = await Promise.all(extraImageDataUrls.map(function (dataUrl) {
+                        return mod.normalizeImageDataUrlForPendingList(dataUrl);
+                    }));
+                } catch (error) {
+                    console.error('[Chat] 额外图片处理失败:', error);
+                    window.showStatusToast(
+                        window.t ? window.t('app.importImageFailed') : '导入图片失败',
+                        4000
+                    );
+                    return false;
+                }
             }
 
             if (hasScreenshots) {
@@ -2651,6 +3051,7 @@
                 screenshotButton.disabled = true;
                 resetSessionButton.disabled = false;
 
+                var composerStartOwner = null;
                 try {
                     if (!mod._textSessionStartPromise) {
                         mod._textSessionStartPromise = (async function () {
@@ -2659,9 +3060,8 @@
                             window.showStatusToast(window.t ? window.t('app.initializingText') : '\u6B63\u5728\u521D\u59CB\u5316\u6587\u672C\u5BF9\u8BDD...', initToastMs2);
 
                             var sessionStartPromise = new Promise(function (resolve, reject) {
-                                S.sessionStartedResolver = resolve;
-                                S.sessionStartedRejecter = reject;
-                                S._pendingSessionStartMode = 'text';
+                                // Owner token for every release in this flow.
+                                composerStartOwner = window.claimSessionStart('text', resolve, reject);
                                 mod._textSessionStartRejecter = reject;
 
                                 if (window.sessionTimeoutId) {
@@ -2669,21 +3069,30 @@
                                     window.sessionTimeoutId = null;
                                 }
                             });
+                            // Consume the rejection up front. claimSessionStart settles the start it
+                            // displaces, and that can land while this flow is still inside
+                            // ensureWebSocketOpen -- before it reaches the await, and possibly before a
+                            // stand-down returns without ever awaiting at all. Without a handler on the
+                            // promise itself a routine takeover surfaces as an unhandledrejection and
+                            // the health diagnostics log it as a runtime error. `await` below still sees
+                            // the rejection: this attaches a handler, it does not swallow one.
+                            sessionStartPromise.catch(function () { });
 
                             await window.ensureWebSocketOpen();
                             S.socket.send(JSON.stringify({
                                 action: 'start_session',
                                 input_type: 'text',
-                                new_session: false
+                                new_session: false,
+                                request_id: window.sessionStartRequestId(composerStartOwner)
                             }));
 
                             // Timeout after WebSocket confirms connection
                             window.sessionTimeoutId = setTimeout(function () {
+                                // Only for the start this timer was armed for.
+                                if (!window.sessionStartIsCurrent(composerStartOwner)) return;
                                 if (S.sessionStartedRejecter) {
                                     var rejecter = S.sessionStartedRejecter;
-                                    S.sessionStartedResolver = null;
-                                    S.sessionStartedRejecter = null;
-                                    S._pendingSessionStartMode = null;
+                                    window.releaseSessionStart(composerStartOwner);
                                     mod._textSessionStartRejecter = null;
                                     window.sessionTimeoutId = null;
 
@@ -2715,28 +3124,40 @@
                     }
 
                     await mod._textSessionStartPromise;
-                    if (window.sessionTimeoutId) {
-                        clearTimeout(window.sessionTimeoutId);
-                        window.sessionTimeoutId = null;
+                    if (window.sessionStartIsCurrent(composerStartOwner)) {
+                        if (window.sessionTimeoutId) {
+                            clearTimeout(window.sessionTimeoutId);
+                            window.sessionTimeoutId = null;
+                        }
+                        window.releaseSessionStart(composerStartOwner);
                     }
-                    S.sessionStartedResolver = null;
-                    S.sessionStartedRejecter = null;
                 } catch (error) {
-                    console.error(window.t('console.startTextSessionFailed'), error);
-                    window.hideVoicePreparingToast();
-                    window.showStatusToast(
-                        window.t
-                            ? window.t('app.startFailed', { error: error.message })
-                            : '\u542F\u52A8\u5931\u8D25: ' + error.message,
-                        5000
-                    );
-
-                    if (window.sessionTimeoutId) {
-                        clearTimeout(window.sessionTimeoutId);
-                        window.sessionTimeoutId = null;
+                    // Displaced rather than failed. The message still cannot go
+                    // out -- the session it was waiting for never started, so
+                    // the optimistic bubble is still marked failed below and the
+                    // composer still comes back -- but the toast would report a
+                    // start failure, in internal English, for what was really
+                    // the user's own newer action taking over.
+                    var composerDisplaced = !!(error && error.sessionStartCancelled)
+                        && !window.sessionStartIsCurrent(composerStartOwner);
+                    if (!composerDisplaced) {
+                        console.error(window.t('console.startTextSessionFailed'), error);
+                        window.showStatusToast(
+                            window.t
+                                ? window.t('app.startFailed', { error: error.message })
+                                : '\u542F\u52A8\u5931\u8D25: ' + error.message,
+                            5000
+                        );
                     }
-                    S.sessionStartedResolver = null;
-                    S.sessionStartedRejecter = null;
+                    window.hideVoicePreparingToast();
+
+                    if (window.sessionStartIsCurrent(composerStartOwner)) {
+                        if (window.sessionTimeoutId) {
+                            clearTimeout(window.sessionTimeoutId);
+                            window.sessionTimeoutId = null;
+                        }
+                        window.releaseSessionStart(composerStartOwner);
+                    }
 
                     textSendButton.disabled = false;
                     textInputBox.disabled = false;
@@ -2763,11 +3184,9 @@
                                 var msg = {
                                     action: 'stream_data',
                                     data: img.src,
-                                    input_type: getPendingAttachmentInputType(screenshotItems[i])
+                                    input_type: getPendingAttachmentInputType(screenshotItems[i]),
+                                    request_id: requestId
                                 };
-                                if (text) {
-                                    msg.request_id = requestId;
-                                }
                                 // Attach paired avatar position metadata (captured at screenshot time)
                                 var storedPos = screenshotItems[i].dataset.avatarPosition;
                                 if (storedPos) {
@@ -2886,7 +3305,13 @@
                     if (sentUserContent) {
                         // 覆盖纯截图/图片首轮输入：没有 text 分支时也要标记用户已交互
                         markFirstUserInputForAchievement();
-                        window.dispatchEvent(new CustomEvent('neko:user-content-sent'));
+                        window.dispatchEvent(new CustomEvent('neko:user-content-sent', {
+                            detail: {
+                                requestId: requestId,
+                                text: text,
+                                source: messageSource || 'text'
+                            }
+                        }));
                         // 标记"WS 已发、还没收到首 chunk"窗口，给 isAssistantTextResponseInFlight 用。
                         // 首 chunk 进来后会被 clearPendingAssistantTurnStart 在 turn-end 路径清零；
                         // 同时有 15s freshness ceiling 防止漏清永远卡 true。
@@ -3058,8 +3483,8 @@
         }
 
         function getDesktopRegionCaptureMethod() {
-            if (!window.electronDesktopCapturer) return null;
-            var bridge = window.electronDesktopCapturer;
+            var bridge = getDesktopProvider();
+            if (!bridge) return null;
             var names = [
                 'beginDesktopRegionSelection',
                 'captureDesktopRegion',
@@ -3076,15 +3501,55 @@
             return null;
         }
 
+        function getCropOverlayTranslations() {
+            var keys = [
+                'chat.cropTabScreenshot', 'chat.cropTabHideNeko', 'chat.cropTabCancel',
+                'chat.cropTabRecapturing', 'chat.cropToolSelect', 'chat.cropToolRect',
+                'chat.cropToolEllipse', 'chat.cropToolArrow', 'chat.cropToolPen',
+                'chat.cropToolHighlight', 'chat.cropToolText', 'chat.cropToolMosaic',
+                'chat.cropToolWatermark', 'chat.cropUndo', 'chat.cropRedo', 'chat.cropSave',
+                'chat.cropPin', 'chat.cropPinTitle',
+                'chat.pinZoomOut', 'chat.pinZoomIn', 'chat.pinClose',
+                'chat.pinRestoreSize', 'chat.pinCopy', 'chat.pinDelete',
+                'chat.cropClearSelectionTitle', 'chat.cropConfirmTitle', 'chat.cropColorRed',
+                'chat.cropColorYellow', 'chat.cropColorGreen', 'chat.cropColorBlue',
+                'chat.cropColorWhite', 'chat.cropColorBlack', 'chat.cropFontSize',
+                'chat.cropOpacity', 'chat.cropMosaicSize', 'chat.cropWatermarkText',
+                'chat.cropWatermarkDefault'
+            ];
+            var translations = {};
+            if (typeof window.t !== 'function') return translations;
+            keys.forEach(function (key) {
+                try {
+                    var value = window.t(key);
+                    if (typeof value === 'string' && value && value !== key) {
+                        translations[key] = value;
+                    }
+                } catch (e) { /* use app-crop fallback */ }
+            });
+            return translations;
+        }
+
         function isDesktopRegionCaptureUnavailable(errorLike) {
             if (!errorLike) return false;
-            var code = errorLike.code || '';
-            if (code === 'ENOSYS' || code === 'UNSUPPORTED_API') return true;
-            var message = String(errorLike.message || errorLike.error || errorLike.reason || '').toLowerCase();
-            return message.indexOf('not implemented') !== -1
-                || message.indexOf('not supported') !== -1
-                || message.indexOf('unsupported') !== -1
-                || message.indexOf('unavailable') !== -1;
+            var code = String(errorLike.code || '').trim();
+            if (!code) {
+                var exactValue = String(
+                    errorLike.message || errorLike.error || errorLike.reason || ''
+                ).trim();
+                if (/^[A-Z][A-Z0-9_]+$/.test(exactValue)) {
+                    code = exactValue;
+                }
+            }
+            if (code === 'ENOSYS' || code === 'UNSUPPORTED_API' || code === 'SCREEN_CAPTURE_UNAVAILABLE') return true;
+            var message = String(errorLike.message || errorLike.error || errorLike.reason || '').toLowerCase().trim();
+            // 仅保留旧壳曾经返回的完整短语。能力级错误（例如
+            // SCREENSHOT_PIN_*）即使包含 unsupported，也必须终止本次操作，
+            // 不能回退到第二轮截图并把编辑器本身抓进画面。
+            return message === 'not implemented'
+                || message === 'not supported'
+                || message === 'unsupported'
+                || message === 'unavailable';
         }
 
         function normalizeDesktopRegionCaptureResult(raw) {
@@ -3099,7 +3564,17 @@
                 return {
                     success: false,
                     error: raw.error || raw.message || 'DESKTOP_REGION_CAPTURE_FAILED',
-                    code: raw.code || null
+                    code: raw.code || null,
+                    capability: raw.capability || null,
+                    retryable: raw.retryable === true
+                };
+            }
+            if (raw.pinned) {
+                return {
+                    success: true,
+                    pinned: true,
+                    pinId: raw.pinId || null,
+                    captureType: raw.captureType || 'desktop-region'
                 };
             }
             if (raw.dataUrl) {
@@ -3123,9 +3598,9 @@
             var selectedSourceId = S.selectedScreenSourceId || null;
             var payload = {
                 sourceId: selectedSourceId,
-                hideNeko: true,
                 returnDataUrl: true,
-                includeOriginalDataUrl: true
+                includeOriginalDataUrl: true,
+                translations: getCropOverlayTranslations()
             };
 
             var raw = null;
@@ -3164,10 +3639,17 @@
                     console.info('[截图] 桌面框选接口声明不可用，回退到内置裁剪:', regionMethod.name);
                     return null;
                 }
-                throw new Error(normalized.error || 'DESKTOP_REGION_CAPTURE_FAILED');
+                var terminalError = new Error(normalized.error || 'DESKTOP_REGION_CAPTURE_FAILED');
+                terminalError.code = normalized.code || null;
+                terminalError.capability = normalized.capability || null;
+                terminalError.retryable = normalized.retryable === true;
+                throw terminalError;
             }
 
             console.log('[截图] 桌面框选捕获成功:', regionMethod.name, (normalized.width || 0) + 'x' + (normalized.height || 0));
+            if (normalized.pinned) {
+                return { pinned: true, pinId: normalized.pinId || null };
+            }
             return {
                 dataUrl: normalized.dataUrl,
                 originalDataUrl: normalized.originalDataUrl || normalized.dataUrl,
@@ -3178,7 +3660,16 @@
             };
         }
 
-        async function recaptureWithoutNeko() {
+        async function recaptureWithoutNeko(rememberedWindowCapture) {
+            function rememberedWindowCaptureIsCurrent() {
+                return !(rememberedWindowCapture && rememberedWindowCapture.required)
+                    || (rememberedWindowCapture.allowed !== false
+                        && (typeof rememberedWindowCapture.isCurrent !== 'function'
+                            || rememberedWindowCapture.isCurrent()));
+            }
+
+            if (!rememberedWindowCaptureIsCurrent()) return null;
+
             // Priority 0 (Electron PC): 主进程原子化路径 — 一次 IPC 完成
             //   隐藏所有 NEKO 窗口 → 等合成 → desktopCapturer 抓图 → 恢复窗口。
             //   把 hide/等待/抓图/show 全放主进程是因为渲染器端 setTimeout 在 Pet 窗口
@@ -3188,11 +3679,17 @@
             // 一起 hide 掉再抓屏，是唯一能真正抹掉立绘的途径；下面的 renderer fallback 只能
             // 对 Pet 的 DOM 做 visibility:hidden，盖不住 WebGL 合成层 —— 那正是"隐藏NEKO
             // 画面刷新了但立绘还在"的根因。主进程在 sourceId 缺省时会自行选择合适屏幕。
-            if (window.electronDesktopCapturer
-                && typeof window.electronDesktopCapturer.captureSourceWithoutNeko === 'function') {
+            var desktopProvider = getDesktopProvider();
+            if (desktopProvider
+                && typeof desktopProvider.captureSourceWithoutNeko === 'function') {
                 var atomicFailed = false;
                 try {
-                    var atomic = await window.electronDesktopCapturer.captureSourceWithoutNeko(selectedSourceId || null);
+                    var atomic = await window.captureDesktopSourceWithTimeout(
+                        desktopProvider,
+                        'captureSourceWithoutNeko',
+                        selectedSourceId || null
+                    );
+                    if (!rememberedWindowCaptureIsCurrent()) return null;
                     if (atomic && atomic.success && atomic.dataUrl) {
                         return atomic.dataUrl;
                     } else if (atomic && atomic.error) {
@@ -3225,29 +3722,35 @@
             // MediaStream 抓帧（getDisplayMedia）会把卫星窗口也拍进去，CSS 隐藏覆盖不到它们。
             var saved = hideNekoUI();
             var fallbackHiddenIds = null;
-            if (window.electronDesktopCapturer
-                && typeof window.electronDesktopCapturer.hideNekoWindows === 'function') {
-                try {
-                    var hideRes = await window.electronDesktopCapturer.hideNekoWindows();
-                    if (hideRes && Array.isArray(hideRes.hiddenIds)) {
-                        fallbackHiddenIds = hideRes.hiddenIds;
-                    }
-                } catch (e) {
-                    console.warn('[隐藏NEKO][fallback] hide 卫星窗口失败:', e);
-                }
-            }
-            await new Promise(function (r) { setTimeout(r, 300); });
             try {
+                if (desktopProvider
+                    && typeof desktopProvider.hideNekoWindows === 'function') {
+                    try {
+                        var hideRes = await desktopProvider.hideNekoWindows();
+                        if (hideRes && Array.isArray(hideRes.hiddenIds)) {
+                            fallbackHiddenIds = hideRes.hiddenIds;
+                        }
+                    } catch (e) {
+                        console.warn('[隐藏NEKO][fallback] hide 卫星窗口失败:', e);
+                    }
+                }
+                await new Promise(function (r) { setTimeout(r, 300); });
+                if (!rememberedWindowCaptureIsCurrent()) return null;
                 // Priority 1: Electron direct capture (不隐藏卫星窗口版本，仅为向后兼容兜底)
                 // 读当前的 S.selectedScreenSourceId —— Priority 0 若刚命中 'Source not found'
                 // 已经通过 maybeClearSourceOnNotFound 把它清空，此时 selectedSourceId 这个本地
                 // 快照已是僵尸 ID；继续用它只会让主进程再原样报一次 'Source not found'，
                 // 多一次 IPC 往返。重读 S 直接跳到 Priority 2 流路径。
                 var currentSourceId = S.selectedScreenSourceId;
-                if (currentSourceId && window.electronDesktopCapturer
-                    && typeof window.electronDesktopCapturer.captureSourceAsDataUrl === 'function') {
+                if (currentSourceId && desktopProvider
+                    && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
                     try {
-                        var direct = await window.electronDesktopCapturer.captureSourceAsDataUrl(currentSourceId);
+                        var direct = await window.captureDesktopSourceWithTimeout(
+                            desktopProvider,
+                            'captureSourceAsDataUrl',
+                            currentSourceId
+                        );
+                        if (!rememberedWindowCaptureIsCurrent()) return null;
                         if (direct && direct.success && direct.dataUrl) {
                             return direct.dataUrl;
                         } else if (typeof window.maybeClearSourceOnNotFound === 'function') {
@@ -3260,14 +3763,17 @@
                 if (typeof window.acquireOrReuseCachedStream === 'function') {
                     try {
                         var acqStream = await window.acquireOrReuseCachedStream({ allowPrompt: false });
+                        if (!rememberedWindowCaptureIsCurrent()) return null;
                         if (acqStream) {
                             var isCached = (acqStream === S.screenCaptureStream);
                             try {
                                 var frame = await window.captureFrameFromStream(acqStream, 0.8, true);
+                                if (!rememberedWindowCaptureIsCurrent()) return null;
                                 if (!frame) {
                                     // 全分辨率编码可能在超大/虚拟显示器上失败；用同一条流退回 720p 再试，
                                     // 保住正确的窗口内容（优于后端 pyautogui 抓整屏）。
                                     frame = await window.captureFrameFromStream(acqStream, 0.8, false);
+                                    if (!rememberedWindowCaptureIsCurrent()) return null;
                                 }
                                 if (frame && frame.dataUrl) return frame.dataUrl;
                             } finally {
@@ -3283,9 +3789,11 @@
                             var tracks = S.screenCaptureStream.getVideoTracks();
                             if (tracks.length > 0 && tracks.some(function (t) { return t.readyState === 'live'; })) {
                                 var cachedFrame = await window.captureFrameFromStream(S.screenCaptureStream, 0.8, true);
+                                if (!rememberedWindowCaptureIsCurrent()) return null;
                                 if (!cachedFrame) {
                                     // 同上：全分辨率失败时用同一条流退回 720p，保住正确窗口内容
                                     cachedFrame = await window.captureFrameFromStream(S.screenCaptureStream, 0.8, false);
+                                    if (!rememberedWindowCaptureIsCurrent()) return null;
                                 }
                                 if (cachedFrame && cachedFrame.dataUrl) return cachedFrame.dataUrl;
                             }
@@ -3293,7 +3801,11 @@
                     } catch (e) { /* fallback below */ }
                 }
 
-                // Priority 3: backend pyautogui
+                // Priority 3: backend pyautogui. A remembered-window recapture
+                // must not widen a failed window grab to the whole desktop.
+                if (rememberedWindowCapture && rememberedWindowCapture.required) {
+                    return null;
+                }
                 var result = await window.fetchBackendScreenshot();
                 if (result && result.dataUrl) {
                     return result.dataUrl || null;
@@ -3303,10 +3815,10 @@
                 // 先恢复卫星窗口，再恢复 Pet 的 DOM visibility —— 反过来用户会看到
                 // 孤零零的 Pet 一帧。
                 if (fallbackHiddenIds && fallbackHiddenIds.length > 0
-                    && window.electronDesktopCapturer
-                    && typeof window.electronDesktopCapturer.restoreNekoWindows === 'function') {
+                    && desktopProvider
+                    && typeof desktopProvider.restoreNekoWindows === 'function') {
                     try {
-                        await window.electronDesktopCapturer.restoreNekoWindows(fallbackHiddenIds);
+                        await desktopProvider.restoreNekoWindows(fallbackHiddenIds);
                     } catch (e) {
                         console.warn('[隐藏NEKO][fallback] 恢复卫星窗口失败:', e);
                     }
@@ -3339,6 +3851,17 @@
             var isCachedStream = false;
             var captureType = null;
             var screenshotCaptureSessionActive = false;
+            var rememberedWindowCapture = { required: false, allowed: true };
+
+            function rememberedWindowUnavailableResult() {
+                return { rememberedWindowUnavailable: true };
+            }
+
+            function rememberedWindowCaptureIsCurrent() {
+                return !(rememberedWindowCapture && rememberedWindowCapture.required)
+                    || typeof rememberedWindowCapture.isCurrent !== 'function'
+                    || rememberedWindowCapture.isCurrent();
+            }
 
             if (!U.isMobile()) {
                 screenshotCaptureSessionActive = true;
@@ -3370,7 +3893,42 @@
                         }
                     }
                 } else {
-                    if (typeof window.fetchBackendInteractiveScreenshot === 'function') {
+                    if (typeof window.prepareRememberedWindowCapture === 'function') {
+                        rememberedWindowCapture = await window.prepareRememberedWindowCapture();
+                        if (rememberedWindowCapture && rememberedWindowCapture.required
+                            && !rememberedWindowCapture.allowed) {
+                            console.warn('[截图] 记忆窗口无法唯一确认，停止本次截图');
+                            return rememberedWindowUnavailableResult();
+                        }
+                    }
+
+                    // Electron 桌面端优先交给 PC 壳的独立截图编辑窗口。它覆盖当前显示器，
+                    // 不改变聊天框/Pet 窗口尺寸，也不会把冻结画面塞进聊天窗口内裁剪。
+                    var desktopRegionResult = await captureDesktopRegionDirectly();
+                    if (!rememberedWindowCaptureIsCurrent()) {
+                        console.warn('[截图] 记忆窗口已在桌面框选期间变化，丢弃旧帧');
+                        return rememberedWindowUnavailableResult();
+                    }
+                    if (desktopRegionResult) {
+                        if (desktopRegionResult.canceled) {
+                            return null;
+                        }
+                        if (desktopRegionResult.pinned) {
+                            return {
+                                pinned: true,
+                                pinId: desktopRegionResult.pinId || null
+                            };
+                        }
+                        return {
+                            dataUrl: desktopRegionResult.dataUrl,
+                            originalDataUrl: desktopRegionResult.originalDataUrl || desktopRegionResult.dataUrl,
+                            avatarPos: desktopRegionResult.avatarPos || null
+                        };
+                    }
+
+                    // 浏览器/旧版 PC 壳没有独立编辑窗口时，macOS 仍可退回系统交互截图。
+                    if (!(rememberedWindowCapture && rememberedWindowCapture.required)
+                        && typeof window.fetchBackendInteractiveScreenshot === 'function') {
                         var interactiveBackendResult = await window.fetchBackendInteractiveScreenshot();
                         if (interactiveBackendResult && interactiveBackendResult.canceled) {
                             return null;
@@ -3384,23 +3942,20 @@
                         }
                     }
 
-                    var desktopRegionResult = await captureDesktopRegionDirectly();
-                    if (desktopRegionResult) {
-                        if (desktopRegionResult.canceled) {
-                            return null;
-                        }
-                        return {
-                            dataUrl: desktopRegionResult.dataUrl,
-                            originalDataUrl: desktopRegionResult.originalDataUrl || desktopRegionResult.dataUrl,
-                            avatarPos: desktopRegionResult.avatarPos || null
-                        };
-                    }
-
                     var selectedSourceId = S.selectedScreenSourceId;
-                    if (selectedSourceId && window.electronDesktopCapturer
-                        && typeof window.electronDesktopCapturer.captureSourceAsDataUrl === 'function') {
+                    var desktopProvider = getDesktopProvider();
+                    if (selectedSourceId && desktopProvider
+                        && typeof desktopProvider.captureSourceAsDataUrl === 'function') {
                         try {
-                            var direct = await window.electronDesktopCapturer.captureSourceAsDataUrl(selectedSourceId);
+                            var direct = await window.captureDesktopSourceWithTimeout(
+                                desktopProvider,
+                                'captureSourceAsDataUrl',
+                                selectedSourceId
+                            );
+                            if (!rememberedWindowCaptureIsCurrent()) {
+                                console.warn('[截图] 记忆窗口已在直接捕获期间变化，丢弃旧帧');
+                                return rememberedWindowUnavailableResult();
+                            }
                             if (direct && direct.success && direct.dataUrl) {
                                 dataUrl = direct.dataUrl;
                                 width = direct.width || 0;
@@ -3429,13 +3984,27 @@
                             acquiredStream = null;
                         }
 
+                        isCachedStream = !!acquiredStream && (acquiredStream === S.screenCaptureStream);
+
+                        if (!rememberedWindowCaptureIsCurrent()) {
+                            console.warn('[截图] 记忆窗口已在流获取期间变化，丢弃旧流');
+                            return rememberedWindowUnavailableResult();
+                        }
+
                         if (acquiredStream) {
-                            isCachedStream = (acquiredStream === S.screenCaptureStream);
                             var frame = await window.captureFrameFromStream(acquiredStream, 0.8, true);
+                            if (!rememberedWindowCaptureIsCurrent()) {
+                                console.warn('[截图] 记忆窗口已在流抓帧期间变化，丢弃旧帧');
+                                return rememberedWindowUnavailableResult();
+                            }
                             if (!frame) {
                                 // 全分辨率编码可能在超大/虚拟显示器上失败；用同一条流退回 720p 再试，
                                 // 保住正确的窗口内容（优于后端 pyautogui 抓整屏的兜底）。
                                 frame = await window.captureFrameFromStream(acquiredStream, 0.8, false);
+                                if (!rememberedWindowCaptureIsCurrent()) {
+                                    console.warn('[截图] 记忆窗口已在降级抓帧期间变化，丢弃旧帧');
+                                    return rememberedWindowUnavailableResult();
+                                }
                             }
                             if (frame) {
                                 dataUrl = frame.dataUrl;
@@ -3452,7 +4021,7 @@
                         }
                     }
 
-                    if (!dataUrl) {
+                    if (!dataUrl && !(rememberedWindowCapture && rememberedWindowCapture.required)) {
                         try {
                             var backendResult = await window.fetchBackendScreenshot();
                             if (backendResult && backendResult.dataUrl) {
@@ -3464,6 +4033,10 @@
                             console.warn('[截图] 后端兜底失败:', beErr);
                         }
                     }
+                }
+
+                if (!dataUrl && rememberedWindowCapture && rememberedWindowCapture.required) {
+                    return rememberedWindowUnavailableResult();
                 }
 
                 if (!dataUrl) {
@@ -3487,10 +4060,11 @@
                 // 在显示裁剪 overlay 前隐藏其他 NEKO 窗口（如 Chat 窗口），
                 // 避免它们的 z-order 遮挡 Pet 窗口中的全屏裁剪界面。
                 var hiddenIds = null;
-                if (window.electronDesktopCapturer
-                    && typeof window.electronDesktopCapturer.hideNekoWindows === 'function') {
+                var desktopProvider = getDesktopProvider();
+                if (desktopProvider
+                    && typeof desktopProvider.hideNekoWindows === 'function') {
                     try {
-                        var hideRes = await window.electronDesktopCapturer.hideNekoWindows();
+                        var hideRes = await desktopProvider.hideNekoWindows();
                         if (hideRes && Array.isArray(hideRes.hiddenIds)) {
                             hiddenIds = hideRes.hiddenIds;
                         }
@@ -3502,7 +4076,9 @@
                 try {
                     if (window.appCrop && typeof window.appCrop.cropImage === 'function') {
                         var croppedUrl = await window.appCrop.cropImage(dataUrl, {
-                            recaptureFn: function () { return recaptureWithoutNeko(); }
+                            recaptureFn: function () {
+                                return recaptureWithoutNeko(rememberedWindowCapture);
+                            }
                         });
                         if (!croppedUrl) {
                             return null;
@@ -3513,10 +4089,10 @@
                     }
                 } finally {
                     if (hiddenIds && hiddenIds.length > 0
-                        && window.electronDesktopCapturer
-                        && typeof window.electronDesktopCapturer.restoreNekoWindows === 'function') {
+                        && desktopProvider
+                        && typeof desktopProvider.restoreNekoWindows === 'function') {
                         try {
-                            await window.electronDesktopCapturer.restoreNekoWindows(hiddenIds);
+                            await desktopProvider.restoreNekoWindows(hiddenIds);
                         } catch (restoreErr) {
                             console.warn('[截图] 恢复其他窗口失败:', restoreErr);
                         }
@@ -3548,32 +4124,33 @@
                 window.showStatusToast(window.t ? window.t('app.capturing') : '\u6B63\u5728\u622A\u56FE...', 2000);
 
                 var result = await mod.captureScreenshotDataUrl();
+                if (result && result.rememberedWindowUnavailable) {
+                    window.showStatusToast(
+                        window.t
+                            ? window.t('app.screenSource.rememberedWindowUnavailable')
+                            : '\u65E0\u6CD5\u552F\u4E00\u627E\u5230\u8BB0\u4F4F\u7684\u7A97\u53E3\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u5C4F\u5E55\u6765\u6E90',
+                        4000
+                    );
+                    return;
+                }
+                if (result && result.pinned) {
+                    return;
+                }
                 if (!result) {
                     window.showStatusToast(window.t ? window.t('app.screenshotCancelled') : '\u5DF2\u53D6\u6D88\u622A\u56FE', 2000);
                     return;
                 }
 
-                // Capture/crop overlay keeps full resolution (crisp); cropping is done here,
-                // so compress to 720p / 0.8 right before queueing. This keeps the pending list
-                // holding only the compressed copy (low memory) and lets send pass it through
-                // without re-encoding.
-                var avatarPos = result.dataUrl === result.originalDataUrl ? result.avatarPos : null;
-                var compactDataUrl;
                 try {
-                    compactDataUrl = await mod.compressScreenshotDataUrlTo720p(result.dataUrl);
+                    await mod.enqueueCapturedScreenshotResult(result);
                 } catch (compressErr) {
-                    // Compression only throws when the image can't be decoded/encoded (the 720p
-                    // canvas is small enough that size limits never apply). Don't fall back to the
-                    // full-res original -- that would break the "list holds only compressed <=1MB"
-                    // invariant and pin a huge dataUrl in memory, and a broken image would fail at
-                    // send anyway. Abort queueing and surface an error toast instead.
+                    // Don't fall back to the full-res original: decode/encode failures and the rare
+                    // 720p image that still exceeds the transport budget must not enter the pending
+                    // list, otherwise it would either pin a huge dataUrl or fail during send.
                     console.warn('[\u622A\u56FE] 720p \u538B\u7F29\u5931\u8D25\uFF0C\u53D6\u6D88\u5165\u5217:', compressErr);
                     window.showStatusToast(window.t ? window.t('app.screenshotFailed') : '\u622A\u56FE\u5931\u8D25', 4000);
                     return false;
                 }
-
-                mod.addScreenshotToList(compactDataUrl, avatarPos);
-                window.showStatusToast(window.t ? window.t('app.screenshotAdded') : '\u622A\u56FE\u5DF2\u6DFB\u52A0\uFF0C\u70B9\u51FB\u53D1\u9001\u4E00\u8D77\u53D1\u9001', 3000);
             } catch (err) {
                 console.error(window.t('console.screenshotFailed'), err);
 
@@ -3607,6 +4184,10 @@
         // Screenshot button click
         // ----------------------------------------------------------------
         screenshotButton.addEventListener('click', mod.captureScreenshotToPendingList);
+        // F4 由 PC 主进程直接触发 React Chat 的截图入口。页面 URL 已加载并不代表
+        // app-buttons 已完成初始化；显式标记能力就绪，避免首轮 F4 误回退到旧的 Pet 路径。
+        window.__NEKO_SCREENSHOT_CAPTURE_READY__ = true;
+        window.dispatchEvent(new CustomEvent('neko:screenshot-capture-ready'));
 
         // ----------------------------------------------------------------
         // Clear all screenshots button
@@ -3663,7 +4244,6 @@
             }
         });
 
-        // 图片文件拖到聊天框时按「导入图片」处理，避免浏览器默认打开本地文件。
         document.addEventListener('dragover', function (e) {
             if (!shouldHandleChatFileDrop(e)) return;
             e.preventDefault();
@@ -3673,7 +4253,7 @@
             }
         }, true);
 
-        document.addEventListener('drop', function (e) {
+        document.addEventListener('drop', async function (e) {
             if (!shouldHandleChatFileDrop(e)) return;
             e.preventDefault();
             e.stopPropagation();
@@ -3682,7 +4262,37 @@
                 return;
             }
             var files = getFilesFromDataTransfer(e.dataTransfer);
-            mod.importImageFilesToPendingList(files, { logPrefix: '[拖放图片]' });
+            var imageFiles = [];
+            var otherFiles = [];
+            files.forEach(function (f) {
+                if (f instanceof File && isLikelyImageFile(f)) {
+                    imageFiles.push(f);
+                } else {
+                    otherFiles.push(f);
+                }
+            });
+            if (imageFiles.length > 0) {
+                mod.importImageFilesToPendingList(imageFiles, { logPrefix: '[拖放图片]' });
+            }
+            if (otherFiles.length > 0) {
+                try {
+                    var parser = window.NekoAvatarDropParser;
+                    if (parser && typeof parser.parseFiles === 'function') {
+                        var result = await parser.parseFiles(otherFiles);
+                        var accepted = result && Array.isArray(result.accepted) ? result.accepted : [];
+                        var rejected = result && Array.isArray(result.rejected) ? result.rejected : [];
+                        if (accepted.length > 0 || rejected.length > 0) {
+                            await mod.sendAvatarDropPayload({
+                                items: accepted,
+                                targetType: 'chat',
+                                rejected: rejected
+                            });
+                        }
+                    }
+                } catch (error) {
+                    console.warn('[ChatDrop] non-image file parse failed:', error && error.message ? error.message : error);
+                }
+            }
         }, true);
 
         mod.ensureImportImageInput();
