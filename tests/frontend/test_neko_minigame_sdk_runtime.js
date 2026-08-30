@@ -197,6 +197,11 @@ async function main() {
           properties: { tag: { type: 'string', minLength: 1, maxLength: 4 } },
           required: ['tag'],
         },
+        'round-zero': {
+          type: 'object',
+          properties: { delta: { type: 'number', enum: [0, 5] } },
+          required: ['delta'],
+        },
         'round-extra': {
           type: 'object',
           properties: { round: { type: 'integer', minimum: 0, maximum: 99 } },
@@ -309,6 +314,24 @@ async function main() {
   catch (error) { tooLongTagError = error; }
   assert(tooLongTagError?.code === 'invalid_contract',
     'a string past its declared code-point maximum was accepted');
+
+  // JSON has one zero: `-0` serializes as `0` and is valid against an enum
+  // declaring `0`, but `Object.is(0, -0)` is false and rejected it. `Object.is`
+  // was only ever needed for NaN, and non-finite enum values are already refused
+  // at manifest time.
+  const emitsBeforeNegativeZero = protocolMessages.length;
+  await game.events.emit('round-zero', { delta: -0 });
+  assert(protocolMessages.length === emitsBeforeNegativeZero + 1,
+    'a payload -0 was rejected against an enum declaring 0');
+  assert(Object.is(protocolMessages.at(-1).envelope.payload.delta, -0)
+    || protocolMessages.at(-1).envelope.payload.delta === 0,
+  'the -0 payload was not carried through');
+  // A value genuinely outside the enum is still rejected.
+  let outsideEnumError = null;
+  try { await game.events.emit('round-zero', { delta: 7 }); }
+  catch (error) { outsideEnumError = error; }
+  assert(outsideEnumError?.code === 'invalid_contract',
+    'a value outside the declared enum was accepted');
 
   // `schema.properties` is a plain object, so an undeclared payload key named
   // after an Object.prototype member used to resolve to the inherited method --
@@ -1042,6 +1065,57 @@ async function main() {
   } catch (error) { coercedMaxEntriesError = error; }
   assert(coercedMaxEntriesError?.code === 'invalid_manifest',
     'a coerced leaderboard maxEntries was accepted instead of rejected');
+
+  // The schema requires an exact enum member for `type`, and its `id` pattern
+  // applies to the declared string. Trimming first turned `' string '` into a
+  // supported type, and remapped `' demo '` onto the registration and storage
+  // identity of the real `demo`.
+  let paddedTypeError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'padded-type-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      contracts: { events: { probe: { type: ' string ' } } },
+    }, { transport });
+  } catch (error) { paddedTypeError = error; }
+  assert(paddedTypeError?.code === 'invalid_manifest',
+    'a whitespace-padded contract type was trimmed into a supported one');
+  let paddedIdError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: ' padded-id-test ',
+      version: '1.0.0',
+      requiredCapabilities: ['logging'],
+    }, { transport });
+  } catch (error) { paddedIdError = error; }
+  assert(paddedIdError?.code === 'invalid_manifest',
+    'a whitespace-padded manifest id was trimmed onto another identity');
+
+  // Both enum definitions in the schema are `uniqueItems: true`.
+  let duplicateEnumError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'duplicate-enum-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      contracts: { events: { probe: { type: 'string', enum: ['a', 'b', 'a'] } } },
+    }, { transport });
+  } catch (error) { duplicateEnumError = error; }
+  assert(duplicateEnumError?.code === 'invalid_manifest',
+    'a duplicate contract enum value was silently de-duplicated');
+  // The shorthand form goes through the same normalizer.
+  let duplicateShorthandError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'duplicate-shorthand-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      contracts: { controls: { stance: ['ready', 'ready'] } },
+    }, { transport });
+  } catch (error) { duplicateShorthandError = error; }
+  assert(duplicateShorthandError?.code === 'invalid_manifest',
+    'a duplicate enum shorthand value was silently de-duplicated');
 
   // The schema applies its capability pattern to the string the manifest
   // actually declares, so `' logging '` is schema-invalid -- while trimming

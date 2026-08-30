@@ -31,6 +31,7 @@ function createTransport({ server = false, shared = null } = {}) {
   let storagePending = false;
   let storagePendingOperation = '';
   let storageGetFailure = null;
+  let storageSetFailure = null;
   let lockPending = false;
   let runtimeState = { sessionId: 'leaderboard-session', characterName: 'Yui' };
 
@@ -78,7 +79,12 @@ function createTransport({ server = false, shared = null } = {}) {
           ? { ok: true, found: true, value: values.get(payload.key) }
           : { ok: true, found: false });
       }
-      if (operation === 'set') values.set(payload.key, payload.value);
+      if (operation === 'set') {
+        // A transport that reports a failed write by RETURNING a non-OK
+        // response instead of throwing.
+        if (storageSetFailure) return Promise.resolve(storageSetFailure);
+        values.set(payload.key, payload.value);
+      }
       if (operation === 'delete') values.delete(payload.key);
       return Promise.resolve({ ok: true });
     },
@@ -141,6 +147,7 @@ function createTransport({ server = false, shared = null } = {}) {
     setStoragePending(value) { storagePending = value; },
     setStoragePendingOperation(value) { storagePendingOperation = String(value || ''); },
     setStorageGetFailure(value) { storageGetFailure = value; },
+    setStorageSetFailure(value) { storageSetFailure = value; },
     setLockPending(value) { lockPending = value; },
   };
 }
@@ -294,6 +301,32 @@ async function main() {
     }
     failHost.setStorageGetFailure(null);
     failGame.dispose();
+  }
+
+  // The dual of the read guard: a failed WRITE reported by return value used to
+  // resolve, and submit() then built its success result from the in-memory
+  // state -- telling the game its entry was retained and ranked while nothing
+  // had been persisted.
+  {
+    const writeFailHost = createTransport();
+    const writeFailGame = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+      transport: writeFailHost.transport,
+    });
+    await writeFailGame.leaderboard.local.submit('main', { score: 42, mode: 'duel' });
+    const storedBeforeWriteFailure = JSON.stringify(writeFailHost.values.get('leaderboards/main'));
+    writeFailHost.setStorageSetFailure({ ok: false, error: 'storage_unavailable' });
+    let writeFailureError = null;
+    try { await writeFailGame.leaderboard.local.submit('main', { score: 99, mode: 'duel' }); }
+    catch (error) { writeFailureError = error; }
+    assert(writeFailureError !== null,
+      'a failed leaderboard write was reported to the game as a retained entry');
+    assert(JSON.stringify(writeFailHost.values.get('leaderboards/main')) === storedBeforeWriteFailure,
+      'the failed write probe changed the stored board');
+    // Control: a successful write carrying an unrelated field must still succeed.
+    writeFailHost.setStorageSetFailure({ ok: true, error: 'x' });
+    await writeFailGame.leaderboard.local.submit('main', { score: 55, mode: 'duel' });
+    writeFailHost.setStorageSetFailure(null);
+    writeFailGame.dispose();
   }
 
   const bulkHost = createTransport();

@@ -284,8 +284,11 @@
         fail('invalid_manifest', `${fieldName} contains an unsupported schema keyword`, { key });
       }
     }
-    const type = String(input.type || '').trim();
-    if (!CONTRACT_SCHEMA_TYPES.includes(type)) {
+    // The ORIGINAL value, untrimmed: the schema requires an exact enum member,
+    // so `type: ' string '` is schema-invalid -- while trimming first silently
+    // turned it into a supported type.
+    const type = input.type;
+    if (typeof type !== 'string' || !CONTRACT_SCHEMA_TYPES.includes(type)) {
       fail('invalid_manifest', `${fieldName}.type is unsupported`, { type });
     }
     const schema = { type };
@@ -305,8 +308,13 @@
         if (!contractPayloadTypeMatches(value, type)) {
           fail('invalid_manifest', `${fieldName}.enum contains a value outside its declared type`);
         }
+        // Both schema definitions declare `uniqueItems: true`, so a duplicate
+        // is schema-invalid; silently dropping it connected with a rewritten
+        // contract. Same rule the capability lists now use.
         const key = `${typeof value}:${JSON.stringify(value)}`;
-        if (seen.has(key)) continue;
+        if (seen.has(key)) {
+          fail('invalid_manifest', `${fieldName}.enum contains a duplicate value`);
+        }
         seen.add(key);
         state.characters += String(value ?? '').length;
         values.push(value);
@@ -542,7 +550,10 @@
         fail('invalid_manifest', `manifest.${field} must be a string`, { field });
       }
     }
-    const id = String(manifest.id || '').trim();
+    // Untrimmed, like the capability names: the schema pattern applies to the
+    // declared string, and trimming silently remapped `' demo '` onto the
+    // registration and storage identity of the real `demo`.
+    const id = manifest.id === undefined ? '' : manifest.id;
     const version = String(manifest.version || '').trim();
     // Default only an ABSENT value. `manifest.protocolVersion || SDK_PROTOCOL_VERSION`
     // also swallowed every falsey supplied one -- `0` and `''` both became the
@@ -679,7 +690,12 @@
     if (!contractPayloadTypeMatches(value, schema.type)) {
       fail('invalid_contract', `${fieldName} must match the declared ${schema.type} schema`);
     }
-    if (schema.enum && !schema.enum.some((candidate) => Object.is(candidate, value))) {
+    // `===`, not `Object.is`: JSON has one zero, so a payload `-0` is valid
+    // against an enum declaring `0` and serializes identically -- while
+    // `Object.is(0, -0)` is false and rejected it. `Object.is` was only ever
+    // needed for NaN, and non-finite enum values are already refused at
+    // manifest time.
+    if (schema.enum && !schema.enum.some((candidate) => candidate === value)) {
       fail('invalid_contract', `${fieldName} is not one of the declared enum values`);
     }
     if (schema.type === 'null' || schema.type === 'boolean') return value;
@@ -3705,7 +3721,21 @@
           entries.pop();
         }
       }
-      await requestLocalLeaderboardStorage('set', boardId, { value: normalizedState }, requestOptions);
+      const writeResponse = await requestLocalLeaderboardStorage(
+        'set', boardId, { value: normalizedState }, requestOptions,
+      );
+      // The dual of the read guard: a transport that reports a failed `set` by
+      // RETURNING a non-OK response instead of throwing used to resolve here,
+      // and submit() then built its success result from the in-memory state --
+      // telling the game its entry was retained and ranked while nothing had
+      // been persisted.
+      if (writeResponse.ok === false || writeResponse.data?.ok === false) {
+        fail('request_failed', 'The local leaderboard could not be written', {
+          operation: 'leaderboard.local.write',
+          boardId,
+          status: writeResponse.status,
+        });
+      }
       return normalizeStoredLeaderboardState(normalizedState, state.definition);
     }
 
