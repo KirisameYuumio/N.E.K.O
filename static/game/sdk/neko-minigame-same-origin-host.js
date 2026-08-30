@@ -98,6 +98,16 @@
     'reason',
   ]);
   const ROUTE_END_POSTGAME_FIELDS = Object.freeze(['ok', 'action', 'reason', 'mode']);
+  // The one thing a launch registration actually gates that same-origin script
+  // cannot reach some other way: the host-supplied capability provider closures.
+  // Namespaced storage keys and /api/game/<type>/... routes are reachable by any
+  // same-origin script regardless, and the adapter deliberately accepts a
+  // caller-supplied windowImpl/fetchImpl, so it was never an isolation boundary.
+  // Keeping the closures off a public `_`-prefixed property at least means they
+  // require a completed connectGame() and a granted capability rather than a
+  // bare read off a freshly constructed host.
+  const HOST_CAPABILITY_PROVIDERS = new WeakMap();
+
   const TRUSTED_PAYLOAD_MAX_DEPTH = 24;
   const TRUSTED_PAYLOAD_MAX_NODES = 4096;
   const TRUSTED_PAYLOAD_OMIT = Symbol('trusted-payload-omit');
@@ -301,11 +311,11 @@
       const capabilityProviders = options.capabilityProviders && typeof options.capabilityProviders === 'object'
         ? options.capabilityProviders
         : {};
-      this._capabilityProviders = Object.freeze({
+      HOST_CAPABILITY_PROVIDERS.set(this, Object.freeze({
         quickLines: typeof capabilityProviders.quickLines === 'function'
           ? capabilityProviders.quickLines
           : null,
-      });
+      }));
       this._disposed = false;
       this._memoryConsentEnabled = false;
       this._controlBridge = {
@@ -466,7 +476,7 @@
       const locallyAvailable = new Set([
         'runtime',
         'dialogue',
-        ...(this._capabilityProviders.quickLines ? ['quick-lines'] : []),
+        ...(HOST_CAPABILITY_PROVIDERS.get(this)?.quickLines ? ['quick-lines'] : []),
         'logging',
         'voice-input',
         'speech-output',
@@ -996,14 +1006,15 @@
           { operation: 'quick_lines' },
         ));
       }
-      if (!this._capabilityProviders.quickLines) {
+      const providers = HOST_CAPABILITY_PROVIDERS.get(this);
+      if (!providers?.quickLines) {
         return Promise.reject(this._hostError(
           'capability_unavailable',
           'The host did not register a quick-lines provider for this game',
           { operation: 'quick_lines' },
         ));
       }
-      return Promise.resolve(this._capabilityProviders.quickLines(
+      return Promise.resolve(providers.quickLines(
         this._trustedRuntimePayload(payload),
         options,
         Object.freeze({

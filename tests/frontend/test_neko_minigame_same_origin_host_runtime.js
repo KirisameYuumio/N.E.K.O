@@ -1061,6 +1061,13 @@ async function main() {
     'end() dropped fields the game legitimately needs');
 
   const rawEndResponse = RAW_END_RESPONSE;
+  // The host-supplied provider closures are the one thing a launch registration
+  // actually gates that same-origin script cannot obtain some other way, so they
+  // must not be readable off a freshly constructed host without a completed
+  // handshake and a granted capability.
+  assert(host._capabilityProviders === undefined,
+    'capability provider closures were exposed on a public host property');
+
   const grantedProjection = host._projectRouteEndResponse(rawEndResponse);
   for (const field of LEAKY_ARCHIVE_FIELDS) {
     assert(!(field in grantedProjection.archive),
