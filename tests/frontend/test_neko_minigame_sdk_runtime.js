@@ -998,7 +998,9 @@ async function main() {
     'a non-string capability entry was coerced instead of rejected');
   // An explicitly supplied falsey protocolVersion must not be replaced by the
   // default: `|| SDK_PROTOCOL_VERSION` swallowed both `0` and `''`.
-  for (const badProtocol of [0, '', '   ']) {
+  // `' 1 '` included: the schema pins this with `const: "1"`, so a padded value
+  // is schema-invalid -- and trimming first turned it into the supported version.
+  for (const badProtocol of [0, '', '   ', ' 1 ', '1 ']) {
     let badProtocolError = null;
     try {
       await window.NekoMiniGame.connect({

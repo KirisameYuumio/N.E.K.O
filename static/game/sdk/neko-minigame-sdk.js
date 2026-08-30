@@ -580,9 +580,12 @@
     // disagreeing with the schema's `const: "1"`. (`0` is now rejected one line
     // above by the type check; `''` reaches here as a string and must fail the
     // identity check below rather than be replaced.)
+    // Untrimmed, like `id` and the contract `type`: the schema pins this with
+    // `const: "1"`, so `' 1 '` is schema-invalid -- and trimming first turned it
+    // into the supported version. Only an ABSENT value defaults.
     const protocolVersion = manifest.protocolVersion === undefined
       ? SDK_PROTOCOL_VERSION
-      : manifest.protocolVersion.trim();
+      : manifest.protocolVersion;
     if (!/^[a-z][a-z0-9-]{0,63}$/.test(id)) {
       fail('invalid_manifest', 'manifest.id must be a lowercase game identifier');
     }
