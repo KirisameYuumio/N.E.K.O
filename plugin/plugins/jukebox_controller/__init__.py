@@ -37,6 +37,32 @@ def _volume_argument_error(action: str, value: Any) -> str | None:
 class JukeboxControllerPlugin(NekoPluginBase):
     name = "jukebox_controller"
 
+    def _resolve_target_lanlan(self, kwargs: dict[str, Any]) -> str | None:
+        """Resolve which character this command belongs to.
+
+        ``ctx._current_lanlan`` lives on the shared plugin context, so two
+        triggers running as separate tasks can overwrite each other's value.
+        Each invocation carries its own ``_ctx``; prefer that. Mirrors
+        ``music_pusher._resolve_target_lanlan``, minus the env/config
+        fallbacks -- an unscoped jukebox command is dropped by the backend on
+        purpose, so guessing a character here would be worse than failing.
+        """
+        explicit = kwargs.get("target_lanlan")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+
+        ctx_obj = kwargs.get("_ctx")
+        if isinstance(ctx_obj, dict):
+            lanlan_name = ctx_obj.get("lanlan_name")
+            if isinstance(lanlan_name, str) and lanlan_name.strip():
+                return lanlan_name.strip()
+
+        current_lanlan = getattr(getattr(self, "ctx", None), "_current_lanlan", None)
+        if isinstance(current_lanlan, str) and current_lanlan.strip():
+            return current_lanlan.strip()
+
+        return None
+
     @plugin_entry(
         id="control_jukebox",
         name="控制点歌台",
@@ -104,11 +130,7 @@ class JukeboxControllerPlugin(NekoPluginBase):
                 "INVALID_ARGUMENT: set_mode requires one of "
                 + ", ".join(sorted(_VALID_MODES))
             ))
-        target_lanlan = kwargs.get("target_lanlan")
-        if not (isinstance(target_lanlan, str) and target_lanlan.strip()):
-            context_lanlan = getattr(getattr(self, "ctx", None), "_current_lanlan", None)
-            target_lanlan = context_lanlan if isinstance(context_lanlan, str) else None
-        clean_target_lanlan = target_lanlan.strip() if isinstance(target_lanlan, str) else ""
+        clean_target_lanlan = self._resolve_target_lanlan(kwargs) or ""
         self.ctx.push_message(
             source="jukebox_controller",
             description=f"Jukebox control: {normalized}",

@@ -1067,6 +1067,10 @@ Object.assign(window.Jukebox, {
 
     try {
       await Jukebox.playAudio(song);
+      // 音频此刻已经在响了。isPlaying 必须立刻为真：stopAudio 的 player.pause()
+      // 挂在这个标志上，等到 playSong 末尾再置的话，动画加载期间来的 stop 会
+      // 停不掉声音，还报成功。
+      Jukebox.State.isPlaying = true;
 
       if (requestId !== Jukebox.State.playRequestId) {
         console.log('[Jukebox] 播放请求已被新请求取代，取消状态更新');

@@ -417,3 +417,45 @@ def test_jukebox_plugin_rejects_incomplete_action_arguments():
         result = asyncio.run(plugin.control_jukebox(action=action, **kwargs))
         assert not isinstance(result, Err), (action, kwargs)
     assert len(pushed) == len(accepted)
+
+
+def test_jukebox_plugin_scopes_command_to_the_invoking_context():
+    """Codex P1: ctx._current_lanlan is shared across concurrent triggers.
+
+    Each invocation carries its own ``_ctx``; that must win over the value
+    another trigger may have left on the shared plugin context.
+    """
+    from plugin.plugins.jukebox_controller import JukeboxControllerPlugin
+
+    plugin = JukeboxControllerPlugin.__new__(JukeboxControllerPlugin)
+    pushed = []
+    # 另一条并发触发把共享上下文改成了别的角色。
+    plugin.ctx = types.SimpleNamespace(
+        push_message=lambda **kwargs: pushed.append(kwargs),
+        _current_lanlan="dog",
+    )
+
+    asyncio.run(
+        plugin.control_jukebox(action="next", _ctx={"lanlan_name": "cat"})
+    )
+    assert pushed[-1]["target_lanlan"] == "cat"
+
+    # 显式 target_lanlan 优先级最高。
+    asyncio.run(
+        plugin.control_jukebox(
+            action="next", target_lanlan="  fox  ", _ctx={"lanlan_name": "cat"}
+        )
+    )
+    assert pushed[-1]["target_lanlan"] == "fox"
+
+    # 没有 _ctx 时才回落到共享上下文。
+    asyncio.run(plugin.control_jukebox(action="next"))
+    assert pushed[-1]["target_lanlan"] == "dog"
+
+    # 什么都没有就不猜：后端会丢掉无归属的点歌台指令。
+    plugin.ctx = types.SimpleNamespace(
+        push_message=lambda **kwargs: pushed.append(kwargs),
+        _current_lanlan=None,
+    )
+    asyncio.run(plugin.control_jukebox(action="next"))
+    assert pushed[-1]["target_lanlan"] is None

@@ -4006,3 +4006,62 @@ def test_jukebox_loader_control_entrypoints_cancel_pending_unload(mock_page: Pag
         "pendingBeforeRuntime": True,
         "pendingAfterRuntime": False,
     }
+
+
+@pytest.mark.frontend
+def test_jukebox_stop_during_animation_load_actually_stops_audio(mock_page: Page):
+    """Codex P2: stopAudio's player.pause() hangs off State.isPlaying.
+
+    A stop arriving while the animation is still loading used to leave the
+    audio running and still report success.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          let releaseAnimation;
+          J.getModelType = () => 'vrm';
+          J.getActionAvailability = async () => ({
+            ok: true,
+            status: 'action_ready',
+            action: { id: 'act', name: 'Dance', file: 'actions/a.vrma' },
+            url: '/api/jukebox/file/actions/a.vrma'
+          });
+          window.vrmManager = {
+            playVRMAAnimation: () => new Promise((resolve) => { releaseAnimation = () => resolve(true); }),
+            stopVRMAAnimation: () => {}
+          };
+
+          const playing = J.playSong('song1');
+          while (typeof releaseAnimation !== 'function') {
+            await new Promise(resolve => setTimeout(resolve, 0));
+          }
+
+          // 音频已经在放，动画还在加载 —— 这时候来一条 stop。
+          const player = J.getPlayer();
+          const pausedBeforeStop = player.audio.paused;
+          const stopped = await J.executeControl({ action: 'stop', headless: true });
+          const pausedAfterStop = player.audio.paused;
+
+          releaseAnimation();
+          await playing;
+
+          return {
+            stopOk: stopped.ok,
+            pausedBeforeStop,
+            pausedAfterStop,
+            isPlaying: J.State.isPlaying
+          };
+        }
+        """
+    )
+
+    assert result["stopOk"] is True
+    assert result["pausedBeforeStop"] is False
+    # ok:true 必须名副其实：声音真的停了。
+    assert result["pausedAfterStop"] is True
+    assert result["isPlaying"] is False
