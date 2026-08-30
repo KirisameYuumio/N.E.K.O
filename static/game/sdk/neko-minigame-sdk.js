@@ -207,7 +207,10 @@
   }
 
   function normalizeCapabilities(value, fieldName) {
-    if (value == null) return [];
+    // Only an ABSENT list defaults. The schema types both capability lists as
+    // arrays, so an explicit `null` is schema-invalid -- swallowing it let a
+    // manifest the schema rejects connect as though nothing was declared.
+    if (value === undefined) return [];
     if (!Array.isArray(value)) {
       fail('invalid_manifest', `${fieldName} must be an array`);
     }
@@ -372,7 +375,9 @@
       schema.items = normalizeContractSchema(input.items, `${fieldName}.items`, state, depth + 1);
     }
     if (type === 'object') {
-      const propertiesInput = input.properties ?? {};
+      // Same rule as manifest.contracts: only ABSENT defaults. The schema
+      // types `properties` as an object, so `null` must not become `{}`.
+      const propertiesInput = input.properties === undefined ? {} : input.properties;
       if (!plainObject(propertiesInput)) {
         fail('invalid_manifest', `${fieldName}.properties must be an object`);
       }
@@ -399,7 +404,7 @@
           depth + 1,
         );
       }
-      const requiredInput = input.required ?? [];
+      const requiredInput = input.required === undefined ? [] : input.required;
       if (!Array.isArray(requiredInput) || requiredInput.length > entries.length) {
         fail('invalid_manifest', `${fieldName}.required must be an array of declared property names`);
       }
@@ -451,7 +456,7 @@
     const state = { nodes: 0, characters: 0 };
     const contracts = {};
     for (const kind of CONTRACT_KINDS) {
-      const declarations = input[kind] ?? {};
+      const declarations = input[kind] === undefined ? {} : input[kind];
       if (!plainObject(declarations)) {
         fail('invalid_manifest', `manifest.contracts.${kind} must be an object`);
       }
@@ -2434,9 +2439,20 @@
       if (signal?.aborted) {
         fail('cancelled', 'The runtime end request was cancelled', { operation: 'runtime.end' });
       }
+      // The caller's deadline has to cover this wait too. A built-in start can
+      // spend many seconds building pregame context, and observing only the
+      // abort signal here meant `timeoutMs` described a request that had not
+      // been issued yet -- end() blocked for the whole start and only THEN
+      // began counting.
+      const budgetMs = requestOptions?.timeoutMs === undefined
+        ? null
+        : normalizedRequestTimeout(requestOptions.timeoutMs, 'timeoutMs');
+      const setTimer = windowImpl.setTimeout?.bind(windowImpl) || globalThis.setTimeout;
+      const clearTimer = windowImpl.clearTimeout?.bind(windowImpl) || globalThis.clearTimeout;
       let abortHandler = null;
+      let timeoutId = null;
       try {
-        await Promise.race([
+        const racers = [
           settlement.promise,
           new Promise((_, reject) => {
             if (!signal?.addEventListener) return;
@@ -2447,8 +2463,21 @@
             ));
             signal.addEventListener('abort', abortHandler, { once: true });
           }),
-        ]);
+        ];
+        if (budgetMs !== null) {
+          racers.push(new Promise((_, reject) => {
+            timeoutId = setTimer(() => reject(new NekoMiniGameError(
+              'timeout',
+              'The runtime end request timed out waiting for start to settle',
+              { operation: 'runtime.end' },
+            )), budgetMs);
+          }));
+        }
+        await Promise.race(racers);
       } finally {
+        if (timeoutId !== null) {
+          try { clearTimer(timeoutId); } catch (_) { /* already cleared */ }
+        }
         signal?.removeEventListener?.('abort', abortHandler);
       }
     }
@@ -2734,7 +2763,13 @@
 
     function beginSpeechCorrelation(metadata) {
       speechCorrelationSequence = (speechCorrelationSequence % Number.MAX_SAFE_INTEGER) + 1;
-      const correlationId = `sdk-speech-${Date.now().toString(36)}-${speechCorrelationSequence.toString(36)}`;
+      // Every SDK client starts this sequence at 1, so two clients on the same
+      // host route speaking in the same millisecond minted the SAME id -- and
+      // both resolve playback state from the shared bridge through their own
+      // correlation maps, so each would attribute the first utterance's state
+      // to its own request. Same entropy as the route generation.
+      const correlationId = `sdk-speech-${Date.now().toString(36)}`
+        + `-${speechCorrelationSequence.toString(36)}-${runtimeRouteInstanceEntropy()}`;
       speechCorrelationMetadata.set(correlationId, Object.freeze({ ...(metadata || {}) }));
       while (speechCorrelationMetadata.size > MAX_SPEECH_REQUEST_METADATA) {
         const oldestKey = speechCorrelationMetadata.keys().next().value;
@@ -3427,24 +3462,38 @@
       },
       async end(payload = {}, requestOptions = {}) {
         requireCapability('runtime', 'runtime.end');
+        let endRequestOptions = requestOptions;
         if (runtimePhase === 'starting' && runtimeStartSettlement) {
           if (runtimeEndWaitingForStart) {
             fail('busy', 'The runtime lifecycle is already waiting to end');
           }
           runtimeEndWaitingForStart = true;
+          const waitStartedAt = Date.now();
           try {
             await waitForRuntimeStartSettlement(requestOptions);
           } finally {
             runtimeEndWaitingForStart = false;
           }
           ensureActive('runtime.end');
+          // Charge the wait to the same budget, so the whole end() honours the
+          // advertised deadline instead of spending it twice.
+          if (requestOptions?.timeoutMs !== undefined) {
+            const budgetMs = normalizedRequestTimeout(requestOptions.timeoutMs, 'timeoutMs');
+            const remainingMs = budgetMs - (Date.now() - waitStartedAt);
+            if (remainingMs < MIN_CONNECT_TIMEOUT_MS) {
+              fail('timeout', 'The runtime end request timed out waiting for start to settle', {
+                operation: 'runtime.end',
+              });
+            }
+            endRequestOptions = { ...requestOptions, timeoutMs: remainingMs };
+          }
         }
         if (runtimePhase === 'ending') {
           fail('busy', 'The runtime lifecycle is already ending');
         }
         stopRuntimeMonitoring();
         stopRuntimeOperation();
-        const operation = beginRuntimeOperation('end', requestOptions);
+        const operation = beginRuntimeOperation('end', endRequestOptions);
         setRuntimePhase('ending', 'end-request');
         const recoverEndFailure = (reason) => {
           if (!isRuntimeOperationCurrent(operation)) return;

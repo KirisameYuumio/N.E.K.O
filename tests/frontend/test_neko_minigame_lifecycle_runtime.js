@@ -1161,6 +1161,123 @@ async function main() {
   });
   monitoringGame.dispose();
 
+  // runtime.end(..., { timeoutMs }) used to observe only the caller's abort
+  // signal while start was still pending, so a built-in start that spends many
+  // seconds building pregame context made the advertised deadline describe a
+  // request that had not been issued yet.
+  const pendingStartEnvironment = createEnvironment();
+  const pendingStartTransport = {
+    ...transport,
+    logger: logger(),
+    resetRuntime() { return { sessionId: 'pending-start-session', characterName: '' }; },
+    getRuntimeState() { return { sessionId: 'pending-start-session', characterName: '' }; },
+    applyRuntimeState() { return { sessionId: 'pending-start-session', characterName: '' }; },
+    start() { return new Promise(() => {}); },
+    async heartbeat() { return { ok: true, active: true }; },
+    async drain() { return { ok: true, outputs: [] }; },
+    async end() { return { ok: true }; },
+    dispose() {},
+  };
+  const pendingStartGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-pending-start-end',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: pendingStartTransport,
+    windowImpl: pendingStartEnvironment.windowImpl,
+    documentImpl: pendingStartEnvironment.documentImpl,
+  });
+  pendingStartGame.runtime.configure({ heartbeat: false, outputs: false, pageExit: false });
+  const neverSettlingStart = pendingStartGame.runtime.start({});
+  void neverSettlingStart.then(() => {}, () => {});
+  for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+  let pendingEndError = null;
+  let pendingEndSettled = false;
+  const pendingEnd = pendingStartGame.runtime.end({}, { timeoutMs: 1000 });
+  void pendingEnd.then(
+    () => { pendingEndSettled = true; },
+    (error) => { pendingEndSettled = true; pendingEndError = error; },
+  );
+  for (let round = 0; round < 40 && !pendingEndSettled; round += 1) {
+    for (let tick = 0; tick < 5; tick += 1) await Promise.resolve();
+    for (const [timerId, timer] of Array.from(pendingStartEnvironment.timeouts.entries())) {
+      if (timer.delayMs !== 1000) continue;
+      pendingStartEnvironment.timeouts.delete(timerId);
+      timer.handler();
+    }
+  }
+  // Asserted BEFORE awaiting: without the deadline nothing ever settles this,
+  // and with only mock timers pending Node drains its event loop and exits 0 --
+  // a hang that reads as a pass.
+  assert(pendingEndSettled,
+    'runtime.end ignored its timeout while the start it waits on stayed pending');
+  await pendingEnd.catch(() => {});
+  assert(pendingEndError?.code === 'timeout',
+    'the start-settlement wait did not fail with the end request timeout');
+  assert(pendingStartEnvironment.timeouts.size === 0,
+    'the start-settlement deadline timer was left armed');
+  pendingStartGame.dispose();
+
+  // ...and a start that DOES settle is charged to the same budget, so the whole
+  // end() honours the advertised deadline instead of spending it twice.
+  const budgetEnvironment = createEnvironment();
+  const budgetEndOptions = [];
+  let releaseBudgetStart = null;
+  const budgetTransport = {
+    ...transport,
+    logger: logger(),
+    resetRuntime() { return { sessionId: 'budget-session', characterName: '' }; },
+    getRuntimeState() { return { sessionId: 'budget-session', characterName: '' }; },
+    applyRuntimeState() { return { sessionId: 'budget-session', characterName: '' }; },
+    start(payload) {
+      return new Promise((resolve) => {
+        releaseBudgetStart = () => resolve({
+          ok: true,
+          state: { game_route_active: true, lanlan_name: 'Yui' },
+          payload,
+        });
+      });
+    },
+    async heartbeat() { return { ok: true, active: true }; },
+    async drain() { return { ok: true, outputs: [] }; },
+    async end(payload, options) {
+      budgetEndOptions.push(options);
+      return { ok: true };
+    },
+    dispose() {},
+  };
+  const budgetRealDateNow = Date.now;
+  let budgetFakeNow = 1700000000000;
+  try {
+    Date.now = () => budgetFakeNow;
+    const budgetGame = await window.NekoMiniGame.connect({
+      id: 'lifecycle-end-budget',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+    }, {
+      transport: budgetTransport,
+      windowImpl: budgetEnvironment.windowImpl,
+      documentImpl: budgetEnvironment.documentImpl,
+    });
+    budgetGame.runtime.configure({ heartbeat: false, outputs: false, pageExit: false });
+    const budgetStart = budgetGame.runtime.start({});
+    void budgetStart.then(() => {}, () => {});
+    for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+    const budgetEnd = budgetGame.runtime.end({}, { timeoutMs: 1000 });
+    for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+    budgetFakeNow += 600;
+    releaseBudgetStart();
+    await budgetStart;
+    await budgetEnd;
+    assert(budgetEndOptions.length === 1,
+      'the end request was not issued after the pending start settled');
+    assert(budgetEndOptions[0].timeoutMs === 400,
+      'the start-settlement wait was not charged to the end request timeout budget');
+    budgetGame.dispose();
+  } finally {
+    Date.now = budgetRealDateNow;
+  }
+
   process.stdout.write('mini-game lifecycle runtime test passed\n');
 }
 

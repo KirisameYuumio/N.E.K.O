@@ -176,7 +176,13 @@
         // dropped silently. Retry on the same 100ms cadence the bootstrap itself
         // uses while it waits for lanlan_name, and stop as soon as the credential
         // lands, the route goes away, or we run out of attempts.
-        if (credentialResyncTimer !== null) return;
+        // Restart rather than bail: the retry chain now outlives its own
+        // outbound request, so an early return would let a stale chain from a
+        // PREVIOUS route swallow the request for the one that just opened.
+        if (credentialResyncTimer !== null) {
+            clearTimeout(credentialResyncTimer);
+            credentialResyncTimer = null;
+        }
         credentialResyncAttempts = 0;
         var attempt = function () {
             credentialResyncTimer = null;
@@ -186,7 +192,9 @@
             // site would be an inert guard.
             if (S.gameVoiceControlCredential) return;
             if (S.gameRouteActive !== true) return;
+            credentialResyncAttempts += 1;
             var bridge = window.appWebSocket;
+            var sent = false;
             if (bridge && typeof bridge.isOpen === 'function' && bridge.isOpen()) {
                 bridge.send({
                     action: 'game_route_credential_resync',
@@ -194,11 +202,18 @@
                     session_id: String(S.gameRouteSessionId || ''),
                     sdk_route_instance_id: String(S.gameRouteInstanceId || '')
                 });
-                return;
+                sent = true;
             }
-            credentialResyncAttempts += 1;
+            // A request that went out is not a credential that came back: the
+            // server can fail to push it (send error, route re-checked away),
+            // and it records the request as served only AFTER a successful
+            // push -- so a later attempt is still accepted. Returning here left
+            // a reloaded host without voice control until the socket
+            // reconnected. Keep retrying until the credential lands, the route
+            // goes away, or the attempt budget runs out; the slower cadence
+            // after a send is to let the round trip finish first.
             if (credentialResyncAttempts >= CREDENTIAL_RESYNC_MAX_ATTEMPTS) return;
-            credentialResyncTimer = setTimeout(attempt, 100);
+            credentialResyncTimer = setTimeout(attempt, sent ? 1000 : 100);
         };
         attempt();
     }

@@ -481,6 +481,42 @@ async function main() {
   ).length === 1, 'the credential request never retried after the socket opened');
   appState.gameVoiceControlCredential = 'voice-credential';
 
+  // A request that went out is not a credential that came back: the server can
+  // fail to push it, and it records the request as served only AFTER a
+  // successful push -- so a later attempt is still accepted. Stopping at the
+  // first outbound request left a reloaded host without voice control until the
+  // websocket reconnected.
+  sentWsMessages.length = 0;
+  appState.gameVoiceControlCredential = '';
+  socketOpen = true;
+  routeWindowListener({ detail: {
+    action: 'opened',
+    gameType: 'soccer',
+    sessionId: 'soccer-runtime',
+    routeInstanceId: 'route-instance-unanswered',
+  } });
+  await flush();
+  const firstUnansweredRequests = sentWsMessages.filter(
+    (message) => message && message.action === 'game_route_credential_resync',
+  ).length;
+  assert(firstUnansweredRequests === 1,
+    'the first credential request was not sent into an open socket');
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  await flush();
+  assert(sentWsMessages.filter(
+    (message) => message && message.action === 'game_route_credential_resync',
+  ).length > firstUnansweredRequests,
+  'a credential request the server never answered was never retried');
+  // Control: once the credential lands the chain must stop, otherwise the
+  // assertion above is satisfied by a loop that simply never terminates.
+  appState.gameVoiceControlCredential = 'voice-credential';
+  sentWsMessages.length = 0;
+  await new Promise((resolve) => setTimeout(resolve, 1200));
+  await flush();
+  assert(sentWsMessages.filter(
+    (message) => message && message.action === 'game_route_credential_resync',
+  ).length === 0, 'the credential retry chain kept asking after the credential arrived');
+
   // A retry that is still pending when the route ends must not fire: by then
   // there is no route to ask about, and the answer would name an identity the
   // page no longer holds.

@@ -627,6 +627,38 @@ async function main() {
   assert(mirrorlessRequiredError?.code === 'capability_unavailable',
     'a required speech-output grant survived a transport that cannot mirror');
 
+  // Two SDK clients on the same host route both start their correlation
+  // sequence at 1, so in the same millisecond they minted the SAME id -- and
+  // both resolve playback state from the shared bridge through their own
+  // correlation maps. Fresh clients, so both sequences really are at 1.
+  pendingMode = false;
+  ignoreSpeechAbortMode = false;
+  ignorePreloadAbortMode = false;
+  malformedResponseId = false;
+  stateBeforeResponseMode = false;
+  speechCalls.length = 0;
+  const correlationPeers = [];
+  for (let peer = 0; peer < 2; peer += 1) {
+    const peerGame = await window.NekoMiniGame.connect({
+      id: 'speech-correlation-peer',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging', 'speech-output'],
+    }, { transport, windowImpl: windowMock, documentImpl: {} });
+    await peerGame.speech.speak({ text: `peer ${peer}` });
+    correlationPeers.push(speechCalls.at(-1).payload.sdk_speech_correlation_id);
+    peerGame.dispose();
+  }
+  const correlationParts = correlationPeers.map((id) => String(id).split('-'));
+  assert(correlationParts.every((parts) => parts.length >= 5 && !!parts[4]),
+    'the speech correlation id carries no per-client entropy segment');
+  // The sequence segment is asserted EQUAL on purpose: it proves the two ids
+  // cannot have been separated by the counter, so the entropy segment is what
+  // is actually being tested.
+  assert(correlationParts[0][3] === correlationParts[1][3],
+    'the correlation probe did not use two fresh clients');
+  assert(correlationParts[0][4] !== correlationParts[1][4],
+    'two SDK clients minted the same speech correlation entropy');
+
   process.stdout.write('mini-game speech output runtime test passed\n');
 }
 

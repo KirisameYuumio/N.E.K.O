@@ -1085,6 +1085,80 @@ async function main() {
       `an explicit null ${field} was treated as absent`);
   }
 
+  // Same family, four more sites that still defaulted on an explicit null.
+  // The schema types both capability lists as arrays, each contract KIND as an
+  // object, and `properties` / `required` inside an object contract as object
+  // and array -- none of them accept null.
+  for (const field of ['requiredCapabilities', 'optionalCapabilities']) {
+    let nullCapabilityError = null;
+    try {
+      await window.NekoMiniGame.connect({
+        id: 'null-capability-test',
+        version: '1.0.0',
+        requiredCapabilities: ['logging'],
+        [field]: null,
+      }, { transport });
+    } catch (error) { nullCapabilityError = error; }
+    assert(nullCapabilityError?.code === 'invalid_manifest',
+      `an explicit null ${field} was treated as absent`);
+  }
+  let nullContractKindError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'null-kind-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      contracts: { events: null },
+    }, { transport });
+  } catch (error) { nullContractKindError = error; }
+  assert(nullContractKindError?.code === 'invalid_manifest',
+    'an explicit null contract kind was treated as absent');
+  // `properties: null` must be tested WITHOUT `required`: with a `required`
+  // list present the manifest is rejected anyway because the named field is
+  // not declared, which satisfies the assertion for the wrong reason (this
+  // exact shape survived its mutation before the split).
+  let nullPropertiesError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'null-properties-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      contracts: { events: { 'null-props': { type: 'object', properties: null } } },
+    }, { transport });
+  } catch (error) { nullPropertiesError = error; }
+  assert(nullPropertiesError?.code === 'invalid_manifest',
+    'an explicit null contract properties was treated as absent');
+  let nullRequiredError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'null-required-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      contracts: {
+        events: {
+          'null-required': {
+            type: 'object',
+            properties: { round: { type: 'integer', minimum: 1, maximum: 99 } },
+            required: null,
+          },
+        },
+      },
+    }, { transport });
+  } catch (error) { nullRequiredError = error; }
+  assert(nullRequiredError?.code === 'invalid_manifest',
+    'an explicit null contract required was treated as absent');
+  // Control: the same manifest with those fields ABSENT must still connect,
+  // otherwise the four assertions above are satisfied by an implementation
+  // that simply stopped accepting object contracts at all.
+  const absentFieldClient = await window.NekoMiniGame.connect({
+    id: 'absent-contract-field-test',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+    contracts: { events: { 'no-fields': { type: 'object' } } },
+  }, { transport });
+  assert(!!absentFieldClient, 'absent contract properties/required stopped connecting');
+  await absentFieldClient.disconnect?.();
+
   // The schema bounds enum SHORTHAND items at maxLength 4096; the expanded
   // `enum` form carries no such bound, so converting first dropped it.
   let longShorthandError = null;
