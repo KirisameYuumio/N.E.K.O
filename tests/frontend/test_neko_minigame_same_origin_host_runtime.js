@@ -1557,6 +1557,27 @@ async function main() {
     for (let index = 0; index < 255; index += 1) {
       sharedStorage.setItem(`${quotaPrefix}seed-${index}`, '"x"');
     }
+    // Instrumented only AFTER seeding: from here on, every namespace scan and
+    // every commit must be observed with the namespace lock held. Asserting
+    // that `locks.request` was called is not enough -- an implementation that
+    // scanned and wrote first and only then requested an empty lock would
+    // satisfy that, and localStorage here is synchronous so nothing else would
+    // notice.
+    const observedOutsideLock = [];
+    let scannedInsideLock = 0;
+    let wroteInsideLock = 0;
+    const rawSetItem = sharedStorage.setItem.bind(sharedStorage);
+    const rawKey = sharedStorage.key.bind(sharedStorage);
+    sharedStorage.setItem = (key, value) => {
+      if (insideNamespaceLock) wroteInsideLock += 1;
+      else observedOutsideLock.push(`setItem:${key}`);
+      return rawSetItem(key, value);
+    };
+    sharedStorage.key = (index) => {
+      if (insideNamespaceLock) scannedInsideLock += 1;
+      else observedOutsideLock.push(`key:${index}`);
+      return rawKey(index);
+    };
     const quotaResults = await Promise.allSettled([
       Promise.resolve().then(() => quotaPeers[0].requestGameStorage(
         'set', { key: 'peer-a', value: 'a' },
@@ -1572,9 +1593,12 @@ async function main() {
         quotaResults.map((entry) => entry.status).join(',')}`);
     assert(quotaRejected[0].reason?.code === 'quota_exceeded',
       'the losing concurrent write failed for a reason other than the quota');
+    // rawKey, not the instrumented wrapper: this loop is the test counting for
+    // itself, and routing it through the probe would report the harness as an
+    // out-of-lock namespace scan.
     let quotaKeyCount = 0;
     for (let index = 0; index < sharedStorage.length; index += 1) {
-      if (String(sharedStorage.key(index) || '').startsWith(quotaPrefix)) quotaKeyCount += 1;
+      if (String(rawKey(index) || '').startsWith(quotaPrefix)) quotaKeyCount += 1;
     }
     assert(quotaKeyCount === 256,
       `the namespace ended up with ${quotaKeyCount} keys past its 256 bound`);
@@ -1589,6 +1613,15 @@ async function main() {
       `storage writes did not take the namespace lock: ${JSON.stringify(lockCalls)}`);
     assert(!sawConcurrentCriticalSections,
       'two storage critical sections were open at the same time');
+    assert(observedOutsideLock.length === 0,
+      `the quota scan or the commit ran outside the namespace lock: ${
+        JSON.stringify(observedOutsideLock.slice(0, 8))}`);
+    // The probe really did touch storage, so the assertion above cannot pass
+    // by observing nothing at all.
+    assert(scannedInsideLock > 0 && wroteInsideLock > 0,
+      `the probe observed no scan/commit at all: scans=${scannedInsideLock} writes=${wroteInsideLock}`);
+    sharedStorage.setItem = rawSetItem;
+    sharedStorage.key = rawKey;
     for (const peer of quotaPeers) peer.dispose();
   }
 

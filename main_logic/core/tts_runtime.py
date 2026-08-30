@@ -1641,7 +1641,12 @@ class TtsRuntimeMixin:
     async def send_speech(self, tts_audio, speech_id: Optional[str] = None):
         """Send speech data to the frontend, sending the speech_id header first for precise interruption control"""
         try:
-            if self.websocket and hasattr(self.websocket, 'client_state') and self.websocket.client_state == self.websocket.client_state.CONNECTED:
+            # Pinned once. The lock keeps other SENDERS out, but ``self.websocket``
+            # is reassigned by reconnect/teardown, which are not senders and do not
+            # take it -- so re-reading the attribute per await could put the header
+            # on the retired socket and its payload on the replacement.
+            websocket = self.websocket
+            if websocket and hasattr(websocket, 'client_state') and websocket.client_state == websocket.client_state.CONNECTED:
                 effective_speech_id = speech_id if speech_id is not None else self.current_speech_id
                 header = {
                     "type": "audio_chunk",
@@ -1654,8 +1659,8 @@ class TtsRuntimeMixin:
                 if playback_gain != 1.0:
                     header["playback_gain"] = playback_gain
                 async with self._ensure_audio_frame_send_lock():
-                    await self.websocket.send_json(header)
-                    await self.websocket.send_bytes(tts_audio)
+                    await websocket.send_json(header)
+                    await websocket.send_bytes(tts_audio)
                     # Inside the lock as well: the monitor mirror consumes this
                     # queue in order, so a frame that is atomic on the wire must
                     # not be split here either.
@@ -1666,8 +1671,8 @@ class TtsRuntimeMixin:
                 self._last_speech_output_bytes = len(tts_audio)
                 return True
             else:
-                ws_state = getattr(self.websocket, 'client_state', None) if self.websocket else None
-                logger.warning(f"⚠️ send_speech skipped: ws={self.websocket is not None}, state={ws_state}")
+                ws_state = getattr(websocket, 'client_state', None) if websocket else None
+                logger.warning(f"⚠️ send_speech skipped: ws={websocket is not None}, state={ws_state}")
                 return False
         except WebSocketDisconnect:
             logger.warning("⚠️ send_speech: WebSocket disconnected")
@@ -1695,7 +1700,11 @@ class TtsRuntimeMixin:
             # 无主信号会让前端给错误的一轮收尾，宁可不发。
             return False
         try:
-            if self.websocket and hasattr(self.websocket, 'client_state') and self.websocket.client_state == self.websocket.client_state.CONNECTED:
+            # Pinned for the same reason as send_speech: the terminal signal has
+            # to land on the socket its audio went to, not on a replacement that
+            # attached while this call was waiting for the frame lock.
+            websocket = self.websocket
+            if websocket and hasattr(websocket, 'client_state') and websocket.client_state == websocket.client_state.CONNECTED:
                 message = {
                     "type": "audio_done",
                     "speech_id": speech_id
@@ -1704,12 +1713,12 @@ class TtsRuntimeMixin:
                 if correlation_id:
                     message["sdk_speech_correlation_id"] = correlation_id
                 async with self._ensure_audio_frame_send_lock():
-                    await self.websocket.send_json(message)
+                    await websocket.send_json(message)
                 logger.debug(f"🔚 send_audio_done OK: speech_id={speech_id}")
                 return True
             else:
-                ws_state = getattr(self.websocket, 'client_state', None) if self.websocket else None
-                logger.warning(f"⚠️ send_audio_done skipped: ws={self.websocket is not None}, state={ws_state}")
+                ws_state = getattr(websocket, 'client_state', None) if websocket else None
+                logger.warning(f"⚠️ send_audio_done skipped: ws={websocket is not None}, state={ws_state}")
                 return False
         except WebSocketDisconnect:
             logger.warning("⚠️ send_audio_done: WebSocket disconnected")

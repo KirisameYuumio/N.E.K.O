@@ -4454,3 +4454,61 @@ async def test_concurrent_speech_sends_never_split_a_frame():
     # Both frames really did go out, so the assertion above cannot be satisfied
     # by a send that silently dropped one of them.
     assert {entry[1] for entry in sent} == {"a", "b"}, sent
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_a_reconnect_mid_frame_cannot_split_it_across_two_sockets():
+    """The frame lock keeps other SENDERS out; it does not pin ``self.websocket``.
+
+    Reconnect and teardown reassign that attribute and never take the lock, so
+    re-reading it per await could put an ``audio_chunk`` header on the retired
+    socket and its payload on the replacement -- the same corruption the lock
+    exists to prevent, arriving through the other door.
+    """
+
+    class _ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    class _RecordingWebsocket:
+        client_state = _ConnectedState()
+
+        def __init__(self, name, on_send_json=None):
+            self.name = name
+            self.received: list[tuple[str, str]] = []
+            self._on_send_json = on_send_json
+
+        async def send_json(self, payload):
+            self.received.append(("header", str(payload.get("speech_id") or "")))
+            if self._on_send_json is not None:
+                self._on_send_json()
+
+        async def send_bytes(self, data):
+            self.received.append(("payload", data.decode()))
+
+    mgr = _make_manager()
+    replacement = _RecordingWebsocket("replacement")
+    # The reconnect lands exactly between the header and its payload.
+    retired = _RecordingWebsocket(
+        "retired", on_send_json=lambda: setattr(mgr, "websocket", replacement),
+    )
+    mgr.websocket = retired
+    mgr._game_speech_correlation_for = lambda _speech_id: ""
+    mgr.speech_playback_gain = lambda _speech_id: 1.0
+    mgr._speech_output_total = 0
+    mgr._last_speech_output_time = 0.0
+    mgr._last_speech_output_bytes = 0
+
+    assert await core_module.LLMSessionManager.send_speech(mgr, b"x", speech_id="x")
+
+    assert retired.received == [("header", "x"), ("payload", "x")], retired.received
+    assert replacement.received == [], (
+        f"a reconnect mid-frame moved part of the frame onto the new socket: "
+        f"{replacement.received}"
+    )
+    # The reconnect really did happen, so the assertion above cannot be
+    # satisfied by a probe whose swap never fired.
+    assert mgr.websocket is replacement
