@@ -925,6 +925,79 @@ async function main() {
       `a non-number minimum (${JSON.stringify(badLimit)}) was coerced instead of rejected`);
   }
 
+  // The published schema declares id/version/protocolVersion as strings and both
+  // capability lists as uniqueItems arrays of strings. `String()` coercion and a
+  // silent de-duplication meant manifests the schema rejects still connected --
+  // so validating in an editor or in CI disagreed with what actually runs.
+  const MANIFEST_TYPE_CASES = [
+    ['version', 1],
+    ['version', true],
+    ['protocolVersion', 1],
+    ['id', 1],
+  ];
+  for (const [field, badValue] of MANIFEST_TYPE_CASES) {
+    let typeError = null;
+    try {
+      await window.NekoMiniGame.connect({
+        id: 'manifest-type-test',
+        version: '1.0.0',
+        requiredCapabilities: ['logging'],
+        [field]: badValue,
+      }, { transport });
+    } catch (error) { typeError = error; }
+    assert(typeError && typeError.code !== undefined,
+      `a non-string ${field} (${JSON.stringify(badValue)}) was coerced instead of rejected`);
+    assert(['invalid_manifest', 'incompatible_version'].includes(typeError.code),
+      `a non-string ${field} produced an unexpected error code: ${typeError.code}`);
+  }
+  let duplicateCapabilityError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'duplicate-capability-test',
+      version: '1.0.0',
+      requiredCapabilities: ['logging', 'logging'],
+    }, { transport });
+  } catch (error) { duplicateCapabilityError = error; }
+  assert(duplicateCapabilityError?.code === 'invalid_manifest',
+    'a duplicate capability was silently de-duplicated instead of rejected');
+  // Deliberately an object that stringifies to a VALID capability name: a value
+  // that stringifies to an invalid one is rejected by the pattern either way, so
+  // it cannot tell coercion from a type check.
+  let nonStringCapabilityError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'nonstring-capability-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', { toString: () => 'logging' }],
+    }, { transport });
+  } catch (error) { nonStringCapabilityError = error; }
+  assert(nonStringCapabilityError?.code === 'invalid_manifest',
+    'a non-string capability entry was coerced instead of rejected');
+  // An explicitly supplied falsey protocolVersion must not be replaced by the
+  // default: `|| SDK_PROTOCOL_VERSION` swallowed both `0` and `''`.
+  for (const badProtocol of [0, '', '   ']) {
+    let badProtocolError = null;
+    try {
+      await window.NekoMiniGame.connect({
+        id: 'protocol-default-test',
+        version: '1.0.0',
+        protocolVersion: badProtocol,
+        requiredCapabilities: ['logging'],
+      }, { transport });
+    } catch (error) { badProtocolError = error; }
+    assert(['invalid_manifest', 'incompatible_version'].includes(badProtocolError?.code),
+      `an explicitly falsey protocolVersion (${JSON.stringify(badProtocol)}) was replaced by the default`);
+  }
+  // An absent one still defaults.
+  const defaultedProtocolGame = await window.NekoMiniGame.connect({
+    id: 'protocol-absent-test',
+    version: '1.0.0',
+    requiredCapabilities: ['logging'],
+  }, { transport });
+  assert(defaultedProtocolGame.manifest.protocolVersion === '1',
+    'an absent protocolVersion stopped defaulting');
+  defaultedProtocolGame.dispose();
+
   // Same rule for every integer limit: the published schema declares
   // minLength/maxLength/minItems/maxItems/maxEntries as JSON integers, and
   // `Number()` accepted '5' and true alike -- so validating a manifest against

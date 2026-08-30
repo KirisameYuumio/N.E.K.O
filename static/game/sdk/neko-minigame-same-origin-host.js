@@ -283,6 +283,14 @@
   // them.
   const HOST_BOOTSTRAP = consumeHostLaunchRegistry();
 
+  function randomIdSuffix(windowImpl) {
+    const cryptoImpl = windowImpl?.crypto || globalThis.crypto;
+    const values = cryptoImpl?.getRandomValues?.(new Uint32Array(2));
+    if (values) return `${values[0].toString(36)}${values[1].toString(36)}`;
+    return `${Math.floor(Math.random() * 0xffffffff).toString(36)}`
+      + `${Math.floor(Math.random() * 0xffffffff).toString(36)}`;
+  }
+
   function createVoiceControlCredential(windowImpl) {
     const cryptoImpl = windowImpl?.crypto || globalThis.crypto;
     if (!cryptoImpl || typeof cryptoImpl.getRandomValues !== 'function') return '';
@@ -327,7 +335,12 @@
         });
       }
       this._session = {
-        id: String(options.sessionId || '').trim() || `${this.gameType}_${Date.now().toString(36)}`,
+        // The generated fallback used to be timestamp-only, so two hosts for the
+        // same game constructed in the same millisecond started life with the
+        // SAME client session id -- and every endpoint keys route identity on
+        // session_id, so one window's requests answer for the other's route.
+        id: String(options.sessionId || '').trim()
+          || `${this.gameType}_${Date.now().toString(36)}_${randomIdSuffix(options.windowImpl || window)}`,
         lanlanName: '',
       };
       this._fetchImpl = options.fetchImpl || window.fetch.bind(window);
@@ -930,7 +943,11 @@
     resetSession({ newSession = false } = {}) {
       if (newSession || !this._session.id) {
         this._cancelVoiceControlRequests('cancelled');
-        this._session.id = `${this.gameType}_${Date.now().toString(36)}`;
+        // Same entropy as the constructor's generator: a reset that mints a
+        // timestamp-only id can hand a "new" session the identity another
+        // window is already using, or -- within the same millisecond -- hand
+        // back the identity it just claimed to replace.
+        this._session.id = `${this.gameType}_${Date.now().toString(36)}_${randomIdSuffix(this._window)}`;
       }
       this._memoryConsentEnabled = false;
       this._session.lanlanName = '';

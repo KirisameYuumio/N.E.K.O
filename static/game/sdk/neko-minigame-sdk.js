@@ -219,14 +219,22 @@
     const result = [];
     const seen = new Set();
     for (const item of value) {
-      const capability = String(item || '').trim();
+      // The published schema declares these lists as `uniqueItems: true` and
+      // their items as strings. Silently coercing and de-duplicating meant a
+      // manifest the schema rejects still connected -- and a duplicate is far
+      // more often a copy-paste slip than an intent worth honouring.
+      if (typeof item !== 'string') {
+        fail('invalid_manifest', `${fieldName} entries must be strings`, { entry: item });
+      }
+      const capability = item.trim();
       if (!CAPABILITY_PATTERN.test(capability)) {
         fail('invalid_manifest', `Invalid capability in ${fieldName}`, { capability });
       }
-      if (!seen.has(capability)) {
-        seen.add(capability);
-        result.push(capability);
+      if (seen.has(capability)) {
+        fail('invalid_manifest', `${fieldName} contains a duplicate entry`, { capability });
       }
+      seen.add(capability);
+      result.push(capability);
     }
     return result;
   }
@@ -499,9 +507,26 @@
         fail('invalid_manifest', 'manifest contains an unsupported field', { field: key });
       }
     }
+    // Type first, coerce second. The published schema declares all three as
+    // strings, so `version: 1` (and `protocolVersion: 1`) used to connect while
+    // the same manifest failed schema validation in an editor or in CI. Absent
+    // fields keep their existing "required" / default handling below.
+    for (const field of ['id', 'version', 'protocolVersion']) {
+      if (manifest[field] !== undefined && typeof manifest[field] !== 'string') {
+        fail('invalid_manifest', `manifest.${field} must be a string`, { field });
+      }
+    }
     const id = String(manifest.id || '').trim();
     const version = String(manifest.version || '').trim();
-    const protocolVersion = String(manifest.protocolVersion || SDK_PROTOCOL_VERSION).trim();
+    // Default only an ABSENT value. `manifest.protocolVersion || SDK_PROTOCOL_VERSION`
+    // also swallowed every falsey supplied one -- `0` and `''` both became the
+    // current protocol and connected, defeating the compatibility guard and
+    // disagreeing with the schema's `const: "1"`. (`0` is now rejected one line
+    // above by the type check; `''` reaches here as a string and must fail the
+    // identity check below rather than be replaced.)
+    const protocolVersion = manifest.protocolVersion === undefined
+      ? SDK_PROTOCOL_VERSION
+      : manifest.protocolVersion.trim();
     if (!/^[a-z][a-z0-9-]{0,63}$/.test(id)) {
       fail('invalid_manifest', 'manifest.id must be a lowercase game identifier');
     }

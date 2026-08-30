@@ -1257,6 +1257,55 @@ async function main() {
     'the keepalive probe did not reach the backend');
   endHost.dispose();
 
+  // The generated session id used to be timestamp-only, so two hosts for the same
+  // game constructed in the same millisecond started life with the SAME client
+  // session id -- and every game endpoint keys route identity on session_id, so
+  // one window's requests would answer for the other's route. resetSession
+  // ({newSession:true}) mints through the same generator, so an immediate reset
+  // could also claim a new session while keeping the old identity.
+  const realSessionDateNow = Date.now;
+  const generatedSessionIds = new Set();
+  const probeIds = [];
+  // windowMock.crypto is deliberately deterministic (`values.fill(7)`) so the
+  // voice-credential assertions above stay stable, which would make every id
+  // here identical for the wrong reason. Give the probe a counter-based source:
+  // distinct ids then prove the entropy is actually mixed into the id, not that
+  // the clock moved.
+  let sessionEntropyCounter = 0;
+  const sessionEntropyWindow = {
+    ...windowMock,
+    crypto: {
+      getRandomValues(values) {
+        for (let index = 0; index < values.length; index += 1) {
+          sessionEntropyCounter += 1;
+          values[index] = sessionEntropyCounter;
+        }
+        return values;
+      },
+    },
+  };
+  try {
+    Date.now = () => 1700000000000;
+    for (let index = 0; index < 4; index += 1) {
+      const idHost = createHost({
+        gameType: 'example-game',
+        fetchImpl,
+        windowImpl: sessionEntropyWindow,
+        navigatorImpl: windowMock.navigator,
+      });
+      const constructed = idHost.sessionId;
+      const reset = idHost.resetRuntime({ newSession: true }).sessionId;
+      probeIds.push([constructed, reset]);
+      generatedSessionIds.add(constructed);
+      generatedSessionIds.add(reset);
+      idHost.dispose();
+    }
+  } finally {
+    Date.now = realSessionDateNow;
+  }
+  assert(generatedSessionIds.size === 8,
+    `same-millisecond hosts minted colliding session ids: ${JSON.stringify(probeIds)}`);
+
   process.stdout.write('mini-game same-origin host runtime test passed\n');
 }
 
