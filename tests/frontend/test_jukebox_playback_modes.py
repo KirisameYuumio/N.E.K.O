@@ -210,6 +210,255 @@ def test_jukebox_loader_native_mode_keeps_animation_facade(mock_page: Page):
     }
 
 
+@pytest.mark.frontend
+def test_jukebox_loader_normalizes_legacy_bundled_vrm_idle(mock_page: Page):
+    mock_page.set_content(
+        """
+        <script>
+          window.t = (key, fallback) => fallback || key;
+          window.__nekoJukeboxToggle = function() {};
+        </script>
+        """
+    )
+    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
+
+    restored = mock_page.evaluate(
+        """
+        async () => {
+          const calls = [];
+          window.lanlan_config = {
+            model_type: 'live3d',
+            live3d_sub_type: 'vrm',
+            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma?legacy=1']
+          };
+          window.vrmManager = {
+            playVRMAAnimation: async (url) => calls.push(url)
+          };
+          await window.Jukebox.restoreIdleAnimation();
+          window.lanlan_config.vrmIdleAnimations = [
+            '/static/vrm/animation/custom-idle.vrma'
+          ];
+          await window.Jukebox.restoreIdleAnimation();
+          return calls;
+        }
+        """
+    )
+
+    assert restored == [
+        "/static/vrm/animation/wait03.vrma.gz?legacy=1",
+        "/static/vrm/animation/custom-idle.vrma",
+    ]
+
+
+@pytest.mark.frontend
+def test_jukebox_loader_rejects_stale_idle_restore(mock_page: Page):
+    mock_page.set_content(
+        """
+        <script>
+          window.t = (key, fallback) => fallback || key;
+          window.__nekoJukeboxToggle = function() {};
+        </script>
+        """
+    )
+    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          let finishRestore;
+          let shouldApply;
+          window.lanlan_config = { model_type: 'live3d', live3d_sub_type: 'vrm' };
+          window.vrmManager = {
+            playVRMAAnimation: (url, options) => {
+              shouldApply = options.shouldApply;
+              return new Promise((resolve) => { finishRestore = resolve; });
+            }
+          };
+          const restore = window.Jukebox.restoreIdleAnimation();
+          const currentBefore = shouldApply();
+          window.Jukebox.State.playRequestId += 1;
+          const currentAfter = shouldApply();
+          finishRestore(false);
+          await restore;
+          return { currentBefore, currentAfter };
+        }
+        """
+    )
+
+    assert result == {"currentBefore": True, "currentAfter": False}
+
+
+@pytest.mark.frontend
+def test_jukebox_vrma_false_or_stale_result_does_not_mark_playback_active(mock_page: Page):
+    mock_page.set_content(
+        """
+        <script>
+          window.t = (key, fallback) => fallback || key;
+          window.__nekoJukeboxToggle = function() {};
+        </script>
+        """
+    )
+    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
+
+    loader_result = mock_page.evaluate(
+        """
+        async () => {
+          let finishStalePlay;
+          window.vrmManager = {
+            playVRMAAnimation: (url) => url === '/false.vrma'
+              ? Promise.resolve(false)
+              : new Promise((resolve) => { finishStalePlay = resolve; })
+          };
+          await window.Jukebox.playVRMA('/false.vrma');
+          const afterFalse = { ...window.Jukebox.State };
+          const stalePlay = window.Jukebox.playVRMA('/stale.vrma');
+          window.Jukebox.State.playRequestId += 1;
+          finishStalePlay(true);
+          await stalePlay;
+          return {
+            afterFalse: {
+              isPlaying: afterFalse.isPlaying,
+              isVMDPlaying: afterFalse.isVMDPlaying,
+              isPaused: afterFalse.isPaused
+            },
+            afterStale: {
+              isPlaying: window.Jukebox.State.isPlaying,
+              isVMDPlaying: window.Jukebox.State.isVMDPlaying,
+              isPaused: window.Jukebox.State.isPaused
+            }
+          };
+        }
+        """
+    )
+    assert loader_result == {
+        "afterFalse": {"isPlaying": False, "isVMDPlaying": False, "isPaused": False},
+        "afterStale": {"isPlaying": False, "isVMDPlaying": False, "isPaused": False},
+    }
+
+    setup_jukebox_page(mock_page)
+    transport_result = mock_page.evaluate(
+        """
+        async () => {
+          let finishStalePlay;
+          window.vrmManager = {
+            playVRMAAnimation: (url) => url === '/false.vrma'
+              ? Promise.resolve(false)
+              : new Promise((resolve) => { finishStalePlay = resolve; })
+          };
+          await window.Jukebox.playVRMA('/false.vrma');
+          const afterFalse = { ...window.Jukebox.State };
+          const stalePlay = window.Jukebox.playVRMA('/stale.vrma');
+          window.Jukebox.State.playRequestId += 1;
+          finishStalePlay(true);
+          await stalePlay;
+          return {
+            afterFalse: {
+              isPlaying: afterFalse.isPlaying,
+              isVMDPlaying: afterFalse.isVMDPlaying,
+              isPaused: afterFalse.isPaused
+            },
+            afterStale: {
+              isPlaying: window.Jukebox.State.isPlaying,
+              isVMDPlaying: window.Jukebox.State.isVMDPlaying,
+              isPaused: window.Jukebox.State.isPaused
+            }
+          };
+        }
+        """
+    )
+    assert transport_result == {
+        "afterFalse": {"isPlaying": False, "isVMDPlaying": False, "isPaused": False},
+        "afterStale": {"isPlaying": False, "isVMDPlaying": False, "isPaused": False},
+    }
+
+
+@pytest.mark.frontend
+def test_jukebox_transport_normalizes_legacy_bundled_vrm_idle(mock_page: Page):
+    setup_jukebox_page(mock_page)
+
+    restored = mock_page.evaluate(
+        """
+        async () => {
+          const calls = [];
+          window.Jukebox.getModelType = () => 'vrm';
+          window.lanlan_config = {
+            vrmIdleAnimation: '/static/vrm/animation/wait03.vrma#saved'
+          };
+          window.vrmManager = {
+            playVRMAAnimation: async (url) => calls.push(url)
+          };
+          await window.Jukebox.restoreIdleAnimation();
+          window.lanlan_config.vrmIdleAnimation = '/static/vrm/animation/custom-idle.vrma';
+          await window.Jukebox.restoreIdleAnimation();
+          return calls;
+        }
+        """
+    )
+
+    assert restored == [
+        "/static/vrm/animation/wait03.vrma.gz#saved",
+        "/static/vrm/animation/custom-idle.vrma",
+    ]
+
+
+def test_jukebox_parts_are_loaded_in_directory_order():
+    expected_paths = [f"/static/jukebox/jukebox/{part.name}" for part in JUKEBOX_PARTS]
+
+    # 模板里的 src 带 ?v={{ static_asset_version }}，所以只能匹配到路径为止，
+    # 不能带闭合引号。
+    loader_positions = [JUKEBOX_LOADER_SCRIPT.find(f"'{part_path}'") for part_path in expected_paths]
+    template_positions = [JUKEBOX_TEMPLATE.find(f'"{part_path}?') for part_path in expected_paths]
+    manager_positions = [JUKEBOX_MANAGER_TEMPLATE.find(f'"{part_path}?') for part_path in expected_paths]
+
+    assert all(position >= 0 for position in loader_positions)
+    assert all(position >= 0 for position in template_positions)
+    assert all(position >= 0 for position in manager_positions)
+    assert loader_positions == sorted(loader_positions)
+    assert template_positions == sorted(template_positions)
+    assert manager_positions == sorted(manager_positions)
+
+
+@pytest.mark.frontend
+def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
+    loaded_parts = []
+
+    def serve_jukebox_part(route):
+        file_name = route.request.url.split("?", 1)[0].rsplit("/", 1)[-1]
+        loaded_parts.append(file_name)
+        route.fulfill(
+            status=200,
+            content_type="application/javascript",
+            body=(JUKEBOX_PARTS_DIR / file_name).read_text(encoding="utf-8"),
+        )
+
+    # part URL 现在带 ?jukebox_control_api=N，glob 必须容纳 query。
+    mock_page.route("**/static/jukebox/jukebox/*.js*", serve_jukebox_part)
+    mock_page.set_content('<base href="http://jukebox.test/"><body></body>')
+    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const jukebox = await window.__nekoJukeboxLoader.load();
+          return {
+            keyCount: Object.keys(jukebox).length,
+            hasLoadSongs: typeof jukebox.loadSongs === 'function',
+            hasManager: typeof jukebox.SongActionManager === 'object',
+            hasScriptTag: window.__nekoJukeboxLoader.getState().hasScriptTag
+          };
+        }
+        """
+    )
+
+    assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
+    assert result == {
+        "keyCount": 184,
+        "hasLoadSongs": True,
+        "hasManager": True,
+        "hasScriptTag": True,
+    }
+
+
 def test_jukebox_action_column_reserves_space_for_two_buttons():
     assert ".jukebox-table col.jukebox-col-action {\n        width: 104px;" in JUKEBOX_SCRIPT
     assert ".jukebox-table td.song-action" in JUKEBOX_SCRIPT
@@ -465,6 +714,298 @@ def test_jukebox_volume_wheel_adjusts_volume_without_scrolling_container(mock_pa
     assert result["upDispatchResult"] is False
     assert result["downDispatchResult"] is False
     assert result["containerWheelCount"] == 0
+
+
+@pytest.mark.frontend
+def test_jukebox_builtin_paths_keep_resource_directories(mock_page: Page):
+    setup_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const playerUrls = [];
+          const vrmaCalls = [];
+
+          window.fetch = async (url, options = {}) => {
+            if (options.method === 'HEAD') {
+              return { ok: true, status: 200 };
+            }
+            if (url === '/api/jukebox/config') {
+              return {
+                ok: true,
+                json: async () => ({
+                  configRevision: 'rev-builtin-paths',
+                  songs: {
+                    song_001: {
+                      name: '桃源恋歌',
+                      artist: 'GARNiDELiA',
+                      audio: 'songs/song_001.mp3',
+                      visible: true,
+                      isBuiltin: true,
+                      defaultAction: 'action_001'
+                    }
+                  },
+                  actions: {
+                    action_001: {
+                      name: '桃源恋歌',
+                      file: 'actions/song_001.vrma',
+                      format: 'vrma',
+                      visible: true,
+                      isBuiltin: true
+                    }
+                  },
+                  bindings: {
+                    song_001: { action_001: { offset: 0 } }
+                  }
+                })
+              };
+            }
+            throw new Error(`unexpected fetch ${url}`);
+          };
+
+          await J.loadSongs();
+          const song = J.State.songs[0];
+
+          J.getModelType = () => 'vrm';
+          J.stopPlayback = () => {};
+          J.playVRMA = async (url) => { vrmaCalls.push(url); };
+          J.getPlayer = () => ({
+            list: {
+              clear() {},
+              add(items) {
+                playerUrls.push(...items.map(item => item.url));
+              }
+            },
+            options: {},
+            on() {},
+            play() {}
+          });
+
+          await J.playSong('song_001');
+
+          return {
+            audio: song.audio,
+            playerUrls,
+            vrmaCalls,
+            legacyStaticVrma: J.resolveJukeboxFileUrl('/static/jukebox/actions/song_001.vrma'),
+            legacyFlatVrma: J.resolveJukeboxFileUrl('static/jukebox/song_001.vrma')
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "audio": "songs/song_001.mp3",
+        "playerUrls": ["/api/jukebox/file/songs/song_001.mp3"],
+        "vrmaCalls": ["/api/jukebox/file/actions/song_001.vrma"],
+        "legacyStaticVrma": "/api/jukebox/file/actions/song_001.vrma",
+        "legacyFlatVrma": "/api/jukebox/file/song_001.vrma",
+    }
+
+
+@pytest.mark.frontend
+def test_jukebox_vrm_progress_seek_and_calibration_sync_animation(mock_page: Page):
+    setup_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        () => {
+          const J = window.Jukebox;
+          const audioSeekCalls = [];
+          const vrmSeekCalls = [];
+          const audio = { duration: 100, currentTime: 20 };
+
+          J.getModelType = () => 'vrm';
+          J.State.currentSong = {
+            id: 'song-vrm',
+            name: 'VRM Song',
+            boundActions: [{ id: 'action-vrma', name: 'Dance', format: 'vrma', fps: 60 }],
+            defaultAction: 'action-vrma'
+          };
+          J.SongActionManager.data = {
+            bindings: {
+              'song-vrm': {
+                'action-vrma': { offset: 30 }
+              }
+            }
+          };
+          J.State.player = {
+            audio,
+            seek(time) {
+              audio.currentTime = time;
+              audioSeekCalls.push(time);
+            }
+          };
+          window.vrmManager = {
+            seekVRMAAnimation(time, options) {
+              vrmSeekCalls.push({ time, paused: options && options.paused });
+              return true;
+            }
+          };
+
+          const slider = document.getElementById('jukebox-progress-slider');
+          slider.value = '50';
+          J._onProgressChange();
+          const afterProgressChange = {
+            audioCurrentTime: audio.currentTime,
+            isSeeking: J.State.isSeeking,
+            timeText: document.getElementById('jukebox-time-current').textContent
+          };
+
+          audio.currentTime = 12;
+          J.syncAnimationToOffset(-30);
+
+          return { audioSeekCalls, vrmSeekCalls, afterProgressChange };
+        }
+        """
+    )
+
+    assert result == {
+        "audioSeekCalls": [50],
+        "vrmSeekCalls": [
+            {"time": 50.5, "paused": False},
+            {"time": 11.5, "paused": False},
+        ],
+        "afterProgressChange": {
+            "audioCurrentTime": 50,
+            "isSeeking": False,
+            "timeText": "0:50",
+        },
+    }
+
+
+@pytest.mark.frontend
+def test_jukebox_progress_seek_uses_loaded_config_offset_before_manager_load(mock_page: Page):
+    setup_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        () => {
+          const J = window.Jukebox;
+          const vrmSeekCalls = [];
+          const audio = { duration: 100, currentTime: 0 };
+
+          J.getModelType = () => 'vrm';
+          J.State.config = {
+            bindings: {
+              'song-vrm': {
+                'action-vrma': { offset: 6 }
+              }
+            }
+          };
+          J.State.currentSong = {
+            id: 'song-vrm',
+            name: 'VRM Song',
+            boundActions: [{ id: 'action-vrma', name: 'Dance', format: 'vrma', fps: 60 }],
+            defaultAction: 'action-vrma'
+          };
+          J.SongActionManager.data = { bindings: {} };
+          J.State.player = {
+            audio,
+            seek(time) {
+              audio.currentTime = time;
+            }
+          };
+          window.vrmManager = {
+            seekVRMAAnimation(time, options) {
+              vrmSeekCalls.push({ time, paused: options && options.paused });
+              return true;
+            }
+          };
+
+          const slider = document.getElementById('jukebox-progress-slider');
+          slider.value = '50';
+          J._onProgressChange();
+
+          return {
+            currentOffset: J.getCurrentOffset(),
+            audioCurrentTime: audio.currentTime,
+            vrmSeekCalls
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "currentOffset": 6,
+        "audioCurrentTime": 50,
+        "vrmSeekCalls": [{"time": 50.1, "paused": False}],
+    }
+
+
+@pytest.mark.frontend
+def test_vrm_animation_seek_preserves_paused_state_and_refreshes_pose(mock_page: Page):
+    mock_page.set_content("<html><body></body></html>")
+    mock_page.evaluate("() => { window.THREE = {}; }")
+    mock_page.add_script_tag(content=VRM_ANIMATION_SCRIPT)
+
+    result = mock_page.evaluate(
+        """
+        () => {
+          const events = [];
+          const skinnedMesh = {
+            isSkinnedMesh: true,
+            skeleton: {
+              update() {
+                events.push('skeleton');
+              }
+            }
+          };
+          const scene = {
+            uuid: 'scene-a',
+            traverse(callback) {
+              callback(skinnedMesh);
+            },
+            updateMatrixWorld(force) {
+              events.push(`matrix:${force}`);
+            }
+          };
+          const manager = { currentModel: { vrm: { scene } } };
+          const anim = new window.VRMAnimation(manager);
+          anim.vrmaMixer = {
+            update(delta) {
+              events.push(`mixer:${delta}`);
+            },
+            getRoot() {
+              return scene;
+            }
+          };
+          anim.currentAction = { time: 0, paused: true };
+
+          const ok = anim.seekTo(3.25);
+          const pausedAfterFirstSeek = anim.currentAction.paused;
+          const okPlaying = anim.seekTo(1.5, { paused: false });
+
+          return {
+            ok,
+            okPlaying,
+            pausedAfterFirstSeek,
+            actionTime: anim.currentAction.time,
+            actionPaused: anim.currentAction.paused,
+            cachedMeshes: anim._skinnedMeshes.length,
+            events
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "ok": True,
+        "okPlaying": True,
+        "pausedAfterFirstSeek": True,
+        "actionTime": 1.5,
+        "actionPaused": False,
+        "cachedMeshes": 1,
+        "events": [
+            "mixer:0",
+            "matrix:true",
+            "skeleton",
+            "mixer:0",
+            "matrix:true",
+            "skeleton",
+        ],
+    }
 
 
 @pytest.mark.frontend
@@ -1664,547 +2205,6 @@ def test_jukebox_drag_sort_order_is_rendered_and_persisted(mock_page: Page):
         "renderedOrder": ["song3", "song1", "song2"],
         "saved": ["song3", "song1", "song2"],
         "reapplied": ["song3", "song1", "song2", "song4"],
-    }
-
-
-@pytest.mark.frontend
-def test_jukebox_loader_normalizes_legacy_bundled_vrm_idle(mock_page: Page):
-    mock_page.set_content(
-        """
-        <script>
-          window.t = (key, fallback) => fallback || key;
-          window.__nekoJukeboxToggle = function() {};
-        </script>
-        """
-    )
-    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
-
-    restored = mock_page.evaluate(
-        """
-        async () => {
-          const calls = [];
-          window.lanlan_config = {
-            model_type: 'live3d',
-            live3d_sub_type: 'vrm',
-            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma?legacy=1']
-          };
-          window.vrmManager = {
-            playVRMAAnimation: async (url) => calls.push(url)
-          };
-          await window.Jukebox.restoreIdleAnimation();
-          window.lanlan_config.vrmIdleAnimations = [
-            '/static/vrm/animation/custom-idle.vrma'
-          ];
-          await window.Jukebox.restoreIdleAnimation();
-          return calls;
-        }
-        """
-    )
-
-    assert restored == [
-        "/static/vrm/animation/wait03.vrma.gz?legacy=1",
-        "/static/vrm/animation/custom-idle.vrma",
-    ]
-
-
-@pytest.mark.frontend
-def test_jukebox_loader_rejects_stale_idle_restore(mock_page: Page):
-    mock_page.set_content(
-        """
-        <script>
-          window.t = (key, fallback) => fallback || key;
-          window.__nekoJukeboxToggle = function() {};
-        </script>
-        """
-    )
-    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
-
-    result = mock_page.evaluate(
-        """
-        async () => {
-          let finishRestore;
-          let shouldApply;
-          window.lanlan_config = { model_type: 'live3d', live3d_sub_type: 'vrm' };
-          window.vrmManager = {
-            playVRMAAnimation: (url, options) => {
-              shouldApply = options.shouldApply;
-              return new Promise((resolve) => { finishRestore = resolve; });
-            }
-          };
-          const restore = window.Jukebox.restoreIdleAnimation();
-          const currentBefore = shouldApply();
-          window.Jukebox.State.playRequestId += 1;
-          const currentAfter = shouldApply();
-          finishRestore(false);
-          await restore;
-          return { currentBefore, currentAfter };
-        }
-        """
-    )
-
-    assert result == {"currentBefore": True, "currentAfter": False}
-
-
-@pytest.mark.frontend
-def test_jukebox_vrma_false_or_stale_result_does_not_mark_playback_active(mock_page: Page):
-    mock_page.set_content(
-        """
-        <script>
-          window.t = (key, fallback) => fallback || key;
-          window.__nekoJukeboxToggle = function() {};
-        </script>
-        """
-    )
-    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
-
-    loader_result = mock_page.evaluate(
-        """
-        async () => {
-          let finishStalePlay;
-          window.vrmManager = {
-            playVRMAAnimation: (url) => url === '/false.vrma'
-              ? Promise.resolve(false)
-              : new Promise((resolve) => { finishStalePlay = resolve; })
-          };
-          await window.Jukebox.playVRMA('/false.vrma');
-          const afterFalse = { ...window.Jukebox.State };
-          const stalePlay = window.Jukebox.playVRMA('/stale.vrma');
-          window.Jukebox.State.playRequestId += 1;
-          finishStalePlay(true);
-          await stalePlay;
-          return {
-            afterFalse: {
-              isPlaying: afterFalse.isPlaying,
-              isVMDPlaying: afterFalse.isVMDPlaying,
-              isPaused: afterFalse.isPaused
-            },
-            afterStale: {
-              isPlaying: window.Jukebox.State.isPlaying,
-              isVMDPlaying: window.Jukebox.State.isVMDPlaying,
-              isPaused: window.Jukebox.State.isPaused
-            }
-          };
-        }
-        """
-    )
-    assert loader_result == {
-        "afterFalse": {"isPlaying": False, "isVMDPlaying": False, "isPaused": False},
-        "afterStale": {"isPlaying": False, "isVMDPlaying": False, "isPaused": False},
-    }
-
-    setup_jukebox_page(mock_page)
-    transport_result = mock_page.evaluate(
-        """
-        async () => {
-          let finishStalePlay;
-          window.vrmManager = {
-            playVRMAAnimation: (url) => url === '/false.vrma'
-              ? Promise.resolve(false)
-              : new Promise((resolve) => { finishStalePlay = resolve; })
-          };
-          await window.Jukebox.playVRMA('/false.vrma');
-          const afterFalse = { ...window.Jukebox.State };
-          const stalePlay = window.Jukebox.playVRMA('/stale.vrma');
-          window.Jukebox.State.playRequestId += 1;
-          finishStalePlay(true);
-          await stalePlay;
-          return {
-            afterFalse: {
-              isPlaying: afterFalse.isPlaying,
-              isVMDPlaying: afterFalse.isVMDPlaying,
-              isPaused: afterFalse.isPaused
-            },
-            afterStale: {
-              isPlaying: window.Jukebox.State.isPlaying,
-              isVMDPlaying: window.Jukebox.State.isVMDPlaying,
-              isPaused: window.Jukebox.State.isPaused
-            }
-          };
-        }
-        """
-    )
-    assert transport_result == {
-        "afterFalse": {"isPlaying": False, "isVMDPlaying": False, "isPaused": False},
-        "afterStale": {"isPlaying": False, "isVMDPlaying": False, "isPaused": False},
-    }
-
-
-@pytest.mark.frontend
-def test_jukebox_transport_normalizes_legacy_bundled_vrm_idle(mock_page: Page):
-    setup_jukebox_page(mock_page)
-
-    restored = mock_page.evaluate(
-        """
-        async () => {
-          const calls = [];
-          window.Jukebox.getModelType = () => 'vrm';
-          window.lanlan_config = {
-            vrmIdleAnimation: '/static/vrm/animation/wait03.vrma#saved'
-          };
-          window.vrmManager = {
-            playVRMAAnimation: async (url) => calls.push(url)
-          };
-          await window.Jukebox.restoreIdleAnimation();
-          window.lanlan_config.vrmIdleAnimation = '/static/vrm/animation/custom-idle.vrma';
-          await window.Jukebox.restoreIdleAnimation();
-          return calls;
-        }
-        """
-    )
-
-    assert restored == [
-        "/static/vrm/animation/wait03.vrma.gz#saved",
-        "/static/vrm/animation/custom-idle.vrma",
-    ]
-
-
-def test_jukebox_parts_are_loaded_in_directory_order():
-    expected_paths = [f"/static/jukebox/jukebox/{part.name}" for part in JUKEBOX_PARTS]
-
-    # 模板里的 src 带 ?v={{ static_asset_version }}，所以只能匹配到路径为止，
-    # 不能带闭合引号。
-    loader_positions = [JUKEBOX_LOADER_SCRIPT.find(f"'{part_path}'") for part_path in expected_paths]
-    template_positions = [JUKEBOX_TEMPLATE.find(f'"{part_path}?') for part_path in expected_paths]
-    manager_positions = [JUKEBOX_MANAGER_TEMPLATE.find(f'"{part_path}?') for part_path in expected_paths]
-
-    assert all(position >= 0 for position in loader_positions)
-    assert all(position >= 0 for position in template_positions)
-    assert all(position >= 0 for position in manager_positions)
-    assert loader_positions == sorted(loader_positions)
-    assert template_positions == sorted(template_positions)
-    assert manager_positions == sorted(manager_positions)
-
-
-@pytest.mark.frontend
-def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
-    loaded_parts = []
-
-    def serve_jukebox_part(route):
-        file_name = route.request.url.split("?", 1)[0].rsplit("/", 1)[-1]
-        loaded_parts.append(file_name)
-        route.fulfill(
-            status=200,
-            content_type="application/javascript",
-            body=(JUKEBOX_PARTS_DIR / file_name).read_text(encoding="utf-8"),
-        )
-
-    # part URL 现在带 ?jukebox_control_api=N，glob 必须容纳 query。
-    mock_page.route("**/static/jukebox/jukebox/*.js*", serve_jukebox_part)
-    mock_page.set_content('<base href="http://jukebox.test/"><body></body>')
-    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
-
-    result = mock_page.evaluate(
-        """
-        async () => {
-          const jukebox = await window.__nekoJukeboxLoader.load();
-          return {
-            keyCount: Object.keys(jukebox).length,
-            hasLoadSongs: typeof jukebox.loadSongs === 'function',
-            hasManager: typeof jukebox.SongActionManager === 'object',
-            hasScriptTag: window.__nekoJukeboxLoader.getState().hasScriptTag
-          };
-        }
-        """
-    )
-
-    assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
-    assert result == {
-        "keyCount": 184,
-        "hasLoadSongs": True,
-        "hasManager": True,
-        "hasScriptTag": True,
-    }
-
-
-@pytest.mark.frontend
-def test_jukebox_builtin_paths_keep_resource_directories(mock_page: Page):
-    setup_jukebox_page(mock_page)
-
-    result = mock_page.evaluate(
-        """
-        async () => {
-          const J = window.Jukebox;
-          const playerUrls = [];
-          const vrmaCalls = [];
-
-          window.fetch = async (url, options = {}) => {
-            if (options.method === 'HEAD') {
-              return { ok: true, status: 200 };
-            }
-            if (url === '/api/jukebox/config') {
-              return {
-                ok: true,
-                json: async () => ({
-                  configRevision: 'rev-builtin-paths',
-                  songs: {
-                    song_001: {
-                      name: '桃源恋歌',
-                      artist: 'GARNiDELiA',
-                      audio: 'songs/song_001.mp3',
-                      visible: true,
-                      isBuiltin: true,
-                      defaultAction: 'action_001'
-                    }
-                  },
-                  actions: {
-                    action_001: {
-                      name: '桃源恋歌',
-                      file: 'actions/song_001.vrma',
-                      format: 'vrma',
-                      visible: true,
-                      isBuiltin: true
-                    }
-                  },
-                  bindings: {
-                    song_001: { action_001: { offset: 0 } }
-                  }
-                })
-              };
-            }
-            throw new Error(`unexpected fetch ${url}`);
-          };
-
-          await J.loadSongs();
-          const song = J.State.songs[0];
-
-          J.getModelType = () => 'vrm';
-          J.stopPlayback = () => {};
-          J.playVRMA = async (url) => { vrmaCalls.push(url); };
-          J.getPlayer = () => ({
-            list: {
-              clear() {},
-              add(items) {
-                playerUrls.push(...items.map(item => item.url));
-              }
-            },
-            options: {},
-            on() {},
-            play() {}
-          });
-
-          await J.playSong('song_001');
-
-          return {
-            audio: song.audio,
-            playerUrls,
-            vrmaCalls,
-            legacyStaticVrma: J.resolveJukeboxFileUrl('/static/jukebox/actions/song_001.vrma'),
-            legacyFlatVrma: J.resolveJukeboxFileUrl('static/jukebox/song_001.vrma')
-          };
-        }
-        """
-    )
-
-    assert result == {
-        "audio": "songs/song_001.mp3",
-        "playerUrls": ["/api/jukebox/file/songs/song_001.mp3"],
-        "vrmaCalls": ["/api/jukebox/file/actions/song_001.vrma"],
-        "legacyStaticVrma": "/api/jukebox/file/actions/song_001.vrma",
-        "legacyFlatVrma": "/api/jukebox/file/song_001.vrma",
-    }
-
-
-@pytest.mark.frontend
-def test_jukebox_vrm_progress_seek_and_calibration_sync_animation(mock_page: Page):
-    setup_jukebox_page(mock_page)
-
-    result = mock_page.evaluate(
-        """
-        () => {
-          const J = window.Jukebox;
-          const audioSeekCalls = [];
-          const vrmSeekCalls = [];
-          const audio = { duration: 100, currentTime: 20 };
-
-          J.getModelType = () => 'vrm';
-          J.State.currentSong = {
-            id: 'song-vrm',
-            name: 'VRM Song',
-            boundActions: [{ id: 'action-vrma', name: 'Dance', format: 'vrma', fps: 60 }],
-            defaultAction: 'action-vrma'
-          };
-          J.SongActionManager.data = {
-            bindings: {
-              'song-vrm': {
-                'action-vrma': { offset: 30 }
-              }
-            }
-          };
-          J.State.player = {
-            audio,
-            seek(time) {
-              audio.currentTime = time;
-              audioSeekCalls.push(time);
-            }
-          };
-          window.vrmManager = {
-            seekVRMAAnimation(time, options) {
-              vrmSeekCalls.push({ time, paused: options && options.paused });
-              return true;
-            }
-          };
-
-          const slider = document.getElementById('jukebox-progress-slider');
-          slider.value = '50';
-          J._onProgressChange();
-          const afterProgressChange = {
-            audioCurrentTime: audio.currentTime,
-            isSeeking: J.State.isSeeking,
-            timeText: document.getElementById('jukebox-time-current').textContent
-          };
-
-          audio.currentTime = 12;
-          J.syncAnimationToOffset(-30);
-
-          return { audioSeekCalls, vrmSeekCalls, afterProgressChange };
-        }
-        """
-    )
-
-    assert result == {
-        "audioSeekCalls": [50],
-        "vrmSeekCalls": [
-            {"time": 50.5, "paused": False},
-            {"time": 11.5, "paused": False},
-        ],
-        "afterProgressChange": {
-            "audioCurrentTime": 50,
-            "isSeeking": False,
-            "timeText": "0:50",
-        },
-    }
-
-
-@pytest.mark.frontend
-def test_jukebox_progress_seek_uses_loaded_config_offset_before_manager_load(mock_page: Page):
-    setup_jukebox_page(mock_page)
-
-    result = mock_page.evaluate(
-        """
-        () => {
-          const J = window.Jukebox;
-          const vrmSeekCalls = [];
-          const audio = { duration: 100, currentTime: 0 };
-
-          J.getModelType = () => 'vrm';
-          J.State.config = {
-            bindings: {
-              'song-vrm': {
-                'action-vrma': { offset: 6 }
-              }
-            }
-          };
-          J.State.currentSong = {
-            id: 'song-vrm',
-            name: 'VRM Song',
-            boundActions: [{ id: 'action-vrma', name: 'Dance', format: 'vrma', fps: 60 }],
-            defaultAction: 'action-vrma'
-          };
-          J.SongActionManager.data = { bindings: {} };
-          J.State.player = {
-            audio,
-            seek(time) {
-              audio.currentTime = time;
-            }
-          };
-          window.vrmManager = {
-            seekVRMAAnimation(time, options) {
-              vrmSeekCalls.push({ time, paused: options && options.paused });
-              return true;
-            }
-          };
-
-          const slider = document.getElementById('jukebox-progress-slider');
-          slider.value = '50';
-          J._onProgressChange();
-
-          return {
-            currentOffset: J.getCurrentOffset(),
-            audioCurrentTime: audio.currentTime,
-            vrmSeekCalls
-          };
-        }
-        """
-    )
-
-    assert result == {
-        "currentOffset": 6,
-        "audioCurrentTime": 50,
-        "vrmSeekCalls": [{"time": 50.1, "paused": False}],
-    }
-
-
-@pytest.mark.frontend
-def test_vrm_animation_seek_preserves_paused_state_and_refreshes_pose(mock_page: Page):
-    mock_page.set_content("<html><body></body></html>")
-    mock_page.evaluate("() => { window.THREE = {}; }")
-    mock_page.add_script_tag(content=VRM_ANIMATION_SCRIPT)
-
-    result = mock_page.evaluate(
-        """
-        () => {
-          const events = [];
-          const skinnedMesh = {
-            isSkinnedMesh: true,
-            skeleton: {
-              update() {
-                events.push('skeleton');
-              }
-            }
-          };
-          const scene = {
-            uuid: 'scene-a',
-            traverse(callback) {
-              callback(skinnedMesh);
-            },
-            updateMatrixWorld(force) {
-              events.push(`matrix:${force}`);
-            }
-          };
-          const manager = { currentModel: { vrm: { scene } } };
-          const anim = new window.VRMAnimation(manager);
-          anim.vrmaMixer = {
-            update(delta) {
-              events.push(`mixer:${delta}`);
-            },
-            getRoot() {
-              return scene;
-            }
-          };
-          anim.currentAction = { time: 0, paused: true };
-
-          const ok = anim.seekTo(3.25);
-          const pausedAfterFirstSeek = anim.currentAction.paused;
-          const okPlaying = anim.seekTo(1.5, { paused: false });
-
-          return {
-            ok,
-            okPlaying,
-            pausedAfterFirstSeek,
-            actionTime: anim.currentAction.time,
-            actionPaused: anim.currentAction.paused,
-            cachedMeshes: anim._skinnedMeshes.length,
-            events
-          };
-        }
-        """
-    )
-
-    assert result == {
-        "ok": True,
-        "okPlaying": True,
-        "pausedAfterFirstSeek": True,
-        "actionTime": 1.5,
-        "actionPaused": False,
-        "cachedMeshes": 1,
-        "events": [
-            "mixer:0",
-            "matrix:true",
-            "skeleton",
-            "mixer:0",
-            "matrix:true",
-            "skeleton",
-        ],
     }
 
 
