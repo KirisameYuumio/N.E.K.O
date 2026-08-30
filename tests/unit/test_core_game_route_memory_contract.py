@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections import deque
 import queue
 import time
@@ -1338,6 +1339,82 @@ async def test_mirror_user_input_propagates_the_source_route_identity():
         "session_id": "reused-session",
         "sdk_route_instance_id": "route-A",
     }]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_ownership_mismatch_drop_is_logged(monkeypatch):
+    """The most total drop in the voice path must not be the quietest one.
+
+    A transcript whose ingress identity does not match the live route is
+    refused above the takeover dispatcher AND above every recording path, so it
+    leaves no trace: not in the game, not in chat, not in the logs. This code
+    has already been reworked several times between the two failure directions
+    -- "dropped a sentence" and "bound one to the wrong route" -- and with no
+    log there is nothing afterwards to tell them apart.
+
+    Captured off the module logger rather than through ``caplog``: these loggers
+    do not propagate to root, so a caplog-based assertion would pass vacuously
+    the moment the log line was deleted.
+    """
+    mgr = _make_transcript_manager()
+    mgr._broadcast_voice_transcript_observed = AsyncMock()
+    monkeypatch.setattr(
+        turn_module,
+        "get_active_game_route_generation_identity",
+        lambda _lanlan_name: ("example-game", "session-b", "route-B"),
+    )
+    logged = []
+    monkeypatch.setattr(
+        turn_module.logger,
+        "info",
+        lambda message, *args: logged.append(message % args if args else message),
+    )
+
+    handled = await core_module.LLMSessionManager.handle_input_transcript(
+        mgr,
+        "  words from the previous route  ",
+        is_voice_source=True,
+        source_game_route_identity=("example-game", "session-a", "route-A"),
+    )
+
+    assert handled is False
+    # Nothing recorded it anywhere else -- which is exactly why the log matters.
+    assert mgr.sync_message_queue.messages == []
+    assert mgr._activity_tracker.user_messages == []
+    dropped = [line for line in logged if "route ownership" in line]
+    assert len(dropped) == 1, logged
+    # Both identities, so an incident can be lined up without the text.
+    assert "route-A" in dropped[0] and "route-B" in dropped[0]
+    assert "words from the previous route" not in dropped[0]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_ownership_match_is_not_logged_as_a_drop(monkeypatch):
+    """The control: a matching identity must not produce the same line."""
+    mgr = _make_transcript_manager()
+    mgr._broadcast_voice_transcript_observed = AsyncMock()
+    monkeypatch.setattr(
+        turn_module,
+        "get_active_game_route_generation_identity",
+        lambda _lanlan_name: ("example-game", "session-a", "route-A"),
+    )
+    logged = []
+    monkeypatch.setattr(
+        turn_module.logger,
+        "info",
+        lambda message, *args: logged.append(message % args if args else message),
+    )
+
+    await core_module.LLMSessionManager.handle_input_transcript(
+        mgr,
+        "  words from the live route  ",
+        is_voice_source=True,
+        source_game_route_identity=("example-game", "session-a", "route-A"),
+    )
+
+    assert not [line for line in logged if "route ownership" in line]
 
 
 @pytest.mark.unit

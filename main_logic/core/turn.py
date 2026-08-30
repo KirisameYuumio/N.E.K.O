@@ -1184,6 +1184,23 @@ class TurnMixin:
                 self.lanlan_name
             )
             if source_game_route_identity != current_route_identity:
+                # Loud on purpose. This drop is total -- it happens above the
+                # takeover dispatcher AND above every recording path, so the
+                # utterance leaves no trace anywhere: not in the game, not in
+                # chat, not in the logs. That is exactly how a route-ownership
+                # regression hides, and this code has already been reworked
+                # several times in both directions ("dropped a sentence" vs
+                # "bound one to the wrong route") with nothing to tell them
+                # apart afterwards. Text is deliberately not logged; the length
+                # is enough to line an incident up with what the user said.
+                logger.info(
+                    "[%s] realtime STT transcript dropped: route ownership "
+                    "mismatch source=%s current=%s len=%d",
+                    self.lanlan_name,
+                    source_game_route_identity,
+                    current_route_identity,
+                    len(transcript_text),
+                )
                 return False
 
         # 更新用户活动时间戳（用于主动搭话检测）。先捕获「转写到达时刻」局部变量，
