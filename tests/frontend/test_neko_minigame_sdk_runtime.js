@@ -192,6 +192,11 @@ async function main() {
           properties: { lines: { type: 'array', items: { type: 'string' } } },
           required: ['lines'],
         },
+        'round-tag': {
+          type: 'object',
+          properties: { tag: { type: 'string', minLength: 1, maxLength: 4 } },
+          required: ['tag'],
+        },
       },
       states: {
         score: {
@@ -268,6 +273,36 @@ async function main() {
   catch (error) { invalidEventError = error; }
   assert(invalidEventError?.code === 'invalid_contract',
     'undeclared event payload fields were not rejected');
+
+  // `Array.prototype.map` SKIPS holes, so a sparse array used to pass its
+  // declared item schema without a single slot being validated -- and the holes
+  // then serialize as `null`, smuggling a null past `items: {type: 'string'}`.
+  const sparseLines = ['first'];
+  sparseLines[3] = 'last';
+  const emitsBeforeSparse = protocolMessages.length;
+  let sparseArrayError = null;
+  try { await game.events.emit('round-log', { lines: sparseLines }); }
+  catch (error) { sparseArrayError = error; }
+  assert(sparseArrayError?.code === 'invalid_contract',
+    'a sparse array passed a declared item schema without its holes being validated');
+  assert(protocolMessages.length === emitsBeforeSparse,
+    'a sparse array payload still reached the host');
+  await game.events.emit('round-log', { lines: ['first', 'second', 'third', 'last'] });
+  assert(protocolMessages.length === emitsBeforeSparse + 1,
+    'the sparse-slot check rejected a dense array of the same length');
+
+  // minLength/maxLength are declared with JSON Schema's vocabulary, where both
+  // count code points. Measuring UTF-16 units charged two per astral character,
+  // so a maxLength:4 field rejected four emoji while accepting four letters.
+  const emitsBeforeCodePoints = protocolMessages.length;
+  await game.events.emit('round-tag', { tag: '🎮🎮🎮🎮' });
+  assert(protocolMessages.length === emitsBeforeCodePoints + 1,
+    'four astral characters were rejected by a maxLength of four');
+  let tooLongTagError = null;
+  try { await game.events.emit('round-tag', { tag: '🎮🎮🎮🎮🎮' }); }
+  catch (error) { tooLongTagError = error; }
+  assert(tooLongTagError?.code === 'invalid_contract',
+    'a string past its declared code-point maximum was accepted');
 
   const controls = [];
   const controlErrors = [];

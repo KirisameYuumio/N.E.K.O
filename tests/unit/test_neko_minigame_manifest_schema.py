@@ -152,3 +152,63 @@ def test_voice_input_requires_runtime(validator: Draft202012Validator) -> None:
     with_optional["requiredCapabilities"] = ["logging", capability]
     with_optional["optionalCapabilities"] = ["runtime"]
     validator.validate(with_optional)
+
+
+def test_contract_property_names_reject_clone_reserved_names(
+    validator: Draft202012Validator,
+) -> None:
+    """The published schema must reject what the SDK rejects at connect time.
+
+    ``validateContractValue`` refuses these property names while cloning every
+    payload, so a contract declared with one connects fine and then rejects
+    every message it was declared for. The schema is the contract authors read;
+    a rule that lives only in the runtime is a rule they discover at runtime.
+    """
+    for reserved in ("__proto__", "prototype", "constructor"):
+        value = manifest()
+        value["contracts"]["events"]["score"] = {
+            "type": "object",
+            "properties": {reserved: {"type": "integer"}},
+            "required": [reserved],
+        }
+        assert_invalid(validator, value)
+
+
+def test_contract_property_names_reject_empty_and_overlong_names(
+    validator: Draft202012Validator,
+) -> None:
+    """Same bound the SDK applies at manifest normalization: 1..64 characters."""
+    empty_name = manifest()
+    empty_name["contracts"]["events"]["score"] = {
+        "type": "object",
+        "properties": {"": {"type": "integer"}},
+    }
+    assert_invalid(validator, empty_name)
+
+    overlong = manifest()
+    overlong["contracts"]["events"]["score"] = {
+        "type": "object",
+        "properties": {"g" * 65: {"type": "integer"}},
+    }
+    assert_invalid(validator, overlong)
+
+    at_the_limit = manifest()
+    at_the_limit["contracts"]["events"]["score"] = {
+        "type": "object",
+        "properties": {"g" * 64: {"type": "integer"}},
+        "required": ["g" * 64],
+    }
+    validator.validate(at_the_limit)
+
+
+def test_required_entries_reject_clone_reserved_names(
+    validator: Draft202012Validator,
+) -> None:
+    """`required` names are property names too, and were bounded separately."""
+    value = manifest()
+    value["contracts"]["events"]["score"] = {
+        "type": "object",
+        "properties": {"goals": {"type": "integer"}},
+        "required": ["constructor"],
+    }
+    assert_invalid(validator, value)

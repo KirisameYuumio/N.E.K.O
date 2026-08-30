@@ -15,6 +15,7 @@ APP_STATE_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-s
 APP_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-settings.js"
 APP_AUDIO_CAPTURE_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-audio-capture.js"
 APP_BUTTONS_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-buttons.js"
+TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
 
 
 def test_game_route_close_events_require_matching_generation_when_one_is_active():
@@ -6946,4 +6947,39 @@ def test_reconnect_reconciliation_tombstones_the_route_the_server_finalized():
         )
     assert "ended_route" in closed_branch, (
         "the reconnect tombstone must read the identity the server finalized"
+    )
+
+
+@pytest.mark.parametrize("template_name", ["index.html", "chat.html"])
+def test_bootstrap_route_snapshot_is_rejected_when_it_lands_late(template_name):
+    """The init-time /route/active read must not re-open a route that just closed.
+
+    The request can start while route A is active and resolve after A's `closed`
+    websocket event has already been handled; dispatching the snapshot then
+    re-opens a dead route on this page, which locks the chat window into its
+    collapsed game layout and suppresses proactive chat for the rest of the
+    round. Every close path advances the route state revision, so the bootstrap
+    compares it across the request the way the reconnect reconciliation in
+    app-websocket.js already does.
+
+    Both templates carry their own copy of this IIFE, so both are checked --
+    a guard in one of them is a guard in neither for the other window.
+    """
+    source = (TEMPLATES_DIR / template_name).read_text(encoding="utf-8")
+    marker = "fetch('/api/game/route/active?lanlan_name="
+    assert source.count(marker) == 1, template_name
+    fetch_at = source.index(marker)
+    prologue = source[max(0, fetch_at - 1200):fetch_at]
+    assert "gameRouteStateRevision" in prologue, (
+        f"{template_name} bootstrap does not capture the route state revision "
+        "before its /route/active request"
+    )
+    handler = source[fetch_at:source.index("dispatchEvent", fetch_at)]
+    assert "gameRouteStateRevision" in handler, (
+        f"{template_name} bootstrap dispatches its snapshot without re-checking "
+        "the route state revision, so a snapshot that lands after the route "
+        "closed re-opens a dead route"
+    )
+    assert "return" in handler, (
+        f"{template_name} bootstrap compares the revision but never bails out"
     )

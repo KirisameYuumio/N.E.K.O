@@ -627,7 +627,14 @@
       return value;
     }
     if (schema.type === 'string') {
-      if (value.length < schema.minLength || value.length > schema.maxLength) {
+      // Code points, not UTF-16 units. `minLength`/`maxLength` are declared in
+      // the manifest with JSON Schema's vocabulary, where both count code
+      // points, so `value.length` charges two units for every astral character
+      // -- one emoji in a maxLength:16 field costs the same as two letters.
+      // (The byte budgets that actually bound payload size are separate and
+      // unchanged; this only affects the author-declared field length.)
+      const codePointLength = [...value].length;
+      if (codePointLength < schema.minLength || codePointLength > schema.maxLength) {
         fail('invalid_contract', `${fieldName} violates the declared string length`);
       }
       return value;
@@ -636,13 +643,23 @@
       if (value.length < schema.minItems || value.length > schema.maxItems) {
         fail('invalid_contract', `${fieldName} violates the declared array length`);
       }
-      return Object.freeze(value.map((item, index) => validateContractValue(
-        item,
-        schema.items,
-        `${fieldName}[${index}]`,
-        state,
-        depth + 1,
-      )));
+      // Index-walk, not `.map()`: map SKIPS holes, so a sparse array
+      // (`new Array(3)`, or `a[5] = 1`) passed its declared item schema without
+      // a single slot being validated, and the holes then serialize as `null`
+      // -- a `null` smuggled past a declared `items: {type: 'string'}`.
+      // Reading a hole yields `undefined`, which no declared type matches, so
+      // it now fails as the invalid value it is.
+      const validatedItems = [];
+      for (let index = 0; index < value.length; index += 1) {
+        validatedItems.push(validateContractValue(
+          value[index],
+          schema.items,
+          `${fieldName}[${index}]`,
+          state,
+          depth + 1,
+        ));
+      }
+      return Object.freeze(validatedItems);
     }
     const entries = Object.entries(value);
     const result = {};
