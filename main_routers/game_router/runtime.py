@@ -2203,7 +2203,34 @@ async def game_route_any_active(lanlan_name: str = ""):
     resolved = _resolve_lanlan_name(lanlan_name)
     state = _get_active_game_route_state(resolved) if resolved else None
     if state is None:
-        return {"ok": True, "active": False}
+        # This read is the compensation path for a MISSED ``closed`` websocket
+        # event, so the caller normally has no record of the route it is about
+        # to clear -- and a late STT gate for that route can then re-activate
+        # it on the page. Hand back the identity the backend actually
+        # finalized, so the caller tombstones a provably dead route instead of
+        # whatever identity the page happens to be holding (which would be a
+        # guess, and tombstoning a live route rejects its real gate for good).
+        ended = None
+        for candidate in _game_route_states.values():
+            if str(candidate.get("lanlan_name") or "") != resolved:
+                continue
+            if candidate.get("game_route_active") or not candidate.get("_exit_flow_started"):
+                continue
+            if ended is None or float(candidate.get("exit_started_at") or 0.0) > float(
+                ended.get("exit_started_at") or 0.0
+            ):
+                ended = candidate
+        if ended is None:
+            return {"ok": True, "active": False}
+        return {
+            "ok": True,
+            "active": False,
+            "ended_route": {
+                "game_type": str(ended.get("game_type") or ""),
+                "session_id": str(ended.get("session_id") or ""),
+                "sdk_route_instance_id": str(ended.get("_sdk_route_instance_id") or ""),
+            },
+        }
     return {
         "ok": True,
         "active": True,

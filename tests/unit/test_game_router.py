@@ -542,6 +542,65 @@ async def test_route_active_reconciliation_exposes_the_authoritative_generation(
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_route_active_reconciliation_names_the_route_it_finalized(monkeypatch):
+    """The inactive answer carries the identity the backend actually retired.
+
+    The frontend uses this read to compensate for a ``closed`` websocket event
+    it never received -- which is exactly when it has no record of the route it
+    is about to clear, so a late STT gate can re-activate a dead route. It can
+    only tombstone safely if the identity comes from here; guessing with its own
+    would tombstone a live route whenever this read and the socket disagree.
+    """
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    with reset_game_route_state():
+        older = gr_runtime._activate_game_route("neutral-sdk-game", "session-1", "Lan")
+        older["_sdk_route_instance_id"] = "route-instance-a"
+        older["game_route_active"] = False
+        older["_exit_flow_started"] = True
+        older["exit_started_at"] = 100.0
+        newer = gr_runtime._activate_game_route("other-game", "session-2", "Lan")
+        newer["_sdk_route_instance_id"] = "route-instance-b"
+        newer["game_route_active"] = False
+        newer["_exit_flow_started"] = True
+        newer["exit_started_at"] = 200.0
+        other_character = gr_runtime._activate_game_route("neutral-sdk-game", "session-3", "Yui")
+        other_character["game_route_active"] = False
+        other_character["_exit_flow_started"] = True
+        other_character["exit_started_at"] = 300.0
+
+        result = await gr_runtime.game_route_any_active("Lan")
+
+    assert result == {
+        "ok": True,
+        "active": False,
+        "ended_route": {
+            "game_type": "other-game",
+            "session_id": "session-2",
+            "sdk_route_instance_id": "route-instance-b",
+        },
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_active_reconciliation_omits_a_route_that_never_finalized(monkeypatch):
+    """A slot that was never entered into finalize is not a dead route.
+
+    Tombstoning it would let the frontend reject the real gate of a route that
+    is still coming up.
+    """
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+    with reset_game_route_state():
+        stale = gr_runtime._activate_game_route("neutral-sdk-game", "session-1", "Lan")
+        stale["game_route_active"] = False
+
+        result = await gr_runtime.game_route_any_active("Lan")
+
+    assert result == {"ok": True, "active": False}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_window_state_change_carries_the_route_generation():
     class ConnectedState:
         CONNECTED = "connected"

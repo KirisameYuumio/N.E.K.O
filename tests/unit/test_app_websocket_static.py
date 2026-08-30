@@ -91,6 +91,45 @@ def test_reconnect_route_snapshot_cannot_overwrite_a_newer_websocket_route_event
     )
     assert source.count("advanceGameRouteStateRevision();") >= 4
 
+def test_rejected_close_events_still_tombstone_their_own_identity():
+    """A close event this window rejects still names a dead route.
+
+    ``GAME_ROUTE_ENDED`` and ``game_window_state_change: closed`` are emitted
+    only from route finalize, so the identity in the payload is provably dead
+    even when it does not match what this window currently holds. Dropping it
+    without a tombstone lets a late STT gate for that identity re-activate
+    ``S.gameRouteActive`` once the current route also ends -- which suppresses
+    proactive chat and auto-goodbye until a full open/close cycle or a reload.
+
+    The tombstone must use the payload's OWN identity: falling back to the
+    current one would tombstone the live route and permanently reject its real
+    gate, which is the fail-closed direction.
+    """
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    rejected_branches = [
+        ("忽略过期的 GAME_ROUTE_ENDED | ended_session=", "return;"),
+        ("忽略过期的 GAME_ROUTE_ENDED | ended_route=", "return;"),
+        ("[GameWindow] 忽略过期窗口事件", "} else if (detail.action === 'opened')"),
+    ]
+    for marker, terminator in rejected_branches:
+        assert source.count(marker) == 1, marker
+        # Start after the guard's own console.log, which legitimately prints the
+        # live identity it is comparing against.
+        start = source.index(");", source.index(marker)) + 2
+        end = source.index(terminator, start)
+        block = source[start:end]
+        assert "rememberEndedGameRouteIdentity(" in block, (
+            f"a rejected close event ({marker}) forgot the identity it just refused"
+        )
+        for live_identity in ("currentSessionId", "currentGameSessionId",
+                              "currentRouteInstanceId", "currentGameRouteInstanceId",
+                              "S.gameRouteGameType", "S.gameRouteSessionId"):
+            assert live_identity not in block, (
+                f"a rejected close event ({marker}) tombstoned the live route via "
+                f"{live_identity}"
+            )
+
+
 
 def test_late_stt_gate_cannot_reactivate_the_most_recently_ended_route():
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
@@ -6842,7 +6881,69 @@ def test_reconnect_reconciliation_repairs_appstate_not_only_the_dom_event():
         )
     # Ordering matters: the repair must follow the dispatch, or index.html's
     # voice bridge observes already-cleared identity and broadcasts a closed
-    # route with an empty session id.
-    assert reconnect_block.index("neko-game-window-state-change") < reconnect_block.index(
-        "S.gameRouteActive = true"
-    ), "appState repair must follow the dispatch so the voice bridge keeps its ordering"
+    # route with an empty session id. Every assignment, not just the flag --
+    # a repair that cleared the identity fields early would produce exactly the
+    # empty-session_id broadcast this ordering exists to prevent, and an
+    # assertion on the flag alone would not notice.
+    dispatch_at = reconnect_block.index("neko-game-window-state-change")
+    for assignment in (
+        "S.gameRouteActive = true",
+        "S.gameRouteGameType = data.game_type",
+        "S.gameRouteSessionId = data.session_id",
+        "S.gameRouteInstanceId = data.sdk_route_instance_id",
+        "S.gameRouteActive = false",
+        "S.gameRouteGameType = ''",
+        "S.gameRouteSessionId = ''",
+        "S.gameRouteInstanceId = ''",
+    ):
+        assert assignment in reconnect_block, assignment
+        assert dispatch_at < reconnect_block.index(assignment), (
+            f"appState repair ({assignment}) must follow the dispatch so the "
+            "voice bridge keeps its ordering"
+        )
+
+
+def test_reconnect_reconciliation_tombstones_the_route_the_server_finalized():
+    """The reconnect snapshot is the compensation path for a missed ``closed``.
+
+    Precisely because the websocket event was lost, no tombstone exists for the
+    route this branch clears, so a late ``GAME_VOICE_STT_GATE_ACTIVE`` for it
+    would re-activate a dead route on the page -- which suppresses proactive
+    chat and auto-goodbye until a full open/close cycle or a reload.
+
+    The identity recorded must come from the server's own snapshot. This read
+    can disagree with the socket (character resolution drift), and tombstoning
+    the identity the page currently holds would permanently reject the live
+    route's real gate -- in browser_fallback mode that means the game never
+    receives a transcript.
+    """
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    reconnect_block = _block_after(
+        source,
+        "function syncGameWindowStateOnWsConnect() {",
+    )
+    closed_branch = reconnect_block[reconnect_block.index("var reconciledWasActive"):]
+    assert "advanceGameRouteStateRevision();" in closed_branch, (
+        "the reconnect snapshot cleared route state without advancing the "
+        "revision, so a snapshot already in flight cannot be recognised as stale"
+    )
+    assert "rememberEndedGameRouteIdentity(" in closed_branch, (
+        "the reconnect snapshot cleared a route without tombstoning it, so a "
+        "late STT gate can re-activate it"
+    )
+    tombstone_call = closed_branch[
+        closed_branch.index("rememberEndedGameRouteIdentity("):
+    ]
+    tombstone_call = tombstone_call[: tombstone_call.index(");")]
+    for page_identity in (
+        "S.gameRouteGameType",
+        "S.gameRouteSessionId",
+        "S.gameRouteInstanceId",
+    ):
+        assert page_identity not in tombstone_call, (
+            f"the reconnect tombstone fell back to {page_identity}; only the "
+            "server's own finalized identity is safe to record here"
+        )
+    assert "ended_route" in closed_branch, (
+        "the reconnect tombstone must read the identity the server finalized"
+    )

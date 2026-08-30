@@ -1040,6 +1040,20 @@ async function main() {
   } catch (error) { consoleCaptureError = error; }
   assert(consoleCaptureError === null,
     'global console capture changed caller control flow for unprintable values');
+  // `details` is truncated leaf by leaf, but `message` was kept verbatim -- and
+  // the global console capture joins every argument into it. One accidental
+  // data URL or serialized snapshot therefore became a multi-megabyte body, and
+  // the send queue holds up to 256 of them before anything leaves the page.
+  const capturedLogPayloads = [];
+  const realRecordLogPayload = loggerHostOne._recordOrSendLogPayload.bind(loggerHostOne);
+  loggerHostOne._recordOrSendLogPayload = (payload) => { capturedLogPayloads.push(payload); };
+  loggerHostOne._logger.enabled = true;
+  windowMock.console.warn('y'.repeat(50000));
+  loggerHostOne._logger.enabled = false;
+  loggerHostOne._recordOrSendLogPayload = realRecordLogPayload;
+  assert(capturedLogPayloads.length === 1 && capturedLogPayloads[0].message.length === 4096,
+    'an oversized console message was queued verbatim');
+
   loggerHostOne.dispose();
   windowMock.console.warn('capture remains after first dispose');
   windowMock.console.error('capture remains after first dispose');

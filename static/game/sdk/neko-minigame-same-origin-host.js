@@ -30,6 +30,12 @@
   const DEFAULT_LOG_RECOVERY_QUIET_MS = 5000;
   const DEFAULT_LOG_FLUSH_WAITER_LIMIT = 8;
   const DEFAULT_LOG_OVERFLOW_SIGNATURE_LIMIT = 64;
+  // `details` is already truncated leaf by leaf, but `message` was verbatim.
+  // The global console.warn/error capture joins every argument into it, so one
+  // accidental data URL or serialized snapshot becomes a multi-megabyte body --
+  // and the queue holds up to 256 of them before anything is sent.
+  const LOG_MESSAGE_MAX_CHARS = 4096;
+  const LOG_MESSAGE_PRESERVED_MAX_CHARS = 64 * 1024;
   const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
   const DEFAULT_PENDING_REQUEST_LIMIT = 64;
   const DEFAULT_PROTOCOL_QUEUE_LIMIT = 64;
@@ -2179,7 +2185,10 @@
         level,
         category,
         event,
-        message: String(message || ''),
+        message: String(message || '').slice(
+          0,
+          preserveMessage ? LOG_MESSAGE_PRESERVED_MAX_CHARS : LOG_MESSAGE_MAX_CHARS,
+        ),
         details: this._safeLogValue(details, 0, preserveDetails),
         sensitive_possible: !!sensitivePossible,
         preserve_message: preserveMessage,

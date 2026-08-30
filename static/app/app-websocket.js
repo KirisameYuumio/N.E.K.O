@@ -2481,6 +2481,23 @@
                                 }
                             } else {
                                 var reconciledWasActive = !!S.gameRouteActive;
+                                // This branch exists to compensate for a MISSED
+                                // `closed` event, so there is usually no tombstone
+                                // for the route being cleared and a late
+                                // GAME_VOICE_STT_GATE_ACTIVE would re-activate it.
+                                // Record the identity the SERVER says it finalized,
+                                // never the page's own: this read can disagree with
+                                // the socket, and tombstoning a live route rejects
+                                // its real gate for the rest of the round.
+                                advanceGameRouteStateRevision();
+                                var reconciledEnded = data.ended_route || null;
+                                if (reconciledEnded && reconciledEnded.session_id) {
+                                    rememberEndedGameRouteIdentity(
+                                        reconciledEnded.game_type || '',
+                                        reconciledEnded.session_id,
+                                        reconciledEnded.sdk_route_instance_id || ''
+                                    );
+                                }
                                 S.gameRouteActive = false;
                                 S.gameRouteGameType = '';
                                 S.gameRouteLanlanName = '';
@@ -3296,6 +3313,20 @@
                         var currentRouteInstanceId = S.gameRouteInstanceId || '';
                         if (endedSessionId && currentSessionId && endedSessionId !== currentSessionId) {
                             console.log(`[GameVoiceSTT] 忽略过期的 GAME_ROUTE_ENDED | ended_session=${endedSessionId} current_session=${currentSessionId}`);
+                            // Ignoring the event for OUR state is right; forgetting the
+                            // identity is not. GAME_ROUTE_ENDED is only ever emitted from
+                            // route finalize, so the identity in this payload is provably
+                            // a dead route -- and without a tombstone a late STT gate for
+                            // it can strand S.gameRouteActive = true after the current
+                            // route also ends, which suppresses proactive chat and
+                            // auto-goodbye until a full open/close cycle or a reload.
+                            // The payload's OWN identity only: `|| current...` would
+                            // tombstone the live route.
+                            rememberEndedGameRouteIdentity(
+                                (statusDetails && statusDetails.game_type) || '',
+                                endedSessionId,
+                                endedRouteInstanceId
+                            );
                             return;
                         }
                         if (
@@ -3303,6 +3334,13 @@
                             && endedRouteInstanceId !== currentRouteInstanceId
                         ) {
                             console.log(`[GameVoiceSTT] 忽略过期的 GAME_ROUTE_ENDED | ended_route=${endedRouteInstanceId} current_route=${currentRouteInstanceId}`);
+                            if (endedSessionId) {
+                                rememberEndedGameRouteIdentity(
+                                    (statusDetails && statusDetails.game_type) || '',
+                                    endedSessionId,
+                                    endedRouteInstanceId
+                                );
+                            }
                             return;
                         }
                         advanceGameRouteStateRevision();
@@ -4974,6 +5012,16 @@
                             );
                         if (isStaleGameWindowEvent) {
                             console.log(`[GameWindow] 忽略过期窗口事件 | action=${detail.action} incoming=${incomingGameSessionId} current=${currentGameSessionId}`);
+                            // Same reasoning as the GAME_ROUTE_ENDED early returns above:
+                            // `closed` is emitted only from route finalize, so this
+                            // payload names a dead route. Its own identity only.
+                            if (incomingGameSessionId) {
+                                rememberEndedGameRouteIdentity(
+                                    detail.gameType || '',
+                                    incomingGameSessionId,
+                                    incomingGameRouteInstanceId
+                                );
+                            }
                         } else if (detail.action === 'opened') {
                             advanceGameRouteStateRevision();
                             pruneRecentlyEndedGameRouteIdentities();
