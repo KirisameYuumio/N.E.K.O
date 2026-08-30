@@ -144,6 +144,7 @@ from .route_lifecycle import (  # noqa: F401
     _game_context_recent_id_limit,
     _maybe_schedule_game_context_organizer,
     _next_game_dialog_id,
+    _push_game_speech_cancel,
     _push_game_window_state_change,
     _route_heartbeat_expired,
     _route_heartbeat_timeout_seconds,
@@ -651,6 +652,24 @@ def _sdk_active_route_from_payload(
     if route_instance_error is not None:
         return lanlan_name, session_id, state, route_instance_error
     return lanlan_name, session_id, state, None
+
+
+def _character_route_owned_by_another_game(lanlan_name: str, game_type: str) -> bool:
+    """True when the character's active route belongs to a different game slot.
+
+    ``_game_route_states`` is keyed by ``(lanlan_name, game_type)`` but the sink
+    every output endpoint writes to is per character. Pre-route output is a
+    deliberate feature (opening-screen work before ``/route/start``), and it is
+    admitted whenever *this* game's slot is empty -- which stays true for the
+    whole time another game owns the character. Callers that emit to the user
+    must ask this question too, or a second surface's generation-free line lands
+    on the owner's stream.
+    """
+    if not lanlan_name:
+        return False
+    if _get_active_game_route_state(lanlan_name, game_type) is not None:
+        return False
+    return _get_active_game_route_state(lanlan_name) is not None
 
 
 def _game_route_stale_session_response(
@@ -1897,6 +1916,22 @@ async def game_route_start(game_type: str, request: Request):
     route_lock = _get_route_lock(lanlan_name, game_type)
     async with supersede_lock:
         async with route_lock:
+            # A retry after a lost/aborted /route/start ships its earlier,
+            # still-unresolved generations behind the primary in
+            # sdk_route_instance_ids. The SDK has already committed to [0];
+            # the tail exists only so the server can reconcile. Retire it here
+            # so a delayed original request for one of those ids cannot arrive
+            # afterwards and supersede the generation the SDK now owns —
+            # the dual of the retirement /route/end already does for the same
+            # candidate list. `[1:]` deliberately, never `or ("",)`: an ID-less
+            # legacy start (soccer/badminton) must not be tombstoned.
+            for superseded_instance_id in route_instance_ids[1:]:
+                _remember_game_route_end_before_start(
+                    lanlan_name,
+                    game_type,
+                    session_id,
+                    superseded_instance_id,
+                )
             if _consume_game_route_end_before_start(
                 lanlan_name, game_type, session_id, route_instance_id,
             ):
@@ -2859,6 +2894,18 @@ async def game_project_mirror_assistant(game_type: str, request: Request):
                 "lanlan_name": lanlan_name,
                 "method": "project_text_mirror",
             }
+        # Same fence as /speak: pre-route mirroring is admitted on an empty own
+        # slot, which says nothing about who owns the character right now.
+        if source_state is None and _character_route_owned_by_another_game(
+            lanlan_name, game_type,
+        ):
+            return {
+                "ok": False,
+                "reason": "route_owned_by_other_game",
+                "mirrored": False,
+                "lanlan_name": lanlan_name,
+                "method": "project_text_mirror",
+            }
         try:
             result = await asyncio.wait_for(
                 _mirror_game_assistant_text(
@@ -3029,7 +3076,20 @@ async def game_project_speak(game_type: str, request: Request):
                 if state is None
                 else current_state is state and state.get("game_route_active") is True
             )
-            if not route_still_authoritative:
+            # Only the pre-route leg needs the character-wide question; an
+            # identity-matched route already *is* the character's owner.
+            foreign_route_owner = (
+                state is None
+                and route_still_authoritative
+                and _character_route_owned_by_another_game(lanlan_name, game_type)
+            )
+            if foreign_route_owner:
+                result = {
+                    "ok": False,
+                    "reason": "route_owned_by_other_game",
+                    "audio_sent": False,
+                }
+            elif not route_still_authoritative:
                 result = {
                     "ok": False,
                     "reason": "route_superseded",
@@ -3118,6 +3178,30 @@ async def game_project_speak(game_type: str, request: Request):
                                 await speech_task
                             except asyncio.CancelledError:
                                 pass
+                            # Cancelling the worker stops the server writing
+                            # more chunks; it does not stop what the browser has
+                            # already buffered. Teardown pushes a cancel for
+                            # every correlation the route registered, but a
+                            # pre-route utterance (state is None) is registered
+                            # nowhere, and a route-scoped one whose caller
+                            # aborted without ending the route gets no teardown
+                            # at all. Push for this request's own correlation,
+                            # after the worker has drained -- a chunk written
+                            # after the cancel would re-latch playback in the
+                            # browser. Empty correlation (every built-in REST
+                            # caller) is a no-op inside the helper: an unscoped
+                            # cancel would kill chat audio this request never
+                            # owned.
+                            await _push_game_speech_cancel(
+                                mgr,
+                                lanlan_name=lanlan_name,
+                                game_type=game_type,
+                                session_id=session_id,
+                                route_instance_id=str(
+                                    (state or {}).get("_sdk_route_instance_id") or ""
+                                ),
+                                speech_correlation_id=speech_correlation_id,
+                            )
                             result = {
                                 "ok": False,
                                 "reason": "cancelled",
@@ -3265,7 +3349,13 @@ async def game_project_speech_preload(game_type: str, request: Request):
     mgr = get_session_manager().get(lanlan_name)
     if not mgr:
         return {"ok": False, "reason": "no_session_manager", "lanlan_name": lanlan_name}
-    _apply_request_render_language(data, mgr)
+    # NOT applied here: set_render_language() mutates the shared session, and a
+    # preload batch holds its own lock for tens of seconds while it synthesizes.
+    # A second preload, a speak, or the user switching the chat language would
+    # move the field the audio cache identity is derived from, and every line
+    # this batch already paid to synthesize gets discarded on completion. Pass
+    # the request locale down instead so the batch keys on what it asked for.
+    preload_render_language = _extract_request_render_language_full(data) or ""
     preload = getattr(mgr, "preload_game_speech_audio", None)
     if not callable(preload):
         return {"ok": False, "reason": "project_tts_preload_unavailable"}
@@ -3310,11 +3400,15 @@ async def game_project_speech_preload(game_type: str, request: Request):
                     "method": "project_tts_preload",
                     "results": [],
                 }
-            preload_task = asyncio.create_task(preload(lines))
+            preload_task = asyncio.create_task(
+                preload(lines, render_language=preload_render_language)
+            )
             raw_route_tasks.add(preload_task)
             route_preload_tasks = raw_route_tasks
     else:
-        preload_task = asyncio.create_task(preload(lines))
+        preload_task = asyncio.create_task(
+            preload(lines, render_language=preload_render_language)
+        )
     is_disconnected = getattr(request, "is_disconnected", None)
     preload_deadline = (
         asyncio.get_running_loop().time()

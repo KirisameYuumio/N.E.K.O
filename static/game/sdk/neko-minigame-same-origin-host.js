@@ -110,6 +110,17 @@
 
   const TRUSTED_PAYLOAD_MAX_DEPTH = 24;
   const TRUSTED_PAYLOAD_MAX_NODES = 4096;
+  // Depth and node counts measure structure only: a string is one node however
+  // many bytes it holds, and keys are not measured at all. The SDK bounds every
+  // other egress path at 256 KiB, but the runtime lifecycle payload -- what
+  // configure({payload}) returns, and the runtime.start/end arguments -- had no
+  // byte bound anywhere, so an honest mistake (stuffing a replay buffer or a
+  // base64 frame into it) became multi-megabyte POSTs at the heartbeat and
+  // drain cadence. Deliberately the same 256 KiB the SDK already uses: a
+  // smaller round number here would reject payloads the SDK has just accepted,
+  // and cumulative content bytes are always <= the serialised size the SDK
+  // measures on the same object, so this cannot reject what the SDK admitted.
+  const TRUSTED_PAYLOAD_MAX_CONTENT_BYTES = 256 * 1024;
   const TRUSTED_PAYLOAD_OMIT = Symbol('trusted-payload-omit');
 
   function isMemoryPolicyPayloadKey(key) {
@@ -125,12 +136,17 @@
     }
   }
 
-  function cloneTrustedJsonData(value, state = { nodes: 0, seen: new Set() }, depth = 0) {
+  function cloneTrustedJsonData(value, state = { nodes: 0, bytes: 0, seen: new Set() }, depth = 0) {
     if (depth > TRUSTED_PAYLOAD_MAX_DEPTH || state.nodes >= TRUSTED_PAYLOAD_MAX_NODES) {
       throw new TypeError('invalid_payload');
     }
     state.nodes += 1;
-    if (value == null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      state.bytes = (state.bytes || 0) + utf8ByteLength(value);
+      if (state.bytes > TRUSTED_PAYLOAD_MAX_CONTENT_BYTES) throw new TypeError('invalid_payload');
+      return value;
+    }
+    if (value == null || typeof value === 'boolean') return value;
     if (typeof value === 'number') return Number.isFinite(value) ? value : null;
     if (['undefined', 'function', 'symbol'].includes(typeof value)) return TRUSTED_PAYLOAD_OMIT;
     if (typeof value === 'bigint') throw new TypeError('invalid_payload');
@@ -147,6 +163,9 @@
       for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
         if (!descriptor.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
         if (key === 'toJSON') continue;
+        // Keys carry bytes too, and a payload can be all keys and no values.
+        state.bytes = (state.bytes || 0) + utf8ByteLength(key);
+        if (state.bytes > TRUSTED_PAYLOAD_MAX_CONTENT_BYTES) throw new TypeError('invalid_payload');
         const cloned = cloneTrustedJsonData(descriptor.value, state, depth + 1);
         if (cloned !== TRUSTED_PAYLOAD_OMIT) result[key] = cloned;
       }

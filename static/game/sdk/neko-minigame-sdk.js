@@ -62,6 +62,10 @@
   const MAX_RUNTIME_EVENT_BYTES = 256 * 1024;
   const MAX_RUNTIME_OUTPUTS_PER_POLL = 50;
   const MAX_RUNTIME_ROUTE_INSTANCE_IDS = 4;
+  // Deadlock breaker, NOT a latency budget: a handler may legitimately await a
+  // cut-scene or a whole spoken line. Only a handler that has been stuck for a
+  // full minute is abandoned, and the next output is still delivered.
+  const MAX_RUNTIME_HANDLER_MS = 60000;
   const MIN_RUNTIME_INTERVAL_MS = 250;
   const MAX_RUNTIME_INTERVAL_MS = 60000;
   const DEFAULT_HEARTBEAT_INTERVAL_MS = 2500;
@@ -704,6 +708,31 @@
     return typeof TextEncoderImpl === 'function'
       ? new TextEncoderImpl().encode(serialized).byteLength
       : unescape(encodeURIComponent(serialized)).length;
+  }
+
+  function normalizeBoundedEnvelope(data, fieldName, maximumBytes, nestedKey = 'value') {
+    // The write path measures the game's payload on its own; the read path used
+    // to measure the same payload wrapped in a reply envelope against the
+    // identical budget. Every unit of wrapper overhead was therefore charged
+    // against the payload's own budget -- 33 bytes for {"ok":true,"found":true,
+    // "value":...}, three extra clone nodes against the fixed 2048, and one
+    // extra level against the fixed depth of 16 -- so a payload that stored
+    // fine could be permanently unreadable. Give the nested payload exactly the
+    // budget it was written under (fresh node counter, depth 0) and hold the
+    // rest of the envelope to its own bound, so a host cannot smuggle bytes in
+    // through a sibling field either.
+    if (!plainObject(data) || !Object.prototype.hasOwnProperty.call(data, nestedKey)) {
+      return normalizeBoundedJson(data, fieldName, maximumBytes);
+    }
+    const nested = data[nestedKey];
+    // `undefined` under a present key is rejected here as `invalid_request`
+    // rather than as the clone's `invalid_contract`; deliberate, and either way
+    // it is a host that answered with something unrepresentable.
+    const boundedNested = normalizeBoundedJson(nested, `${fieldName} ${nestedKey}`, maximumBytes);
+    const envelope = { ...data };
+    delete envelope[nestedKey];
+    const boundedEnvelope = normalizeBoundedJson(envelope, fieldName, maximumBytes);
+    return Object.freeze({ ...boundedEnvelope, [nestedKey]: boundedNested });
   }
 
   function normalizeBoundedJson(value, fieldName, maximumBytes = MAX_CONTRACT_PAYLOAD_BYTES) {
@@ -1982,6 +2011,47 @@
       catch (_) { return Number.POSITIVE_INFINITY; }
     }
 
+    async function awaitHandlerWithinBudget(result, normalizedType) {
+      // `waitForHandlers` is a promised ordering contract (README: runtime
+      // output handlers run sequentially in poll order), so this must not
+      // become fire-and-forget. But the await was unbounded, and a handler that
+      // never settles pins `outputLifecycle.inFlight` at true forever: every
+      // later poll returns null with no error, no event and no log, drain stops
+      // (so declared controls stop arriving too), and the backend's 50-entry
+      // pending ring silently discards everything past the cap. Only an
+      // explicit restart cleared it.
+      const settled = Promise.resolve(result);
+      const setTimer = windowImpl.setTimeout?.bind(windowImpl) || globalThis.setTimeout;
+      const clearTimer = windowImpl.clearTimeout?.bind(windowImpl) || globalThis.clearTimeout;
+      if (typeof setTimer !== 'function' || typeof clearTimer !== 'function') {
+        await settled;
+        return;
+      }
+      // The handler promise outlives this race when it times out; mark it
+      // handled so a late rejection is not an unhandled rejection. This does
+      // not stop the `await` below from throwing a prompt rejection.
+      settled.catch(() => {});
+      let timerId = null;
+      let timedOut = false;
+      try {
+        await Promise.race([
+          settled,
+          new Promise((resolve) => {
+            timerId = setTimer(() => { timedOut = true; resolve(); }, MAX_RUNTIME_HANDLER_MS);
+          }),
+        ]);
+      } finally {
+        if (timerId !== null) clearTimer(timerId);
+      }
+      if (timedOut) {
+        // Log only. Publishing a runtime-error from here would recurse into
+        // listeners that can hang the same way.
+        windowImpl.console?.error?.(
+          `[NekoMiniGame] ${normalizedType} listener exceeded the handler budget`,
+        );
+      }
+    }
+
     async function publishRuntimeEvent(type, payload, { waitForHandlers = false } = {}) {
       if (disposed) return null;
       const normalizedType = String(type || '').trim();
@@ -2012,7 +2082,7 @@
         try {
           const result = handler(envelope);
           if (result && typeof result.then === 'function') {
-            if (waitForHandlers) await result;
+            if (waitForHandlers) await awaitHandlerWithinBudget(result, normalizedType);
             else {
               void Promise.resolve(result).catch((error) => {
                 windowImpl.console?.error?.(`[NekoMiniGame] ${normalizedType} listener failed`, error);
@@ -2042,6 +2112,21 @@
       const numeric = Number(value);
       if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
       return Math.max(MIN_RUNTIME_INTERVAL_MS, Math.min(Math.floor(numeric), maximum));
+    }
+
+    function requireBoundedRuntimeLifecyclePayload(payload, operation) {
+      // Every other SDK egress path is bounded; the runtime lifecycle payload
+      // was not, in the one dimension that costs anything. Same 256 KiB the
+      // trusted host now enforces, so the two cannot disagree about an honest
+      // payload.
+      const bytes = jsonByteLength(payload ?? {});
+      if (bytes > MAX_RUNTIME_EVENT_BYTES) {
+        fail('invalid_request', 'The runtime lifecycle payload exceeds its size limit', {
+          operation,
+          bytes,
+          limit: MAX_RUNTIME_EVENT_BYTES,
+        });
+      }
     }
 
     function runtimePayload() {
@@ -3043,6 +3128,14 @@
             operation: 'runtime.start',
           });
         }
+        // Deliberately BEFORE the generation is minted. The trusted host also
+        // bounds this payload, but a transport throw lands in the catch below,
+        // which leaves the generation unresolved on purpose (a network throw
+        // may well have reached the server). An oversized payload never leaves
+        // the browser, so letting it take that path would burn one of the four
+        // candidate slots per attempt and wedge start() on `busy` after four
+        // tries with the same mistake.
+        requireBoundedRuntimeLifecyclePayload(payload, 'runtime.start');
         memoryConsentLocked = true;
         runtimeRouteEstablished = false;
         const routeInstanceId = nextRuntimeRouteInstanceId();
@@ -3342,7 +3435,7 @@
       const response = await normalizeTransportResponse(rawResponse);
       return Object.freeze({
         ...response,
-        data: normalizeBoundedJson(response.data, 'storage response', MAX_STORAGE_VALUE_BYTES),
+        data: normalizeBoundedEnvelope(response.data, 'storage response', MAX_STORAGE_VALUE_BYTES),
       });
     }
 
@@ -3396,7 +3489,7 @@
       const response = await normalizeTransportResponse(rawResponse);
       return Object.freeze({
         ...response,
-        data: normalizeBoundedJson(response.data, 'local leaderboard response', MAX_LEADERBOARD_STATE_BYTES),
+        data: normalizeBoundedEnvelope(response.data, 'local leaderboard response', MAX_LEADERBOARD_STATE_BYTES),
       });
     }
 
@@ -3429,7 +3522,10 @@
       return Object.freeze({
         ok: true,
         status: 200,
-        data: normalizeBoundedJson(data, 'local leaderboard result', MAX_LEADERBOARD_STATE_BYTES),
+        // `entries` restates a board state that was written under exactly
+        // this budget, under a different wrapper; measuring the wrapper with
+        // it breaks `list` on a full board.
+        data: normalizeBoundedEnvelope(data, 'local leaderboard result', MAX_LEADERBOARD_STATE_BYTES, 'entries'),
       });
     }
 

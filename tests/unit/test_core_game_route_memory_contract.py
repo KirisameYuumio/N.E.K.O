@@ -309,7 +309,7 @@ async def test_mirror_assistant_speech_replays_opted_in_cached_audio_without_req
     mgr = _make_manager()
     mgr.tts_thread = _FakeAliveThread()
     mgr.tts_ready = True
-    mgr.game_speech_audio_cache_identity = lambda _text: ("opaque-cache-key", "voice-signature")
+    mgr.game_speech_audio_cache_identity = lambda _text, **_kwargs: ("opaque-cache-key", "voice-signature")
     sent_audio = []
     completed_audio = []
 
@@ -376,7 +376,7 @@ async def test_cached_speech_replay_reports_failed_audio_delivery():
     mgr = _make_manager()
     mgr.tts_thread = _FakeAliveThread()
     mgr.tts_ready = True
-    mgr.game_speech_audio_cache_identity = lambda _text: ("opaque-cache-key", "voice-signature")
+    mgr.game_speech_audio_cache_identity = lambda _text, **_kwargs: ("opaque-cache-key", "voice-signature")
     completed_audio = []
 
     async def send_audio_done(speech_id):
@@ -429,7 +429,7 @@ async def test_cached_speech_replay_reports_failed_audio_done_delivery():
     mgr = _make_manager()
     mgr.tts_thread = _FakeAliveThread()
     mgr.tts_ready = True
-    mgr.game_speech_audio_cache_identity = lambda _text: ("opaque-cache-key", "voice-signature")
+    mgr.game_speech_audio_cache_identity = lambda _text, **_kwargs: ("opaque-cache-key", "voice-signature")
     try:
         first = await core_module.LLMSessionManager.mirror_assistant_speech(
             mgr,
@@ -815,7 +815,7 @@ async def test_game_speech_preload_captures_audio_without_sending_playback():
     GAME_SPEECH_AUDIO_CACHE.clear()
     mgr = _make_manager()
     mgr.send_speech = AsyncMock(return_value=True)
-    mgr.game_speech_audio_cache_identity = lambda _text: (
+    mgr.game_speech_audio_cache_identity = lambda _text, **_kwargs: (
         "preload-cache-key",
         "preload-runtime-signature",
     )
@@ -878,10 +878,86 @@ async def test_game_speech_preload_captures_audio_without_sending_playback():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_game_speech_preload_keys_on_its_own_locale_and_survives_a_mid_batch_switch():
+    """A preload batch owns its cache identity from precompute to completion.
+
+    ``game_speech_audio_cache_identity`` derives the signature from a mutable
+    session field, and a batch holds its lock across seconds of synthesis. Both
+    halves are asserted here: the request locale reaches the identity call
+    instead of being written onto the shared session, and a locale switch
+    landing mid-batch cannot discard audio the batch already paid to
+    synthesize.
+    """
+    GAME_SPEECH_AUDIO_CACHE.clear()
+    mgr = _make_manager()
+    mgr.send_speech = AsyncMock(return_value=True)
+    mgr._conversation_render_language = "Chinese"
+    seen_languages = []
+
+    def identity(_text, *, render_language=""):
+        seen_languages.append(render_language)
+        language = render_language or mgr._conversation_render_language
+        return f"preload-key-{language}", f"preload-signature-{language}"
+
+    mgr.game_speech_audio_cache_identity = identity
+    mgr.current_game_speech_audio_runtime_signature = (
+        lambda: f"preload-signature-{mgr._conversation_render_language}"
+    )
+
+    def fake_worker(request_queue, response_queue, _api_key, _voice_id):
+        response_queue.put(("__ready__", True))
+        active_speech_id = None
+        while True:
+            speech_id, _text = request_queue.get()
+            if speech_id == "__shutdown__":
+                return
+            if speech_id is None:
+                if active_speech_id:
+                    # Someone switches the chat language while this batch is
+                    # still synthesizing -- a second preload, a speak, or the
+                    # user changing the UI language.
+                    mgr._conversation_render_language = "English"
+                    response_queue.put(("__audio_done__", active_speech_id))
+                    active_speech_id = None
+                continue
+            active_speech_id = speech_id
+            response_queue.put(("__audio__", speech_id, b"silent-preload-pcm"))
+
+    mgr._resolve_tts_worker_spec = lambda: (
+        fake_worker,
+        "",
+        "voice",
+        None,
+        False,
+        {},
+    )
+    try:
+        result = await core_module.LLMSessionManager.preload_game_speech_audio(
+            mgr,
+            ["预载这句"],
+            render_language="Japanese",
+        )
+
+        # Keyed on what the request asked for, not on the session's "Chinese".
+        assert seen_languages == ["Japanese"]
+        assert mgr._conversation_render_language == "English"
+        assert result["ok"] is True
+        assert result["results"] == [{"index": 0, "status": "loaded"}]
+        assert GAME_SPEECH_AUDIO_CACHE.get("preload-key-Japanese") == (
+            b"silent-preload-pcm",
+        )
+        assert GAME_SPEECH_AUDIO_CACHE.get("preload-key-Chinese") is None
+        assert GAME_SPEECH_AUDIO_CACHE.get("preload-key-English") is None
+    finally:
+        GAME_SPEECH_AUDIO_CACHE.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_game_speech_preload_propagates_real_cancellation_and_releases_worker():
     GAME_SPEECH_AUDIO_CACHE.clear()
     mgr = _make_manager()
-    mgr.game_speech_audio_cache_identity = lambda _text: (
+    mgr.game_speech_audio_cache_identity = lambda _text, **_kwargs: (
         "cancel-cache-key",
         "cancel-runtime-signature",
     )
@@ -950,7 +1026,7 @@ async def test_game_speech_preload_supersede_returns_cancelled_without_killing_t
     """
     GAME_SPEECH_AUDIO_CACHE.clear()
     mgr = _make_manager()
-    mgr.game_speech_audio_cache_identity = lambda _text: (
+    mgr.game_speech_audio_cache_identity = lambda _text, **_kwargs: (
         "supersede-cache-key",
         "supersede-runtime-signature",
     )
@@ -1000,7 +1076,7 @@ async def test_game_speech_preload_supersede_returns_cancelled_without_killing_t
 async def test_game_speech_preload_rejects_worker_without_completion_before_starting_thread():
     GAME_SPEECH_AUDIO_CACHE.clear()
     mgr = _make_manager()
-    mgr.game_speech_audio_cache_identity = lambda _text: (
+    mgr.game_speech_audio_cache_identity = lambda _text, **_kwargs: (
         "unavailable-cache-key",
         "unavailable-runtime-signature",
     )
@@ -1048,7 +1124,7 @@ async def test_game_speech_preload_retires_legacy_worker_after_item_timeout():
     GAME_SPEECH_AUDIO_CACHE.clear()
     mgr = _make_manager()
     mgr._game_speech_preload_item_timeout_seconds = 0.05
-    mgr.game_speech_audio_cache_identity = lambda text: (
+    mgr.game_speech_audio_cache_identity = lambda text, **_kwargs: (
         f"legacy-timeout:{text}",
         "legacy-timeout-signature",
     )

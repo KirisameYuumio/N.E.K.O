@@ -370,6 +370,93 @@ async def test_repeated_route_end_does_not_cancel_same_session_restart(monkeypat
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_start_retires_the_generations_its_retry_left_behind(monkeypatch):
+    """A delayed original start must not supersede the generation the SDK owns.
+
+    When the first ``/route/start`` is lost (timeout / abort) the SDK cannot
+    resolve that generation, so the retry ships it behind the new primary in
+    ``sdk_route_instance_ids``. If the original request was in flight all along
+    and reaches the handler after the retry, it activates a route the game has
+    already given up on -- and takes the character's takeover with it. The retry
+    retires the tail, mirroring what ``/route/end`` already does for the same
+    candidate list.
+    """
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    async def fake_pregame_context(**kwargs):
+        return gr_pregame._default_soccer_pregame_context(), "lightweight", ""
+
+    _gr_patch_all(monkeypatch, "_build_soccer_pregame_context", fake_pregame_context)
+
+    with reset_game_route_state():
+        retry = await gr_runtime.game_route_start(
+            "soccer",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "lost-start",
+                "sdk_route_instance_id": "route-B",
+                "sdk_route_instance_ids": ["route-B", "route-A"],
+            }),
+        )
+
+        assert retry["ok"] is True
+        assert retry["state"]["game_route_active"] is True
+        assert ("Lan", "soccer", "lost-start", "route-A") in (
+            gr_runtime._game_route_end_tombstones
+        )
+        # The primary is what the SDK now owns; retiring it would cancel the
+        # very route this request just activated.
+        assert ("Lan", "soccer", "lost-start", "route-B") not in (
+            gr_runtime._game_route_end_tombstones
+        )
+
+        delayed_original = await gr_runtime.game_route_start(
+            "soccer",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "lost-start",
+                "sdk_route_instance_id": "route-A",
+            }),
+        )
+
+        assert delayed_original == {
+            "ok": True,
+            "reason": "ended_before_start",
+            "state": {"game_route_active": False},
+        }
+        surviving = gr_runtime._get_active_game_route_state("Lan", "soccer")
+        assert surviving is not None
+        assert surviving["_sdk_route_instance_id"] == "route-B"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_route_start_without_sdk_generations_leaves_no_tombstone(monkeypatch):
+    """An ID-less legacy start must not tombstone its own session.
+
+    ``/route/end`` normalises an empty candidate list to ``("",)``; copying that
+    here would write the ID-less key and cancel the next soccer/badminton start
+    that reuses the session id.
+    """
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {})
+
+    async def fake_pregame_context(**kwargs):
+        return gr_pregame._default_soccer_pregame_context(), "lightweight", ""
+
+    _gr_patch_all(monkeypatch, "_build_soccer_pregame_context", fake_pregame_context)
+
+    with reset_game_route_state():
+        started = await gr_runtime.game_route_start(
+            "soccer",
+            _FakeRequest({"lanlan_name": "Lan", "session_id": "legacy-session"}),
+        )
+
+        assert started["ok"] is True
+        assert gr_runtime._game_route_end_tombstones == {}
+
+
+@pytest.mark.unit
 def test_route_end_before_start_tombstones_expire_and_stay_bounded(monkeypatch):
     clock = {"now": 100.0}
     patch_module_clock(monkeypatch, gr_runtime, monotonic=lambda: clock["now"])
@@ -4899,6 +4986,7 @@ class _FakeGameRouteManager:
         self.assistant_mirrored = []
         self.spoken = []
         self.preloaded = []
+        self.preload_render_languages = []
         self.statuses = []
         self.user_activity_count = 0
         self._takeover_active = False
@@ -4931,10 +5019,11 @@ class _FakeGameRouteManager:
             "voice_source": {"provider": "project_tts"},
         }
 
-    async def preload_game_speech_audio(self, lines):
+    async def preload_game_speech_audio(self, lines, *, render_language=""):
         self.render_language_at_mirror.append(
             getattr(self, "_conversation_render_language", None)
         )
+        self.preload_render_languages.append(render_language)
         self.preloaded.append(list(lines))
         return {
             "ok": True,
@@ -7036,7 +7125,14 @@ async def test_project_speech_preload_is_silent_and_deduplicates_lines(monkeypat
     assert result["ok"] is True
     assert result["method"] == "project_tts_preload"
     assert mgr.preloaded == [["开球了", "看我的"]]
-    assert mgr.render_language_at_mirror == ["ja"]
+    # The request locale reaches the batch as an argument and never touches the
+    # shared session field: a batch runs for tens of seconds behind its own
+    # lock, and the audio cache identity is derived from that field, so any
+    # concurrent writer would invalidate audio this batch already synthesized.
+    assert mgr.preload_render_languages == ["ja"]
+    # Observed from inside the batch: the shared field is still unwritten.
+    assert mgr.render_language_at_mirror == [None]
+    assert getattr(mgr, "_conversation_render_language", None) is None
     assert mgr.spoken == []
     assert mgr.assistant_mirrored == []
 
@@ -7127,8 +7223,9 @@ async def test_project_speech_preload_disconnect_cancels_backend_work(monkeypatc
             super().__init__()
             self.cancelled = False
 
-        async def preload_game_speech_audio(self, lines):
+        async def preload_game_speech_audio(self, lines, *, render_language=""):
             self.preloaded.append(list(lines))
+            self.preload_render_languages.append(render_language)
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -7161,8 +7258,9 @@ async def test_project_speech_preload_is_cancelled_with_its_active_route(monkeyp
             self.preload_started = asyncio.Event()
             self.preload_cancelled = asyncio.Event()
 
-        async def preload_game_speech_audio(self, lines):
+        async def preload_game_speech_audio(self, lines, *, render_language=""):
             self.preloaded.append(list(lines))
+            self.preload_render_languages.append(render_language)
             self.preload_started.set()
             try:
                 await asyncio.Event().wait()
@@ -7227,8 +7325,9 @@ async def test_project_speech_preload_propagates_cancellation_of_its_own_request
             self.preload_started = asyncio.Event()
             self.preload_cancelled = asyncio.Event()
 
-        async def preload_game_speech_audio(self, lines):
+        async def preload_game_speech_audio(self, lines, *, render_language=""):
             self.preloaded.append(list(lines))
+            self.preload_render_languages.append(render_language)
             self.preload_started.set()
             try:
                 await asyncio.Event().wait()
@@ -7327,7 +7426,8 @@ async def test_project_speech_preload_has_total_timeout_and_cleans_task(monkeypa
             super().__init__()
             self.cancelled = False
 
-        async def preload_game_speech_audio(self, _lines):
+        async def preload_game_speech_audio(self, _lines, *, render_language=""):
+            self.preload_render_languages.append(render_language)
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -7441,6 +7541,107 @@ async def test_project_speak_preroute_disconnect_cancels_backend_work(monkeypatc
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_project_speak_disconnect_cancels_the_audio_it_already_handed_to_the_browser(monkeypatch):
+    """Cancelling the worker does not un-send chunks the browser already has.
+
+    Route teardown pushes a cancel for every correlation the route registered,
+    but a pre-route utterance is registered nowhere (there is no route state to
+    register it on), and a route-scoped one whose caller merely aborted the
+    fetch gets no teardown at all. Either way the browser keeps playing a line
+    the game has abandoned unless this request cancels its own correlation.
+    """
+    class ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    class DisconnectingRequest(_FakeRequest):
+        async def is_disconnected(self):
+            return True
+
+    class BlockingSpeechManager(_FakeGameRouteManager):
+        def __init__(self):
+            super().__init__()
+            self.websocket = SimpleNamespace(
+                client_state=ConnectedState(),
+                send_json=AsyncMock(),
+            )
+
+        async def mirror_assistant_speech(self, line, **kwargs):
+            self.spoken.append((line, kwargs))
+            await asyncio.Event().wait()
+
+    with reset_game_route_state():
+        mgr = BlockingSpeechManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+        result = await gr_runtime.game_project_speak(
+            "example-game",
+            DisconnectingRequest({
+                "line": "abandoned pre-route line",
+                "session_id": "pregame-session",
+                "lanlan_name": "Lan",
+                "sdk_speech_correlation_id": "speech-correlation-x",
+            }),
+        )
+
+    assert result["reason"] == "cancelled"
+    mgr.websocket.send_json.assert_awaited_once_with({
+        "type": "game_route_speech_cancel",
+        "lanlan_name": "Lan",
+        "game_type": "example-game",
+        "session_id": "pregame-session",
+        "sdk_speech_correlation_id": "speech-correlation-x",
+    })
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speak_disconnect_without_a_correlation_cancels_nothing(monkeypatch):
+    """Built-in REST callers send no correlation, and an unscoped cancel would
+    clear chat audio this request never owned."""
+    class ConnectedState:
+        CONNECTED = "connected"
+
+        def __eq__(self, other):
+            return other == self.CONNECTED
+
+    class DisconnectingRequest(_FakeRequest):
+        async def is_disconnected(self):
+            return True
+
+    class BlockingSpeechManager(_FakeGameRouteManager):
+        def __init__(self):
+            super().__init__()
+            self.websocket = SimpleNamespace(
+                client_state=ConnectedState(),
+                send_json=AsyncMock(),
+            )
+
+        async def mirror_assistant_speech(self, line, **kwargs):
+            self.spoken.append((line, kwargs))
+            await asyncio.Event().wait()
+
+    with reset_game_route_state():
+        mgr = BlockingSpeechManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            DisconnectingRequest({
+                "line": "legacy line",
+                "session_id": "match_1",
+                "lanlan_name": "Lan",
+            }),
+        )
+
+    assert result["reason"] == "cancelled"
+    mgr.websocket.send_json.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_project_speak_rejects_stale_route_session(monkeypatch):
     with reset_game_route_state():
         mgr = _FakeGameRouteManager()
@@ -7497,6 +7698,73 @@ async def test_project_speak_rejects_closed_game_route_output(monkeypatch):
         assert result["audio_sent"] is False
         assert result["state"]["game_route_active"] is False
         assert mgr.spoken == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speak_pre_route_rejects_output_while_another_game_owns_the_character(monkeypatch):
+    """Pre-route speech is admitted on an empty *own* slot, not an empty character.
+
+    ``_game_route_states`` is keyed by ``(lanlan_name, game_type)`` but the
+    audio sink is per character. A second surface opened for the same character
+    -- a game whose ``/route/start`` failed and fell back to local play, or an
+    SDK game speaking before its own start -- would otherwise have every line
+    played on the owner's stream.
+    """
+    with reset_game_route_state():
+        mgr = _FakeGameRouteManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+        gr_runtime._activate_game_route("badminton", "owner-session", "Lan")
+
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({"line": "开球了", "lanlan_name": "Lan"}),
+        )
+
+        assert result["ok"] is False
+        assert result["reason"] == "route_owned_by_other_game"
+        assert result["audio_sent"] is False
+        assert mgr.spoken == []
+        # The counter this endpoint increments before its try/finally must not
+        # leak, or four rejections wedge the character on ``busy`` forever.
+        assert getattr(mgr, "_sdk_game_speech_pending_count", 0) == 0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_speak_pre_route_still_allowed_when_the_character_is_free(monkeypatch):
+    """The documented opening-screen path is untouched when nobody owns the character."""
+    with reset_game_route_state():
+        mgr = _FakeGameRouteManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+        result = await gr_runtime.game_project_speak(
+            "soccer",
+            _FakeRequest({"line": "开球了", "lanlan_name": "Lan"}),
+        )
+
+        assert result["ok"] is True
+        assert [entry[0] for entry in mgr.spoken] == ["开球了"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_project_mirror_assistant_pre_route_rejects_output_while_another_game_owns_the_character(monkeypatch):
+    """Same fence as /speak: the text mirror writes to the same per-character sink."""
+    with reset_game_route_state():
+        mgr = _FakeGameRouteManager()
+        _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+        gr_runtime._activate_game_route("badminton", "owner-session", "Lan")
+
+        result = await gr_runtime.game_project_mirror_assistant(
+            "soccer",
+            _FakeRequest({"line": "开球了", "lanlan_name": "Lan"}),
+        )
+
+        assert result["ok"] is False
+        assert result["reason"] == "route_owned_by_other_game"
+        assert result["mirrored"] is False
+        assert mgr.assistant_mirrored == []
 
 
 @pytest.mark.unit

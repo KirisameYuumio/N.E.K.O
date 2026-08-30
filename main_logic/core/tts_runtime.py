@@ -480,10 +480,22 @@ class TtsRuntimeMixin:
                 bool(getattr(self, "_is_free_preset_voice", False)),
             )
 
-    def game_speech_audio_cache_identity(self, clean_text: str) -> tuple[str, str]:
-        """Return opaque runtime and utterance hashes for mini-game audio reuse."""
+    def game_speech_audio_cache_identity(
+        self,
+        clean_text: str,
+        *,
+        render_language: str = "",
+    ) -> tuple[str, str]:
+        """Return opaque runtime and utterance hashes for mini-game audio reuse.
+
+        ``render_language`` lets a caller that must not mutate the shared
+        session locale (silent preload) key its audio under the locale it was
+        asked for. Empty means "use whatever the session currently renders in",
+        which is what the interactive speak path wants.
+        """
         language = str(
-            getattr(self, "_conversation_render_language", "")
+            render_language
+            or getattr(self, "_conversation_render_language", "")
             or getattr(self, "_conversation_turn_language", "")
             or getattr(self, "user_language", "")
             or ""
@@ -549,8 +561,19 @@ class TtsRuntimeMixin:
             except Exception:
                 pass
 
-    async def preload_game_speech_audio(self, lines: list[str]) -> dict:
-        """Silently synthesize bounded mini-game text into the reusable cache."""
+    async def preload_game_speech_audio(
+        self,
+        lines: list[str],
+        *,
+        render_language: str = "",
+    ) -> dict:
+        """Silently synthesize bounded mini-game text into the reusable cache.
+
+        The caller passes its request locale instead of writing it onto the
+        shared session: this batch runs for tens of seconds behind its own lock,
+        and every concurrent speak/preload/UI language change would otherwise
+        move the field the cache identity is derived from.
+        """
         max_lines = 32
         max_pending_batches = 4
         ready_timeout_seconds = 30.0
@@ -632,7 +655,9 @@ class TtsRuntimeMixin:
                 pending_lines: list[tuple[int, str, str, str]] = []
                 for index, clean in enumerate(unique_lines):
                     cache_key, runtime_signature = (
-                        self.game_speech_audio_cache_identity(clean)
+                        self.game_speech_audio_cache_identity(
+                            clean, render_language=render_language,
+                        )
                     )
                     if GAME_SPEECH_AUDIO_CACHE.get(cache_key) is not None:
                         results_by_index[index] = {"index": index, "status": "hit"}
@@ -801,7 +826,20 @@ class TtsRuntimeMixin:
                                     loaded = GAME_SPEECH_AUDIO_CACHE.complete_capture(
                                         capture_owner,
                                         speech_id,
-                                        self.current_game_speech_audio_runtime_signature(),
+                                        # The signature this batch precomputed,
+                                        # not a fresh read: one worker is
+                                        # resolved for the whole batch with no
+                                        # await between the precompute and the
+                                        # resolve, so this audio provably came
+                                        # from that runtime. Re-reading compares
+                                        # against whatever the session renders
+                                        # in *now* and throws away audio that
+                                        # was already synthesized. (The
+                                        # streaming speak path below is
+                                        # different: its worker really can be
+                                        # restarted mid-utterance, so it must
+                                        # re-read.)
+                                        runtime_signature,
                                     )
                                     failure_reason = (
                                         "tts_incomplete" if not loaded else ""

@@ -235,7 +235,9 @@ Incoming host events use immutable envelopes with `protocolVersion`, monotonic
 types are `runtime-state`, `runtime-inactive`, `runtime-error`,
 `visibility-change`, `page-exit`, and `runtime-output`. Handlers are bounded to 32 per event;
 each event payload is bounded to 256 KiB, and each output poll accepts at most 50
-items. Runtime output handlers run sequentially in poll order.
+items. Runtime output handlers run sequentially in poll order. A handler that has
+not settled after 60 seconds is abandoned so output polling cannot stall
+permanently; the ordering guarantee is unchanged for handlers that settle.
 
 Host-to-game runtime lifecycle events remain a fixed core list. Game-to-host
 events use the separate manifest-declared contract API above; they cannot add

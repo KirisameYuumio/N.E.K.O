@@ -512,6 +512,40 @@ async function main() {
       (call) => call.url.endsWith('/route/heartbeat'),
     ).length === heartbeatCallsBeforeWidePayload,
   'a payload wider than the trusted clone bound reached the backend');
+  // Depth and node counts measure structure only -- a string is one node
+  // however many bytes it holds, and keys were not measured at all -- so the
+  // runtime lifecycle payload had no byte bound anywhere. Every other SDK
+  // egress path is capped at 256 KiB; this one shipped whatever
+  // configure({payload}) returned, at the heartbeat and drain cadence.
+  const heartbeatCallsBeforeHeavyPayload = calls.filter(
+    (call) => call.url.endsWith('/route/heartbeat'),
+  ).length;
+  let heavyPayloadError = null;
+  try { await ungrantedHost.heartbeat({ replay: 'x'.repeat(300 * 1024) }); }
+  catch (error) { heavyPayloadError = error; }
+  assert(heavyPayloadError?.code === 'invalid_payload'
+    && calls.filter(
+      (call) => call.url.endsWith('/route/heartbeat'),
+    ).length === heartbeatCallsBeforeHeavyPayload,
+  'a multi-hundred-KiB runtime payload reached the backend unbounded');
+  let heavyKeyError = null;
+  try {
+    await ungrantedHost.heartbeat({
+      [`k${'y'.repeat(300 * 1024)}`]: 1,
+    });
+  } catch (error) { heavyKeyError = error; }
+  assert(heavyKeyError?.code === 'invalid_payload',
+    'payload bytes hidden in a key bypassed the trusted payload budget');
+  // The bound is the SDK's own 256 KiB, so it can never reject a payload the
+  // SDK has already accepted.
+  const heartbeatCallsBeforeAdmittedPayload = calls.filter(
+    (call) => call.url.endsWith('/route/heartbeat'),
+  ).length;
+  await ungrantedHost.heartbeat({ replay: 'x'.repeat(200 * 1024) });
+  assert(calls.filter(
+    (call) => call.url.endsWith('/route/heartbeat'),
+  ).length === heartbeatCallsBeforeAdmittedPayload + 1,
+  'a payload within the shared 256 KiB budget was rejected by the host');
   ungrantedHost.dispose();
 
   const speechOnlyHost = createHost({

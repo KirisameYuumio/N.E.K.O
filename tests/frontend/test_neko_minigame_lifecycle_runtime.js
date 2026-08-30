@@ -19,6 +19,7 @@ function deferred() {
 function createEnvironment() {
   let nextTimerId = 0;
   const intervals = new Map();
+  const timeouts = new Map();
   const documentListeners = new Map();
   const windowListeners = new Map();
   const consoleErrors = [];
@@ -51,6 +52,12 @@ function createEnvironment() {
       return nextTimerId;
     },
     clearInterval(timerId) { intervals.delete(timerId); },
+    setTimeout(handler, delayMs) {
+      nextTimerId += 1;
+      timeouts.set(nextTimerId, { handler, delayMs });
+      return nextTimerId;
+    },
+    clearTimeout(timerId) { timeouts.delete(timerId); },
     addEventListener(type, handler) {
       let handlers = windowListeners.get(type);
       if (!handlers) {
@@ -69,7 +76,8 @@ function createEnvironment() {
     },
   };
   return {
-    windowImpl, documentImpl, intervals, documentListeners, windowListeners, consoleErrors,
+    windowImpl, documentImpl, intervals, timeouts,
+    documentListeners, windowListeners, consoleErrors,
   };
 }
 
@@ -330,6 +338,57 @@ async function main() {
     && unresolvedIds.every((id) => retryEndPayload.sdk_route_instance_ids.includes(id)),
   'runtime end discarded a possibly committed route generation after retry failure');
   retryGame.dispose();
+
+  // The runtime lifecycle payload is the one SDK egress path that had no byte
+  // bound: a game stuffing a replay buffer or a base64 frame into
+  // configure({payload}) or into runtime.start() shipped it whole, at the
+  // heartbeat and drain cadence. The check sits BEFORE the generation is
+  // minted -- routing it through the transport catch instead would leave the
+  // generation unresolved (correct for a network throw, wrong for a payload
+  // that never left the browser) and wedge start() on `busy` after four tries.
+  const rejectedPayloadEnvironment = createEnvironment();
+  const rejectedPayloadStarts = [];
+  const rejectedPayloadTransport = {
+    ...transport,
+    logger: logger(),
+    resetRuntime() { return { sessionId: 'rejected-session', characterName: '' }; },
+    getRuntimeState() { return { sessionId: 'rejected-session', characterName: '' }; },
+    applyRuntimeState() { return { sessionId: 'rejected-session', characterName: '' }; },
+    async start(payload) {
+      rejectedPayloadStarts.push(payload);
+      return { ok: true, state: { game_route_active: true, lanlan_name: 'Yui' }, payload };
+    },
+    async heartbeat() { return { ok: true, active: true }; },
+    async drain() { return { ok: true, outputs: [] }; },
+    async end() { return { ok: true }; },
+    dispose() {},
+  };
+  const rejectedPayloadGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-rejected-payload',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: rejectedPayloadTransport,
+    windowImpl: rejectedPayloadEnvironment.windowImpl,
+    documentImpl: rejectedPayloadEnvironment.documentImpl,
+  });
+  rejectedPayloadGame.runtime.configure({ heartbeat: false, outputs: false, pageExit: false });
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    let rejectedError = null;
+    try { await rejectedPayloadGame.runtime.start({ replay: 'x'.repeat(300 * 1024) }); }
+    catch (error) { rejectedError = error; }
+    assert(rejectedError?.code === 'invalid_request',
+      'an oversized runtime lifecycle payload was accepted for dispatch');
+  }
+  assert(rejectedPayloadStarts.length === 0,
+    'an oversized runtime lifecycle payload reached the transport');
+  assert(rejectedPayloadGame.runtime.state === 'idle',
+    'a payload rejected before dispatch still moved the runtime state machine');
+  const acceptedStart = await rejectedPayloadGame.runtime.start({ replay: 'x'.repeat(200 * 1024) });
+  assert(acceptedStart.ok && rejectedPayloadStarts.length === 1,
+    'a runtime payload within the 256 KiB budget was rejected');
+  await rejectedPayloadGame.runtime.end({ reason: 'bounded-payload' });
+  rejectedPayloadGame.dispose();
 
   let reentrantDisposeError = null;
   game.events.on('runtime-state', (event) => {
@@ -856,6 +915,74 @@ async function main() {
   assert(inactiveDialogueError?.code === 'invalid_state',
     'an inactive successful start response established a route');
   inactiveStartGame.dispose();
+
+  // A runtime-output handler that never settles used to pin
+  // `outputLifecycle.inFlight` at true forever: every later poll returned null
+  // with no error, no event and no log, so declared controls stopped arriving
+  // (drain is the only control-bridge producer) and the backend's bounded
+  // pending ring silently dropped everything past its cap. Only an explicit
+  // stopMonitoring/end/reset cleared it.
+  const stuckEnvironment = createEnvironment();
+  const stuckGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-stuck-handler',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: {
+      ...transport,
+      logger: logger(),
+      async drain(payload) {
+        return { ok: true, outputs: outputs.map((output) => ({ ...output })), payload };
+      },
+    },
+    windowImpl: stuckEnvironment.windowImpl,
+    documentImpl: stuckEnvironment.documentImpl,
+  });
+  stuckGame.runtime.configure({ heartbeat: false, outputs: { intervalMs: 700 }, pageExit: false });
+  await stuckGame.runtime.start({ mode: 'stuck' });
+  for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+  const stuckForever = new Promise(() => {});
+  const releaseStuckHandler = stuckGame.events.on('runtime-output', () => stuckForever);
+  const stuckPoll = stuckGame.runtime.pollOutputs();
+  let stuckPollSettled = false;
+  void stuckPoll.then(() => { stuckPollSettled = true; }, () => { stuckPollSettled = true; });
+  let budgetTimersFired = 0;
+  for (let round = 0; round < 40 && !stuckPollSettled; round += 1) {
+    for (let tick = 0; tick < 5; tick += 1) await Promise.resolve();
+    for (const [timerId, timer] of Array.from(stuckEnvironment.timeouts.entries())) {
+      if (timer.delayMs !== 60000) continue;
+      stuckEnvironment.timeouts.delete(timerId);
+      budgetTimersFired += 1;
+      timer.handler();
+    }
+  }
+  // Asserted BEFORE awaiting: an unbounded await never settles, and with only
+  // mock timers pending Node would drain its event loop and exit 0 -- a hang
+  // that reads as a pass.
+  assert(stuckPollSettled,
+    'output polling stayed pinned in flight while a handler refused to settle');
+  await stuckPoll;
+  assert(budgetTimersFired === 2,
+    'a stuck runtime-output handler was awaited without a per-handler deadlock budget');
+  assert(stuckEnvironment.consoleErrors.some((args) => (
+    String(args[0]).includes('runtime-output listener exceeded the handler budget')
+  )), 'abandoning a stuck runtime-output handler was silent');
+  releaseStuckHandler();
+  const recoveredEnvelopes = [];
+  stuckGame.events.on('runtime-output', (event) => {
+    recoveredEnvelopes.push(event);
+    // A thenable, so the budget path runs for a handler that settles normally.
+    return Promise.resolve();
+  });
+  const recoveredPoll = await stuckGame.runtime.pollOutputs();
+  assert(recoveredPoll !== null && recoveredEnvelopes.length === 2,
+    'output polling stayed wedged after a stuck handler was abandoned');
+  assert(stuckEnvironment.timeouts.size === 0,
+    'handler budget timers were left armed after their handlers settled');
+  assert(stuckEnvironment.consoleErrors.filter((args) => (
+    String(args[0]).includes('exceeded the handler budget')
+  )).length === 2, 'a handler that settled normally was reported as exceeding the budget');
+  stuckGame.dispose();
 
   process.stdout.write('mini-game lifecycle runtime test passed\n');
 }

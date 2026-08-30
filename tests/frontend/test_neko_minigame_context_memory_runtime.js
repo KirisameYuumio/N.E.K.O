@@ -40,6 +40,7 @@ function createTransport(options = {}) {
   let contextPendingMode = false;
   let consentPendingMode = false;
   let storagePendingMode = false;
+  let storageEnvelopeExtra = null;
 
   function pendingRequest(bucket, requestOptions) {
     return new Promise((resolve, reject) => {
@@ -113,7 +114,14 @@ function createTransport(options = {}) {
       if (operation === 'delete') storageValues.delete(payload.key);
       if (operation === 'clear') storageValues.clear();
       if (operation === 'get') {
-        return Promise.resolve({ ok: true, found: storageValues.has(payload.key), value: storageValues.get(payload.key) });
+        const extra = storageEnvelopeExtra;
+        storageEnvelopeExtra = null;
+        return Promise.resolve({
+          ok: true,
+          found: storageValues.has(payload.key),
+          value: storageValues.get(payload.key),
+          ...(extra || {}),
+        });
       }
       if (operation === 'list') {
         const keys = [...storageValues.keys()]
@@ -137,6 +145,7 @@ function createTransport(options = {}) {
     setContextPending(value) { contextPendingMode = value; },
     setConsentPending(value) { consentPendingMode = value; },
     setStoragePending(value) { storagePendingMode = value; },
+    setNextStorageEnvelopeExtra(value) { storageEnvelopeExtra = value; },
     get disposed() { return disposed; },
     get lastStartPayload() { return lastStartPayload; },
   };
@@ -178,6 +187,47 @@ async function main() {
   assert(listed.data.keys.join(',') === 'settings/difficulty',
     'namespaced storage list did not apply its prefix');
   await game.storage.delete('settings/difficulty');
+
+  // Whatever the write path accepted, the read path must give back. The read
+  // used to measure the host's whole {ok, found, value} envelope against the
+  // value's own budget, so the wrapper was charged to the value: 33 bytes of
+  // envelope against the 64 KiB cap, three clone nodes against the fixed 2048,
+  // and one extra level against the fixed depth of 16. A save blob sized to the
+  // round budget, or nested to the depth limit, stored fine and was then
+  // permanently unreadable -- and for a game that is every user, forever,
+  // because the size is a property of the game, not of the run.
+  const maximalBlob = { blob: 'x'.repeat(65525) };
+  await game.storage.set('saves/maximal', maximalBlob);
+  const readBackBlob = await game.storage.get('saves/maximal');
+  assert(readBackBlob.data.value?.blob?.length === 65525,
+    'a value accepted at its exact byte budget could not be read back');
+  let deepValue = { leaf: true };
+  for (let level = 0; level < 15; level += 1) deepValue = { nested: deepValue };
+  await game.storage.set('saves/deep', deepValue);
+  const readBackDeep = await game.storage.get('saves/deep');
+  assert(readBackDeep.data.found === true && readBackDeep.data.value?.nested,
+    'a value accepted at its exact depth budget could not be read back');
+  // Splitting the value out of the envelope must not leave the rest of the
+  // envelope unmeasured: a buggy or hostile host could otherwise ship megabytes
+  // through a sibling field.
+  await game.storage.set('saves/small', { level: 1 });
+  host.setNextStorageEnvelopeExtra({ junk: 'x'.repeat(70000) });
+  let envelopeOverflowError = null;
+  try { await game.storage.get('saves/small'); }
+  catch (error) { envelopeOverflowError = error; }
+  assert(envelopeOverflowError?.code === 'invalid_request',
+    'an oversized sibling field bypassed the storage response bound');
+  // And the nested value keeps exactly its own 64 KiB bound: the fix moves the
+  // wrapper out of the budget, it does not widen the budget.
+  host.setNextStorageEnvelopeExtra({ value: 'x'.repeat(70000) });
+  let oversizedValueError = null;
+  try { await game.storage.get('saves/small'); }
+  catch (error) { oversizedValueError = error; }
+  assert(oversizedValueError?.code === 'invalid_request',
+    'an oversized nested value bypassed the storage response bound');
+  await game.storage.delete('saves/small');
+  await game.storage.delete('saves/maximal');
+  await game.storage.delete('saves/deep');
 
   // The local leaderboard persists through this same namespace under a
   // reserved prefix, and the public storage path takes none of the Web Locks

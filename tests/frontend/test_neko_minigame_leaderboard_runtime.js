@@ -151,6 +151,12 @@ function manifest(capabilities) {
         maxEntries: 3,
         retention: 'recent',
       },
+      bulk: {
+        scoreField: 'score',
+        order: 'descending',
+        maxEntries: 64,
+        retention: 'recent',
+      },
     },
   };
 }
@@ -185,6 +191,41 @@ async function main() {
     'local leaderboard did not preserve recent ordering');
   const best = await game.leaderboard.local.getBest('main');
   assert(best.data.entry.score === 40, 'local leaderboard best entry was incorrect');
+
+  // A board trimmed to exactly its byte budget must still be listable. `list`
+  // restates the same entries under a different wrapper -- {boardId, entries,
+  // totalEntries, limit, offset, hasMore} instead of {version, entries} -- and
+  // used to measure that wrapper against the state's own budget. A board whose
+  // per-entry size parks the trimmed state within the wrapper's overhead of the
+  // cap therefore became permanently unlistable, for every user of that game,
+  // because entry size is a property of the game and not of the run.
+  const bulkHost = createTransport();
+  const bulkEntries = [];
+  for (let index = 0; index < 64; index += 1) {
+    bulkEntries.push({
+      id: `entry-${String(index).padStart(4, '0')}`,
+      submittedAt: 1700000000000 + index,
+      score: index,
+      data: { score: index, pad: '' },
+    });
+  }
+  let padBudget = 65536 - JSON.stringify({ version: 1, entries: bulkEntries }).length;
+  for (let index = 0; index < bulkEntries.length; index += 1) {
+    const share = Math.floor(padBudget / (bulkEntries.length - index));
+    bulkEntries[index].data.pad = 'x'.repeat(share);
+    padBudget -= share;
+  }
+  const bulkState = { version: 1, entries: bulkEntries };
+  assert(JSON.stringify(bulkState).length === 65536,
+    'the full-board fixture was not sized to the exact state byte budget');
+  bulkHost.values.set('leaderboards/bulk', bulkState);
+  const bulkGame = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+    transport: bulkHost.transport,
+  });
+  const bulkList = await bulkGame.leaderboard.local.list('bulk', { sort: 'rank', limit: 64 });
+  assert(bulkList.data.entries.length === 64,
+    'a local board sitting at its exact byte budget could not be listed');
+  bulkGame.dispose();
 
   const shared = { values: new Map(), lockTails: new Map() };
   const firstClientHost = createTransport({ shared });
