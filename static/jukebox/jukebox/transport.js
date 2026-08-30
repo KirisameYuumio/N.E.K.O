@@ -50,6 +50,7 @@ Object.assign(window.Jukebox, {
   },
 
   destroyRuntimeHost: function() {
+    Jukebox.terminateFuzzySearchWorker();
     if (Jukebox.State.runtimeHost) {
       try {
         Jukebox.State.runtimeHost.remove();
@@ -61,6 +62,25 @@ Object.assign(window.Jukebox, {
 
   ensureRuntime: async function(options = {}) {
     const Jukebox = window.Jukebox || this;
+    const headless = options.headless === true;
+    // 记在 State 上而不是靠 playerHost 反推：复用 music_ui 的共享播放器时根本
+    // 不会新建无头宿主，playerHost 会一直是 null。
+    if (headless) {
+      Jukebox.State.headlessRuntimeRequested = true;
+    }
+
+    // 真正的记忆化。之前只在 finally 里清 runtimeInitPromise、从不看
+    // isRuntimeReady，等于只有并发锁：每条指令（连 set_volume）都要重新拉一遍
+    // 全量 /api/jukebox/config 并重建 State.songs，而面板里已渲染的行还指着上
+    // 一个数组里的对象。曲库变更由 UI 侧的 config 轮询负责；无头下则由 play
+    // 找不到歌时再刷新一次兜底。
+    if (Jukebox.State.isRuntimeReady && Jukebox.getPlayer()) {
+      return {
+        songCount: Jukebox.State.songs.length,
+        headless
+      };
+    }
+
     if (Jukebox.State.runtimeInitPromise) {
       return Jukebox.State.runtimeInitPromise;
     }
@@ -68,14 +88,14 @@ Object.assign(window.Jukebox, {
     Jukebox.State.runtimeInitPromise = (async () => {
       Jukebox.loadPlaybackPreferences();
       await Jukebox.loadSongData();
-      const player = Jukebox.initPlayer({ headless: options.headless === true });
+      const player = Jukebox.initPlayer({ headless });
       if (!player && !Jukebox.getPlayer()) {
         throw new Error(window.t('Jukebox.playError', '音乐播放器未初始化'));
       }
       Jukebox.State.isRuntimeReady = true;
       return {
         songCount: Jukebox.State.songs.length,
-        headless: options.headless === true
+        headless
       };
     })();
 
@@ -142,27 +162,51 @@ Object.assign(window.Jukebox, {
     return previous[b.length];
   },
 
+  getFuzzyDistanceBudget: function(query) {
+    return query.length <= 3 ? 1 : Math.max(1, Math.floor(query.length * 0.3));
+  },
+
   getBestFuzzyDistance: function(query, target) {
     if (!query || !target || query.length < 2 || target.length < 2) return Infinity;
 
-    const maxDistance = query.length <= 3 ? 1 : Math.max(1, Math.floor(query.length * 0.3));
-    let best = Infinity;
-    const minLength = Math.max(1, query.length - maxDistance);
-    const maxLength = Math.min(target.length, query.length + maxDistance);
+    const maxDistance = Jukebox.getFuzzyDistanceBudget(query);
 
-    for (let start = 0; start < target.length; start += 1) {
-      for (let length = minLength; length <= maxLength; length += 1) {
-        if (start + length > target.length) continue;
-        const fragment = target.slice(start, start + length);
-        const distance = Jukebox.getLevenshteinDistance(query, fragment, Math.min(maxDistance, best));
-        if (distance < best) best = distance;
+    // 近似子串匹配（Sellers）：首行全 0 表示「子串可以从 target 任意位置起」，
+    // 末行最小值就是 query 到 target 任一子串的最小编辑距离。语义与旧的
+    // start×length 双层枚举完全一致（长度差超过 maxDistance 的窗口距离必然
+    // 也超过 maxDistance），但代价从 O(|q|*|t|^2) 降到 O(|q|*|t|)：旧实现在
+    // 300 首 / 50 字查询 / 120 字候选下实测要 35.6s。
+    let previous = new Array(target.length + 1).fill(0);
+    let current = new Array(target.length + 1).fill(0);
+    for (let i = 1; i <= query.length; i += 1) {
+      current[0] = i;
+      let rowMin = current[0];
+      for (let j = 1; j <= target.length; j += 1) {
+        const cost = query[i - 1] === target[j - 1] ? 0 : 1;
+        const value = Math.min(
+          previous[j] + 1,
+          current[j - 1] + 1,
+          previous[j - 1] + cost
+        );
+        current[j] = value;
+        if (value < rowMin) rowMin = value;
       }
+      // 每一行的最小值只会随行数单调不减，整行都超预算就不可能再降回来。
+      if (rowMin > maxDistance) return Infinity;
+      const swap = previous;
+      previous = current;
+      current = swap;
     }
 
+    let best = Infinity;
+    for (let j = 0; j <= target.length; j += 1) {
+      if (previous[j] < best) best = previous[j];
+    }
     return best <= maxDistance ? best : Infinity;
   },
 
-  scoreSongForQuery: function(song, normalizedQuery, index) {
+  scoreSongForQuery: function(song, normalizedQuery, index, options = {}) {
+    const allowFuzzy = options.fuzzy !== false;
     let bestScore = -Infinity;
     const values = Jukebox.getSongSearchValues(song);
 
@@ -181,6 +225,8 @@ Object.assign(window.Jukebox, {
         return;
       }
 
+      if (!allowFuzzy) return;
+
       const fuzzyDistance = Jukebox.getBestFuzzyDistance(normalizedQuery, value);
       if (Number.isFinite(fuzzyDistance)) {
         bestScore = Math.max(bestScore, 7000 - fuzzyDistance * 100 - Math.abs(value.length - normalizedQuery.length) - index);
@@ -190,24 +236,146 @@ Object.assign(window.Jukebox, {
     return Number.isFinite(bestScore) ? bestScore : null;
   },
 
-  findSongForQuery: function(query) {
+  findBestSongIndex: function(songs, normalizedQuery, options = {}) {
+    let bestIndex = -1;
+    let bestScore = -Infinity;
+    for (let index = 0; index < songs.length; index += 1) {
+      const score = Jukebox.scoreSongForQuery(songs[index], normalizedQuery, index, options);
+      if (score !== null && score > bestScore) {
+        bestIndex = index;
+        bestScore = score;
+      }
+    }
+    return bestIndex;
+  },
+
+  buildFuzzySearchWorkerSource: function() {
+    // Worker 里跑的就是这几个函数本体（toString 序列化），不另抄一份实现，
+    // 免得主线程与 worker 的匹配规则各自漂移。
+    const names = [
+      'normalizeSongQuery',
+      'getSongSearchValues',
+      'getLevenshteinDistance',
+      'getFuzzyDistanceBudget',
+      'getBestFuzzyDistance',
+      'scoreSongForQuery',
+      'findBestSongIndex'
+    ];
+    const declarations = names
+      .map(name => 'const ' + name + ' = ' + Jukebox[name].toString() + ';')
+      .join('\n');
+    return [
+      declarations,
+      'const Jukebox = { ' + names.join(', ') + ' };',
+      'self.onmessage = function(event) {',
+      '  const data = event.data || {};',
+      '  let index = -1;',
+      '  try {',
+      '    index = Jukebox.findBestSongIndex(data.songs || [], data.query || \'\');',
+      '  } catch (error) {',
+      '    self.postMessage({ token: data.token, error: String(error && error.message || error) });',
+      '    return;',
+      '  }',
+      '  self.postMessage({ token: data.token, index: index });',
+      '};'
+    ].join('\n');
+  },
+
+  terminateFuzzySearchWorker: function() {
+    const state = Jukebox.State;
+    if (state.fuzzySearchWorker) {
+      try { state.fuzzySearchWorker.terminate(); } catch (_) {}
+      state.fuzzySearchWorker = null;
+    }
+    if (state.fuzzySearchWorkerUrl) {
+      try { URL.revokeObjectURL(state.fuzzySearchWorkerUrl); } catch (_) {}
+      state.fuzzySearchWorkerUrl = null;
+    }
+  },
+
+  createFuzzySearchWorker: function() {
+    if (typeof Worker !== 'function' || typeof Blob !== 'function'
+      || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+      return null;
+    }
+    try {
+      const blob = new Blob([Jukebox.buildFuzzySearchWorkerSource()], { type: 'text/javascript' });
+      const url = URL.createObjectURL(blob);
+      const worker = new Worker(url);
+      Jukebox.State.fuzzySearchWorker = worker;
+      Jukebox.State.fuzzySearchWorkerUrl = url;
+      return worker;
+    } catch (error) {
+      console.warn('[Jukebox] 模糊搜索 worker 创建失败，退回主线程:', error);
+      Jukebox.terminateFuzzySearchWorker();
+      return null;
+    }
+  },
+
+  findSongByFuzzyWorker: function(songs, normalizedQuery) {
+    // 前一次模糊搜索直接作废：曲库大时它可能还在跑，留着只会拖慢这一次。
+    Jukebox.terminateFuzzySearchWorker();
+    const worker = Jukebox.createFuzzySearchWorker();
+    if (!worker) return null;
+
+    const token = (Jukebox.State.fuzzySearchToken || 0) + 1;
+    Jukebox.State.fuzzySearchToken = token;
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (index) => {
+        if (settled) return;
+        settled = true;
+        if (Jukebox.State.fuzzySearchWorker === worker) {
+          Jukebox.terminateFuzzySearchWorker();
+        }
+        resolve(index);
+      };
+      worker.onmessage = (event) => {
+        const data = event.data || {};
+        if (data.token !== token) return;
+        if (data.error) {
+          console.warn('[Jukebox] 模糊搜索 worker 报错:', data.error);
+          finish(-1);
+          return;
+        }
+        finish(Number.isInteger(data.index) ? data.index : -1);
+      };
+      worker.onerror = (error) => {
+        console.warn('[Jukebox] 模糊搜索 worker 异常:', error && error.message);
+        finish(-1);
+      };
+      try {
+        worker.postMessage({ token, query: normalizedQuery, songs });
+      } catch (error) {
+        console.warn('[Jukebox] 模糊搜索 worker 投递失败:', error);
+        finish(-1);
+      }
+    });
+  },
+
+  findSongForQuery: async function(query) {
     const songs = Jukebox.State.songs || [];
     const normalizedQuery = Jukebox.normalizeSongQuery(query);
     if (!normalizedQuery) {
       return songs[0] || null;
     }
 
-    let best = null;
-    let bestScore = -Infinity;
-    songs.forEach((song, index) => {
-      const score = Jukebox.scoreSongForQuery(song, normalizedQuery, index);
-      if (score !== null && score > bestScore) {
-        best = song;
-        bestScore = score;
-      }
-    });
+    // 精确 / 前缀 / 子串三档只是字符串比较，主线程跑得起；而且这三档的分数
+    // （8000-10000）永远高于模糊档（<=7000），命中就已经是全局最优，不必再
+    // 开线程。
+    const directIndex = Jukebox.findBestSongIndex(songs, normalizedQuery, { fuzzy: false });
+    if (directIndex >= 0) return songs[directIndex];
 
-    return best;
+    const workerResult = Jukebox.findSongByFuzzyWorker(songs, normalizedQuery);
+    if (workerResult) {
+      const index = await workerResult;
+      return index >= 0 ? songs[index] : null;
+    }
+
+    // 没有 Worker（老宿主 / 创建失败）时才退回主线程，此时算法已是 O(|q|*|t|)。
+    const index = Jukebox.findBestSongIndex(songs, normalizedQuery);
+    return index >= 0 ? songs[index] : null;
   },
 
   executeControl: async function(command = {}) {
@@ -258,7 +426,13 @@ Object.assign(window.Jukebox, {
       return Jukebox.executePlayControl(normalizedAction, adjacentSong, { fromQueue: Jukebox.State.playbackMode === 'random' });
     }
 
-    const song = Jukebox.findSongForQuery(command.query || '');
+    let song = await Jukebox.findSongForQuery(command.query || '');
+    if (!song && Jukebox.State.songs.length) {
+      // 运行时是记忆化的，无头会话里可能一直用着开机时那份曲库；只有在真的
+      // 找不到时才多花一次请求重新拉，避免每条指令都重拉。
+      await Jukebox.loadSongData();
+      song = await Jukebox.findSongForQuery(command.query || '');
+    }
     if (!song) {
       return { ok: false, action: 'play', message: 'song_not_found' };
     }
@@ -266,12 +440,21 @@ Object.assign(window.Jukebox, {
     return Jukebox.executePlayControl('play', song);
   },
 
+  // 0-1 和 0-100 两套量纲共存时，判据不能是「是否大于 1」：那样 value:1 会被
+  // 当成满量程（100%），value:2 却只有 2%，请求更大反而结果小 50 倍，而 1 恰恰
+  // 是模型说「调大一点」时最常给的数。改成按区间分：(0,1) 之间是比例，其余
+  // 一律按百分点，于是 1→1%、2→2%、0.5→50%，1 到 100 之间单调。
+  toVolumeRatio: function(numberValue) {
+    const magnitude = Math.abs(numberValue);
+    return magnitude > 0 && magnitude < 1 ? numberValue : numberValue / 100;
+  },
+
   normalizeControlVolume: function(value) {
     if (value === null || value === undefined || value === '') return null;
     const numberValue = Number(value);
     if (!Number.isFinite(numberValue)) return null;
     if (numberValue < 0 || numberValue > 100) return null;
-    return Math.max(0, Math.min(1, numberValue > 1 ? numberValue / 100 : numberValue));
+    return Math.max(0, Math.min(1, Jukebox.toVolumeRatio(numberValue)));
   },
 
   normalizeControlVolumeDelta: function(value) {
@@ -279,7 +462,7 @@ Object.assign(window.Jukebox, {
     const numberValue = Number(value);
     if (!Number.isFinite(numberValue)) return null;
     if (numberValue < -100 || numberValue > 100) return null;
-    return Math.max(-1, Math.min(1, Math.abs(numberValue) > 1 ? numberValue / 100 : numberValue));
+    return Math.max(-1, Math.min(1, Jukebox.toVolumeRatio(numberValue)));
   },
 
   getCurrentVolume: function() {
@@ -389,7 +572,11 @@ Object.assign(window.Jukebox, {
     const playedSong = await Jukebox.playSong(song.id, {
       ...playOptions,
       actionAvailability: preflight.actionAvailability,
-      forceReplay: action === 'play',
+      // next / previous 在单曲曲库下会绕回当前这首，走进 playSong 的「同曲即停」
+      // 分支：音乐停了，却因为拿到了 song 对象而报 ok:true，猫娘照样说「已切歌」。
+      // 「同曲即停」是面板上双击的交互，不是控制面的语义 —— 控制面来的三种动作
+      // 都该无条件重新起播。
+      forceReplay: true,
       requestId
     });
     if (!playedSong) {
@@ -1051,7 +1238,24 @@ Object.assign(window.Jukebox, {
 
   updateVolume: function(value) {
     const volume = parseFloat(value);
-    Jukebox.setRuntimeVolume(volume);
+    if (!Number.isFinite(volume)) return;
+    if (Jukebox.setRuntimeVolume(volume)) return;
+
+    // 面板的 buildUI 是同步建好的，initPlayer 却在 open() 里 100ms 的 setTimeout
+    // 之后才跑。这段窗口里拖滑条 setRuntimeVolume 会因为没有 player 直接返回
+    // false，百分比标签就此僵在旧值。播放器还没来之前也要给反馈，并把音量记下来。
+    const clampedVolume = Math.max(0, Math.min(1, volume));
+    if (clampedVolume > 0) {
+      Jukebox.State.isMuted = false;
+      Jukebox.State.savedVolume = clampedVolume;
+    } else {
+      Jukebox.State.isMuted = true;
+    }
+    const volumeSlider = document.getElementById('jukebox-volume-slider');
+    if (volumeSlider) {
+      volumeSlider.value = clampedVolume;
+    }
+    Jukebox.updateVolumeDisplay(clampedVolume);
   },
 
   logVolumeChange: function(value) {
@@ -1622,22 +1826,36 @@ Object.assign(window.Jukebox, {
     return Jukebox.State.player;
   },
 
+  // 播放器可能是新建的，也可能是复用 music_ui 的共享实例或已存在的 State.player。
+  // 后两条早返回路径原来完全不写 playerHost，于是无头播放的宿主一直是 null。
+  markPlayerHost: function(isHeadless) {
+    if (!isHeadless) {
+      Jukebox.State.playerHost = 'ui';
+      return;
+    }
+    if (!Jukebox.State.playerHost) {
+      Jukebox.State.playerHost = 'runtime';
+    }
+  },
+
   initPlayer: function(options = {}) {
     const Jukebox = window.Jukebox || this;
+    const isHeadless = options.headless === true;
     if (window.music_ui && window.music_ui.getMusicPlayerInstance) {
       const existingPlayer = window.music_ui.getMusicPlayerInstance();
       if (existingPlayer) {
         console.log('[Jukebox] 使用现有的音乐播放器');
+        Jukebox.markPlayerHost(isHeadless);
         return existingPlayer;
       }
       console.log('[Jukebox] music_ui 存在但播放器未初始化，创建新播放器');
     }
 
     if (Jukebox.State.player) {
+      Jukebox.markPlayerHost(isHeadless);
       return Jukebox.State.player;
     }
 
-    const isHeadless = options.headless === true;
     const host = isHeadless
       ? Jukebox.ensureRuntimeHost()
       : Jukebox.State.container;
@@ -1672,7 +1890,7 @@ Object.assign(window.Jukebox, {
       volume: 1,
       audio: []
     });
-    Jukebox.State.playerHost = isHeadless ? 'runtime' : 'ui';
+    Jukebox.markPlayerHost(isHeadless);
 
     console.log('[Jukebox] APlayer已创建，音量:', Jukebox.State.player.audio.volume);
     return Jukebox.State.player;

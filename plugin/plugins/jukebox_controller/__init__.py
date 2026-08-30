@@ -38,7 +38,12 @@ class JukeboxControllerPlugin(NekoPluginBase):
                 },
                 "value": {
                     "type": "number",
-                    "description": "action=set_volume 时表示目标音量，可传 0-1 或 0-100；action=adjust_volume 时表示相对增减量，可传 -1 到 1 或 -100 到 100。",
+                    "description": (
+                        "音量数值。0 到 1 之间的小数按比例算（0.5 = 50%），"
+                        "1 以上按百分点算（30 = 30%，1 = 1%）。"
+                        "action=set_volume 时是目标音量，取值 0-100；"
+                        "action=adjust_volume 时是相对增减量，取值 -100 到 100。"
+                    ),
                 },
                 "mode": {
                     "type": "string",

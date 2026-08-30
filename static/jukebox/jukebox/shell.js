@@ -281,15 +281,34 @@ Object.assign(window.Jukebox, {
     Jukebox.cleanupUiRuntimeShell();
     Jukebox.destroyPlayer();
     Jukebox.destroyRuntimeHost();
+    Jukebox.State.headlessRuntimeRequested = false;
   },
 
   hasHeadlessRuntime: function() {
-    return !!(
-      Jukebox.State.isRuntimeReady
-      && Jukebox.State.runtimeHost
-      && document.body.contains(Jukebox.State.runtimeHost)
-      && Jukebox.State.playerHost === 'runtime'
-    );
+    if (!Jukebox.State.isRuntimeReady) return false;
+    if (!Jukebox.State.headlessRuntimeRequested) return false;
+    if (!Jukebox.getPlayer()) return false;
+    // 无头宿主是自己建的时候，它必须还挂在 DOM 上；复用 music_ui 的共享播放器
+    // 或面板播放器时压根没有这个宿主，不能拿它当判据。
+    if (Jukebox.State.runtimeHost) {
+      return document.body.contains(Jukebox.State.runtimeHost);
+    }
+    return true;
+  },
+
+  // 面板先开、AI 再借同一个播放器起播时，播放器的 DOM 在面板容器里；close()
+  // 会把容器整个 remove 掉。保活前先把播放器节点移进无头宿主 —— appendChild
+  // 是移动而不是重建，APlayer 实例和正在播的音频都不受影响。
+  adoptPlayerIntoRuntimeHost: function() {
+    const playerContainer = document.getElementById('jukebox-player');
+    if (!playerContainer) return false;
+    const host = Jukebox.ensureRuntimeHost();
+    if (!host) return false;
+    if (!host.contains(playerContainer)) {
+      host.appendChild(playerContainer);
+    }
+    Jukebox.State.playerHost = 'runtime';
+    return true;
   },
 
   notifyFullClose: function(reason) {
@@ -303,6 +322,7 @@ Object.assign(window.Jukebox, {
   close: function() {
     const preserveRuntime = Jukebox.hasHeadlessRuntime();
     if (preserveRuntime) {
+      Jukebox.adoptPlayerIntoRuntimeHost();
       Jukebox.cleanupUiRuntimeShell();
     } else {
       Jukebox.stopPlayback();

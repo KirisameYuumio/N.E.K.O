@@ -1909,7 +1909,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 176,
+        "keyCount": 185,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -3253,4 +3253,391 @@ def test_jukebox_audio_end_queued_next_respects_request_generation(mock_page: Pa
         "played": [],
         "currentSong": None,
         "playRequestId": 8,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 以下六条是 #2293 评审检出问题的回归护栏，每条都对应一个具体的失败场景。
+# ---------------------------------------------------------------------------
+
+
+def _single_song_fetch_override() -> str:
+    """只有一首可见歌的曲库：next/previous 必然绕回当前这首。"""
+    return """
+          window.fetch = async (url, options = {}) => {
+            if (options.method === 'HEAD') return { ok: true, status: 200 };
+            if (url === '/api/jukebox/config') {
+              return {
+                ok: true,
+                json: async () => ({
+                  configRevision: 'rev-single',
+                  songs: {
+                    only: { name: 'Only Song', artist: 'A', audio: 'songs/only.mp3', visible: true }
+                  },
+                  actions: {},
+                  bindings: {}
+                })
+              };
+            }
+            throw new Error('Unexpected fetch: ' + url);
+          };
+    """
+
+
+@pytest.mark.frontend
+def test_jukebox_control_next_replays_the_only_song_instead_of_stopping(mock_page: Page):
+    """#1：单曲曲库下 next 绕回当前这首，不能停播还报 ok。"""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          %s
+          const J = window.Jukebox;
+          const played = await J.executeControl({ action: 'play', query: 'Only', headless: true });
+          const afterPlay = {
+            ok: played.ok,
+            isPlaying: J.State.isPlaying,
+            currentSong: J.State.currentSong && J.State.currentSong.id
+          };
+
+          window.__lastAPlayer.played = false;
+          const next = await J.executeControl({ action: 'next', headless: true });
+          const previous = await J.executeControl({ action: 'previous', headless: true });
+
+          return {
+            afterPlay,
+            nextOk: next.ok,
+            previousOk: previous.ok,
+            // ok:true 必须名副其实：音乐还在放，而不是被「同曲即停」分支停掉。
+            stillPlaying: J.State.isPlaying,
+            currentSong: J.State.currentSong && J.State.currentSong.id,
+            replayed: window.__lastAPlayer.played === true
+          };
+        }
+        """ % _single_song_fetch_override()
+    )
+
+    assert result == {
+        "afterPlay": {"ok": True, "isPlaying": True, "currentSong": "only"},
+        "nextOk": True,
+        "previousOk": True,
+        "stillPlaying": True,
+        "currentSong": "only",
+        "replayed": True,
+    }
+
+
+@pytest.mark.frontend
+def test_jukebox_control_volume_scale_does_not_invert_between_one_and_two(mock_page: Page):
+    """#2：value 1 曾经等于满量程、2 只有 2%，比 1 大的请求反而小 50 倍。"""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          const setTo = async (value) => {
+            await J.executeControl({ action: 'set_volume', value, headless: true });
+            return Number(J.getCurrentVolume().toFixed(4));
+          };
+          const adjustFrom = async (start, delta) => {
+            await J.executeControl({ action: 'set_volume', value: start * 100, headless: true });
+            await J.executeControl({ action: 'adjust_volume', value: delta, headless: true });
+            return Number(J.getCurrentVolume().toFixed(4));
+          };
+
+          const ladder = [];
+          for (const value of [1, 2, 3, 10, 50, 100]) {
+            ladder.push(await setTo(value));
+          }
+
+          return {
+            ladder,
+            // 0-1 之间的小数仍按比例
+            halfAsRatio: await setTo(0.5),
+            // 「调大一点」最常给的 1，应当是 +1 个百分点而不是拉满
+            adjustByOne: await adjustFrom(0.3, 1),
+            adjustByTwenty: await adjustFrom(0.3, 20),
+            adjustByHalf: await adjustFrom(0.3, 0.5),
+            adjustDown: await adjustFrom(0.3, -10)
+          };
+        }
+        """
+    )
+
+    assert result["ladder"] == [0.01, 0.02, 0.03, 0.1, 0.5, 1.0]
+    # 单调：1 到 100 之间不再出现「更大的请求得到更小的音量」。
+    assert result["ladder"] == sorted(result["ladder"])
+    assert result["halfAsRatio"] == 0.5
+    assert result["adjustByOne"] == 0.31
+    assert result["adjustByTwenty"] == 0.5
+    assert result["adjustByHalf"] == 0.8
+    assert result["adjustDown"] == 0.2
+
+
+@pytest.mark.frontend
+def test_jukebox_fuzzy_search_runs_in_a_worker(mock_page: Page):
+    """#3：模糊搜索必须离开主线程；精确/子串命中则不该开线程。"""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const NativeWorker = window.Worker;
+          let constructed = 0;
+          window.Worker = class extends NativeWorker {
+            constructor(url) {
+              super(url);
+              constructed += 1;
+            }
+          };
+
+          await J.ensureRuntime({ headless: true });
+
+          // 子串直接命中：不必开线程。
+          const direct = await J.findSongForQuery('Song 2');
+          const afterDirect = constructed;
+
+          // 「桃园」不是「桃源恋歌」的子串，只能靠模糊匹配。
+          const fuzzy = await J.findSongForQuery('桃园');
+          const afterFuzzy = constructed;
+
+          window.Worker = NativeWorker;
+          return {
+            directId: direct && direct.id,
+            fuzzyId: fuzzy && fuzzy.id,
+            afterDirect,
+            afterFuzzy,
+            workerReleased: J.State.fuzzySearchWorker === null
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "directId": "song2",
+        "fuzzyId": "song4",
+        "afterDirect": 0,
+        "afterFuzzy": 1,
+        "workerReleased": True,
+    }
+
+
+@pytest.mark.frontend
+def test_jukebox_fuzzy_distance_stays_linear_in_candidate_length(mock_page: Page):
+    """#3 的另一半：算法本身不能再是 O(|q|*|t|^2)。
+
+    评审实测旧实现在 300 首 / 50 字查询 / 120 字候选下要 35.6 s。这里只跑单次
+    最坏形状，给一个宽到不会 flaky、但挡得住二次方回归的上限。
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    elapsed_ms = mock_page.evaluate(
+        """
+        () => {
+          const J = window.Jukebox;
+          const alphabet = 'abcdefghij0123';
+          const make = (n) => {
+            let s = '';
+            for (let i = 0; i < n; i += 1) s += alphabet[(i * 7 + 3) % alphabet.length];
+            return s;
+          };
+          const query = make(50);
+          const target = make(120) + 'zz' + make(120);
+          const started = performance.now();
+          for (let i = 0; i < 200; i += 1) {
+            J.getBestFuzzyDistance(query, target);
+          }
+          return performance.now() - started;
+        }
+        """
+    )
+
+    # 旧实现单次就要几十 ms 到几秒；200 次线性实现在 1 s 内绰绰有余。
+    assert elapsed_ms < 1000, f"模糊匹配 200 次耗时 {elapsed_ms:.0f} ms，疑似退回二次方实现"
+
+
+@pytest.mark.frontend
+def test_jukebox_close_preserves_playback_started_on_a_shared_player(mock_page: Page):
+    """#4：复用 music_ui 共享播放器时没有无头宿主，关面板不能顺手停掉 AI 播放。"""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const shared = new window.APlayer({ volume: 1, audio: [] });
+          window.music_ui = { getMusicPlayerInstance: () => shared };
+
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          const startedOnShared = J.getPlayer() === shared;
+
+          let fullCloseEvents = 0;
+          window.addEventListener('neko:jukebox-full-close', () => { fullCloseEvents += 1; });
+
+          const wrapper = document.createElement('div');
+          wrapper.className = 'jukebox-wrapper';
+          wrapper.innerHTML = '<div class="jukebox-container"></div>';
+          document.body.appendChild(wrapper);
+          J.State.container = wrapper;
+          J.State.isOpen = true;
+
+          let stopped = 0;
+          const originalStop = J.stopPlayback;
+          J.stopPlayback = function(...args) { stopped += 1; return originalStop.apply(this, args); };
+          J.close();
+          J.stopPlayback = originalStop;
+
+          return {
+            startedOnShared,
+            stopped,
+            fullCloseEvents,
+            sharedDestroyed: shared.destroyed === true,
+            currentSong: J.State.currentSong && J.State.currentSong.id,
+            isRuntimeReady: J.State.isRuntimeReady
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "startedOnShared": True,
+        "stopped": 0,
+        "fullCloseEvents": 0,
+        "sharedDestroyed": False,
+        "currentSong": "song1",
+        "isRuntimeReady": True,
+    }
+
+
+@pytest.mark.frontend
+def test_jukebox_close_preserves_playback_when_panel_opened_first(mock_page: Page):
+    """#4 的另一半：面板先开、AI 借同一个播放器起播，关面板同样不该打断。"""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+
+          // 先按「面板已打开」建出播放器：宿主是容器，playerHost === 'ui'。
+          const wrapper = document.createElement('div');
+          wrapper.className = 'jukebox-wrapper';
+          wrapper.innerHTML = '<div class="jukebox-container"></div>';
+          document.body.appendChild(wrapper);
+          J.State.container = wrapper;
+          J.State.isOpen = true;
+          J.initPlayer({ headless: false });
+          const uiHost = J.State.playerHost;
+          const playerNode = document.getElementById('jukebox-player');
+          const insideContainer = wrapper.contains(playerNode);
+
+          // 再由 AI 借这个播放器起播。
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          let stopped = 0;
+          const originalStop = J.stopPlayback;
+          J.stopPlayback = function(...args) { stopped += 1; return originalStop.apply(this, args); };
+          J.close();
+          J.stopPlayback = originalStop;
+
+          const host = document.getElementById('neko-jukebox-runtime-host');
+          return {
+            uiHost,
+            insideContainer,
+            stopped,
+            // 播放器节点被移进无头宿主，而不是随容器一起被 remove。
+            adoptedIntoRuntimeHost: !!host && host.contains(document.getElementById('jukebox-player')),
+            playerDestroyed: window.__lastAPlayer.destroyed === true,
+            currentSong: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "uiHost": "ui",
+        "insideContainer": True,
+        "stopped": 0,
+        "adoptedIntoRuntimeHost": True,
+        "playerDestroyed": False,
+        "currentSong": "song1",
+    }
+
+
+@pytest.mark.frontend
+def test_jukebox_runtime_is_memoized_across_commands(mock_page: Page):
+    """#5：ensureRuntime 曾经只是并发锁，每条指令都重拉一次全量 config。"""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          let configFetches = 0;
+          const originalFetch = window.fetch;
+          window.fetch = async (url, options = {}) => {
+            if (url === '/api/jukebox/config') configFetches += 1;
+            return originalFetch(url, options);
+          };
+
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          const afterPlay = configFetches;
+          const songsAfterPlay = J.State.songs;
+
+          await J.executeControl({ action: 'set_volume', value: 40, headless: true });
+          await J.executeControl({ action: 'adjust_volume', value: 5, headless: true });
+          await J.executeControl({ action: 'next', headless: true });
+
+          return {
+            afterPlay,
+            afterEverything: configFetches,
+            // 曲库数组没有被换掉，面板里已渲染的行还指着同一批对象。
+            songsIdentity: J.State.songs === songsAfterPlay
+          };
+        }
+        """
+    )
+
+    assert result == {"afterPlay": 1, "afterEverything": 1, "songsIdentity": True}
+
+
+@pytest.mark.frontend
+def test_jukebox_volume_slider_updates_before_the_player_exists(mock_page: Page):
+    """#6：面板建好到 initPlayer 之间有 100 ms 窗口，这期间拖滑条要有反馈。"""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        () => {
+          const J = window.Jukebox;
+          document.body.insertAdjacentHTML('beforeend',
+            '<input id="jukebox-volume-slider" type="range" min="0" max="1" step="0.01" value="1">'
+            + '<span id="jukebox-volume-value">100%</span>');
+
+          // 播放器还没建出来。
+          const hasPlayer = !!J.getPlayer();
+          J.updateVolume(0.4);
+
+          return {
+            hasPlayer,
+            label: document.getElementById('jukebox-volume-value').textContent,
+            slider: document.getElementById('jukebox-volume-slider').value,
+            savedVolume: J.State.savedVolume,
+            isMuted: J.State.isMuted
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "hasPlayer": False,
+        "label": "40%",
+        "slider": "0.4",
+        "savedVolume": 0.4,
+        "isMuted": False,
     }
