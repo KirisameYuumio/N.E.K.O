@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,6 +83,7 @@ class _FakeInstallSourceManager:
         profile_installed: bool | None = None,
         channel: str = "imported",
         root_id: str = "user",
+        plugin_id: str | None = None,
         active_package_ids: tuple[str, ...] = (),
         active_profile_dirs: tuple[str, ...] = (),
         active_root_ids: tuple[str, ...] = (),
@@ -94,6 +96,7 @@ class _FakeInstallSourceManager:
         self.profile_installed = profile_installed
         self.channel = channel
         self.root_id = root_id
+        self.plugin_id = plugin_id
         self.active_package_ids = active_package_ids
         self.active_profile_dirs = active_profile_dirs
         self.active_root_ids = active_root_ids
@@ -101,6 +104,7 @@ class _FakeInstallSourceManager:
         self.active_channels = active_channels
         self.list_entries_error = list_entries_error
         self.marked_removed: list[Path] = []
+        self.is_degraded = False
 
     def package_id_for_directory(
         self,
@@ -123,12 +127,13 @@ class _FakeInstallSourceManager:
         del include_removed
         return SimpleNamespace(
             package_id=self.package_id,
-            plugin_id=directory_path.name,
+            plugin_id=self.plugin_id or directory_path.name,
             profile_dir=self.profile_dir,
             profile_installed=self.profile_installed,
             channel=self.channel,
             root_id=self.root_id,
             directory_name=directory_path.name,
+            removed=False,
         )
 
     def profile_dir_for_directory(
@@ -459,6 +464,388 @@ async def test_start_plugin_refreshes_registry_before_loading(
             module.state.event_handlers.update(handlers_backup)
         with module.state._snapshot_cache_lock:
             module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_fails", [False, True])
+async def test_delete_user_override_restores_running_builtin_and_preserves_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    start_fails: bool,
+) -> None:
+    exec_root = tmp_path / "exec" / "plugins"
+    user_dir = exec_root / "study_companion"
+    user_config = user_dir / "plugin.toml"
+    user_dir.mkdir(parents=True)
+    user_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    builtin_config = tmp_path / "builtin" / "study_companion" / "plugin.toml"
+    builtin_config.parent.mkdir(parents=True)
+    builtin_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    state_dir = tmp_path / "state" / "plugins" / "study_companion" / "data"
+    state_files = {
+        state_dir / "study.db": b"persistent-db",
+        state_dir / "study.db-wal": b"persistent-wal",
+        state_dir / "study.db-shm": b"persistent-shm",
+    }
+    for path, content in state_files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    hashes_before = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in state_files
+    }
+
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+    start_calls: list[str] = []
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["study_companion"] = {
+                "id": "study_companion",
+                "config_path": str(user_config),
+                "effective_source": "user",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts["study_companion"] = object()
+
+        async def stop_plugin(self, plugin_id: str, **_kwargs: object) -> dict[str, object]:
+            with module.state.acquire_plugin_hosts_write_lock():
+                module.state.plugin_hosts.pop(plugin_id, None)
+            return {"success": True}
+
+        async def start_plugin(self, plugin_id: str, **_kwargs: object) -> dict[str, object]:
+            start_calls.append(plugin_id)
+            if start_fails:
+                raise ServerDomainError(
+                    code="PLUGIN_START_FAILED",
+                    message="builtin start failed",
+                    status_code=500,
+                )
+            return {"success": True}
+
+        async def refresh_registry() -> dict[str, object]:
+            with module.state.acquire_plugins_write_lock():
+                module.state.plugins["study_companion"] = {
+                    "id": "study_companion",
+                    "config_path": str(builtin_config),
+                    "effective_source": "builtin",
+                }
+            return {"success": True}
+
+        monkeypatch.setattr(module, "get_user_plugin_exec_root", lambda: exec_root)
+        monkeypatch.setattr(module, "get_plugin_state_root", lambda: tmp_path / "state" / "plugins")
+        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (exec_root, builtin_config.parent.parent))
+        monkeypatch.setattr(module.PluginLifecycleService, "stop_plugin", stop_plugin)
+        monkeypatch.setattr(module.PluginLifecycleService, "start_plugin", start_plugin)
+        monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", refresh_registry)
+        install_source_manager = _FakeInstallSourceManager(package_id="")
+        monkeypatch.setattr(module, "get_install_source_manager", lambda: install_source_manager)
+        monkeypatch.setattr(module, "_stage_orphaned_package_profile_sync", lambda _path: None)
+        monkeypatch.setattr(module, "_mark_install_source_removed_sync", lambda _path: None)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+        response = await module.PluginLifecycleService().delete_plugin("study_companion")
+
+        assert response["success"] is True
+        assert response["restored_builtin"] is True
+        assert response["restored_builtin_started"] is not start_fails
+        restart_error = response["restored_builtin_restart_error"]
+        if start_fails:
+            assert restart_error == {
+                "code": "PLUGIN_BUILTIN_RESTORE_START_FAILED",
+                "message": "builtin start failed",
+                "error_type": "ServerDomainError",
+            }
+        else:
+            assert restart_error is None
+        assert start_calls == ["study_companion"]
+        assert user_dir.exists() is False
+        assert builtin_config.is_file()
+        assert {
+            path: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in state_files
+        } == hashes_before
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_user_override_preserves_disabled_preference_for_restored_builtin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _isolate_runtime_overrides: dict,
+) -> None:
+    exec_root = tmp_path / "exec"
+    user_dir = exec_root / "study_companion"
+    user_config = user_dir / "plugin.toml"
+    user_dir.mkdir(parents=True)
+    user_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    builtin_config = tmp_path / "builtin" / "study_companion" / "plugin.toml"
+    builtin_config.parent.mkdir(parents=True)
+    builtin_config.write_text("[plugin]\nid='study_companion'\n", encoding="utf-8")
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["study_companion"] = {
+                "config_path": str(user_config),
+                "effective_source": "user",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        runtime_overrides_module.set_runtime_override(
+            "study_companion",
+            False,
+            auto_start=False,
+        )
+
+        async def refresh_registry() -> dict[str, object]:
+            with module.state.acquire_plugins_write_lock():
+                module.state.plugins["study_companion"] = {
+                    "config_path": str(builtin_config),
+                    "effective_source": "builtin",
+                    "runtime_enabled": False,
+                    "runtime_auto_start": False,
+                }
+            return {"success": True}
+
+        monkeypatch.setattr(module, "get_user_plugin_exec_root", lambda: exec_root)
+        monkeypatch.setattr(module, "get_plugin_state_root", lambda: tmp_path / "state")
+        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (exec_root, builtin_config.parent.parent))
+        monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", refresh_registry)
+        install_source_manager = _FakeInstallSourceManager(package_id="")
+        monkeypatch.setattr(module, "get_install_source_manager", lambda: install_source_manager)
+        monkeypatch.setattr(module, "_stage_orphaned_package_profile_sync", lambda _path: None)
+        monkeypatch.setattr(module, "_mark_install_source_removed_sync", lambda _path: None)
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+        response = await module.PluginLifecycleService().delete_plugin("study_companion")
+
+        assert response["restored_builtin"] is True
+        assert response["restored_builtin_started"] is False
+        assert _isolate_runtime_overrides == {
+            "study_companion": {"enabled": False, "auto_start": False},
+        }
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_manual_plugin_fails_before_runtime_or_filesystem_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "manual_plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.toml").write_text(
+        "[plugin]\nid='manual_plugin'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    manager = _FakeInstallSourceManager(package_id="", channel="manual")
+    runtime_checks: list[str] = []
+    delete_calls: list[Path] = []
+
+    monkeypatch.setattr(
+        module,
+        "_get_plugin_meta_sync",
+        lambda _plugin_id: {"id": "manual_plugin"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_resolve_plugin_config_path_sync",
+        lambda _plugin_id, _meta: plugin_dir / "plugin.toml",
+    )
+    monkeypatch.setattr(module, "get_install_source_manager", lambda: manager)
+    monkeypatch.setattr(
+        module,
+        "_plugin_is_running_sync",
+        lambda plugin_id: runtime_checks.append(plugin_id) or True,
+    )
+    monkeypatch.setattr(
+        module,
+        "_delete_plugin_directory_sync",
+        lambda path: delete_calls.append(path) or True,
+    )
+
+    with pytest.raises(ServerDomainError) as captured:
+        await module.PluginLifecycleService().delete_plugin("manual_plugin")
+
+    assert captured.value.code == "PLUGIN_MANUAL_NOT_MANAGED"
+    assert captured.value.status_code == 409
+    assert captured.value.details["plugin_id"] == "manual_plugin"
+    assert runtime_checks == []
+    assert delete_calls == []
+    assert manager.marked_removed == []
+    assert plugin_dir.is_dir()
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+async def test_delete_reloads_install_source_before_ownership_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "managed_plugin"
+    plugin_dir.mkdir()
+    config_path = plugin_dir / "plugin.toml"
+    config_path.write_text(
+        "[plugin]\nid='managed_plugin'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    manager = _FakeInstallSourceManager(package_id="", channel="imported")
+    load_calls = 0
+
+    def reload_stale_snapshot() -> None:
+        nonlocal load_calls
+        load_calls += 1
+        manager.channel = "manual"
+
+    manager.load = reload_stale_snapshot  # type: ignore[attr-defined]
+    runtime_checks: list[str] = []
+    delete_calls: list[Path] = []
+
+    monkeypatch.setattr(
+        module,
+        "_get_plugin_meta_sync",
+        lambda _plugin_id: {"id": "managed_plugin"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_resolve_plugin_config_path_sync",
+        lambda _plugin_id, _meta: config_path,
+    )
+    monkeypatch.setattr(module, "get_install_source_manager", lambda: manager)
+    monkeypatch.setattr(
+        module,
+        "_plugin_is_running_sync",
+        lambda plugin_id: runtime_checks.append(plugin_id) or False,
+    )
+    monkeypatch.setattr(
+        module,
+        "_delete_plugin_directory_sync",
+        lambda path: delete_calls.append(path) or True,
+    )
+
+    with pytest.raises(ServerDomainError) as captured:
+        await module.PluginLifecycleService().delete_plugin("managed_plugin")
+
+    assert captured.value.code == "PLUGIN_MANUAL_NOT_MANAGED"
+    assert load_calls == 1
+    assert runtime_checks == []
+    assert delete_calls == []
+    assert plugin_dir.is_dir()
+
+
+@pytest.mark.plugin_unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["imported", "market"])
+async def test_delete_runtime_alias_uses_declared_id_for_managed_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    channel: str,
+) -> None:
+    root = tmp_path / "plugins"
+    plugin_dir = root / "demo_1"
+    config_path = plugin_dir / "plugin.toml"
+    plugin_dir.mkdir(parents=True)
+    config_path.write_text(
+        "[plugin]\nid='demo'\nentry='tests.fake:Plugin'\n",
+        encoding="utf-8",
+    )
+    manager = _FakeInstallSourceManager(
+        package_id="",
+        channel=channel,
+        plugin_id="demo",
+    )
+    plugins_backup = copy.deepcopy(module.state.plugins)
+    hosts_backup = dict(module.state.plugin_hosts)
+    handlers_backup = dict(module.state.event_handlers)
+    cache_backup = copy.deepcopy(module.state._snapshot_cache)
+
+    try:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins["demo_1"] = {
+                "id": "demo_1",
+                "config_path": str(config_path),
+                "effective_source": "user",
+            }
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+
+        async def _refresh_registry() -> dict[str, object]:
+            return {"success": True}
+
+        monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (root,))
+        monkeypatch.setattr(module, "get_install_source_manager", lambda: manager)
+        monkeypatch.setattr(
+            module.plugin_registry_service,
+            "refresh_registry",
+            _refresh_registry,
+        )
+        monkeypatch.setattr(module, "emit_lifecycle_event", lambda _event: None)
+
+        response = await module.PluginLifecycleService().delete_plugin("demo_1")
+
+        assert response["success"] is True
+        assert response["plugin_id"] == "demo_1"
+        assert plugin_dir.exists() is False
+        assert manager.marked_removed == [plugin_dir]
+    finally:
+        with module.state.acquire_plugins_write_lock():
+            module.state.plugins.clear()
+            module.state.plugins.update(plugins_backup)
+        with module.state.acquire_plugin_hosts_write_lock():
+            module.state.plugin_hosts.clear()
+            module.state.plugin_hosts.update(hosts_backup)
+        with module.state.acquire_event_handlers_write_lock():
+            module.state.event_handlers.clear()
+            module.state.event_handlers.update(handlers_backup)
+        with module.state._snapshot_cache_lock:
+            module.state._snapshot_cache = cache_backup
+
+
+@pytest.mark.plugin_unit
+def test_delete_path_guard_rejects_builtin_and_state_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    exec_root = tmp_path / "exec"
+    builtin_root = tmp_path / "builtin"
+    state_root = tmp_path / "plugins"
+    monkeypatch.setattr(module, "get_user_plugin_exec_root", lambda: exec_root)
+    monkeypatch.setattr(module, "get_plugin_state_root", lambda: state_root)
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (exec_root, builtin_root))
+
+    assert module._path_within_plugin_roots_sync(exec_root / "demo") is True
+    assert module._path_within_plugin_roots_sync(builtin_root / "demo") is False
+    assert module._path_within_plugin_roots_sync(state_root / "demo") is False
+
+    monkeypatch.setattr(module, "get_user_plugin_exec_root", lambda: state_root)
+    monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (state_root, builtin_root))
+    assert module._path_within_plugin_roots_sync(state_root / "demo") is False
 
 
 @pytest.mark.plugin_unit
@@ -2263,6 +2650,33 @@ def test_delete_uses_plugin_directory_name_for_legacy_empty_package_id(
 
 
 @pytest.mark.plugin_unit
+def test_delete_legacy_empty_profile_dir_uses_explicit_config_root_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    custom_exec_root = tmp_path / "custom" / "plugins"
+    plugin_dir = custom_exec_root / "legacy_plugin"
+    legacy_profiles_root = custom_exec_root.parent / ".neko-package-profiles"
+    profile_dir = legacy_profiles_root / "legacy_package"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "settings.toml").write_text("[settings]\nkeep = true\n", encoding="utf-8")
+    install_source_manager = _FakeInstallSourceManager(
+        package_id="legacy_package",
+        profile_dir="",
+    )
+    monkeypatch.setenv("PLUGIN_CONFIG_ROOT", str(custom_exec_root))
+    monkeypatch.delenv("PACKAGE_PROFILES_ROOT", raising=False)
+    monkeypatch.setattr(module, "get_install_source_manager", lambda: install_source_manager)
+
+    staged_profile = module._stage_orphaned_package_profile_sync(plugin_dir)
+
+    assert staged_profile is not None
+    assert staged_profile.original_dir == profile_dir.resolve()
+    module._restore_staged_package_profile_sync(staged_profile)
+    assert (profile_dir / "settings.toml").is_file()
+
+
+@pytest.mark.plugin_unit
 def test_delete_skips_legacy_inference_when_another_legacy_row_is_installed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2525,6 +2939,61 @@ def test_delete_removes_recorded_profile_after_profile_root_changes(
 
 
 @pytest.mark.plugin_unit
+def test_delete_preserves_recorded_profile_under_plugin_state_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "exec" / "legacy_plugin"
+    state_root = tmp_path / "state" / "plugins"
+    profile_dir = state_root / "legacy_package"
+    state_file = profile_dir / "data" / "state.db"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_bytes(b"persistent legacy state")
+    install_source_manager = _FakeInstallSourceManager(
+        package_id="legacy_package",
+        profile_dir=str(profile_dir),
+        profile_installed=True,
+    )
+    monkeypatch.setattr(module, "get_install_source_manager", lambda: install_source_manager)
+    monkeypatch.setattr(module, "get_user_package_profiles_root", lambda: tmp_path / "profiles")
+    monkeypatch.setattr(module, "get_plugin_state_root", lambda: state_root)
+
+    staged_profile = module._stage_orphaned_package_profile_sync(plugin_dir)
+
+    assert staged_profile is None
+    assert state_file.read_bytes() == b"persistent legacy state"
+    assert not list(state_root.glob(".*.deleting-*"))
+
+
+@pytest.mark.plugin_unit
+def test_delete_preserves_recorded_profile_under_builtin_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plugin_dir = tmp_path / "exec" / "legacy_plugin"
+    builtin_root = tmp_path / "builtin"
+    profile_dir = builtin_root / "legacy_package"
+    builtin_manifest = profile_dir / "plugin.toml"
+    builtin_manifest.parent.mkdir(parents=True)
+    builtin_manifest.write_bytes(b"immutable builtin")
+    install_source_manager = _FakeInstallSourceManager(
+        package_id="legacy_package",
+        profile_dir=str(profile_dir),
+        profile_installed=True,
+    )
+    monkeypatch.setattr(module, "get_install_source_manager", lambda: install_source_manager)
+    monkeypatch.setattr(module, "get_user_package_profiles_root", lambda: tmp_path / "profiles")
+    monkeypatch.setattr(module, "get_plugin_state_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(module, "BUILTIN_PLUGIN_CONFIG_ROOT", builtin_root)
+
+    staged_profile = module._stage_orphaned_package_profile_sync(plugin_dir)
+
+    assert staged_profile is None
+    assert builtin_manifest.read_bytes() == b"immutable builtin"
+    assert not list(builtin_root.glob(".*.deleting-*"))
+
+
+@pytest.mark.plugin_unit
 def test_delete_refuses_symlinked_recorded_profile(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2707,6 +3176,37 @@ def test_deferred_profile_cleanup_retries_dotted_package_ids(
 
 
 @pytest.mark.plugin_unit
+def test_deferred_profile_cleanup_migrates_legacy_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    record_path = tmp_path / "stable" / "package_profile_cleanup.json"
+    legacy_record_path = tmp_path / "legacy" / "package_profile_cleanup.json"
+    staged_dir = tmp_path / "profiles" / (".demo.deleting-" + "a" * 32)
+    staged_dir.mkdir(parents=True)
+    legacy_record_path.parent.mkdir(parents=True)
+    module._save_deferred_profile_cleanup_paths_sync(
+        legacy_record_path,
+        [str(staged_dir)],
+    )
+    monkeypatch.setattr(
+        module,
+        "_deferred_profile_cleanup_record_path_sync",
+        lambda: record_path,
+    )
+    monkeypatch.setattr(
+        module,
+        "_legacy_deferred_profile_cleanup_record_path_sync",
+        lambda: legacy_record_path,
+    )
+
+    assert module._retry_deferred_profile_cleanup_sync() == 1
+    assert staged_dir.exists() is False
+    assert legacy_record_path.exists() is False
+    assert record_path.exists() is False
+
+
+@pytest.mark.plugin_unit
 def test_unreadable_deferred_cleanup_record_is_never_overwritten(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2803,6 +3303,8 @@ async def test_delete_plugin_stops_running_host_before_removing(
         monkeypatch.setattr(module.PluginLifecycleService, "stop_plugin", _tracked_stop)
         monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", _refresh_registry)
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        install_source_manager = _FakeInstallSourceManager(package_id="")
+        monkeypatch.setattr(module, "get_install_source_manager", lambda: install_source_manager)
 
         service = module.PluginLifecycleService()
         response = await service.delete_plugin("running_plugin")
@@ -2870,6 +3372,8 @@ async def test_delete_plugin_clears_runtime_override(
         monkeypatch.setattr(module, "PLUGIN_CONFIG_ROOTS", (tmp_path,))
         monkeypatch.setattr(module.plugin_registry_service, "refresh_registry", _refresh_registry)
         monkeypatch.setattr(module, "emit_lifecycle_event", lambda event: None)
+        install_source_manager = _FakeInstallSourceManager(package_id="")
+        monkeypatch.setattr(module, "get_install_source_manager", lambda: install_source_manager)
 
         service = module.PluginLifecycleService()
         await service.delete_plugin("demo_plugin")

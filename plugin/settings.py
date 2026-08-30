@@ -80,16 +80,82 @@ def get_builtin_plugin_config_root() -> Path:
     return (Path(__file__).parent / "plugins").resolve()
 
 
-def get_user_plugin_config_root() -> Path:
-    """获取用户插件根目录。
+PLUGIN_EXEC_STATE_ROOT_COLLISION = "PLUGIN_EXEC_STATE_ROOT_COLLISION"
 
-    - Env: ``PLUGIN_CONFIG_ROOT``
-    - 默认：``我的文档/{APP_NAME}/plugins``
+
+class PluginExecStateRootCollisionError(ValueError):
+    """Raised when executable packages and persistent state share one root."""
+
+    code = PLUGIN_EXEC_STATE_ROOT_COLLISION
+
+    def __init__(self, *, exec_root: Path, state_root: Path) -> None:
+        self.exec_root = exec_root
+        self.state_root = state_root
+        super().__init__(
+            f"{self.code}: plugin execution root {exec_root} must not equal "
+            f"plugin state root {state_root}"
+        )
+
+
+def get_plugin_state_root() -> Path:
+    """Return the SDK-owned persistent plugin state root.
+
+    This path intentionally retains the historical ``<N.E.K.O user root>/plugins``
+    layout. Package install, upgrade, rollback and uninstall code must never use
+    it as an executable-package replacement target.
     """
+
+    return Path(get_plugins_directory()).resolve()
+
+
+def get_user_plugin_exec_root() -> Path:
+    """Return the writable root for user-installed plugin code.
+
+    An explicit legacy ``PLUGIN_CONFIG_ROOT`` override is still honoured as the
+    execution root. Without one, code is isolated under
+    ``.neko-plugin-installations/plugins`` while persistent state remains under
+    :func:`get_plugin_state_root`.
+    """
+
     custom_path = os.getenv("PLUGIN_CONFIG_ROOT")
     if custom_path:
         return Path(custom_path).expanduser().resolve()
-    return Path(get_plugins_directory()).resolve()
+    return (
+        get_plugin_state_root().parent
+        / ".neko-plugin-installations"
+        / "plugins"
+    ).resolve()
+
+
+def get_user_plugin_config_root() -> Path:
+    """Compatibility alias for the user plugin execution root.
+
+    New code should use :func:`get_user_plugin_exec_root`. The old helper name
+    is retained while callers migrate away from treating package code as
+    configuration/state.
+    """
+
+    return get_user_plugin_exec_root()
+
+
+def ensure_plugin_exec_state_roots_separated(
+    *,
+    exec_root: Path | None = None,
+    state_root: Path | None = None,
+) -> None:
+    """Fail closed before a package write can target persistent state."""
+
+    resolved_exec = (exec_root or get_user_plugin_exec_root()).resolve(strict=False)
+    resolved_state = (state_root or get_plugin_state_root()).resolve(strict=False)
+    if (
+        resolved_exec == resolved_state
+        or resolved_exec.is_relative_to(resolved_state)
+        or resolved_state.is_relative_to(resolved_exec)
+    ):
+        raise PluginExecStateRootCollisionError(
+            exec_root=resolved_exec,
+            state_root=resolved_state,
+        )
 
 
 def get_plugin_config_root() -> Path:
@@ -110,9 +176,9 @@ def get_plugin_config_root() -> Path:
 
 
 def get_plugin_config_roots() -> tuple[Path, ...]:
-    """获取插件配置根目录列表：内置优先，用户目录其次。"""
+    """Return executable plugin roots in effective-source priority order."""
     roots: list[Path] = []
-    for root in (get_builtin_plugin_config_root(), get_user_plugin_config_root()):
+    for root in (get_user_plugin_exec_root(), get_builtin_plugin_config_root()):
         if root not in roots:
             roots.append(root)
     return tuple(roots)
@@ -122,32 +188,48 @@ def get_user_package_profiles_root() -> Path:
     """获取用户插件包 profile 根目录。
 
     - Env: ``PACKAGE_PROFILES_ROOT``
-    - 默认：``<user plugins root>/../.neko-package-profiles``，即与
-      ``USER_PLUGIN_CONFIG_ROOT`` 同级，便于统一存放于我的文档下的
-      应用配置目录中。
+    - 显式设置旧 ``PLUGIN_CONFIG_ROOT`` 时，兼容其同级的
+      ``.neko-package-profiles``。
+    - 其他情况默认：``<N.E.K.O user root>/.neko-package-profiles``。
     """
     custom_path = os.getenv("PACKAGE_PROFILES_ROOT")
     if custom_path:
         return Path(custom_path).expanduser().resolve()
-    return (get_user_plugin_config_root().parent / ".neko-package-profiles").resolve()
+    legacy_plugin_root = os.getenv("PLUGIN_CONFIG_ROOT")
+    if legacy_plugin_root:
+        return (
+            Path(legacy_plugin_root).expanduser().resolve().parent
+            / ".neko-package-profiles"
+        ).resolve()
+    return (get_plugin_state_root().parent / ".neko-package-profiles").resolve()
 
 
 def get_user_plugin_packages_root() -> Path:
     """获取用户插件包（``.neko-plugin`` / ``.neko-bundle``）落地目录。
 
     - Env: ``PLUGIN_PACKAGES_ROOT``
-    - 默认：``<user plugins root>/../.neko-plugin-packages``，与
-      ``USER_PLUGIN_CONFIG_ROOT`` / ``USER_PACKAGE_PROFILES_ROOT`` 同级，
-      避免落到 Nuitka 打包后的只读 dist 目录中。
+    - 显式设置旧 ``PLUGIN_CONFIG_ROOT`` 时，兼容其同级的
+      ``.neko-plugin-packages``。
+    - 其他情况默认：``<N.E.K.O user root>/.neko-plugin-packages``。
     """
     custom_path = os.getenv("PLUGIN_PACKAGES_ROOT")
     if custom_path:
         return Path(custom_path).expanduser().resolve()
-    return (get_user_plugin_config_root().parent / ".neko-plugin-packages").resolve()
+    legacy_plugin_root = os.getenv("PLUGIN_CONFIG_ROOT")
+    if legacy_plugin_root:
+        return (
+            Path(legacy_plugin_root).expanduser().resolve().parent
+            / ".neko-plugin-packages"
+        ).resolve()
+    return (get_plugin_state_root().parent / ".neko-plugin-packages").resolve()
 
 
 BUILTIN_PLUGIN_CONFIG_ROOT = get_builtin_plugin_config_root()
-USER_PLUGIN_CONFIG_ROOT = get_user_plugin_config_root()
+PLUGIN_STATE_ROOT = get_plugin_state_root()
+USER_PLUGIN_EXEC_ROOT = get_user_plugin_exec_root()
+# Compatibility alias: historically this was both code and state. It now
+# deliberately names the execution root only.
+USER_PLUGIN_CONFIG_ROOT = USER_PLUGIN_EXEC_ROOT
 USER_PACKAGE_PROFILES_ROOT = get_user_package_profiles_root()
 USER_PLUGIN_PACKAGES_ROOT = get_user_plugin_packages_root()
 # Deprecated compatibility alias for older single-root callers.
@@ -456,7 +538,15 @@ if MESSAGE_PLANE_VALIDATE_MODE not in ("off", "warn", "strict"):
 
 MESSAGE_PLANE_TOPIC_MAX = _get_int_env("NEKO_MESSAGE_PLANE_TOPIC_MAX", 2000)
 MESSAGE_PLANE_TOPIC_NAME_MAX_LEN = _get_int_env("NEKO_MESSAGE_PLANE_TOPIC_NAME_MAX_LEN", 128)
-MESSAGE_PLANE_PAYLOAD_MAX_BYTES = _get_int_env("NEKO_MESSAGE_PLANE_PAYLOAD_MAX_BYTES", 256 * 1024)
+# message_plane 单条 payload 上限（字节）。插件侧 push_message 和 host 侧 ingest
+# 共用这一个常量来判定 payload_too_large，因此两边不会漂移。
+# 512 KiB 而不是 256 KiB：inline 图片以 base64 走线，是原始字节的 4/3，所以这里
+# 定的是"编码后"的预算。要让文档承诺的 256 KiB inline 图片真的能过，编码后就得
+# 放得下 341 KiB，再留出 text part 和信封的余量——512 KiB 换算回原始字节约
+# 384 KiB。（同期停掉了 legacy binary_data 的裸字节副本；在那之前一张图要走
+# 约 2.34x，256 KiB 的上限实际只兜得住约 110 KiB 的图。）
+# Env: NEKO_MESSAGE_PLANE_PAYLOAD_MAX_BYTES, default=512*1024
+MESSAGE_PLANE_PAYLOAD_MAX_BYTES = _get_int_env("NEKO_MESSAGE_PLANE_PAYLOAD_MAX_BYTES", 512 * 1024)
 MESSAGE_PLANE_STORE_MAXLEN = _get_int_env("NEKO_MESSAGE_PLANE_STORE_MAXLEN", 20000)
 MESSAGE_PLANE_GET_RECENT_MAX_LIMIT = _get_int_env("NEKO_MESSAGE_PLANE_GET_RECENT_MAX_LIMIT", 1000)
 
