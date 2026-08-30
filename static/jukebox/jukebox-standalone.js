@@ -5,6 +5,16 @@
     return;
   }
 
+  // 这个窗口持有用户看得见的那个播放器，所以由它来接管从角色窗口转发过来的
+  // AI 控制指令。parts 是同步加载的，这里 window.Jukebox 已经就位。
+  try {
+    if (window.Jukebox && typeof window.Jukebox.startControlOwnerService === 'function') {
+      window.Jukebox.startControlOwnerService();
+    }
+  } catch (error) {
+    console.warn('[Jukebox] 控制归属服务启动失败:', error);
+  }
+
   var IGNORE_DRAG_SELECTOR =
     'button, input, a, select, textarea, .jukebox-header-buttons, ' +
     '.jukebox-table tbody tr, .sam-panel, .jukebox-controls-row, .jukebox-resize-handle';

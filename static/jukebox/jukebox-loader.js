@@ -461,6 +461,86 @@
     hideToast(2800);
   }
 
+  // ===== 跨窗口控制归属（角色窗口一侧）=====
+  // 独立点唱机窗口（templates/jukebox.html）持有用户看得见的播放器，但它既不加载
+  // 本文件也不加载 app-websocket.js。它开着的时候，控制指令必须转发过去，而不是
+  // 在角色窗口里另起一个隐藏运行时 —— 那会让 stop/next/音量/模式对可见播放器全部
+  // 失效，play 还会同时响两条音轨。
+  var CONTROL_OWNER_CHANNEL = 'neko-jukebox-control';
+  var CONTROL_OWNER_TTL_MS = 6000;      // 拥有者心跳 2s 一次，容三拍
+  var CONTROL_FORWARD_TIMEOUT_MS = 5000;
+  var controlChannel = null;
+  var controlOwnerExpiresAt = 0;
+  var pendingForwards = new Map();
+  var forwardSeq = 0;
+
+  function ensureControlChannel() {
+    if (controlChannel) return controlChannel;
+    if (typeof BroadcastChannel === 'undefined') return null;
+    try {
+      controlChannel = new BroadcastChannel(CONTROL_OWNER_CHANNEL);
+    } catch (_) {
+      return null;
+    }
+    controlChannel.onmessage = function(event) {
+      var data = event && event.data;
+      if (!data || typeof data !== 'object') return;
+      if (data.type === 'jukebox_owner_alive') {
+        controlOwnerExpiresAt = Date.now() + CONTROL_OWNER_TTL_MS;
+        return;
+      }
+      if (data.type === 'jukebox_owner_gone') {
+        controlOwnerExpiresAt = 0;
+        return;
+      }
+      if (data.type === 'jukebox_control_result') {
+        var settle = pendingForwards.get(data.requestId);
+        if (settle) {
+          pendingForwards.delete(data.requestId);
+          settle(data.result);
+        }
+      }
+    };
+    try {
+      // 刚起来时主动问一声，不用干等第一个心跳。
+      controlChannel.postMessage({ type: 'jukebox_owner_query' });
+    } catch (_) {}
+    return controlChannel;
+  }
+
+  function hasControlOwner() {
+    ensureControlChannel();
+    return Date.now() < controlOwnerExpiresAt;
+  }
+
+  function forwardControlToOwner(command) {
+    var channel = ensureControlChannel();
+    if (!channel) {
+      return Promise.resolve({ ok: false, action: (command && command.action) || '', message: 'jukebox_owner_unreachable' });
+    }
+    forwardSeq += 1;
+    var requestId = 'ctl-' + forwardSeq + '-' + Date.now();
+    return new Promise(function(resolve) {
+      var settled = false;
+      var finish = function(result) {
+        if (settled) return;
+        settled = true;
+        pendingForwards.delete(requestId);
+        resolve(result);
+      };
+      pendingForwards.set(requestId, finish);
+      setTimeout(function() {
+        // 超时不回落本地执行：那样会在隐藏窗口里再起一条音轨，比失败更糟。
+        finish({ ok: false, action: (command && command.action) || '', message: 'jukebox_owner_timeout' });
+      }, CONTROL_FORWARD_TIMEOUT_MS);
+      try {
+        channel.postMessage({ type: 'jukebox_control_request', requestId: requestId, command: command || {} });
+      } catch (_) {
+        finish({ ok: false, action: (command && command.action) || '', message: 'jukebox_owner_unreachable' });
+      }
+    });
+  }
+
   function clearPendingUnload() {
     if (unloadTimer) {
       clearTimeout(unloadTimer);
@@ -712,10 +792,13 @@
     window.__nekoJukeboxToggle = toggleJukebox;
     window.__nekoJukeboxToggle.__nekoJukeboxWebLoader = true;
   }
+  ensureControlChannel();
   window.__nekoJukeboxLoader = {
     load: loadJukeboxScript,
     toggle: toggleJukebox,
     unload: unloadJukebox,
-    getState: getState
+    getState: getState,
+    hasControlOwner: hasControlOwner,
+    forwardControl: forwardControlToOwner
   };
 })();

@@ -120,7 +120,8 @@ def _websocket_jukebox_handler_source() -> str:
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     queue_decl = "let _jukeboxControlQueue = Promise.resolve();"
     assert queue_decl in source, "jukebox control queue declaration moved"
-    handler_start = "    function handleJukeboxControlResponse(response) {"
+    # 路由判定和处理器一起切出来：谁执行这条指令由它们两个共同决定。
+    handler_start = "    function isSecondaryJukeboxControlSurface() {"
     handler_end = "    function readNewUserIcebreakerStore() {"
     assert handler_start in source and handler_end in source
     handler = handler_start + source.split(handler_start, 1)[1].split(handler_end, 1)[0]
@@ -153,7 +154,7 @@ def test_jukebox_websocket_handler_forwards_canonical_command_and_serializes():
         textwrap.dedent(
             """
             const emit = console.log;
-            const window = { Jukebox: null };
+            const window = { Jukebox: null, location: { pathname: '/' } };
             globalThis.window = window;
             """
         )
@@ -463,3 +464,88 @@ def test_jukebox_plugin_scopes_command_to_the_invoking_context():
     )
     asyncio.run(plugin.control_jukebox(action="next"))
     assert pushed[-1]["target_lanlan"] is None
+
+
+def test_jukebox_control_routes_to_exactly_one_executor():
+    """#4: in multi-window Electron the same message reaches several windows.
+
+    RAW_MESSAGE forwarding hands one WebSocket message to the pet window and
+    the chat window, while the standalone jukebox window owns the player the
+    user can actually see. Exactly one of them may act on it.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              const settle = () => new Promise(resolve => setTimeout(resolve, 5));
+
+              const setup = (opts) => {
+                window.__NEKO_MULTI_WINDOW__ = opts.multiWindow === true;
+                window.location.pathname = opts.pathname;
+                window.Jukebox = {
+                  executeControl: (command) => {
+                    log.push({ scenario: opts.scenario, via: 'local', command });
+                    return Promise.resolve({ ok: true });
+                  }
+                };
+                window.__nekoJukeboxLoader = {
+                  hasControlOwner: () => opts.ownerAlive === true,
+                  forwardControl: (command) => {
+                    log.push({ scenario: opts.scenario, via: 'forward', command });
+                    return opts.forwardFails
+                      ? Promise.resolve({ ok: false, message: 'jukebox_owner_timeout' })
+                      : Promise.resolve({ ok: true });
+                  }
+                };
+              };
+
+              const fire = async (opts) => {
+                setup(opts);
+                handleJukeboxControlResponse({
+                  type: 'jukebox_control',
+                  command: { action: 'next' }
+                });
+                await settle();
+              };
+
+              // 独立点唱机窗口开着：必须转发，不能本地执行
+              await fire({ scenario: 'owner', ownerAlive: true, pathname: '/' });
+              // 没有拥有者 + 多窗口下的 chat 窗口：让位，什么都不做
+              await fire({ scenario: 'chat', ownerAlive: false, multiWindow: true, pathname: '/chat' });
+              await fire({ scenario: 'chat_full', ownerAlive: false, multiWindow: true, pathname: '/chat_full' });
+              // 没有拥有者 + 主窗口：本地执行
+              await fire({ scenario: 'pet', ownerAlive: false, multiWindow: true, pathname: '/' });
+              // 网页端单窗口（没有多窗口标志）即便路径是 /chat 也要本地执行
+              await fire({ scenario: 'web_chat', ownerAlive: false, multiWindow: false, pathname: '/chat' });
+              // 转发失败不能回落本地：那会在隐藏窗口里再起一条音轨
+              await fire({ scenario: 'forward_fails', ownerAlive: true, forwardFails: true, pathname: '/' });
+
+              emit(JSON.stringify(log));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    log = json.loads(result.stdout.strip().splitlines()[-1])
+    routed = [(entry["scenario"], entry["via"]) for entry in log]
+
+    assert routed == [
+        ("owner", "forward"),
+        ("pet", "local"),
+        ("web_chat", "local"),
+        ("forward_fails", "forward"),
+    ], routed
+    # 让位的两个 chat 场景一条记录都不该有。
+    assert not [entry for entry in log if entry["scenario"].startswith("chat")]
+    # 转发出去的仍是规范化命令，不是原始 response。
+    assert log[0]["command"] == {"action": "next", "query": "", "headless": True}

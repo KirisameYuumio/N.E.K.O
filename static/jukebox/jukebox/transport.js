@@ -411,6 +411,92 @@ Object.assign(window.Jukebox, {
     return index >= 0 ? songs[index] : null;
   },
 
+  // ===== 跨窗口控制归属 =====
+  // Electron 分发形态下同一条 jukebox_control 会被 RAW_MESSAGE 转发给多个窗口
+  // （pet + chat），而独立点唱机窗口（templates/jukebox.html）另有自己的 Jukebox
+  // 实例和 APlayer，且既不加载 app-websocket.js 也不加载 jukebox-loader.js。
+  // 不做归属判定的话：可见的那个播放器收不到 stop/next/音量/模式，play 还会在
+  // 隐藏窗口里另起一条音轨。
+  //
+  // 通道用 BroadcastChannel：点唱机窗口在 Electron 里没有单独 partition（只有
+  // full-chat 用 persist:neko-full-chat），与 pet 窗口同 session，能互通。
+  CONTROL_OWNER_CHANNEL: 'neko-jukebox-control',
+  CONTROL_OWNER_HEARTBEAT_MS: 2000,
+
+  startControlOwnerService: function() {
+    // 只有真正持有可见播放器的独立窗口才当拥有者。
+    if (!window.__NEKO_JUKEBOX_STANDALONE__) return false;
+    if (Jukebox.State.controlOwnerChannel) return true;
+    if (typeof BroadcastChannel === 'undefined') return false;
+
+    let channel;
+    try {
+      channel = new BroadcastChannel(Jukebox.CONTROL_OWNER_CHANNEL);
+    } catch (error) {
+      console.warn('[Jukebox] 控制通道不可用，跨窗口归属失效:', error);
+      return false;
+    }
+    Jukebox.State.controlOwnerChannel = channel;
+
+    const announce = () => {
+      try {
+        channel.postMessage({ type: 'jukebox_owner_alive' });
+      } catch (_) {}
+    };
+
+    channel.onmessage = async (event) => {
+      const data = event && event.data;
+      if (!data || typeof data !== 'object') return;
+      if (data.type === 'jukebox_owner_query') {
+        announce();
+        return;
+      }
+      if (data.type !== 'jukebox_control_request') return;
+
+      let result;
+      try {
+        result = await Jukebox.executeControl(data.command || {});
+      } catch (error) {
+        result = {
+          ok: false,
+          action: (data.command && data.command.action) || '',
+          message: String((error && error.message) || error)
+        };
+      }
+      try {
+        channel.postMessage({
+          type: 'jukebox_control_result',
+          requestId: data.requestId,
+          result: result
+        });
+      } catch (_) {}
+    };
+
+    announce();
+    Jukebox.State.controlOwnerHeartbeatTimer = setInterval(announce, Jukebox.CONTROL_OWNER_HEARTBEAT_MS);
+    window.addEventListener('beforeunload', Jukebox.stopControlOwnerService);
+    return true;
+  },
+
+  stopControlOwnerService: function() {
+    const state = Jukebox.State;
+    if (state.controlOwnerHeartbeatTimer) {
+      clearInterval(state.controlOwnerHeartbeatTimer);
+      state.controlOwnerHeartbeatTimer = null;
+    }
+    if (state.controlOwnerChannel) {
+      try {
+        // 主动告知对端我退出了，免得它们等 TTL 到期才把指令转回本地。
+        state.controlOwnerChannel.postMessage({ type: 'jukebox_owner_gone' });
+      } catch (_) {}
+      try {
+        state.controlOwnerChannel.onmessage = null;
+        state.controlOwnerChannel.close();
+      } catch (_) {}
+      state.controlOwnerChannel = null;
+    }
+  },
+
   isControlEpochCurrent: function(epoch) {
     return epoch === Jukebox.State.teardownEpoch;
   },

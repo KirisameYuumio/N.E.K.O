@@ -767,21 +767,45 @@
         dispatchMusicPlayUrlResponse(response, 'websocket');
     }
 
+    // 多窗口分发形态下同一条 WS 消息会被 RAW_MESSAGE 转发给多个窗口，chat 窗口和
+    // pet 窗口都会走到这里。谁来执行必须唯一，判据都能在本窗口内直接判定：
+    //   1. 独立点唱机窗口开着 -> 它才持有可见播放器，转发给它
+    //   2. 多窗口下的 chat 窗口 -> 让位给主窗口（它和点唱机窗口同 partition，
+    //      能听见拥有者；chat 处于 persist:neko-full-chat，听不见）
+    //   3. 其余（网页端单窗口、pet 窗口）-> 本地执行
+    function isSecondaryJukeboxControlSurface() {
+        return window.__NEKO_MULTI_WINDOW__ === true
+            && /^\/chat(?:_full)?(?:\/|$)/.test(window.location.pathname || '');
+    }
+
     function handleJukeboxControlResponse(response) {
-        if (!response || !window.Jukebox || typeof window.Jukebox.executeControl !== 'function') {
+        if (!response) return;
+
+        var command = response.command && typeof response.command === 'object' ? response.command : response;
+        var payload = {
+            action: command.action,
+            query: command.query || '',
+            value: command.value,
+            mode: command.mode,
+            headless: true
+        };
+        var loader = window.__nekoJukeboxLoader;
+        var ownerAlive = !!(loader && typeof loader.hasControlOwner === 'function' && loader.hasControlOwner());
+
+        if (!ownerAlive && isSecondaryJukeboxControlSurface()) {
+            console.log('[Jukebox] 跳过点歌台控制：多窗口下由主窗口执行');
+            return;
+        }
+        if (!ownerAlive && (!window.Jukebox || typeof window.Jukebox.executeControl !== 'function')) {
             console.log('[Jukebox] 跳过点歌台控制：当前窗口没有点歌台控制入口');
             return;
         }
 
-        var command = response.command && typeof response.command === 'object' ? response.command : response;
         var runCommand = function () {
-            return window.Jukebox.executeControl({
-                action: command.action,
-                query: command.query || '',
-                value: command.value,
-                mode: command.mode,
-                headless: true
-            }).then(function (result) {
+            var executed = ownerAlive
+                ? loader.forwardControl(payload)
+                : window.Jukebox.executeControl(payload);
+            return Promise.resolve(executed).then(function (result) {
                 console.log('[Jukebox] 点歌台控制完成:', result);
             }).catch(function (error) {
                 console.warn('[Jukebox] 点歌台控制失败:', error);

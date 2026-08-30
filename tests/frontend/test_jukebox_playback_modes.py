@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 188,
+        "keyCount": 192,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -4243,3 +4243,155 @@ def test_jukebox_reports_failure_when_autoplay_is_blocked(mock_page: Page):
     assert result["isPlayingAfterBlocked"] is False
     assert result["allowedOk"] is True
     assert result["current"] == "song2"
+
+
+@pytest.mark.frontend
+def test_jukebox_standalone_window_serves_forwarded_controls(mock_page: Page):
+    """#4 owner side: the standalone window answers discovery and runs commands.
+
+    It owns the player the user can see, but loads neither app-websocket.js nor
+    jukebox-loader.js, so it has to pick the command up off the channel.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          const started = J.startControlOwnerService();
+
+          // 扮演角色窗口：BroadcastChannel 不会把消息投回发送它的那个对象，
+          // 但同页面里另一个 channel 对象收得到，足以驱动完整协议。
+          const peer = new BroadcastChannel('neko-jukebox-control');
+          const seen = [];
+          peer.onmessage = (event) => seen.push(event.data);
+
+          const waitFor = async (predicate, timeoutMs) => {
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+              if (predicate()) return true;
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            return false;
+          };
+
+          // 1) 探测：问一声就该有人应答
+          peer.postMessage({ type: 'jukebox_owner_query' });
+          const answered = await waitFor(
+            () => seen.some(m => m && m.type === 'jukebox_owner_alive'), 1000);
+
+          // 2) 代执行：转发一条指令，结果要原样回来
+          peer.postMessage({
+            type: 'jukebox_control_request',
+            requestId: 'req-1',
+            command: { action: 'set_mode', mode: 'random', headless: true }
+          });
+          const replied = await waitFor(
+            () => seen.some(m => m && m.type === 'jukebox_control_result' && m.requestId === 'req-1'), 3000);
+          const reply = seen.find(m => m && m.type === 'jukebox_control_result' && m.requestId === 'req-1');
+
+          // 3) 退出时主动通告，别让对端干等 TTL
+          J.stopControlOwnerService();
+          const goneSeen = await waitFor(
+            () => seen.some(m => m && m.type === 'jukebox_owner_gone'), 1000);
+
+          peer.close();
+          return {
+            started,
+            answered,
+            replied,
+            replyOk: reply && reply.result && reply.result.ok,
+            replyAction: reply && reply.result && reply.result.action,
+            modeApplied: J.State.playbackMode,
+            goneSeen,
+            channelReleased: J.State.controlOwnerChannel === null
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "started": True,
+        "answered": True,
+        "replied": True,
+        "replyOk": True,
+        "replyAction": "set_mode",
+        "modeApplied": "random",
+        "goneSeen": True,
+        "channelReleased": True,
+    }
+
+
+@pytest.mark.frontend
+def test_jukebox_loader_discovers_and_forwards_to_the_owner(mock_page: Page):
+    """#4 character-window side: discovery + forwarding without loading the parts.
+
+    Answering "is there an owner?" must not drag the hidden runtime up, which is
+    why this lives in the loader rather than in the jukebox parts.
+    """
+    mock_page.set_content(
+        """
+        <script>
+          window.t = (key, fallback) => typeof fallback === 'string' ? fallback : key;
+        </script>
+        """
+    )
+    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const loader = window.__nekoJukeboxLoader;
+          const ownerless = loader.hasControlOwner();
+
+          // 扮演独立点唱机窗口
+          const owner = new BroadcastChannel('neko-jukebox-control');
+          const requests = [];
+          owner.onmessage = (event) => {
+            const data = event.data;
+            if (!data) return;
+            if (data.type === 'jukebox_owner_query') {
+              owner.postMessage({ type: 'jukebox_owner_alive' });
+              return;
+            }
+            if (data.type === 'jukebox_control_request') {
+              requests.push(data.command);
+              owner.postMessage({
+                type: 'jukebox_control_result',
+                requestId: data.requestId,
+                result: { ok: true, action: data.command.action, via: 'owner' }
+              });
+            }
+          };
+          owner.postMessage({ type: 'jukebox_owner_alive' });
+          await new Promise(resolve => setTimeout(resolve, 50));
+          const discovered = loader.hasControlOwner();
+
+          const forwarded = await loader.forwardControl({ action: 'next', headless: true });
+
+          // 拥有者退出后要回落成「没有拥有者」
+          owner.postMessage({ type: 'jukebox_owner_gone' });
+          await new Promise(resolve => setTimeout(resolve, 50));
+          const afterGone = loader.hasControlOwner();
+
+          owner.close();
+          return {
+            ownerless,
+            discovered,
+            requests,
+            forwarded,
+            afterGone,
+            // 全程没有把 parts 拉起来
+            partsLoaded: !!document.querySelector('script[data-neko-jukebox-part="true"]')
+          };
+        }
+        """
+    )
+
+    assert result["ownerless"] is False
+    assert result["discovered"] is True
+    assert result["requests"] == [{"action": "next", "headless": True}]
+    assert result["forwarded"] == {"ok": True, "action": "next", "via": "owner"}
+    assert result["afterGone"] is False
+    assert result["partsLoaded"] is False

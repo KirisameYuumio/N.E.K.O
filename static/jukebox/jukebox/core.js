@@ -123,6 +123,8 @@ Object.assign(window.Jukebox, {
     isRuntimeReady: false,
     headlessRuntimeRequested: false,
     teardownEpoch: 0,
+    controlOwnerChannel: null,
+    controlOwnerHeartbeatTimer: null,
     fuzzySearchWorker: null,
     fuzzySearchWorkerUrl: null,
     fuzzySearchToken: 0,
