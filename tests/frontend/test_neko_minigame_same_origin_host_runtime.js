@@ -789,6 +789,16 @@ async function main() {
     }));
   };
   windowMock.addEventListener('neko-game-voice-control-message', sameDocumentController);
+  // Two adapters sharing a session and a millisecond both minted `voice-<ms>-1`,
+  // and the shared channel then routed one adapter's reply into the other's
+  // pending map. Capture the ids the requests actually carry.
+  const observedVoiceRequestIds = [];
+  const voiceRequestIdObserver = (event) => {
+    if (event?.detail?.type === 'game_voice_control_request') {
+      observedVoiceRequestIds.push(event.detail.request_id);
+    }
+  };
+  windowMock.addEventListener('neko-game-voice-control-message', voiceRequestIdObserver);
   const sameDocumentResponse = await host.requestVoiceControl('query', {
     timeoutMs: 500,
     sdkRouteInstanceId: 'route-instance-a',
@@ -806,6 +816,70 @@ async function main() {
   windowMock.localStorage.setItem = originalStorageSetItem;
   assert(storageBlockedResponse.reason === 'queried',
     'same-document voice fallback was skipped when localStorage failed');
+  const realVoiceDateNow = Date.now;
+  let voiceEntropyCounter = 0;
+  try {
+    Date.now = () => 1700000000000;
+    // TWO FRESH adapters: both per-bridge counters start at 0, which is the
+    // collision. Reusing the long-lived `host` here would not reproduce it --
+    // its counter has already advanced past 1 in the assertions above, so the
+    // ids would differ for the wrong reason.
+    const peerIds = [];
+    for (const peerIndex of [0, 1]) {
+      // windowMock.crypto is the deterministic `values.fill(7)` stub that keeps
+      // the credential assertions above stable, which would make both ids equal
+      // for the wrong reason. Counter source, so "distinct" really means the
+      // entropy reached the id.
+      const peerWindow = {
+        ...windowMock,
+        BroadcastChannel: undefined,
+        crypto: {
+          getRandomValues(values) {
+            for (let index = 0; index < values.length; index += 1) {
+              voiceEntropyCounter += 1;
+              values[index] = voiceEntropyCounter;
+            }
+            return values;
+          },
+        },
+      };
+      const peerVoiceHost = createHost({
+        gameType: 'example-game',
+        sessionId: 'server-session',
+        fetchImpl,
+        windowImpl: peerWindow,
+        navigatorImpl: windowMock.navigator,
+      });
+      peerVoiceHost.connectGame({
+        protocolVersions: ['1'],
+        manifest: {
+          id: 'example-game', version: '1.0.0',
+          requiredCapabilities: ['runtime', 'logging'],
+          optionalCapabilities: ['voice-input'],
+        },
+      });
+      peerVoiceHost.applyRouteState({
+        game_route_active: true,
+        session_id: 'server-session',
+        lanlan_name: 'Server Neko',
+      });
+      peerVoiceHost.startVoiceControlBridge({ onState() {} });
+      const before = observedVoiceRequestIds.length;
+      await peerVoiceHost.requestVoiceControl('query', {
+        timeoutMs: 500,
+        sdkRouteInstanceId: 'route-instance-a',
+      }).catch(() => { /* answered by the shared controller above */ });
+      assert(observedVoiceRequestIds.length === before + 1,
+        `peer adapter ${peerIndex} did not dispatch a voice request`);
+      peerIds.push(observedVoiceRequestIds.at(-1));
+      peerVoiceHost.dispose();
+    }
+    assert(peerIds[0] !== peerIds[1],
+      `two same-session adapters minted the same voice request id in one millisecond: ${JSON.stringify(peerIds)}`);
+  } finally {
+    Date.now = realVoiceDateNow;
+  }
+  windowMock.removeEventListener('neko-game-voice-control-message', voiceRequestIdObserver);
   windowMock.removeEventListener('neko-game-voice-control-message', sameDocumentController);
   const voiceAbortController = new AbortController();
   const cancelledVoiceRequest = host.requestVoiceControl('query', {

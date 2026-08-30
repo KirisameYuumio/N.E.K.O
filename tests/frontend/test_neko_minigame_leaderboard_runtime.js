@@ -32,6 +32,7 @@ function createTransport({ server = false, shared = null } = {}) {
   let storagePendingOperation = '';
   let storageGetFailure = null;
   let storageSetFailure = null;
+  let storageDeleteFailure = null;
   let lockPending = false;
   let runtimeState = { sessionId: 'leaderboard-session', characterName: 'Yui' };
 
@@ -85,7 +86,10 @@ function createTransport({ server = false, shared = null } = {}) {
         if (storageSetFailure) return Promise.resolve(storageSetFailure);
         values.set(payload.key, payload.value);
       }
-      if (operation === 'delete') values.delete(payload.key);
+      if (operation === 'delete') {
+        if (storageDeleteFailure) return Promise.resolve(storageDeleteFailure);
+        values.delete(payload.key);
+      }
       return Promise.resolve({ ok: true });
     },
     async runGameStorageExclusive(lockName, callback, options = {}) {
@@ -148,6 +152,7 @@ function createTransport({ server = false, shared = null } = {}) {
     setStoragePendingOperation(value) { storagePendingOperation = String(value || ''); },
     setStorageGetFailure(value) { storageGetFailure = value; },
     setStorageSetFailure(value) { storageSetFailure = value; },
+    setStorageDeleteFailure(value) { storageDeleteFailure = value; },
     setLockPending(value) { lockPending = value; },
   };
 }
@@ -301,6 +306,47 @@ async function main() {
     }
     failHost.setStorageGetFailure(null);
     failGame.dispose();
+  }
+
+  // Third of the same family: a failed DELETE reported by return value used to
+  // resolve, and clear() told the game the board was cleared while it was still
+  // there.
+  {
+    const clearFailHost = createTransport();
+    const clearFailGame = await window.NekoMiniGame.connect(manifest(['leaderboard-local']), {
+      transport: clearFailHost.transport,
+    });
+    await clearFailGame.leaderboard.local.submit('main', { score: 42, mode: 'duel' });
+    const storedBeforeClearFailure = JSON.stringify(clearFailHost.values.get('leaderboards/main'));
+    clearFailHost.setStorageDeleteFailure({ ok: false, error: 'storage_unavailable' });
+    let clearFailureError = null;
+    try { await clearFailGame.leaderboard.local.clear('main', { confirm: true }); }
+    catch (error) { clearFailureError = error; }
+    assert(clearFailureError !== null,
+      'a failed leaderboard delete was reported to the game as a cleared board');
+    assert(JSON.stringify(clearFailHost.values.get('leaderboards/main')) === storedBeforeClearFailure,
+      'the failed delete probe changed the stored board');
+    clearFailHost.setStorageDeleteFailure(null);
+    await clearFailGame.leaderboard.local.clear('main', { confirm: true });
+    assert(clearFailHost.values.get('leaderboards/main') === undefined,
+      'a successful clear did not remove the board');
+    clearFailGame.dispose();
+  }
+
+  // Padded modes: the schema requires an exact enum member, so `' descending '`
+  // is schema-invalid while trimming silently executed it as the real mode.
+  for (const [field, padded] of [['order', ' descending '], ['retention', ' recent ']]) {
+    const paddedManifest = manifest(['leaderboard-local']);
+    paddedManifest.leaderboards = {
+      main: { scoreField: 'score', order: 'descending', maxEntries: 3, retention: 'recent' },
+    };
+    paddedManifest.leaderboards.main[field] = padded;
+    let paddedModeError = null;
+    try {
+      await window.NekoMiniGame.connect(paddedManifest, { transport: createTransport().transport });
+    } catch (error) { paddedModeError = error; }
+    assert(paddedModeError?.code === 'invalid_manifest',
+      `a padded ${field} (${JSON.stringify(padded)}) was trimmed into a real mode`);
   }
 
   // The dual of the read guard: a failed WRITE reported by return value used to

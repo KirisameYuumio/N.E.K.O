@@ -1066,6 +1066,56 @@ async function main() {
   assert(coercedMaxEntriesError?.code === 'invalid_manifest',
     'a coerced leaderboard maxEntries was accepted instead of rejected');
 
+  // `?? {}` also swallowed an explicit null, which the schema types as an object
+  // and rejects -- so a schema-invalid manifest connected as though the author
+  // had declared nothing at all.
+  for (const field of ['contracts', 'leaderboards']) {
+    let nullContainerError = null;
+    try {
+      await window.NekoMiniGame.connect({
+        id: 'null-container-test',
+        version: '1.0.0',
+        requiredCapabilities: ['logging'],
+        [field]: null,
+      }, { transport });
+    } catch (error) { nullContainerError = error; }
+    assert(nullContainerError?.code === 'invalid_manifest',
+      `an explicit null ${field} was treated as absent`);
+  }
+
+  // The schema bounds enum SHORTHAND items at maxLength 4096; the expanded
+  // `enum` form carries no such bound, so converting first dropped it.
+  let longShorthandError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'long-shorthand-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      contracts: { controls: { stance: ['ready', 'z'.repeat(4097)] } },
+    }, { transport });
+  } catch (error) { longShorthandError = error; }
+  assert(longShorthandError?.code === 'invalid_manifest',
+    'an over-long enum shorthand value was accepted');
+  // Exactly at the bound is still fine.
+  const boundedShorthandGame = await window.NekoMiniGame.connect({
+    id: 'bounded-shorthand-test',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+    contracts: { controls: { stance: ['ready', 'z'.repeat(4096)] } },
+  }, { transport });
+  boundedShorthandGame.dispose();
+
+  // `version` has no pattern in the schema, so `' 1.0 '` is schema-VALID and
+  // distinct from `'1.0'`; trimming aliased two declared identities into one.
+  const paddedVersionGame = await window.NekoMiniGame.connect({
+    id: 'padded-version-test',
+    version: ' 1.0 ',
+    requiredCapabilities: ['logging'],
+  }, { transport });
+  assert(paddedVersionGame.manifest.version === ' 1.0 ',
+    'a schema-valid padded version was silently aliased onto a different one');
+  paddedVersionGame.dispose();
+
   // The schema requires an exact enum member for `type`, and its `id` pattern
   // applies to the declared string. Trimming first turned `' string '` into a
   // supported type, and remapped `' demo '` onto the registration and storage

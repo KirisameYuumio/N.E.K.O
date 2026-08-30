@@ -198,6 +198,11 @@ async function main() {
 
   const bubbleSlot = documentImpl.createElement('div');
   const bubble = game.presentation.bubble.mount({ container: bubbleSlot });
+  // Mounted means IN the container. Without this the mount built a root,
+  // registered it, handed it back and never attached it -- so every assertion
+  // below passes on a detached node that no user could ever see.
+  assert(bubbleSlot.children.includes(bubble.element),
+    'the bubble presentation was never appended to its container');
   bubble.show('Ready!', { durationMs: 4000 });
   assert(!bubble.disposed && !bubble.element.hidden && bubble.element.textContent === 'Ready!',
     'bubble presentation did not render text');

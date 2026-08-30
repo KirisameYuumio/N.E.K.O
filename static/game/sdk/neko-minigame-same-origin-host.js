@@ -1642,7 +1642,12 @@
       }
 
       bridge.nextRequestId = (bridge.nextRequestId + 1) % Number.MAX_SAFE_INTEGER;
-      const requestId = `voice-${Date.now().toString(36)}-${bridge.nextRequestId.toString(36)}`;
+      // Per-client entropy: two host adapters in the same session that issue
+      // their first voice command in the same millisecond both mint
+      // `voice-<ms>-1`, and the shared BroadcastChannel then routes one
+      // adapter's reply into the other's pending map.
+      const requestId = `voice-${Date.now().toString(36)}-${bridge.nextRequestId.toString(36)}`
+        + `-${randomIdSuffix(this._window)}`;
       const timeoutMs = Math.max(500, Number(options.timeoutMs || DEFAULT_VOICE_CONTROL_TIMEOUT_MS));
       return new Promise((resolve, reject) => {
         const abortHandler = () => {

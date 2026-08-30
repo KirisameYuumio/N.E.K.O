@@ -270,7 +270,19 @@
       });
     }
     let input = schemaInput;
-    if (Array.isArray(input)) input = { type: 'string', enum: input };
+    if (Array.isArray(input)) {
+      // The schema bounds shorthand items at `maxLength: 4096`; the expanded
+      // `enum` form carries no such bound, so converting first dropped it and a
+      // longer string connected against a schema that rejects it.
+      for (const item of input) {
+        if (typeof item === 'string' && [...item].length > 4096) {
+          fail('invalid_manifest', `${fieldName} enum shorthand value exceeds its length limit`, {
+            limit: 4096,
+          });
+        }
+      }
+      input = { type: 'string', enum: input };
+    }
     if (!plainObject(input)) {
       fail('invalid_manifest', `${fieldName} must be a contract schema object`);
     }
@@ -426,7 +438,10 @@
   }
 
   function normalizeContracts(value) {
-    const input = value ?? {};
+    // `?? {}` also swallowed an explicit `null`, which the schema types as an
+    // object and rejects -- so a schema-invalid manifest connected as though the
+    // author had declared no contracts at all. Only ABSENT defaults.
+    const input = value === undefined ? {} : value;
     if (!plainObject(input)) fail('invalid_manifest', 'manifest.contracts must be an object');
     for (const key of Object.keys(input)) {
       if (!CONTRACT_KINDS.includes(key)) {
@@ -463,7 +478,8 @@
   }
 
   function normalizeLeaderboardDefinitions(value) {
-    const input = value ?? {};
+    // Same rule as manifest.contracts: only an ABSENT value defaults.
+    const input = value === undefined ? {} : value;
     if (!plainObject(input)) fail('invalid_manifest', 'manifest.leaderboards must be an object');
     const entries = Object.entries(input);
     if (entries.length > MAX_LEADERBOARD_BOARDS) {
@@ -508,16 +524,15 @@
       // explicit `null` / `''` / `false`, so a manifest the schema rejects (it
       // allows only the named enum strings) ran with configuration its author
       // never declared.
-      const order = rawDefinition.order === undefined
-        ? 'descending'
-        : String(rawDefinition.order).trim();
-      if (!['ascending', 'descending'].includes(order)) {
+      // Untrimmed, like every other enum-valued manifest field: the schema
+      // requires an exact member, so `' descending '` is schema-invalid while
+      // trimming silently executed it as the real mode.
+      const order = rawDefinition.order === undefined ? 'descending' : rawDefinition.order;
+      if (typeof order !== 'string' || !['ascending', 'descending'].includes(order)) {
         fail('invalid_manifest', `manifest.leaderboards.${boardId}.order is unsupported`);
       }
-      const retention = rawDefinition.retention === undefined
-        ? 'recent'
-        : String(rawDefinition.retention).trim();
-      if (!['best', 'recent'].includes(retention)) {
+      const retention = rawDefinition.retention === undefined ? 'recent' : rawDefinition.retention;
+      if (typeof retention !== 'string' || !['best', 'recent'].includes(retention)) {
         fail('invalid_manifest', `manifest.leaderboards.${boardId}.retention is unsupported`);
       }
       const maxEntries = contractInteger(
@@ -554,7 +569,11 @@
     // declared string, and trimming silently remapped `' demo '` onto the
     // registration and storage identity of the real `demo`.
     const id = manifest.id === undefined ? '' : manifest.id;
-    const version = String(manifest.version || '').trim();
+    // Declared as-is. The schema puts no pattern on `version`, so `' 1.0 '` is
+    // schema-VALID -- and trimming aliased it onto the distinct, equally valid
+    // `'1.0'`, rewriting an identity the author declared and that rides the
+    // handshake and registration.
+    const version = manifest.version === undefined ? '' : manifest.version;
     // Default only an ABSENT value. `manifest.protocolVersion || SDK_PROTOCOL_VERSION`
     // also swallowed every falsey supplied one -- `0` and `''` both became the
     // current protocol and connected, defeating the compatibility guard and
@@ -1149,8 +1168,14 @@
     if (mode !== 'registered' && mode !== 'development') {
       fail('invalid_handshake', 'The host registration mode is invalid', { mode });
     }
-    const gameId = String(value.gameId || value.game_id || '').trim();
-    const version = String(value.version || '').trim();
+    // Compared EXACTLY against the manifest, so neither side is trimmed: this
+    // check exists to catch a host minting a registration for a different game
+    // or version than the manifest asked for, and normalizing one side first is
+    // precisely how a mismatch becomes invisible. (`manifest.version` is now
+    // kept as declared, so trimming here would also break the round-trip for a
+    // schema-valid padded version.)
+    const gameId = String(value.gameId || value.game_id || '');
+    const version = String(value.version || '');
     const publisherId = String(value.publisherId || value.publisher_id || '').trim();
     if (gameId !== manifest.id || version !== manifest.version) {
       fail('invalid_handshake', 'The host registration does not match the game manifest', {
@@ -3872,7 +3897,20 @@
           fail('invalid_request', 'leaderboard.local.clear requires { confirm: true }');
         }
         return mutateLocalLeaderboard(boardId, 'leaderboard.local.clear', async (managedRequestOptions) => {
-          await requestLocalLeaderboardStorage('delete', boardId, {}, managedRequestOptions);
+          const deleteResponse = await requestLocalLeaderboardStorage(
+            'delete', boardId, {}, managedRequestOptions,
+          );
+          // Third of the same family as the read and write guards: a transport
+          // that reports a failed delete by RETURNING a non-OK response used to
+          // resolve here, and the game was told the board was cleared while it
+          // was still there.
+          if (deleteResponse.ok === false || deleteResponse.data?.ok === false) {
+            fail('request_failed', 'The local leaderboard could not be cleared', {
+              operation: 'leaderboard.local.clear',
+              boardId,
+              status: deleteResponse.status,
+            });
+          }
           return localLeaderboardResult({ boardId, cleared: true });
         }, requestOptions);
       },
@@ -4069,6 +4107,11 @@
       root.setAttribute('aria-live', live);
       root.setAttribute('aria-atomic', 'true');
       root.hidden = true;
+      // Attach it. Every mount built a root, registered it, handed it back and
+      // never put it in the document, so `presentation.bubble` could never
+      // display anything -- the sibling loading presentation does this at its
+      // own mount.
+      container.appendChild(root);
       const state = { root, disposed: false, timer: null };
       bubblePresentations.add(state);
       const clearTimer = () => {
