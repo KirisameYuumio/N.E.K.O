@@ -1063,8 +1063,26 @@ async function main() {
   const rawEndResponse = RAW_END_RESPONSE;
   // The host-supplied provider closures are the one thing a launch registration
   // actually gates that same-origin script cannot obtain some other way, so they
-  // must not be readable off a freshly constructed host without a completed
-  // handshake and a granted capability.
+  // must not be readable off a host that has not completed a handshake. Assert
+  // on a FRESHLY CONSTRUCTED host: checking the already-connected `host` would
+  // not test the claim, since that one has been granted `quick-lines` anyway.
+  const bareHost = createHost({
+    gameType: 'example-game',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  assert(bareHost._capabilityProviders === undefined,
+    'capability provider closures were readable off a host with no handshake');
+  assert(!Object.values(bareHost).some((value) => typeof value === 'function'
+    && value !== bareHost.dispose && String(value).includes('lines')),
+  'a provider closure leaked onto a public property of an unconnected host');
+  let bareQuickLinesError = null;
+  try { await bareHost.getQuickLines({ event: { kind: 'prepare' } }); }
+  catch (error) { bareQuickLinesError = error; }
+  assert(bareQuickLinesError?.code === 'capability_denied',
+    'an unconnected host served quick-lines without a granted capability');
+  bareHost.dispose();
   assert(host._capabilityProviders === undefined,
     'capability provider closures were exposed on a public host property');
 

@@ -178,6 +178,23 @@ async function main() {
   assert(listed.data.keys.join(',') === 'settings/difficulty',
     'namespaced storage list did not apply its prefix');
   await game.storage.delete('settings/difficulty');
+
+  // The local leaderboard persists through this same namespace under a
+  // reserved prefix, and the public storage path takes none of the Web Locks
+  // that serialise leaderboard read-modify-write, so a public write here could
+  // silently clobber a board or drop a concurrent submission.
+  for (const reservedOp of ['get', 'set', 'delete']) {
+    let reservedError = null;
+    try {
+      await (reservedOp === 'set'
+        ? game.storage.set('leaderboards/main', { forged: true })
+        : game.storage[reservedOp]('leaderboards/main'));
+    } catch (error) { reservedError = error; }
+    assert(reservedError?.code === 'invalid_request',
+      `storage.${reservedOp} accepted a key in the reserved leaderboard prefix`);
+  }
+  // list keeps its whole-namespace meaning on purpose.
+  await game.storage.list({ prefix: 'leaderboards/' });
   let clearConfirmationError = null;
   try { await game.storage.clear(); }
   catch (error) { clearConfirmationError = error; }

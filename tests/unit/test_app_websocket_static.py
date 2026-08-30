@@ -6811,3 +6811,38 @@ def test_deferred_session_start_resolve_is_pinned_to_the_ack_it_belongs_to():
         "release the slot before settling, so the awaiter never observes a slot "
         "that still points at an already-settled start"
     )
+
+
+def test_reconnect_reconciliation_repairs_appstate_not_only_the_dom_event():
+    """chat.html has no listener that writes S.gameRoute*, so the shared
+    reconnect path must repair appState itself.
+
+    The DOM event dispatched here is only turned into appState by
+    app-game-voice-control.js, and templates/index.html is the only page that
+    loads that file. Without an appState write in this block, a chat window that
+    reconnects or reloads while a game route is active keeps gameRouteActive
+    false for the rest of the round, and the reverse desync survives too.
+    """
+    source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
+    reconnect_block = _block_after(
+        source,
+        "function syncGameWindowStateOnWsConnect() {",
+    )
+
+    assert "neko-game-window-state-change" in reconnect_block
+    for field in (
+        "S.gameRouteActive",
+        "S.gameRouteGameType",
+        "S.gameRouteSessionId",
+        "S.gameRouteInstanceId",
+    ):
+        assert field in reconnect_block, (
+            f"reconnect reconciliation does not repair {field}; chat.html has no "
+            "other writer for it"
+        )
+    # Ordering matters: the repair must follow the dispatch, or index.html's
+    # voice bridge observes already-cleared identity and broadcasts a closed
+    # route with an empty session id.
+    assert reconnect_block.index("neko-game-window-state-change") < reconnect_block.index(
+        "S.gameRouteActive = true"
+    ), "appState repair must follow the dispatch so the voice bridge keeps its ordering"

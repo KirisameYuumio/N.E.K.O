@@ -333,7 +333,11 @@ await game.storage.delete('settings/pacing');
 ```
 
 `storage.clear()` affects only the current game's namespace and requires the
-explicit argument `{ confirm: true }`. Storage is not a substitute for memory:
+explicit argument `{ confirm: true }`. The local leaderboard persists through
+this same namespace under a reserved `leaderboards/` prefix: `storage.get`,
+`storage.set` and `storage.delete` reject keys starting with it, while
+`storage.list` and `storage.clear` keep their whole-namespace meaning and
+therefore do see and do clear local leaderboard state. Storage is not a substitute for memory:
 it cannot access N.E.K.O conversations, character memory or another game.
 
 ## Local records and reserved server leaderboards

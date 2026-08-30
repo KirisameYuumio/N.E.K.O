@@ -2460,6 +2460,41 @@
                                 }
                             }));
                         } catch (_) {}
+                        // Repair appState from the authoritative snapshot too.
+                        // The dispatch above is only converted into appState by
+                        // app-game-voice-control.js, which ONLY index.html loads;
+                        // chat.html has no listener that writes S.gameRoute*, so
+                        // without this its route state stays wrong in both
+                        // directions after a reconnect or reload. Runs after the
+                        // dispatch so index.html keeps today's ordering and this
+                        // is an idempotent rewrite there.
+                        try {
+                            if (action === 'opened') {
+                                S.gameRouteActive = true;
+                                S.gameRouteGameType = data.game_type || '';
+                                S.gameRouteLanlanName = data.lanlan_name || lan;
+                                S.gameRouteSessionId = data.session_id || '';
+                                S.gameRouteInstanceId = data.sdk_route_instance_id || '';
+                                if (typeof window.stopProactiveChatSchedule === 'function') {
+                                    S.proactiveChatWasStoppedByGameRoute = !!S.proactiveChatEnabled;
+                                    window.stopProactiveChatSchedule();
+                                }
+                            } else {
+                                var reconciledWasActive = !!S.gameRouteActive;
+                                S.gameRouteActive = false;
+                                S.gameRouteGameType = '';
+                                S.gameRouteLanlanName = '';
+                                S.gameRouteSessionId = '';
+                                S.gameRouteInstanceId = '';
+                                S.gameVoiceControlCredential = '';
+                                if ((reconciledWasActive || S.proactiveChatWasStoppedByGameRoute)
+                                        && S.proactiveChatEnabled
+                                        && typeof window.scheduleProactiveChat === 'function') {
+                                    window.scheduleProactiveChat();
+                                }
+                                S.proactiveChatWasStoppedByGameRoute = false;
+                            }
+                        } catch (_) {}
                     })
                     .catch(function () {});
             })();

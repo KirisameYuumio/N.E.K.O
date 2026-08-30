@@ -775,10 +775,25 @@
     return normalizeBoundedJson(value, 'memory submission');
   }
 
-  function normalizeStorageKey(value, fieldName = 'storage key', { allowEmpty = false } = {}) {
+  // The local leaderboard persists through this same storage channel under a
+  // `leaderboards/` prefix, so a public storage write can silently overwrite or
+  // delete a board's state -- and the public path takes none of the Web Locks
+  // that serialise leaderboard read-modify-write, so it can also drop a
+  // concurrent submission. Reserve the prefix on the single-key operations.
+  // `list`/`clear` intentionally still see it: their documented meaning is "the
+  // whole namespace", and pretending otherwise would hide real usage from the
+  // game's own quota accounting.
+  const RESERVED_STORAGE_PREFIX = 'leaderboards/';
+
+  function normalizeStorageKey(value, fieldName = 'storage key', { allowEmpty = false, allowReserved = false } = {}) {
     const key = String(value || '').trim();
     if ((!allowEmpty && !key) || key.length > 128 || (key && !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/.test(key))) {
       fail('invalid_request', `${fieldName} is invalid`);
+    }
+    if (!allowReserved && key.startsWith(RESERVED_STORAGE_PREFIX)) {
+      fail('invalid_request', `${fieldName} uses the reserved "${RESERVED_STORAGE_PREFIX}" prefix owned by the local leaderboard`, {
+        key,
+      });
     }
     return key;
   }
@@ -3352,7 +3367,7 @@
           fail('invalid_request', 'storage list limit must be an integer between 1 and 256');
         }
         return requestStorage('list', {
-          prefix: normalizeStorageKey(options.prefix || '', 'storage prefix', { allowEmpty: true }),
+          prefix: normalizeStorageKey(options.prefix || '', 'storage prefix', { allowEmpty: true, allowReserved: true }),
           limit,
         }, requestOptions);
       },
