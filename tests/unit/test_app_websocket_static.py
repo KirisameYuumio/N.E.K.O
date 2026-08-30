@@ -16,6 +16,9 @@ APP_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "ap
 APP_AUDIO_CAPTURE_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-audio-capture.js"
 APP_BUTTONS_PATH = Path(__file__).resolve().parents[2] / "static" / "app" / "app-buttons.js"
 TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
+APP_GAME_VOICE_CONTROL_PATH = (
+    Path(__file__).resolve().parents[2] / "static" / "app" / "app-game-voice-control.js"
+)
 
 
 def test_game_route_close_events_require_matching_generation_when_one_is_active():
@@ -6983,3 +6986,57 @@ def test_bootstrap_route_snapshot_is_rejected_when_it_lands_late(template_name):
     assert "return" in handler, (
         f"{template_name} bootstrap compares the revision but never bails out"
     )
+
+
+def test_game_voice_command_commits_its_teardown_before_it_can_yield():
+    """The microphone teardown must be issued while the admitting check still holds.
+
+    ``stopMicCapture()`` is process-global. If a command could issue it after
+    awaiting, a stop belonging to a route that has since been superseded would
+    land on whatever owns the microphone by then -- the replacement route, or
+    the ordinary chat capture the host resumes on route exit -- and kill it
+    mid-utterance with no transcript and nothing logged.
+
+    Two properties keep that unreachable, and both are easy to lose in an edit:
+      1. ``routeMatches()`` admits the command and the single ``stopMicCapture()``
+         call sits in the same synchronous segment -- no ``await`` between them,
+         so no route change can interleave.
+      2. Nothing after the awaited command tears anything down. The
+         route-superseded branch reports and returns; it never issues a
+         teardown, and never re-starts. (The runtime harness in
+         tests/frontend/test_game_voice_control_runtime.js asserts the
+         behaviour; this pins the ordering the behaviour depends on.)
+    """
+    source = APP_GAME_VOICE_CONTROL_PATH.read_text(encoding="utf-8")
+
+    stop_body = _block_after(source, "async function stopOfficialVoiceSession() {")
+    assert stop_body.count("stopMicCapture(") == 1, (
+        "the stop helper issues more than one microphone teardown"
+    )
+    assert stop_body.index("stopMicCapture(") < stop_body.index("waitFor("), (
+        "the microphone teardown is issued after this helper has already yielded, "
+        "so it can land on a capture the command never opened"
+    )
+
+    handler = _block_after(source, "async function handleRequest(request) {")
+    admit_at = handler.index("if (!routeMatches(request))")
+    dispatch_at = handler.index("await startOfficialVoiceSession()")
+    admitted_segment = handler[admit_at:dispatch_at]
+    assert "await" not in admitted_segment, (
+        "an await was introduced between the route check that admits a voice "
+        "command and the command dispatch, so the route can change underneath it"
+    )
+
+    superseded_at = handler.index("if (!routeSnapshotIsCurrent(acceptedRoute))")
+    superseded_branch = handler[superseded_at:handler.index("broadcastState({", superseded_at)]
+    # Code only: this branch carries a long comment explaining which mechanisms
+    # it deliberately does NOT reach for, and those names must not trip the check.
+    superseded_code = chr(10).join(
+        line for line in superseded_branch.splitlines()
+        if not line.strip().startswith("//")
+    )
+    for teardown in ("stopMicCapture(", "startMicCapture(", ".click("):
+        assert teardown not in superseded_code, (
+            f"the superseded branch reaches for {teardown}; a command whose route "
+            "is gone must not touch the process-global microphone"
+        )

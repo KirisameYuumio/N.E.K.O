@@ -43,6 +43,7 @@ async function main() {
     voiceInputRouteBlocked: false,
   };
   let holdMicStart = false;
+  const stopMicCaptureCalls = [];
   const micButton = {
     disabled: false,
     classList: { contains: () => false },
@@ -75,7 +76,10 @@ async function main() {
     document: documentMock,
     console: { log() {}, warn() {} },
     isMicStarting: false,
-    stopMicCapture: async () => { appState.isRecording = false; },
+    stopMicCapture: async () => {
+      stopMicCaptureCalls.push(Date.now());
+      appState.isRecording = false;
+    },
     addEventListener,
     removeEventListener,
     dispatchEvent(event) {
@@ -272,6 +276,12 @@ async function main() {
   } });
   await flush();
   assert(!appState.isRecording, 'stop request did not use the official microphone teardown');
+  // Exactly one teardown per stop command. The microphone is process-global, so
+  // a second issue after the command has yielded would land on whatever owns it
+  // by then -- a replacement route, or the ordinary chat capture the host
+  // resumes on route exit.
+  assert(stopMicCaptureCalls.length === 1,
+    `a stop command issued ${stopMicCaptureCalls.length} microphone teardowns`);
   assert(posted.some((message) => message.request_id === 'stop-1' && message.reason === 'stopped' && !message.active),
     'stop request did not acknowledge the confirmed inactive state');
 
