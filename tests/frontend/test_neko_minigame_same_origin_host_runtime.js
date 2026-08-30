@@ -1364,18 +1364,68 @@ async function main() {
     'the oversized caller payload was not shed from the page-exit body');
   assert(exitCall.init.body.length < 60 * 1024,
     'the page-exit body still exceeds the keepalive quota after shedding');
-  // And when the oversized content is in a field shedding KEEPS (the backend
-  // finalizes on `reason`), page exit still must not fall back to a request the
-  // unloading document can cancel. Shedding is best-effort; keepalive on the
-  // unload path is not conditional on it.
+  // Shedding the caller's payload is not enough on its own: `reason` is kept
+  // (the backend finalizes on it) and is caller-sized, so an oversized reason
+  // would leave the body over quota -- and keepalive on an over-quota body
+  // fails BEFORE the request leaves the page, i.e. it guarantees exactly the
+  // loss it was kept for. Trim what is kept until the body actually fits.
   await exitHost.end(
     { reason: `pagehide-${'r'.repeat(100 * 1024)}` },
     { useBeacon: true },
   );
   const unshrinkableExitCall = calls.filter((call) => /\/end$/.test(call.url)).at(-1);
+  assert(unshrinkableExitCall.init.body.length <= 60 * 1024,
+    'an oversized page-exit reason left the body over the keepalive quota');
   assert(unshrinkableExitCall.init.keepalive === true,
-    'a page-exit end whose oversized content survives shedding lost keepalive');
+    'a page-exit end whose reason had to be trimmed lost keepalive');
+  assert(typeof unshrinkableExitCall.body.reason === 'string'
+    && unshrinkableExitCall.body.reason.startsWith('pagehide-')
+    && unshrinkableExitCall.body.reason.length <= 512,
+  'the trimmed page-exit reason was dropped instead of shortened');
+
+  // A direct host caller is not bound by the SDK's four-generation cap, so the
+  // retained candidate list is the next thing that can hold the body over quota.
+  await exitHost.end({
+    reason: 'pagehide',
+    sdk_route_instance_ids: Array.from({ length: 900 }, (_unused, index) => (
+      `route-${index}-${'i'.repeat(120)}`
+    )),
+  }, { useBeacon: true });
+  const bulkIdsExitCall = calls.filter((call) => /\/end$/.test(call.url)).at(-1);
+  assert(bulkIdsExitCall.init.body.length <= 60 * 1024,
+    'an oversized retained candidate list left the page-exit body over quota');
+  assert(bulkIdsExitCall.init.keepalive === true,
+    'trimming the candidate list lost keepalive on the unload path');
+  assert(bulkIdsExitCall.body.reason === 'pagehide',
+    'the candidate-list trim dropped the reason before the list');
   exitHost.dispose();
+
+  // And when nothing CAN be shed -- the host's own stamped session id is over
+  // quota by itself -- keepalive must be dropped rather than kept: a keepalive
+  // request over the shared budget fails before it leaves the page, which is
+  // exactly the loss it was kept for. A plain request at least has a chance.
+  const hugeSessionHost = createHost({
+    gameType: 'example-game',
+    sessionId: `s${'q'.repeat(80 * 1024)}`,
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: { ...windowMock.navigator, sendBeacon: () => false },
+  });
+  hugeSessionHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'example-game', version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'], optionalCapabilities: [],
+    },
+  });
+  await hugeSessionHost.end({ reason: 'pagehide' }, { useBeacon: true });
+  const unshedableExitCall = calls.filter((call) => /\/end$/.test(call.url)).at(-1);
+  assert(unshedableExitCall.init.body.length > 60 * 1024,
+    'the unshedable probe did not actually exceed the keepalive quota');
+  assert(unshedableExitCall.init.keepalive !== true,
+    'a page-exit body that cannot be shed under the quota still used keepalive, '
+    + 'which fails before the request leaves the page');
+  hugeSessionHost.dispose();
 
   process.stdout.write('mini-game same-origin host runtime test passed\n');
 }

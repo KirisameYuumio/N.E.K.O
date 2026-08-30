@@ -43,6 +43,8 @@
   const KEEPALIVE_BODY_BYTES = 60 * 1024;
   // Cumulative budget for one log payload's `details`, across the whole walk.
   const LOG_DETAILS_MAX_CHARS = 32 * 1024;
+  // The only caller-sized field a shed page-exit body keeps.
+  const ROUTE_END_ESSENTIAL_REASON_CHARS = 512;
   const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
   const DEFAULT_PENDING_REQUEST_LIMIT = 64;
   const DEFAULT_PROTOCOL_QUEUE_LIMIT = 64;
@@ -2833,7 +2835,25 @@
         ]) {
           if (parsedPayload[key] !== undefined) essential[key] = parsedPayload[key];
         }
-        body = JSON.stringify(this._trustedRuntimePayload(essential));
+        // `reason` is the one retained field a caller controls the size of, so
+        // shedding the rest is not enough on its own: an oversized reason would
+        // leave the body over quota and `keepalive` then guarantees the failure
+        // it was kept for. Trim in decreasing order of usefulness, and verify --
+        // never hand `_post` a keepalive body that is still too large.
+        if (typeof essential.reason === 'string') {
+          essential.reason = essential.reason.slice(0, ROUTE_END_ESSENTIAL_REASON_CHARS);
+        }
+        const shed = () => {
+          body = JSON.stringify(this._trustedRuntimePayload(essential));
+          return utf8ByteLength(body) <= KEEPALIVE_BODY_BYTES;
+        };
+        if (!shed()) {
+          delete essential.sdk_route_instance_ids;
+          if (!shed()) {
+            delete essential.reason;
+            shed();
+          }
+        }
         if (sendEndBeacon()) return { ok: true, beacon: true, truncated: true };
       }
       // Keepalive only while the body fits the shared quota. Past it, fetch
@@ -2850,7 +2870,12 @@
         // cancels the request outright. The awaited path drops keepalive instead,
         // where the caller is still there to see the result and an oversized body
         // would otherwise reject before leaving the page.
-        keepalive: options.useBeacon || utf8ByteLength(body) <= KEEPALIVE_BODY_BYTES,
+        // Page exit keeps keepalive only once the body actually fits: the shed
+        // above guarantees that, and a keepalive request over the shared 64 KiB
+        // quota fails before it leaves the page -- the exact loss keepalive is
+        // there to prevent. The awaited path drops keepalive instead, where the
+        // caller is still around to see the result.
+        keepalive: utf8ByteLength(body) <= KEEPALIVE_BODY_BYTES,
         operation: 'route_end',
         // Honour a caller-supplied deadline, the way every other networked
         // method here does via `...options`. This one enumerates explicitly on
