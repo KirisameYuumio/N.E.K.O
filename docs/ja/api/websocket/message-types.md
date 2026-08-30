@@ -166,10 +166,7 @@ Playback boundary は proactive arbitration に重要です。Upstream generatio
 
 - Agent: `agent_notification`、`agent_task_update`、`agent_status_update`。
 - Capture: `request_screenshot`、`capture_bridge_request`、`screen_share_error`。
-- Mini-game: `mini_game_invite_options`、`mini_game_invite_resolved`、`game_window_state_change`、
-  `game_route_voice_control_credential`（クライアントアクション `game_route_credential_resync`
-  への応答。ルートが有効なまま再読み込みされたホストページへゲーム音声クレデンシャルを再配信し、
-  要求された識別子が現在の有効なルートと完全に一致する場合にのみ送信される）。
+- Mini-game: `mini_game_invite_options`、`mini_game_invite_resolved`、`game_window_state_change`。
 - Music/tool: `music_play_url`、`music_allowlist_add`。
 - Activity/onboarding: `activity_context_prompt`。
 - Legacy/sync: `system`、`cozy_audio`。

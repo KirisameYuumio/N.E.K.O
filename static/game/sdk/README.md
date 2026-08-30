@@ -76,11 +76,20 @@ capability provider. A future marketplace/isolated host can produce the same
 launch registrations after registry, integrity and launch-ticket checks without
 changing game code.
 
-The phase-one voice credential is intentionally not returned by public active
-route state. If the trusted main host page reloads during an active game route,
-voice control stays unavailable until that route is restarted. A future private
-transport may add a scoped reconnect ticket; do not restore this by publishing
-the bearer credential in public route state or shared storage.
+Voice control is addressed by route identity alone: the host page accepts a
+voice command only when its `game_type`, `session_id` and `sdk_route_instance_id`
+match the live route, and the generation is required rather than optional, which
+is what keeps the built-in soccer/badminton routes (they mint none) out of it.
+None of those three are secrets -- `GET /api/game/route/active` returns them
+unauthenticated -- so a reloaded host page recovers voice control on its own.
+
+There is deliberately no bearer credential here. One existed briefly and was
+removed: every page sharing this origin is inside the same trust boundary
+already, and `POST /api/game/{game_type}/route/start` carries no local-mutation
+validation, so anything able to reach this router could mint its own credential
+and claim the route outright. A token that cannot be withheld from the party it
+is meant to exclude is not a control, and keeping it made the boundary look
+stronger than it is.
 
 ```html
 <script id="neko-minigame-host-launch" type="application/json">

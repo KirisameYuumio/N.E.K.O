@@ -295,14 +295,6 @@
       + `${Math.floor(Math.random() * 0xffffffff).toString(36)}`;
   }
 
-  function createVoiceControlCredential(windowImpl) {
-    const cryptoImpl = windowImpl?.crypto || globalThis.crypto;
-    if (!cryptoImpl || typeof cryptoImpl.getRandomValues !== 'function') return '';
-    const bytes = new Uint8Array(24);
-    cryptoImpl.getRandomValues(bytes);
-    return [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
-  }
-
   class NekoMiniGameSameOriginHost {
     constructor(options = {}) {
       // The internal host bootstrap owns this immutable record. A game manifest
@@ -351,7 +343,6 @@
       this._navigator = options.navigatorImpl || window.navigator;
       this._window = options.windowImpl || window;
       this._console = this._window.console || console;
-      this._voiceControlCredential = createVoiceControlCredential(this._window);
       this._grantedCapabilities = new Set();
       this._avatarHost = options.avatarHost || null;
       this._audioHost = options.audioHost || null;
@@ -538,7 +529,6 @@
       const grantedCapabilities = [...new Set(requested)].filter((name) => (
         locallyAvailable.has(name)
         && allowedCapabilities.has(name)
-        && (name !== 'voice-input' || Boolean(this._voiceControlCredential))
       ));
       this._grantedCapabilities = new Set(grantedCapabilities);
       return {
@@ -1089,11 +1079,6 @@
       this._requireGrantedCapability('runtime', 'route_start');
       return this._post(this._gameEndpoint('route/start'), {
         ...this._trustedRuntimePayload(payload),
-        sdk_voice_control_credential: (
-          this._grantedCapabilities.has('voice-input')
-            ? this._voiceControlCredential
-            : ''
-        ),
       }, {
         timeoutMs: 60000,
         operation: 'route_start',
@@ -1617,7 +1602,7 @@
           operation: 'voice_control',
         }));
       }
-      if (!this._grantedCapabilities.has('voice-input') || !this._voiceControlCredential) {
+      if (!this._grantedCapabilities.has('voice-input')) {
         return Promise.reject(this._hostError('capability_denied', 'Voice input was not granted to this launch', {
           operation: 'voice_control',
         }));
@@ -1686,7 +1671,6 @@
           action: normalizedAction,
           game_type: this.gameType,
           session_id: this.sessionId,
-          launch_credential: this._voiceControlCredential,
           ...(routeInstanceId ? { sdk_route_instance_id: routeInstanceId } : {}),
         });
         if (!posted) {
@@ -2922,7 +2906,6 @@
       this.stopAllSpeechRecognition();
       this.stopSpeechPlaybackBridge();
       this.stopVoiceControlBridge('disposed');
-      this._voiceControlCredential = '';
       this._grantedCapabilities.clear();
       this.stopGameControlBridge();
       try { this._avatarHost?.dispose?.(); }

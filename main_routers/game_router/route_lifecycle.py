@@ -74,7 +74,6 @@ async def _push_game_window_state_change(
     game_type: str,
     session_id: str = "",
     route_instance_id: str = "",
-    voice_control_credential: str = "",
 ) -> None:
     """Broadcast the 'game window opened/closed' WS event so the chat.html / pet
     multi-windows can collapse / restore in sync (user-level UX linkage; not
@@ -103,8 +102,6 @@ async def _push_game_window_state_change(
         payload["session_id"] = session_id
     if route_instance_id:
         payload["sdk_route_instance_id"] = route_instance_id
-    if voice_control_credential:
-        payload["sdk_voice_control_credential"] = voice_control_credential
     try:
         ws = getattr(mgr, "websocket", None)
         if ws is None or not hasattr(ws, "send_json"):
@@ -121,65 +118,6 @@ async def _push_game_window_state_change(
             "game_window_state_change WS push failed (action=%s, game=%s, lanlan=%s): %s",
             action, game_type, lanlan_name, exc,
         )
-
-
-_GAME_ROUTE_CREDENTIAL_PUSH_TIMEOUT_SECONDS = 2.0
-
-
-async def _push_game_route_voice_control_credential(
-    websocket,
-    *,
-    lanlan_name: str,
-    game_type: str,
-    session_id: str,
-    route_instance_id: str,
-    voice_control_credential: str,
-) -> bool:
-    """Hand the game-voice credential back to a host page that lost its copy.
-
-    ``game_window_state_change`` is edge-triggered and carries the credential
-    only on ``opened``, so a host page that reloads while a route is still
-    active can never recover it -- and ``routeMatches()`` rejects every voice
-    command without it, for the rest of the round.
-
-    Deliberately its own message rather than a re-pushed ``opened``: the
-    frontend's ``opened`` branch performs eleven writes and a four-listener DOM
-    fan-out, has no identity guard of its own, and assigns the credential
-    unconditionally -- so an ``opened`` whose payload lacked the credential
-    would CLEAR a good one, re-creating the very failure this repairs.
-
-    Deliberately replied on the requesting socket rather than ``mgr.websocket``:
-    the answer belongs to the page that asked, and it is the page that knows it
-    is missing a credential.
-    """
-    credential = str(voice_control_credential or "")
-    if not websocket or not lanlan_name or not credential:
-        return False
-    payload: dict[str, Any] = {
-        "type": "game_route_voice_control_credential",
-        "lanlan_name": lanlan_name,
-        "game_type": game_type,
-        "session_id": session_id,
-        "sdk_route_instance_id": route_instance_id,
-        "sdk_voice_control_credential": credential,
-    }
-    try:
-        if not hasattr(websocket, "send_json"):
-            return False
-        client_state = getattr(websocket, "client_state", None)
-        if client_state is not None and client_state != client_state.CONNECTED:
-            return False
-        await asyncio.wait_for(
-            websocket.send_json(payload),
-            timeout=_GAME_ROUTE_CREDENTIAL_PUSH_TIMEOUT_SECONDS,
-        )
-        return True
-    except Exception as exc:
-        logger.warning(
-            "game_route_voice_control_credential WS push failed (game=%s, lanlan=%s): %s",
-            game_type, lanlan_name, exc,
-        )
-        return False
 
 
 _GAME_ROUTE_SPEECH_CANCEL_PUSH_TIMEOUT_SECONDS = 2.0

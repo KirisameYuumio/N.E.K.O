@@ -398,8 +398,6 @@ async function main() {
   assert(!Object.hasOwn(startCall.body, 'legacyGameMemoryEnabled')
     && !Object.hasOwn(startCall.body, 'legacy_game_memory_event_reply_enabled'),
   'caller-controlled legacy memory aliases survived the trusted host boundary');
-  assert(/^[a-f0-9]{48}$/.test(startCall.body.sdk_voice_control_credential || ''),
-    'capability-granted route start did not carry its opaque voice credential');
   const ungrantedHost = createHost({
     gameType: 'third-party-game',
     sessionId: 'ungranted-session',
@@ -441,7 +439,6 @@ async function main() {
     && windowMock.localStorage.getItem(`${ungrantedHost._gameStoragePrefix()}denied`) == null,
   'a denied direct host operation produced a fetch or storage side effect');
   await ungrantedHost.start({
-    sdk_voice_control_credential: 'f'.repeat(48),
     gameMemoryEnabled: true,
     game_archive_memory_enabled: true,
     legacy_game_memory_enabled: true,
@@ -454,8 +451,6 @@ async function main() {
     },
   });
   const ungrantedStart = calls.filter((call) => call.url.endsWith('/route/start')).at(-1);
-  assert(ungrantedStart.body.sdk_voice_control_credential === '',
-    'an ungranted game smuggled its own voice credential into route start');
   assert(ungrantedStart.body.game_memory_enabled === false
     && ungrantedStart.body.game_memory_player_interaction_enabled === false
     && ungrantedStart.body.game_memory_event_reply_enabled === false
@@ -826,10 +821,9 @@ async function main() {
     // ids would differ for the wrong reason.
     const peerIds = [];
     for (const peerIndex of [0, 1]) {
-      // windowMock.crypto is the deterministic `values.fill(7)` stub that keeps
-      // the credential assertions above stable, which would make both ids equal
-      // for the wrong reason. Counter source, so "distinct" really means the
-      // entropy reached the id.
+      // windowMock.crypto is a deterministic `values.fill(7)` stub, which
+      // would make both ids equal for the wrong reason. Counter source, so
+      // "distinct" really means the entropy reached the id.
       const peerWindow = {
         ...windowMock,
         BroadcastChannel: undefined,
@@ -1367,11 +1361,10 @@ async function main() {
   const realSessionDateNow = Date.now;
   const generatedSessionIds = new Set();
   const probeIds = [];
-  // windowMock.crypto is deliberately deterministic (`values.fill(7)`) so the
-  // voice-credential assertions above stay stable, which would make every id
-  // here identical for the wrong reason. Give the probe a counter-based source:
-  // distinct ids then prove the entropy is actually mixed into the id, not that
-  // the clock moved.
+  // windowMock.crypto is deliberately deterministic (`values.fill(7)`), which
+  // would make every id here identical for the wrong reason. Give the probe a
+  // counter-based source: distinct ids then prove the entropy is actually mixed
+  // into the id, not that the clock moved.
   let sessionEntropyCounter = 0;
   const sessionEntropyWindow = {
     ...windowMock,

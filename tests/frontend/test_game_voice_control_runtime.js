@@ -32,7 +32,6 @@ async function main() {
     gameRouteGameType: 'soccer',
     gameRouteSessionId: 'soccer-runtime',
     gameRouteInstanceId: 'route-instance-b',
-    gameVoiceControlCredential: 'voice-credential',
     isRecording: false,
     voiceStartPending: false,
     isMicMuted: false,
@@ -150,7 +149,6 @@ async function main() {
     sessionId: 'soccer-runtime',
     routeInstanceId: 'route-instance-a',
   } });
-  appState.gameVoiceControlCredential = 'voice-credential';
   assert(posted.some((message) => message.reason === 'route_closed'
     && message.route_active === false
     && message.game_type === 'soccer'
@@ -164,20 +162,28 @@ async function main() {
     routeInstanceId: 'route-instance-b',
   } });
 
-  channel.onmessage({ data: {
-    type: 'game_voice_control_request',
-    sender_id: 'ungranted-window',
-    request_id: 'forged-credential',
-    action: 'start',
-    game_type: 'soccer',
-    session_id: 'soccer-runtime',
-    sdk_route_instance_id: 'route-instance-b',
-    launch_credential: 'wrong-credential',
-  } });
-  await flush();
-  assert(micButton.clickCount === 0 && posted.some((message) => (
-    message.request_id === 'forged-credential' && message.reason === 'route_mismatch'
-  )), 'a route identity without the launch credential controlled the microphone');
+  // The route generation is REQUIRED, not merely compared when present: it is
+  // what keeps a non-SDK route (soccer/badminton never mint one) out of voice
+  // control, so a request that omits it must be refused even though its
+  // game_type and session_id match the live route exactly.
+  for (const missingGeneration of ['', undefined]) {
+    channel.onmessage({ data: {
+      type: 'game_voice_control_request',
+      sender_id: 'ungranted-window',
+      request_id: `no-generation-${String(missingGeneration)}`,
+      action: 'start',
+      game_type: 'soccer',
+      session_id: 'soccer-runtime',
+      ...(missingGeneration === undefined
+        ? {}
+        : { sdk_route_instance_id: missingGeneration }),
+    } });
+    await flush();
+    assert(micButton.clickCount === 0 && posted.some((message) => (
+      message.request_id === `no-generation-${String(missingGeneration)}`
+      && message.reason === 'route_mismatch'
+    )), 'a request without a route generation controlled the microphone');
+  }
 
   channel.onmessage({ data: {
     type: 'game_voice_control_request',
@@ -187,7 +193,6 @@ async function main() {
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-a',
-    launch_credential: 'voice-credential',
   } });
   await flush();
   assert(micButton.clickCount === 0 && posted.some((message) => message.request_id === 'stale-start'
@@ -204,7 +209,6 @@ async function main() {
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-b',
-    launch_credential: 'voice-credential',
   };
   channel.onmessage({ data: duplicatedStartRequest });
   windowMock.dispatchEvent(new windowMock.CustomEvent('neko-game-voice-control-message', {
@@ -278,7 +282,6 @@ async function main() {
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-b',
-    launch_credential: 'voice-credential',
   } });
   await flush();
   assert(!appState.isRecording, 'stop request did not use the official microphone teardown');
@@ -300,7 +303,6 @@ async function main() {
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-b',
-    launch_credential: 'voice-credential',
   } });
   await flush();
   routeWindowListener({ detail: {
@@ -309,7 +311,6 @@ async function main() {
     sessionId: 'soccer-runtime',
     routeInstanceId: 'route-instance-c',
   } });
-  appState.gameVoiceControlCredential = 'voice-credential';
   appState.voiceStartPending = false;
   appState.isRecording = true;
   await new Promise((resolve) => setTimeout(resolve, 180));
@@ -341,7 +342,6 @@ async function main() {
     sessionId: 'soccer-runtime',
     routeInstanceId: 'route-instance-d',
   } });
-  appState.gameVoiceControlCredential = 'voice-credential';
   appState.isRecording = false;
   appState.voiceStartPending = false;
   holdMicStart = true;
@@ -353,7 +353,6 @@ async function main() {
     game_type: 'soccer',
     session_id: 'soccer-runtime',
     sdk_route_instance_id: 'route-instance-d',
-    launch_credential: 'voice-credential',
   } });
   await flush();
   routeWindowListener({ detail: {
@@ -385,7 +384,6 @@ async function main() {
     game_type: 'badminton',
     session_id: 'badminton-runtime',
     sdk_route_instance_id: 'badminton-route',
-    launch_credential: 'voice-credential',
   } });
   await flush();
   assert(posted.some((message) => message.request_id === 'wrong-route'
@@ -412,139 +410,11 @@ async function main() {
       game_type: 'soccer',
       session_id: 'soccer-runtime',
       sdk_route_instance_id: 'route-instance-c',
-      launch_credential: 'voice-credential',
     },
   }));
   await flush();
   assert(sameDocumentResponses.some((message) => message.request_id === 'same-document-query'),
     'same-document fallback request was not answered after channel and storage failure');
-  // The credential rides only the edge-triggered `opened` push, so a host page
-  // that reloads while the route is still live gets its identity back from
-  // /api/game/route/active but never the credential -- and routeMatches()
-  // rejects every command, including `query`, for the rest of the round.
-  await new Promise((resolve) => setTimeout(resolve, 120));
-  await flush();
-  sentWsMessages.length = 0;
-  appState.gameVoiceControlCredential = '';
-  socketOpen = true;
-  routeWindowListener({ detail: {
-    action: 'opened',
-    gameType: 'soccer',
-    sessionId: 'soccer-runtime',
-    routeInstanceId: 'route-instance-resync',
-  } });
-  await flush();
-  const resyncRequests = sentWsMessages.filter(
-    (message) => message && message.action === 'game_route_credential_resync',
-  );
-  assert(resyncRequests.length === 1,
-    `a credential-less route did not ask for its credential exactly once: ${resyncRequests.length}`);
-  assert(resyncRequests[0].game_type === 'soccer'
-    && resyncRequests[0].session_id === 'soccer-runtime'
-    && resyncRequests[0].sdk_route_instance_id === 'route-instance-resync',
-  'the credential request did not carry the route identity it is asking about');
-
-  // A page that already holds one must not ask.
-  sentWsMessages.length = 0;
-  appState.gameVoiceControlCredential = 'voice-credential';
-  routeWindowListener({ detail: {
-    action: 'opened',
-    gameType: 'soccer',
-    sessionId: 'soccer-runtime',
-    routeInstanceId: 'route-instance-resync',
-  } });
-  await flush();
-  assert(sentWsMessages.filter(
-    (message) => message && message.action === 'game_route_credential_resync',
-  ).length === 0, 'a page that already held a credential asked for another one');
-
-  // index.html dispatches `opened` from a bootstrap IIFE that is NOT inside
-  // socket.onopen, so on the exact page-reload this repairs the socket can still
-  // be CONNECTING. A raw send would be dropped silently.
-  sentWsMessages.length = 0;
-  appState.gameVoiceControlCredential = '';
-  socketOpen = false;
-  routeWindowListener({ detail: {
-    action: 'opened',
-    gameType: 'soccer',
-    sessionId: 'soccer-runtime',
-    routeInstanceId: 'route-instance-resync',
-  } });
-  await flush();
-  assert(sentWsMessages.length === 0,
-    'the credential request was sent into a socket that was not open');
-  socketOpen = true;
-  await new Promise((resolve) => setTimeout(resolve, 260));
-  await flush();
-  assert(sentWsMessages.filter(
-    (message) => message && message.action === 'game_route_credential_resync',
-  ).length === 1, 'the credential request never retried after the socket opened');
-  appState.gameVoiceControlCredential = 'voice-credential';
-
-  // A request that went out is not a credential that came back: the server can
-  // fail to push it, and it records the request as served only AFTER a
-  // successful push -- so a later attempt is still accepted. Stopping at the
-  // first outbound request left a reloaded host without voice control until the
-  // websocket reconnected.
-  sentWsMessages.length = 0;
-  appState.gameVoiceControlCredential = '';
-  socketOpen = true;
-  routeWindowListener({ detail: {
-    action: 'opened',
-    gameType: 'soccer',
-    sessionId: 'soccer-runtime',
-    routeInstanceId: 'route-instance-unanswered',
-  } });
-  await flush();
-  const firstUnansweredRequests = sentWsMessages.filter(
-    (message) => message && message.action === 'game_route_credential_resync',
-  ).length;
-  assert(firstUnansweredRequests === 1,
-    'the first credential request was not sent into an open socket');
-  await new Promise((resolve) => setTimeout(resolve, 1200));
-  await flush();
-  assert(sentWsMessages.filter(
-    (message) => message && message.action === 'game_route_credential_resync',
-  ).length > firstUnansweredRequests,
-  'a credential request the server never answered was never retried');
-  // Control: once the credential lands the chain must stop, otherwise the
-  // assertion above is satisfied by a loop that simply never terminates.
-  appState.gameVoiceControlCredential = 'voice-credential';
-  sentWsMessages.length = 0;
-  await new Promise((resolve) => setTimeout(resolve, 1200));
-  await flush();
-  assert(sentWsMessages.filter(
-    (message) => message && message.action === 'game_route_credential_resync',
-  ).length === 0, 'the credential retry chain kept asking after the credential arrived');
-
-  // A retry that is still pending when the route ends must not fire: by then
-  // there is no route to ask about, and the answer would name an identity the
-  // page no longer holds.
-  sentWsMessages.length = 0;
-  appState.gameVoiceControlCredential = '';
-  socketOpen = false;
-  routeWindowListener({ detail: {
-    action: 'opened',
-    gameType: 'soccer',
-    sessionId: 'soccer-runtime',
-    routeInstanceId: 'route-instance-abandoned',
-  } });
-  await flush();
-  routeWindowListener({ detail: {
-    action: 'closed',
-    gameType: 'soccer',
-    sessionId: 'soccer-runtime',
-    routeInstanceId: 'route-instance-abandoned',
-  } });
-  await flush();
-  socketOpen = true;
-  await new Promise((resolve) => setTimeout(resolve, 260));
-  await flush();
-  assert(sentWsMessages.filter(
-    (message) => message && message.action === 'game_route_credential_resync',
-  ).length === 0, 'a pending credential retry fired after its route had ended');
-  appState.gameVoiceControlCredential = 'voice-credential';
-
   failLocalStorageWrites = false;
   removeEventListener('neko-game-voice-control-message', sameDocumentObserver);
 

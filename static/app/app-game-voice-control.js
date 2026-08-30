@@ -165,70 +165,23 @@
         return state;
     }
 
-    var credentialResyncTimer = null;
-    var credentialResyncAttempts = 0;
-    var CREDENTIAL_RESYNC_MAX_ATTEMPTS = 20;
-
-    function requestVoiceControlCredential() {
-        // index.html dispatches `opened` from its own bootstrap IIFE, which is
-        // NOT inside socket.onopen -- so on the exact page-reload this repairs,
-        // the socket can still be CONNECTING when we get here, and a raw send is
-        // dropped silently. Retry on the same 100ms cadence the bootstrap itself
-        // uses while it waits for lanlan_name, and stop as soon as the credential
-        // lands, the route goes away, or we run out of attempts.
-        // Restart rather than bail: the retry chain now outlives its own
-        // outbound request, so an early return would let a stale chain from a
-        // PREVIOUS route swallow the request for the one that just opened.
-        if (credentialResyncTimer !== null) {
-            clearTimeout(credentialResyncTimer);
-            credentialResyncTimer = null;
-        }
-        credentialResyncAttempts = 0;
-        var attempt = function () {
-            credentialResyncTimer = null;
-            if (disposed) return;
-            // The only credential-presence check on this path, deliberately:
-            // it also has to hold on every retry, and a duplicate at the call
-            // site would be an inert guard.
-            if (S.gameVoiceControlCredential) return;
-            if (S.gameRouteActive !== true) return;
-            credentialResyncAttempts += 1;
-            var bridge = window.appWebSocket;
-            var sent = false;
-            if (bridge && typeof bridge.isOpen === 'function' && bridge.isOpen()) {
-                bridge.send({
-                    action: 'game_route_credential_resync',
-                    game_type: String(S.gameRouteGameType || ''),
-                    session_id: String(S.gameRouteSessionId || ''),
-                    sdk_route_instance_id: String(S.gameRouteInstanceId || '')
-                });
-                sent = true;
-            }
-            // A request that went out is not a credential that came back: the
-            // server can fail to push it (send error, route re-checked away),
-            // and it records the request as served only AFTER a successful
-            // push -- so a later attempt is still accepted. Returning here left
-            // a reloaded host without voice control until the socket
-            // reconnected. Keep retrying until the credential lands, the route
-            // goes away, or the attempt budget runs out; the slower cadence
-            // after a send is to let the round trip finish first.
-            if (credentialResyncAttempts >= CREDENTIAL_RESYNC_MAX_ATTEMPTS) return;
-            credentialResyncTimer = setTimeout(attempt, sent ? 1000 : 100);
-        };
-        attempt();
-    }
-
     function routeMatches(request) {
         var route = currentRoute();
         if (!route.active) return false;
         if (String(request.game_type || '') !== route.gameType) return false;
         var requestedSessionId = String(request.session_id || '');
         if (requestedSessionId && route.sessionId && requestedSessionId !== route.sessionId) return false;
+        // The route generation is REQUIRED here, not merely compared when both
+        // sides happen to have one. It is what keeps a non-SDK route (soccer /
+        // badminton never mint one) out of voice control, and it is minted from
+        // crypto on every runtime.start(), so a stale window cannot carry the
+        // live one. It is not a secret and makes no claim to be: the same
+        // unauthenticated GET /api/game/route/active that the page reads its
+        // identity from returns it, which is exactly why a reloaded host
+        // recovers without asking anyone for anything.
         var requestedRouteInstanceId = String(request.sdk_route_instance_id || '');
-        if (route.routeInstanceId && requestedRouteInstanceId !== route.routeInstanceId) return false;
-        var expectedCredential = String(S.gameVoiceControlCredential || '');
-        return !!expectedCredential
-            && String(request.launch_credential || '') === expectedCredential;
+        if (!route.routeInstanceId || !requestedRouteInstanceId) return false;
+        return requestedRouteInstanceId === route.routeInstanceId;
     }
 
     function routeSnapshotIsCurrent(snapshot) {
@@ -439,15 +392,6 @@
             S.gameRouteLanlanName = String(detail.lanlanName || '');
             S.gameRouteSessionId = incomingSessionId;
             S.gameRouteInstanceId = incomingRouteInstanceId;
-            // The credential rides only the edge-triggered `opened` PUSH. A page
-            // that reloads while the route is still live gets its identity back
-            // from /api/game/route/active, but never the credential -- and
-            // routeMatches() then rejects every voice command, including `query`,
-            // for the rest of the round. Ask for it back over the socket, which
-            // is where it already travels. Only this module consumes the
-            // credential (index.html is the only page that loads this file), so
-            // asking from here keeps chat.html from ever holding one.
-            requestVoiceControlCredential();
         } else if (action === 'closed') {
             var currentSessionId = String(S.gameRouteSessionId || '');
             if (incomingSessionId && currentSessionId && incomingSessionId !== currentSessionId) return;
@@ -479,7 +423,6 @@
             S.gameRouteLanlanName = '';
             S.gameRouteSessionId = '';
             S.gameRouteInstanceId = '';
-            S.gameVoiceControlCredential = '';
         } else {
             return;
         }

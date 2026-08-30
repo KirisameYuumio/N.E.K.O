@@ -1246,7 +1246,6 @@ async def _finalize_game_route_state_inner(
     state["_exit_flow_started"] = True
     state["exit_reason"] = reason
     state["exit_started_at"] = time.time()
-    state.pop("_sdk_voice_control_credential", None)
     # Capture postgame's prompt context BEFORE flipping the route inactive
     # / before the archive resolution / before any peer ``/route/start``
     # can replace this state in ``_game_route_states``.
@@ -1269,7 +1268,6 @@ async def _finalize_game_route_state_inner(
         game_type=str(state.get("game_type") or ""),
         session_id=str(state.get("session_id") or ""),
         route_instance_id=str(state.get("_sdk_route_instance_id") or ""),
-        voice_control_credential="",
     )
     # Release the SessionManager-level takeover so ordinary chat handlers come
     # back online; chat LLM may produce auto-replies again, but the player has

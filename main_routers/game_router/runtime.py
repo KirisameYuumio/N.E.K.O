@@ -269,7 +269,6 @@ _GAME_ROUTE_END_TOMBSTONE_TTL_SECONDS = 120.0
 _GAME_ROUTE_END_TOMBSTONE_LIMIT = 256
 _SDK_ROUTE_INSTANCE_ID_LIMIT = 4
 _SDK_ROUTE_INSTANCE_ID_MAX_CHARS = 128
-_SDK_VOICE_CONTROL_CREDENTIAL_PATTERN = re.compile(r"^[A-Fa-f0-9]{48}$")
 
 
 # A page-exit beacon can reach the backend before its already-dispatched
@@ -2032,11 +2031,6 @@ async def game_route_start(game_type: str, request: Request):
             )
             if route_instance_id:
                 state["_sdk_route_instance_id"] = route_instance_id
-            voice_control_credential = str(
-                data.get("sdk_voice_control_credential") or ""
-            ).strip()
-            if _SDK_VOICE_CONTROL_CREDENTIAL_PATTERN.fullmatch(voice_control_credential):
-                state["_sdk_voice_control_credential"] = voice_control_credential
             # This start now owns the slot, so its locale is finally safe to
             # write onto the shared session (see the pure read at the top).
             _absorb_request_language(data, lanlan_name)
@@ -2102,9 +2096,6 @@ async def game_route_start(game_type: str, request: Request):
             game_type=game_type,
             session_id=session_id,
             route_instance_id=route_instance_id,
-            voice_control_credential=str(
-                state.get("_sdk_voice_control_credential") or ""
-            ),
         )
     else:
         logger.info(
@@ -2313,15 +2304,6 @@ async def game_sdk_protocol(game_type: str, request: Request):
     if not isinstance(data, dict):
         return {"ok": False, "reason": "invalid_body"}
 
-    from ..system_router import _validate_local_mutation_request
-
-    validation_error = _validate_local_mutation_request(
-        request,
-        payload=data,
-        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
-    )
-    if validation_error is not None:
-        return validation_error
 
     lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
         game_type,
@@ -2414,15 +2396,6 @@ async def game_sdk_context_read(game_type: str, request: Request):
     if not isinstance(data, dict):
         return {"ok": False, "reason": "invalid_body"}
 
-    from ..system_router import _validate_local_mutation_request
-
-    validation_error = _validate_local_mutation_request(
-        request,
-        payload=data,
-        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
-    )
-    if validation_error is not None:
-        return validation_error
 
     lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
         game_type,
@@ -2499,15 +2472,6 @@ async def game_sdk_memory_submit(game_type: str, request: Request):
     if not isinstance(data, dict):
         return {"ok": False, "reason": "invalid_body"}
 
-    from ..system_router import _validate_local_mutation_request
-
-    validation_error = _validate_local_mutation_request(
-        request,
-        payload=data,
-        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
-    )
-    if validation_error is not None:
-        return validation_error
     lanlan_name, session_id, state, route_error = _sdk_active_route_from_payload(
         game_type,
         data,
@@ -3343,15 +3307,6 @@ async def game_project_speech_preload(game_type: str, request: Request):
     if not isinstance(data, dict):
         return {"ok": False, "reason": "invalid_body"}
 
-    from ..system_router import _validate_local_mutation_request
-
-    validation_error = _validate_local_mutation_request(
-        request,
-        payload=data,
-        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
-    )
-    if validation_error is not None:
-        return validation_error
 
     raw_lines = data.get("lines")
     if not isinstance(raw_lines, list):
@@ -4152,15 +4107,6 @@ async def game_realtime_context(game_type: str, request: Request):
     if not isinstance(data, dict):
         return {"ok": False, "reason": "invalid_body"}
 
-    from ..system_router import _validate_local_mutation_request
-
-    validation_error = _validate_local_mutation_request(
-        request,
-        payload=data,
-        error_defaults={"ok": False, "reason": "csrf_validation_failed"},
-    )
-    if validation_error is not None:
-        return validation_error
 
     lanlan_name = str(data.get("lanlan_name") or "").strip()
     if not lanlan_name:

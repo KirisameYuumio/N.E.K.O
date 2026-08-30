@@ -143,7 +143,6 @@
         // the array with the rest of this state object.
         gameRouteRecentlyEndedIdentities: [],
         gameRouteStateRevision: 0,
-        gameVoiceControlCredential: '',
         gameVoiceSttGateActive: false,
         gameVoiceSttGameType: '',
         gameVoiceSttSessionId: '',
