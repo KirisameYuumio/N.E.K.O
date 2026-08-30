@@ -3675,3 +3675,334 @@ def test_jukebox_volume_slider_updates_before_the_player_exists(mock_page: Page)
         "savedVolume": 0.4,
         "isMuted": False,
     }
+
+
+@pytest.mark.frontend
+def test_jukebox_switching_songs_while_dancing_starts_the_new_song(mock_page: Page):
+    """Codex P2: the play generation must survive stopPlayback's idle restore.
+
+    stopVMD's idle restoration bumps ``playRequestId`` as its own staleness
+    token, which used to invalidate the very request that triggered it.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const vrmaCalls = [];
+          const idleCalls = [];
+          window.lanlan_config = {
+            model_type: 'live3d',
+            live3d_sub_type: 'vrm',
+            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma']
+          };
+          window.vrmManager = {
+            playVRMAAnimation: async (url, options = {}) => {
+              if (options.isIdle) { idleCalls.push(url); return true; }
+              vrmaCalls.push(url);
+              return true;
+            },
+            stopVRMAAnimation: () => {}
+          };
+          window.fetch = async (url, options = {}) => {
+            if (options.method === 'HEAD') return { ok: true, status: 200 };
+            if (url === '/api/jukebox/config') {
+              return {
+                ok: true,
+                json: async () => ({
+                  configRevision: 'rev-dance',
+                  songs: {
+                    a: { name: 'Alpha', artist: 'A', audio: 'songs/a.mp3', visible: true, defaultAction: 'act_a' },
+                    b: { name: 'Bravo', artist: 'B', audio: 'songs/b.mp3', visible: true, defaultAction: 'act_b' }
+                  },
+                  actions: {
+                    act_a: { name: 'Dance A', file: 'actions/a.vrma', format: 'vrma', visible: true },
+                    act_b: { name: 'Dance B', file: 'actions/b.vrma', format: 'vrma', visible: true }
+                  },
+                  bindings: { a: { act_a: { offset: 0 } }, b: { act_b: { offset: 0 } } }
+                })
+              };
+            }
+            throw new Error('Unexpected fetch: ' + url);
+          };
+
+          const first = await J.executeControl({ action: 'play', query: 'Alpha', headless: true });
+          const afterFirst = {
+            ok: first.ok,
+            current: J.State.currentSong && J.State.currentSong.id,
+            dancing: J.State.isVMDPlaying
+          };
+
+          // 换歌：此刻 A 的舞蹈动画正在播，stopPlayback 会走到待机恢复那条路。
+          const second = await J.executeControl({ action: 'play', query: 'Bravo', headless: true });
+
+          return {
+            afterFirst,
+            secondOk: second.ok,
+            secondMessage: second.message || null,
+            current: J.State.currentSong && J.State.currentSong.id,
+            isPlaying: J.State.isPlaying,
+            vrmaCalls
+          };
+        }
+        """
+    )
+
+    assert result["afterFirst"] == {"ok": True, "current": "a", "dancing": True}
+    assert result["secondOk"] is True
+    assert result["secondMessage"] is None
+    assert result["current"] == "b"
+    assert result["isPlaying"] is True
+    assert result["vrmaCalls"] == [
+        "/api/jukebox/file/actions/a.vrma",
+        "/api/jukebox/file/actions/b.vrma",
+    ]
+
+
+@pytest.mark.frontend
+def test_jukebox_auto_advance_is_cancelled_when_mode_changes(mock_page: Page):
+    """Greptile P1: a pending auto-advance must not outlive the mode it was picked under.
+
+    ``set_mode`` does not move ``playRequestId``, so switching to ``none`` in
+    the gap before the zero-delay callback used to still start the next track.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.executeControl({ action: 'set_mode', mode: 'sequence', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          const played = [];
+          const originalPlaySong = J.playSong;
+          J.playSong = async function(songId, options) {
+            played.push(songId);
+            return originalPlaySong.call(this, songId, options);
+          };
+
+          // 歌放完 -> 自动续播被挂到 setTimeout(0)；回调跑之前把模式改掉。
+          J.handleAudioEnded(J.getPlayer());
+          J.State.playbackMode = 'none';
+          await new Promise(resolve => setTimeout(resolve, 30));
+
+          J.playSong = originalPlaySong;
+          return { played, current: J.State.currentSong && J.State.currentSong.id };
+        }
+        """
+    )
+
+    assert result["played"] == []
+    assert result["current"] is None
+
+
+@pytest.mark.frontend
+def test_vrm_animation_stale_request_does_not_touch_shared_state(mock_page: Page):
+    """Codex P2: shouldStart must gate the shared-state mutations, not only playback.
+
+    A request superseded while its asset loads used to still set
+    ``isIdleAnimation`` and build an action on the live mixer before the final
+    gate rejected it.
+    """
+    mock_page.set_content("<html><body></body></html>")
+    mock_page.evaluate("() => { window.THREE = {}; }")
+    mock_page.add_script_tag(content=VRM_ANIMATION_SCRIPT)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const scene = { uuid: 'scene-a', traverse() {}, updateMatrixWorld() {} };
+          const manager = { currentModel: { vrm: { scene, humanoid: {} } } };
+          const anim = new window.VRMAnimation(manager);
+
+          let created = 0;
+          let released = 0;
+          let played = 0;
+          let superseded = false;
+
+          anim._cacheSkinnedMeshes = () => {};
+          anim._cleanupOldMixer = () => {};
+          anim._initLoader = async () => ({});
+          anim._loadVRMAGltf = async () => {
+            // 资源加载期间，点唱机换了歌，这条动画请求已经作废。
+            superseded = true;
+            return { userData: { vrmAnimations: [{}] } };
+          };
+          anim._detectVRMVersion = () => 1;
+          anim._ensureNormalizedRootInScene = () => {};
+          anim._createLookAtProxy = async () => {};
+          anim._createAndValidateAnimationClip = async () => ({});
+          anim._processTracksForVersion = () => {};
+          anim._normalizeQuaternionTrackSigns = () => {};
+          anim._alignClipToCurrentPose = () => {};
+          anim._findBestMixerRoot = () => ({});
+          anim._createAndConfigureAction = () => { created += 1; return {}; };
+          anim._releaseMixerAction = () => { released += 1; };
+          anim._playAction = () => { played += 1; };
+          anim._restorePhysics = () => {};
+          anim.isIdleAnimation = 'untouched';
+
+          const started = await anim.playVRMAAnimation('/x.vrma', {
+            isIdle: true,
+            shouldStart: () => !superseded
+          });
+
+          return { started, created, released, played, isIdleAnimation: anim.isIdleAnimation };
+        }
+        """
+    )
+
+    assert result["started"] is False
+    assert result["played"] == 0
+    # 作废的请求既不该改 isIdleAnimation，也不该在活着的 mixer 上建 action。
+    assert result["isIdleAnimation"] == "untouched"
+    assert result["created"] == 0
+    assert result["released"] == 0
+
+
+@pytest.mark.frontend
+def test_jukebox_superseded_fuzzy_search_settles_instead_of_hanging(mock_page: Page):
+    """CodeRabbit: terminating a worker fires neither onmessage nor onerror.
+
+    A superseded search must be settled explicitly, or the ``findSongForQuery``
+    awaiting it never returns and the serialized control queue wedges.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          // 两次模糊查询背靠背发出：第二次会 terminate 第一次的 worker。
+          const firstPromise = J.findSongForQuery('桃园');
+          const secondPromise = J.findSongForQuery('桃园');
+
+          const timeout = new Promise(resolve => setTimeout(() => resolve('TIMEOUT'), 3000));
+          const first = await Promise.race([firstPromise, timeout]);
+          const second = await Promise.race([secondPromise, timeout]);
+
+          return {
+            firstSettled: first !== 'TIMEOUT',
+            firstResult: first === 'TIMEOUT' ? 'TIMEOUT' : (first && first.id) || null,
+            secondId: second === 'TIMEOUT' ? 'TIMEOUT' : (second && second.id) || null,
+            settleReleased: J.State.fuzzySearchSettle === null
+          };
+        }
+        """
+    )
+
+    # 被取代的那次必须 settle（返回 null 即可），不能永远悬着。
+    assert result["firstSettled"] is True
+    assert result["firstResult"] is None
+    assert result["secondId"] == "song4"
+    assert result["settleReleased"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_play_recovers_when_library_was_empty_at_startup(mock_page: Page):
+    """CodeRabbit: a memoized runtime must not pin an empty library forever."""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          let serveSongs = false;
+          let configFetches = 0;
+          window.fetch = async (url, options = {}) => {
+            if (options.method === 'HEAD') return { ok: true, status: 200 };
+            if (url === '/api/jukebox/config') {
+              configFetches += 1;
+              return {
+                ok: true,
+                json: async () => ({
+                  configRevision: serveSongs ? 'rev-late' : 'rev-empty',
+                  songs: serveSongs
+                    ? { late: { name: 'Late Arrival', artist: 'A', audio: 'songs/late.mp3', visible: true } }
+                    : {},
+                  actions: {},
+                  bindings: {}
+                })
+              };
+            }
+            throw new Error('Unexpected fetch: ' + url);
+          };
+
+          // 运行时在曲库还是空的时候就绪。
+          await J.ensureRuntime({ headless: true });
+          const songsAtStartup = J.State.songs.length;
+
+          // 之后后端才有了歌。
+          serveSongs = true;
+          const played = await J.executeControl({ action: 'play', query: 'Late', headless: true });
+
+          return {
+            songsAtStartup,
+            ok: played.ok,
+            message: played.message || null,
+            current: J.State.currentSong && J.State.currentSong.id,
+            configFetches
+          };
+        }
+        """
+    )
+
+    assert result["songsAtStartup"] == 0
+    assert result["ok"] is True
+    assert result["message"] is None
+    assert result["current"] == "late"
+    # 一次是运行时初始化，一次是找不到歌之后的兜底刷新。
+    assert result["configFetches"] == 2
+
+
+@pytest.mark.frontend
+def test_jukebox_loader_control_entrypoints_cancel_pending_unload(mock_page: Page):
+    """CodeRabbit: a control command inside the 3s unload window must cancel it."""
+    mock_page.set_content(
+        """
+        <script>
+          window.t = (key, fallback) => typeof fallback === 'string' ? fallback : key;
+        </script>
+        """
+    )
+    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const loader = window.__nekoJukeboxLoader;
+          const before = [];
+          const after = [];
+
+          loader.unload();
+          before.push(loader.getState().pendingUnload);
+          // 门面的 executeControl 会去加载 parts；这里只关心它有没有先撤销卸载定时器。
+          const controlPromise = window.Jukebox.executeControl({ action: 'stop' }).catch(() => 'failed');
+          after.push(loader.getState().pendingUnload);
+
+          loader.unload();
+          const beforeRuntime = loader.getState().pendingUnload;
+          const runtimePromise = window.Jukebox.ensureRuntime({ headless: true }).catch(() => 'failed');
+          const afterRuntime = loader.getState().pendingUnload;
+
+          await Promise.all([controlPromise, runtimePromise]);
+          return {
+            pendingBeforeControl: before[0],
+            pendingAfterControl: after[0],
+            pendingBeforeRuntime: beforeRuntime,
+            pendingAfterRuntime: afterRuntime
+          };
+        }
+        """
+    )
+
+    assert result == {
+        "pendingBeforeControl": True,
+        "pendingAfterControl": False,
+        "pendingBeforeRuntime": True,
+        "pendingAfterRuntime": False,
+    }

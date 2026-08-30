@@ -125,6 +125,7 @@ Object.assign(window.Jukebox, {
     fuzzySearchWorker: null,
     fuzzySearchWorkerUrl: null,
     fuzzySearchToken: 0,
+    fuzzySearchSettle: null,
     lastPlaybackReport: null,
     isOpen: false,
     isHidden: false,

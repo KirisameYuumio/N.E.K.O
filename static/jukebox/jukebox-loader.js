@@ -496,6 +496,9 @@
       facade.init = function() {};
     }
     facade.ensureRuntime = async function(options) {
+      // unloadJukebox() 排的是 3 秒定时器；控制指令落在这个窗口里而不撤销它的话，
+      // parts 刚加载完就会被 finalizeUnload 把 window.Jukebox 删掉。
+      clearPendingUnload();
       var jukebox = await loadJukeboxScript();
       initJukebox(jukebox);
       if (!jukebox || typeof jukebox.ensureRuntime !== 'function') {
@@ -504,6 +507,7 @@
       return jukebox.ensureRuntime(options || {});
     };
     facade.executeControl = async function(command) {
+      clearPendingUnload();
       var jukebox = await loadJukeboxScript();
       initJukebox(jukebox);
       if (!jukebox || typeof jukebox.executeControl !== 'function') {

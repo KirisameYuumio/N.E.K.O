@@ -283,6 +283,14 @@ Object.assign(window.Jukebox, {
 
   terminateFuzzySearchWorker: function() {
     const state = Jukebox.State;
+    // 先把上一次挂着的 Promise 结掉。terminate() 既不触发 onmessage 也不触发
+    // onerror，不主动 settle 的话 await 它的 findSongForQuery 会永远悬着，
+    // 前端那条串行的控制队列跟着一起再也不动。
+    if (typeof state.fuzzySearchSettle === 'function') {
+      const settle = state.fuzzySearchSettle;
+      state.fuzzySearchSettle = null;
+      settle(-1);
+    }
     if (state.fuzzySearchWorker) {
       try { state.fuzzySearchWorker.terminate(); } catch (_) {}
       state.fuzzySearchWorker = null;
@@ -326,11 +334,15 @@ Object.assign(window.Jukebox, {
       const finish = (index) => {
         if (settled) return;
         settled = true;
+        if (Jukebox.State.fuzzySearchSettle === finish) {
+          Jukebox.State.fuzzySearchSettle = null;
+        }
         if (Jukebox.State.fuzzySearchWorker === worker) {
           Jukebox.terminateFuzzySearchWorker();
         }
         resolve(index);
       };
+      Jukebox.State.fuzzySearchSettle = finish;
       worker.onmessage = (event) => {
         const data = event.data || {};
         if (data.token !== token) return;
@@ -427,9 +439,11 @@ Object.assign(window.Jukebox, {
     }
 
     let song = await Jukebox.findSongForQuery(command.query || '');
-    if (!song && Jukebox.State.songs.length) {
+    if (!song) {
       // 运行时是记忆化的，无头会话里可能一直用着开机时那份曲库；只有在真的
-      // 找不到时才多花一次请求重新拉，避免每条指令都重拉。
+      // 找不到时才多花一次请求重新拉，避免每条指令都重拉。这里不能再加
+      // 「songs 非空」前置条件：运行时初始化那一刻曲库为空的话，那个条件会让
+      // 之后每一条 play 都直接 song_not_found，永远等不到刷新。
       await Jukebox.loadSongData();
       song = await Jukebox.findSongForQuery(command.query || '');
     }
@@ -983,10 +997,15 @@ Object.assign(window.Jukebox, {
 
     if (nextSong) {
       const requestId = Jukebox.State.playRequestId;
-      const fromQueue = Jukebox.State.playbackMode === 'random';
+      const scheduledMode = Jukebox.State.playbackMode;
+      const fromQueue = scheduledMode === 'random';
       setTimeout(() => {
         if (!Jukebox.State.isOpen && !Jukebox.State.isRuntimeReady && !window.__NEKO_JUKEBOX_STANDALONE__) return;
         if (requestId !== Jukebox.State.playRequestId) return;
+        // nextSong 是按排队时的模式选出来的，而 set_mode 不动 playRequestId。
+        // 模式在这一个宏任务的空档里变了，这次自动续播就作废 —— 尤其是改成
+        // none 之后不该再自动播下一首。
+        if (Jukebox.State.playbackMode !== scheduledMode) return;
         Jukebox.playSong(nextSong.id, { fromQueue, requestId });
       }, 0);
     }
@@ -1039,7 +1058,12 @@ Object.assign(window.Jukebox, {
         Jukebox.State.randomQueueExitSongId
         && Jukebox.State.randomQueueExitSongId === songId
       );
-    Jukebox.stopPlayback({ preserveRandomQueue });
+    // stopVMD 的待机恢复会自己 ++playRequestId 当作废令牌。换歌时那一下会把本次
+    // 播放的世代顶掉，于是新歌起播后自己判定「已被取代」：动画不启动，控制面还报
+    // play_failed。换歌一律跳过这次恢复，本首没有可播动作时在收尾处补回来 ——
+    // 补的条件跟 stopVMD 原本一致：只有真的打断了一段舞蹈才需要回到待机。
+    const interruptedDance = Jukebox.State.isVMDPlaying === true;
+    Jukebox.stopPlayback({ preserveRandomQueue, skipIdleRestore: true });
 
     try {
       await Jukebox.playAudio(song);
@@ -1056,7 +1080,8 @@ Object.assign(window.Jukebox, {
         return null;
       }
       const action = actionAvailability.action;
-      if (action && actionAvailability.ok) {
+      const startsAnimation = !!(action && actionAvailability.ok);
+      if (startsAnimation) {
         const actionUrl = actionAvailability.url;
         console.log('[Jukebox] 播放动画:', action.name, '格式:', action.format || 'vmd', '路径:', actionUrl);
 
@@ -1086,6 +1111,11 @@ Object.assign(window.Jukebox, {
 
       Jukebox.updatePlayingStatus(song);
       Jukebox.updateCalibrationDisplay();
+      if (!startsAnimation && interruptedDance) {
+        // 打断了一段舞蹈、这首歌又没有要接的动作。所有世代检查都过完了，此时
+        // 再恢复待机，它的 ++playRequestId 不会反过来作废本次播放。
+        Jukebox.restoreIdleAnimation();
+      }
       return song;
     } catch (error) {
       if (requestId !== Jukebox.State.playRequestId) {
@@ -1456,7 +1486,7 @@ Object.assign(window.Jukebox, {
   stopPlayback: function(options = {}) {
     const preserveRandomQueue = options.preserveRandomQueue === true;
     Jukebox.stopAudio();
-    Jukebox.stopVMD();
+    Jukebox.stopVMD(options.skipIdleRestore === true);
 
     Jukebox.State.currentSong = null;
     Jukebox.State.isPlaying = false;

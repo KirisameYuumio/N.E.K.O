@@ -8,6 +8,29 @@ from plugin.sdk.plugin import Err, NekoPluginBase, Ok, SdkError, neko_plugin, pl
 
 
 _VALID_ACTIONS = {"play", "next", "previous", "stop", "set_volume", "adjust_volume", "set_mode"}
+_VALID_MODES = {"none", "sequence", "single", "random"}
+_VOLUME_ACTIONS = {"set_volume", "adjust_volume"}
+
+
+def _volume_argument_error(action: str, value: Any) -> str | None:
+    """Return an error message when a volume action's ``value`` is unusable.
+
+    The browser rejects these as ``invalid_volume`` / ``invalid_volume_delta``,
+    but that verdict arrives asynchronously and never reaches the caller, so
+    the model would otherwise report a change it never made.
+    """
+    if value is None or value == "":
+        return f"INVALID_ARGUMENT: {action} requires a numeric value"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return f"INVALID_ARGUMENT: {action} value must be a number"
+    if number != number or number in (float("inf"), float("-inf")):
+        return f"INVALID_ARGUMENT: {action} value must be a finite number"
+    low = 0.0 if action == "set_volume" else -100.0
+    if not low <= number <= 100.0:
+        return f"INVALID_ARGUMENT: {action} value must be within {low:g}..100"
+    return None
 
 
 @neko_plugin
@@ -69,6 +92,18 @@ class JukeboxControllerPlugin(NekoPluginBase):
 
         clean_query = str(query or "").strip()
         clean_mode = str(mode or "").strip().lower()
+
+        # 动作专属参数在推给前端之前就要判掉。前端的 invalid_volume /
+        # invalid_playback_mode 是异步结果，回不到这里，模型会照样跟用户说已发送。
+        if normalized in _VOLUME_ACTIONS:
+            volume_error = _volume_argument_error(normalized, value)
+            if volume_error:
+                return Err(SdkError(volume_error))
+        if normalized == "set_mode" and clean_mode not in _VALID_MODES:
+            return Err(SdkError(
+                "INVALID_ARGUMENT: set_mode requires one of "
+                + ", ".join(sorted(_VALID_MODES))
+            ))
         target_lanlan = kwargs.get("target_lanlan")
         if not (isinstance(target_lanlan, str) and target_lanlan.strip()):
             context_lanlan = getattr(getattr(self, "ctx", None), "_current_lanlan", None)

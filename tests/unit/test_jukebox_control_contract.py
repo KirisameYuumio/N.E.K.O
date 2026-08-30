@@ -365,3 +365,55 @@ def test_jukebox_proactive_bridge_uses_canonical_control_keys(monkeypatch):
     )
 
     assert legacy_push.events == []
+
+
+def test_jukebox_plugin_rejects_incomplete_action_arguments():
+    """Codex P2: a volume/mode command missing its argument must not report success.
+
+    The browser rejects it as invalid_volume / invalid_playback_mode, but that
+    verdict is asynchronous and never reaches the caller, so the model would
+    tell the user a change was made that never happened.
+    """
+    from plugin.plugins.jukebox_controller import JukeboxControllerPlugin
+    from plugin.sdk.plugin import Err
+
+    plugin = JukeboxControllerPlugin.__new__(JukeboxControllerPlugin)
+    pushed = []
+    plugin.ctx = types.SimpleNamespace(
+        push_message=lambda **kwargs: pushed.append(kwargs),
+        _current_lanlan="cat",
+    )
+
+    rejected = [
+        ("set_volume", {}),
+        ("set_volume", {"value": ""}),
+        ("set_volume", {"value": "loud"}),
+        ("set_volume", {"value": 140}),
+        ("set_volume", {"value": -1}),
+        ("adjust_volume", {}),
+        ("adjust_volume", {"value": None}),
+        ("adjust_volume", {"value": -140}),
+        ("set_mode", {}),
+        ("set_mode", {"mode": "shuffle"}),
+    ]
+    for action, kwargs in rejected:
+        result = asyncio.run(plugin.control_jukebox(action=action, **kwargs))
+        assert isinstance(result, Err), (action, kwargs)
+    # 被拒的调用一条都不该推到前端。
+    assert pushed == []
+
+    accepted = [
+        ("set_volume", {"value": 0}),
+        ("set_volume", {"value": 35}),
+        ("set_volume", {"value": "42"}),
+        ("adjust_volume", {"value": -20}),
+        ("adjust_volume", {"value": 0.5}),
+        ("set_mode", {"mode": " RANDOM "}),
+        # 不带参数的动作不受这条校验影响。
+        ("next", {}),
+        ("stop", {}),
+    ]
+    for action, kwargs in accepted:
+        result = asyncio.run(plugin.control_jukebox(action=action, **kwargs))
+        assert not isinstance(result, Err), (action, kwargs)
+    assert len(pushed) == len(accepted)
