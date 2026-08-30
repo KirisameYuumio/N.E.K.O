@@ -1046,13 +1046,22 @@ async function main() {
   // The schema applies its capability pattern to the string the manifest
   // actually declares, so `' logging '` is schema-invalid -- while trimming
   // first silently rewrote it into a real permission request.
-  for (const padded of [' logging', 'logging ', ' runtime ']) {
+  // Each case declares whatever ELSE it needs unpadded, so the only reason the
+  // manifest can fail is the padding itself. `[' runtime ']` alone would fail
+  // for a second reason (no mandatory `logging`) and pass this assertion even if
+  // the padding were trimmed away.
+  for (const padded of [
+    [' logging'],
+    ['logging '],
+    [' runtime ', 'logging'],
+    ['logging', ' runtime '],
+  ]) {
     let paddedCapabilityError = null;
     try {
       await window.NekoMiniGame.connect({
         id: 'padded-capability-test',
         version: '1.0.0',
-        requiredCapabilities: [padded],
+        requiredCapabilities: padded,
       }, { transport });
     } catch (error) { paddedCapabilityError = error; }
     assert(paddedCapabilityError?.code === 'invalid_manifest',
