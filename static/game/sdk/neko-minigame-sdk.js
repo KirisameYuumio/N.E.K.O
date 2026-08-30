@@ -239,11 +239,16 @@
 
   function contractInteger(value, fieldName, minimum, maximum, fallback) {
     if (value === undefined) return fallback;
-    const numeric = Number(value);
-    if (!Number.isInteger(numeric) || numeric < minimum || numeric > maximum) {
+    // No coercion. The published schema declares every one of these
+    // (minLength/maxLength/minItems/maxItems/maxEntries) as a JSON integer, and
+    // `Number()` accepted `'5'` and `true` alike -- so editor/CI validation
+    // against the schema and the validation that actually runs disagreed about
+    // the same manifest. Same rule the minimum/maximum path now uses.
+    if (typeof value !== 'number' || !Number.isInteger(value)
+        || value < minimum || value > maximum) {
       fail('invalid_manifest', `${fieldName} must be an integer between ${minimum} and ${maximum}`);
     }
-    return numeric;
+    return value;
   }
 
   function normalizeContractSchema(schemaInput, fieldName, state, depth = 0) {
@@ -1001,7 +1006,12 @@
 
     const allowedRoles = new Set(['system', 'user', 'assistant']);
     let totalChars = 0;
-    const messages = value.messages.map((message, index) => {
+    // Index-walk, not `.map()`: map SKIPS holes, so a sparse array
+    // (`new Array(1)`) was accepted and frozen without a single slot being
+    // validated, and JSON transport then turned the hole into `null` -- the
+    // backend rejected with HTTP 400 what the SDK had just admitted locally.
+    const messages = Array.from({ length: value.messages.length }, (_unused, index) => {
+      const message = value.messages[index];
       if (!plainObject(message)) {
         fail('invalid_request', `dialogue prompt.messages[${index}] must be an object`);
       }
@@ -1216,8 +1226,15 @@
       case 'audio':
         return typeof transport.mountAudio === 'function';
       case 'speech-output':
+        // `speech.mirror()` is on the public SpeechOutput interface unconditionally,
+        // so a transport that implements speaking, preloading and the playback
+        // bridge but not mirroring used to satisfy even a REQUIRED grant -- and
+        // then every mirror call on that connected client failed
+        // `transport_unavailable`. Negotiate on the whole surface the capability
+        // hands out, not part of it.
         return typeof transport.requestSpeechOutput === 'function'
           && typeof transport.preloadSpeechOutput === 'function'
+          && typeof transport.mirrorSpeechOutput === 'function'
           && typeof transport.startSpeechOutputBridge === 'function'
           && typeof transport.stopSpeechOutputBridge === 'function';
       case 'context-read':

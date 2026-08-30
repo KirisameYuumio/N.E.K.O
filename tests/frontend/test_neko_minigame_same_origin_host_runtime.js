@@ -96,6 +96,11 @@ async function main() {
       await protocolTwoGate;
     }
     if (/\/api\/game\/[^/]+\/end$/.test(pathName)) {
+      // FastAPI and common proxies answer a rejected close with a non-2xx
+      // `{"detail": ...}` body: it parses fine and carries no `ok`.
+      if (body.force_end_http_error === true) {
+        return jsonResponse({ detail: 'route is not closable' }, 409);
+      }
       return jsonResponse(RAW_END_RESPONSE);
     }
     if (pathName.endsWith('/route/start')) {
@@ -1205,6 +1210,53 @@ async function main() {
   noLockHost.dispose();
   genericHost.dispose();
   host.dispose();
+  const endHost = createHost({
+    gameType: 'example-game',
+    sessionId: 'end-projection-session',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: windowMock.navigator,
+  });
+  endHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'example-game',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      optionalCapabilities: [],
+    },
+  });
+
+  // A rejected close must not read as success. `/end` answering non-2xx with a
+  // FastAPI-shaped `{"detail": ...}` parses fine, carries no `ok`, and keeps no
+  // field the projection preserves -- so it used to arrive as `{}`, which the
+  // SDK reads as SUCCESS. The client then retired its route generation and
+  // entered `ended` while the backend had refused to close the route.
+  const rejectedEnd = await endHost.end({ force_end_http_error: true });
+  assert(rejectedEnd.ok === false && rejectedEnd.status === 409,
+    `a non-2xx route end was projected as success: ${JSON.stringify(rejectedEnd)}`);
+  const acceptedEnd = await endHost.end({});
+  assert(acceptedEnd.ok !== false,
+    'a successful route end was projected as a failure');
+
+  // Fetch caps keepalive bodies at 64 KiB and the quota is SHARED with the
+  // diagnostic logger, so an oversized-but-valid end payload (the SDK admits up
+  // to 256 KiB) used to reject before the request left the page: explicit end
+  // degraded, and an unloading page skipped cleanup and postgame entirely.
+  const endCallsBefore = calls.filter((call) => /\/end$/.test(call.url)).length;
+  await endHost.end({ small: 'x'.repeat(1024) });
+  const smallEndCall = calls.filter((call) => /\/end$/.test(call.url)).at(-1);
+  assert(smallEndCall.init.keepalive === true,
+    'a small route end payload lost its keepalive guarantee');
+  await endHost.end({ big: 'x'.repeat(100 * 1024) });
+  const bigEndCall = calls.filter((call) => /\/end$/.test(call.url)).at(-1);
+  // `_post` omits the key entirely rather than sending `keepalive: false`.
+  assert(bigEndCall.init.keepalive !== true,
+    'an end payload past the keepalive quota was still sent with keepalive');
+  assert(calls.filter((call) => /\/end$/.test(call.url)).length === endCallsBefore + 2,
+    'the keepalive probe did not reach the backend');
+  endHost.dispose();
+
   process.stdout.write('mini-game same-origin host runtime test passed\n');
 }
 

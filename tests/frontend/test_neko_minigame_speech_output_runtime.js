@@ -532,6 +532,7 @@ async function main() {
       connectGame: transport.connectGame,
       requestSpeechOutput() { return Promise.resolve({ ok: true }); },
       preloadSpeechOutput() { return Promise.resolve({ ok: true }); },
+      mirrorSpeechOutput() { return Promise.resolve({ ok: true }); },
       startSpeechOutputBridge() { return false; },
       stopSpeechOutputBridge() { optionalBridgeCleanup += 1; },
       dispose() {},
@@ -559,6 +560,7 @@ async function main() {
         connectGame: transport.connectGame,
         requestSpeechOutput() { return Promise.resolve({ ok: true }); },
         preloadSpeechOutput() { return Promise.resolve({ ok: true }); },
+        mirrorSpeechOutput() { return Promise.resolve({ ok: true }); },
         startSpeechOutputBridge() { return false; },
         stopSpeechOutputBridge() { requiredBridgeCleanup += 1; },
         dispose() { requiredTransportDisposals += 1; },
@@ -571,6 +573,59 @@ async function main() {
     'unavailable required speech bridge did not reject connection');
   assert(requiredBridgeCleanup === 1 && requiredTransportDisposals === 1,
     'failed required speech bridge did not release partial host state');
+
+  // `speech.mirror()` is on the public SpeechOutput interface unconditionally,
+  // so negotiating `speech-output` on three of its four transport methods let a
+  // transport that cannot mirror satisfy even a REQUIRED grant -- and every
+  // mirror call on that connected client then failed `transport_unavailable`,
+  // with nothing in the handshake having warned the game.
+  let mirrorlessOptional = null;
+  try {
+    mirrorlessOptional = await window.NekoMiniGame.connect({
+      id: 'mirrorless-speech-optional',
+      version: '1',
+      requiredCapabilities: ['logging'],
+      optionalCapabilities: ['speech-output'],
+    }, {
+      transport: {
+        logger: logger(),
+        connectGame: transport.connectGame,
+        requestSpeechOutput() { return Promise.resolve({ ok: true }); },
+        preloadSpeechOutput() { return Promise.resolve({ ok: true }); },
+        startSpeechOutputBridge() { return true; },
+        stopSpeechOutputBridge() {},
+        dispose() {},
+      },
+      windowImpl: windowMock,
+      documentImpl: {},
+    });
+  } catch (_) { /* an optional capability must not fail the connection */ }
+  assert(mirrorlessOptional && !mirrorlessOptional.capabilities.has('speech-output'),
+    'a transport with no mirrorSpeechOutput was granted speech-output');
+  mirrorlessOptional?.dispose();
+
+  let mirrorlessRequiredError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'mirrorless-speech-required',
+      version: '1',
+      requiredCapabilities: ['logging', 'speech-output'],
+    }, {
+      transport: {
+        logger: logger(),
+        connectGame: transport.connectGame,
+        requestSpeechOutput() { return Promise.resolve({ ok: true }); },
+        preloadSpeechOutput() { return Promise.resolve({ ok: true }); },
+        startSpeechOutputBridge() { return true; },
+        stopSpeechOutputBridge() {},
+        dispose() {},
+      },
+      windowImpl: windowMock,
+      documentImpl: {},
+    });
+  } catch (error) { mirrorlessRequiredError = error; }
+  assert(mirrorlessRequiredError?.code === 'capability_unavailable',
+    'a required speech-output grant survived a transport that cannot mirror');
 
   process.stdout.write('mini-game speech output runtime test passed\n');
 }

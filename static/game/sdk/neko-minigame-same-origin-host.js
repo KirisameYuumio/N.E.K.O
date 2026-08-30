@@ -36,6 +36,11 @@
   // and the queue holds up to 256 of them before anything is sent.
   const LOG_MESSAGE_MAX_CHARS = 4096;
   const LOG_MESSAGE_PRESERVED_MAX_CHARS = 64 * 1024;
+  // The Fetch keepalive body quota is 64 KiB and it is SHARED across every
+  // in-flight keepalive request from this context -- the diagnostic logger uses
+  // keepalive too. A body past this threshold makes fetch reject before the
+  // request leaves the page, so leave headroom rather than sitting on the cap.
+  const KEEPALIVE_BODY_BYTES = 60 * 1024;
   const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
   const DEFAULT_PENDING_REQUEST_LIMIT = 64;
   const DEFAULT_PROTOCOL_QUEUE_LIMIT = 64;
@@ -2772,8 +2777,16 @@
           options.onBeaconError?.(error);
         }
       }
+      // Keepalive only while the body fits the shared quota. Past it, fetch
+      // rejects before the request is sent, which turned an oversized-but-valid
+      // end payload (the SDK admits up to 256 KiB) into a guaranteed failure:
+      // explicit end degraded, and an unloading page -- where sendBeacon has
+      // already declined the same body above -- skipped route cleanup and
+      // postgame entirely until server-side expiry. Dropping keepalive costs
+      // nothing on the awaited path and is strictly better than certain failure
+      // on the unload path.
       const response = await this._post(this._gameEndpoint('end'), body, {
-        keepalive: true,
+        keepalive: utf8ByteLength(body) <= KEEPALIVE_BODY_BYTES,
         operation: 'route_end',
         // Honour a caller-supplied deadline, the way every other networked
         // method here does via `...options`. This one enumerates explicitly on
@@ -2787,7 +2800,20 @@
         signal: options.signal,
       });
       const data = await response.json().catch(() => ({ ok: response.ok, status: response.status }));
-      return this._projectRouteEndResponse(data);
+      const projected = this._projectRouteEndResponse(data);
+      if (response.ok) return projected;
+      // A non-2xx body is usually FastAPI's `{"detail": ...}`: it parses fine,
+      // carries no `ok`, and no field the projection keeps -- so it arrived as
+      // `{}`, and the SDK reads a plain object without `ok` as SUCCESS. The
+      // client then retired its route generation and entered `ended` while the
+      // backend had refused to close the route.
+      return {
+        ...(projected && typeof projected === 'object' && !Array.isArray(projected)
+          ? projected
+          : {}),
+        ok: false,
+        status: response.status,
+      };
     }
 
     dispose(options = {}) {

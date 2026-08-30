@@ -536,6 +536,35 @@ async function main() {
   assert(invalidAuthorPromptError?.code === 'invalid_request',
     'author-managed dialogue accepted an unsupported role');
 
+  // `Array.prototype.map` SKIPS holes, so a sparse author-managed message array
+  // was accepted and frozen without a single slot being validated. JSON
+  // transport then turned the hole into `null`, and the backend rejected with
+  // HTTP 400 what the SDK had just admitted locally -- the game gets a server
+  // error where it should have got `invalid_request` before any request left.
+  const sparseMessages = [{ role: 'user', content: 'first' }];
+  sparseMessages[2] = { role: 'user', content: 'third' };
+  let sparsePromptError = null;
+  try {
+    await game.dialogue.request({
+      event: 'checkpoint',
+      prompt: { mode: 'author-managed', messages: sparseMessages },
+    });
+  } catch (error) { sparsePromptError = error; }
+  assert(sparsePromptError?.code === 'invalid_request',
+    'author-managed dialogue accepted a sparse message array without validating its holes');
+  // The dense array of the same length still goes through.
+  await game.dialogue.request({
+    event: 'checkpoint',
+    prompt: {
+      mode: 'author-managed',
+      messages: [
+        { role: 'user', content: 'first' },
+        { role: 'user', content: 'second' },
+        { role: 'user', content: 'third' },
+      ],
+    },
+  });
+
   dialoguePendingMode = true;
   const boundedDialogueRequests = Array.from({ length: 4 }, (_, index) => (
     game.dialogue.request({ event: `pending-${index}` }).then(() => null, (error) => error)
@@ -895,6 +924,51 @@ async function main() {
     assert(badLimitError?.code === 'invalid_manifest',
       `a non-number minimum (${JSON.stringify(badLimit)}) was coerced instead of rejected`);
   }
+
+  // Same rule for every integer limit: the published schema declares
+  // minLength/maxLength/minItems/maxItems/maxEntries as JSON integers, and
+  // `Number()` accepted '5' and true alike -- so validating a manifest against
+  // the schema in an editor or in CI disagreed with the validation that runs.
+  const INTEGER_LIMIT_CASES = [
+    ['minLength', '5'],
+    ['maxLength', true],
+    ['minItems', '0'],
+    ['maxItems', true],
+  ];
+  for (const [field, badValue] of INTEGER_LIMIT_CASES) {
+    const arrayShaped = field === 'minItems' || field === 'maxItems';
+    let coercedError = null;
+    try {
+      await window.NekoMiniGame.connect({
+        id: 'integer-limit-test',
+        version: '1.0.0',
+        requiredCapabilities: ['runtime', 'logging'],
+        contracts: {
+          events: {
+            'limit-probe': arrayShaped
+              ? { type: 'array', items: { type: 'string' }, [field]: badValue }
+              : { type: 'string', [field]: badValue },
+          },
+        },
+      }, { transport });
+    } catch (error) { coercedError = error; }
+    assert(coercedError?.code === 'invalid_manifest',
+      `a coerced ${field} (${JSON.stringify(badValue)}) was accepted instead of rejected`);
+  }
+  let coercedMaxEntriesError = null;
+  try {
+    await window.NekoMiniGame.connect({
+      id: 'integer-maxentries-test',
+      version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'],
+      optionalCapabilities: ['leaderboard-local'],
+      leaderboards: {
+        main: { scoreField: 'score', order: 'descending', maxEntries: '20', retention: 'recent' },
+      },
+    }, { transport });
+  } catch (error) { coercedMaxEntriesError = error; }
+  assert(coercedMaxEntriesError?.code === 'invalid_manifest',
+    'a coerced leaderboard maxEntries was accepted instead of rejected');
 
   // Declared property names are bounded at 64 in the published schema, where
   // JSON Schema counts CODE POINTS. `name.length` charged two per astral
