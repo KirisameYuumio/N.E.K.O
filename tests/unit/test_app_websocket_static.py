@@ -7122,3 +7122,27 @@ def test_credential_resync_action_answers_only_the_exact_live_route():
     assert "websocket," in block and "mgr.websocket" not in block, (
         "the credential resync reply does not go to the requesting socket"
     )
+    # The three identity fields are all readable from the unauthenticated GET
+    # /api/game/route/active, so matching them is not proof of ownership. Two
+    # bounds keep this from being a new capability: the requester must already
+    # BE the character's current socket (a position that receives the credential
+    # on the next `opened` push anyway, plus every other message for that
+    # character), and one reply per socket per route identity so it cannot be
+    # polled.
+    assert 'getattr(session_manager[lanlan_name], "websocket", None)' in block, (
+        "the credential resync answers a socket that does not hold the character, "
+        "so any same-origin page that opened a second socket could harvest it"
+    )
+    assert "is websocket" in block, (
+        "the credential resync does not compare the holder socket by identity"
+    )
+    # Both halves, spelled out: asserting only that the names appear lets either
+    # the check or the record be deleted while the other keeps the name alive.
+    assert "_credential_request_identity not in _credential_socket_served" in block, (
+        "the credential resync does not check whether this socket was already "
+        "answered for this route identity, so it can be polled"
+    )
+    assert "_credential_socket_served.add(_credential_request_identity)" in block, (
+        "the credential resync never records that it answered, so its poll bound "
+        "is inert"
+    )

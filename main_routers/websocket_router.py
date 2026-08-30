@@ -1257,8 +1257,44 @@ async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
                 from utils.game_route_state import _get_active_game_route_state
 
                 _credential_state = _get_active_game_route_state(lanlan_name)
+                # The three identity fields this compares are all readable from
+                # the unauthenticated GET /api/game/route/active, so matching them
+                # is NOT proof that the requester owns the host route. Two further
+                # bounds, and one honest limitation:
+                #
+                #  * the reply goes only to the character's CURRENT socket. That
+                #    does not tell an attacker apart from the reloaded page --
+                #    nothing at this layer can -- but it collapses the
+                #    requirement to "you already hold this character's socket",
+                #    and a socket in that position receives the credential on the
+                #    next `opened` push anyway, along with every other message
+                #    for the character. So this grants nothing that state did
+                #    not already grant.
+                #  * one reply per socket per route identity, so a socket cannot
+                #    poll for it.
+                #
+                # The underlying gap is upstream and predates this action:
+                # POST /api/game/{game_type}/route/start carries no local-mutation
+                # validation and stores whatever 48-hex credential arrives, so a
+                # same-origin page that can POST already owns voice control
+                # outright. Tightening that is the real fix and is tracked
+                # separately.
+                _credential_socket_served = getattr(
+                    websocket, "_neko_credential_resync_served", None,
+                )
+                if _credential_socket_served is None:
+                    _credential_socket_served = set()
+                    websocket._neko_credential_resync_served = _credential_socket_served
+                _credential_request_identity = (
+                    str(message.get("game_type") or ""),
+                    str(message.get("session_id") or ""),
+                    str(message.get("sdk_route_instance_id") or ""),
+                )
                 if (
                     _credential_state is not None
+                    and _credential_request_identity not in _credential_socket_served
+                    and getattr(session_manager[lanlan_name], "websocket", None)
+                    is websocket
                     and str(_credential_state.get("game_type") or "")
                     == str(message.get("game_type") or "")
                     and str(_credential_state.get("session_id") or "")
@@ -1266,6 +1302,7 @@ async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
                     and str(_credential_state.get("_sdk_route_instance_id") or "")
                     == str(message.get("sdk_route_instance_id") or "")
                 ):
+                    _credential_socket_served.add(_credential_request_identity)
                     await _push_game_route_voice_control_credential(
                         websocket,
                         lanlan_name=lanlan_name,
