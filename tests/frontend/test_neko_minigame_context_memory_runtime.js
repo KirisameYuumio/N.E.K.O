@@ -217,6 +217,41 @@ async function main() {
   });
   assert(memoryResponse.ok && host.memoryCalls.length === 1,
     'consented memory submission did not reach the trusted host');
+
+  // The advertised byte limit is measured on the input, but the payload that
+  // actually ships is a clone built from own enumerable properties. Anything
+  // whose two observations disagree used to slip a far larger payload past the
+  // gate. Strings have no length cap of their own inside the clone, so this
+  // byte check is the only thing bounding them.
+  const callsBeforeOversize = host.memoryCalls.length;
+  const hugeString = 'x'.repeat(1024 * 1024);
+  const toJsonDecoy = { summary: hugeString };
+  Object.defineProperty(toJsonDecoy, 'toJSON', {
+    enumerable: false,
+    value: () => ({ summary: 'tiny' }),
+  });
+  let toJsonSizeError = null;
+  try { await game.memory.submit(toJsonDecoy); }
+  catch (error) { toJsonSizeError = error; }
+  assert(toJsonSizeError?.code === 'invalid_request',
+    'a non-enumerable toJSON hid an oversized memory submission from the size limit');
+
+  // Not specific to toJSON: an enumerable getter that answers differently on
+  // the second read does the same thing, so the fix must measure the clone
+  // rather than blocking one serialisation hook.
+  let reads = 0;
+  const driftingDecoy = {};
+  Object.defineProperty(driftingDecoy, 'summary', {
+    enumerable: true,
+    get() { reads += 1; return reads === 1 ? 'tiny' : hugeString; },
+  });
+  let driftSizeError = null;
+  try { await game.memory.submit(driftingDecoy); }
+  catch (error) { driftSizeError = error; }
+  assert(driftSizeError?.code === 'invalid_request',
+    'a drifting getter hid an oversized memory submission from the size limit');
+  assert(host.memoryCalls.length === callsBeforeOversize,
+    'an oversized memory submission still reached the trusted host');
   assert(host.memoryCalls[0].payload.session_id === 'context-memory-session',
     'memory submission did not bind the runtime session');
   assert(host.memoryCalls[0].payload.sdk_route_instance_id === routeInstanceId,

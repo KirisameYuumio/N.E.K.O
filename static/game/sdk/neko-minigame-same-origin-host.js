@@ -2736,7 +2736,15 @@
       const response = await this._post(this._gameEndpoint('end'), body, {
         keepalive: true,
         operation: 'route_end',
-        timeoutMs: 8000,
+        // Honour a caller-supplied deadline, the way every other networked
+        // method here does via `...options`. This one enumerates explicitly on
+        // purpose (so `operation`/`keepalive`/`headers` cannot be overridden),
+        // which silently dropped the `timeoutMs` the SDK does forward and the
+        // .d.ts does advertise. Clamped rather than passed through: end carries
+        // keepalive and is deliberately preserved across dispose, so a game must
+        // not be able to stretch it to minutes. Any invalid value degrades to
+        // exactly today's 8000.
+        timeoutMs: boundedPositiveInteger(options.timeoutMs, 8000, 30000),
         signal: options.signal,
       });
       const data = await response.json().catch(() => ({ ok: response.ok, status: response.status }));

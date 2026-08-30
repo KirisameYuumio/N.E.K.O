@@ -682,7 +682,28 @@
         limit: MAX_CONTRACT_PAYLOAD_BYTES,
       });
     }
-    return validateContractValue(value, schema, fieldName, { nodes: 0 });
+    // Same reason as normalizeBoundedJson: the pre-check measured a projection
+    // of the input, so re-measure what validation actually produced.
+    const validated = validateContractValue(value, schema, fieldName, { nodes: 0 });
+    const validatedBytes = jsonByteLength(validated);
+    if (validatedBytes > MAX_CONTRACT_PAYLOAD_BYTES) {
+      fail('invalid_contract', `${fieldName} exceeds the contract payload size limit`, {
+        bytes: validatedBytes,
+        limit: MAX_CONTRACT_PAYLOAD_BYTES,
+      });
+    }
+    return validated;
+  }
+
+  function jsonByteLength(value) {
+    let serialized;
+    try { serialized = JSON.stringify(value); }
+    catch (_) { return Number.POSITIVE_INFINITY; }
+    if (serialized === undefined) return Number.POSITIVE_INFINITY;
+    const TextEncoderImpl = globalThis.TextEncoder;
+    return typeof TextEncoderImpl === 'function'
+      ? new TextEncoderImpl().encode(serialized).byteLength
+      : unescape(encodeURIComponent(serialized)).length;
   }
 
   function normalizeBoundedJson(value, fieldName, maximumBytes = MAX_CONTRACT_PAYLOAD_BYTES) {
@@ -700,7 +721,25 @@
         limit: maximumBytes,
       });
     }
-    return cloneAdditionalContractValue(value, fieldName, { nodes: 0 }, 0);
+    // Measure the CLONE, not just the input. The pre-check above serialises the
+    // input, which honours toJSON(); the clone walks own enumerable properties
+    // and does not. Any input whose two observations disagree -- a
+    // non-enumerable toJSON returning something small, or an enumerable getter
+    // that returns different values on successive reads -- would otherwise ship
+    // a payload far larger than the advertised limit. Strings carry no length
+    // cap of their own in the clone, so this byte gate is the only bound on
+    // them. Honest inputs are unaffected: everything the clone would alter
+    // (undefined, functions, symbols, non-finite numbers, non-plain objects) it
+    // rejects instead, so its serialisation is byte-identical to the input's.
+    const cloned = cloneAdditionalContractValue(value, fieldName, { nodes: 0 }, 0);
+    const clonedBytes = jsonByteLength(cloned);
+    if (clonedBytes > maximumBytes) {
+      fail('invalid_request', `${fieldName} exceeds its size limit`, {
+        bytes: clonedBytes,
+        limit: maximumBytes,
+      });
+    }
+    return cloned;
   }
 
   function normalizeContextScopes(value) {
@@ -954,7 +993,12 @@
         registeredVersion: version,
       });
     }
-    if (publisherId.length > 64) {
+    // 128, matching what the trusted host actually hands back: both the
+    // bootstrap (neko-minigame-same-origin-bootstrap.js) and the host
+    // (neko-minigame-same-origin-host.js) clamp publisherId to 128, so a
+    // stricter bound here rejects a registration the host already accepted and
+    // fails the handshake on a value the game never chose.
+    if (publisherId.length > 128) {
       fail('invalid_handshake', 'The host publisher identifier is too long');
     }
     return Object.freeze({ mode, gameId, version, publisherId });

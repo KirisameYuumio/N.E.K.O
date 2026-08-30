@@ -47,7 +47,7 @@ async function main() {
         registration: {
           mode: 'registered',
           gameId: request.manifest.id,
-          publisherId: 'test-publisher',
+          publisherId: 'p'.repeat(100),
           version: request.manifest.version,
         },
         grantedCapabilities: [
@@ -184,6 +184,14 @@ async function main() {
           properties: { round: { type: 'integer', minimum: 1, maximum: 99 } },
           required: ['round'],
         },
+        // Each string is capped at 4096 by the schema default, so the byte cap
+        // is only reachable in aggregate -- 256 items x 4096 is 1 MB against a
+        // 256 KB limit. That makes this payload's ONLY bound the byte check.
+        'round-log': {
+          type: 'object',
+          properties: { lines: { type: 'array', items: { type: 'string' } } },
+          required: ['lines'],
+        },
       },
       states: {
         score: {
@@ -233,6 +241,29 @@ async function main() {
   assert(protocolMessages.every((item) => item.envelope.sessionId === 'sdk-test-session'),
     'game protocol messages did not bind the runtime session');
   let invalidEventError = null;
+  // The declared payload cap is measured on the input, but what actually ships
+  // is the validated copy, built from own enumerable properties. A
+  // non-enumerable toJSON returning something small used to hide an oversized
+  // payload from the check -- same shape as the memory.submit case, different
+  // entry point.
+  const emitsBeforeOversize = protocolMessages.length;
+  const bulkLines = Array.from({ length: 256 }, () => 'n'.repeat(4096));
+  const logDecoy = { lines: bulkLines };
+  Object.defineProperty(logDecoy, 'toJSON', {
+    enumerable: false,
+    value: () => ({ lines: ['tiny'] }),
+  });
+  let oversizeContractError = null;
+  try { await game.events.emit('round-log', logDecoy); }
+  catch (error) { oversizeContractError = error; }
+  assert(oversizeContractError?.code === 'invalid_contract',
+    'a non-enumerable toJSON hid an oversized contract payload from the size limit');
+  assert(protocolMessages.length === emitsBeforeOversize,
+    'an oversized contract payload still reached the host');
+  await game.events.emit('round-log', { lines: ['ordinary'] });
+  assert(protocolMessages.length === emitsBeforeOversize + 1,
+    'the size check rejected an honest contract payload');
+
   try { await game.events.emit('round-started', { round: 1, undeclared: true }); }
   catch (error) { invalidEventError = error; }
   assert(invalidEventError?.code === 'invalid_contract',

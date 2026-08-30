@@ -1026,6 +1026,28 @@ async function main() {
   // pregame context must not reach it just because it holds `runtime`.
   // Drive the real transport boundary first: projecting correctly is useless if
   // end() stops calling the projection.
+  // The SDK forwards runtime.end(payload, { timeoutMs }) and the .d.ts
+  // advertises it, but this method enumerates _post options explicitly (so
+  // operation/keepalive/headers cannot be overridden) and used to drop it.
+  const endOptionCalls = [];
+  const realPost = host._post.bind(host);
+  host._post = (url, body, options) => {
+    endOptionCalls.push({ url: String(url), timeoutMs: options?.timeoutMs });
+    return realPost(url, body, options);
+  };
+  await host.end({ session_id: 'server-session' }, { timeoutMs: 1234 });
+  assert(endOptionCalls.some((call) => /\/end$/.test(call.url) && call.timeoutMs === 1234),
+    'runtime end ignored the caller-supplied timeout');
+  endOptionCalls.length = 0;
+  await host.end({ session_id: 'server-session' }, { timeoutMs: 999999 });
+  assert(endOptionCalls.some((call) => /\/end$/.test(call.url) && call.timeoutMs === 30000),
+    'runtime end did not clamp an oversized caller timeout');
+  endOptionCalls.length = 0;
+  await host.end({ session_id: 'server-session' }, { timeoutMs: 'nonsense' });
+  assert(endOptionCalls.some((call) => /\/end$/.test(call.url) && call.timeoutMs === 8000),
+    'an invalid caller timeout did not degrade to the existing default');
+  host._post = realPost;
+
   const endResult = await host.end({ session_id: 'server-session' });
   for (const field of LEAKY_ARCHIVE_FIELDS) {
     assert(!(field in endResult.archive),
