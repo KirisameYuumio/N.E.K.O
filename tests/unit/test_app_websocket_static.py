@@ -7146,3 +7146,17 @@ def test_credential_resync_action_answers_only_the_exact_live_route():
         "the credential resync never records that it answered, so its poll bound "
         "is inert"
     )
+    # Recorded on SUCCESS, not on attempt: the push returns False on a 2s timeout
+    # or a send failure, and marking it served regardless turns "reply once per
+    # socket per route" into "try once" -- one congested send and this page can
+    # never get its credential again for the life of the connection.
+    assert "_credential_pushed = await _push_game_route_voice_control_credential(" in block, (
+        "the credential resync discards the push result, so it cannot tell a "
+        "delivered credential from a failed send"
+    )
+    assert block.index("_credential_pushed = await") < block.index(
+        "_credential_socket_served.add(_credential_request_identity)"
+    ), "the credential resync records 'served' before it knows the push succeeded"
+    assert "if _credential_pushed:" in block, (
+        "the credential resync records 'served' unconditionally"
+    )

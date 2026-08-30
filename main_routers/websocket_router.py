@@ -1302,8 +1302,14 @@ async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
                     and str(_credential_state.get("_sdk_route_instance_id") or "")
                     == str(message.get("sdk_route_instance_id") or "")
                 ):
-                    _credential_socket_served.add(_credential_request_identity)
-                    await _push_game_route_voice_control_credential(
+                    # Recorded on SUCCESS, not on attempt. The push returns False
+                    # on a 2s timeout or a send failure, and marking the identity
+                    # served regardless turned "reply once per socket per route"
+                    # into "try once": one congested send and this page could never
+                    # get its credential again for the life of the connection.
+                    # Recording on success does not reopen polling in any way that
+                    # matters -- a failed push delivered nothing.
+                    _credential_pushed = await _push_game_route_voice_control_credential(
                         websocket,
                         lanlan_name=lanlan_name,
                         game_type=str(_credential_state.get("game_type") or ""),
@@ -1315,6 +1321,8 @@ async def websocket_endpoint(websocket: WebSocket, lanlan_name: str):
                             _credential_state.get("_sdk_voice_control_credential") or ""
                         ),
                     )
+                    if _credential_pushed:
+                        _credential_socket_served.add(_credential_request_identity)
 
             elif action == "ping":
                 # 心跳保活消息，回复pong
