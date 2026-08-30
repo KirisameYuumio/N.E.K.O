@@ -3262,7 +3262,7 @@ def test_jukebox_audio_end_queued_next_respects_request_generation(mock_page: Pa
 
 
 def _single_song_fetch_override() -> str:
-    """只有一首可见歌的曲库：next/previous 必然绕回当前这首。"""
+    """A library with exactly one visible song: next/previous wrap onto it."""
     return """
           window.fetch = async (url, options = {}) => {
             if (options.method === 'HEAD') return { ok: true, status: 200 };
@@ -3286,7 +3286,11 @@ def _single_song_fetch_override() -> str:
 
 @pytest.mark.frontend
 def test_jukebox_control_next_replays_the_only_song_instead_of_stopping(mock_page: Page):
-    """#1：单曲曲库下 next 绕回当前这首，不能停播还报 ok。"""
+    """#1: next/previous on a one-song library must not stop playback.
+
+    They wrap onto the song already playing, which used to fall into playSong's
+    "same song -> stopPlayback()" branch while still reporting ok:true.
+    """
     setup_headless_jukebox_page(mock_page)
 
     result = mock_page.evaluate(
@@ -3336,7 +3340,11 @@ def test_jukebox_control_next_replays_the_only_song_instead_of_stopping(mock_pag
 
 @pytest.mark.frontend
 def test_jukebox_control_volume_scale_does_not_invert_between_one_and_two(mock_page: Page):
-    """#2：value 1 曾经等于满量程、2 只有 2%，比 1 大的请求反而小 50 倍。"""
+    """#2: the 0-1 / 0-100 volume scales must not invert between 1 and 2.
+
+    ``value: 1`` used to mean full scale and ``value: 2`` only 2%, so a larger
+    request produced a 50x smaller volume.
+    """
     setup_headless_jukebox_page(mock_page)
 
     result = mock_page.evaluate(
@@ -3386,7 +3394,7 @@ def test_jukebox_control_volume_scale_does_not_invert_between_one_and_two(mock_p
 
 @pytest.mark.frontend
 def test_jukebox_fuzzy_search_runs_in_a_worker(mock_page: Page):
-    """#3：模糊搜索必须离开主线程；精确/子串命中则不该开线程。"""
+    """#3: fuzzy scoring runs in a worker; a direct hit must not spawn one."""
     setup_headless_jukebox_page(mock_page)
 
     result = mock_page.evaluate(
@@ -3435,10 +3443,10 @@ def test_jukebox_fuzzy_search_runs_in_a_worker(mock_page: Page):
 
 @pytest.mark.frontend
 def test_jukebox_fuzzy_distance_stays_linear_in_candidate_length(mock_page: Page):
-    """#3 的另一半：算法本身不能再是 O(|q|*|t|^2)。
+    """#3, second half: the algorithm itself must stay linear in the candidate.
 
-    评审实测旧实现在 300 首 / 50 字查询 / 120 字候选下要 35.6 s。这里只跑单次
-    最坏形状，给一个宽到不会 flaky、但挡得住二次方回归的上限。
+    The worst case is a query that is not in the library at all, where the old
+    start x length enumeration had no bound to prune against.
     """
     setup_headless_jukebox_page(mock_page)
 
@@ -3476,7 +3484,11 @@ def test_jukebox_fuzzy_distance_stays_linear_in_candidate_length(mock_page: Page
 
 @pytest.mark.frontend
 def test_jukebox_close_preserves_playback_started_on_a_shared_player(mock_page: Page):
-    """#4：复用 music_ui 共享播放器时没有无头宿主，关面板不能顺手停掉 AI 播放。"""
+    """#4: closing the panel must not stop playback started on a shared player.
+
+    Reusing ``music_ui``'s player creates no headless host, which used to make
+    hasHeadlessRuntime() permanently false.
+    """
     setup_headless_jukebox_page(mock_page)
 
     result = mock_page.evaluate(
@@ -3529,7 +3541,11 @@ def test_jukebox_close_preserves_playback_started_on_a_shared_player(mock_page: 
 
 @pytest.mark.frontend
 def test_jukebox_close_preserves_playback_when_panel_opened_first(mock_page: Page):
-    """#4 的另一半：面板先开、AI 借同一个播放器起播，关面板同样不该打断。"""
+    """#4, second half: panel opened first, then the control API reuses its player.
+
+    Closing the panel must adopt the player node into the headless host instead
+    of removing it along with the container.
+    """
     setup_headless_jukebox_page(mock_page)
 
     result = mock_page.evaluate(
@@ -3581,7 +3597,11 @@ def test_jukebox_close_preserves_playback_when_panel_opened_first(mock_page: Pag
 
 @pytest.mark.frontend
 def test_jukebox_runtime_is_memoized_across_commands(mock_page: Page):
-    """#5：ensureRuntime 曾经只是并发锁，每条指令都重拉一次全量 config。"""
+    """#5: ensureRuntime must memoize instead of refetching the whole config.
+
+    It used to be a concurrency guard only, so every command re-downloaded the
+    config and rebuilt State.songs under the rendered rows.
+    """
     setup_headless_jukebox_page(mock_page)
 
     result = mock_page.evaluate(
@@ -3618,7 +3638,11 @@ def test_jukebox_runtime_is_memoized_across_commands(mock_page: Page):
 
 @pytest.mark.frontend
 def test_jukebox_volume_slider_updates_before_the_player_exists(mock_page: Page):
-    """#6：面板建好到 initPlayer 之间有 100 ms 窗口，这期间拖滑条要有反馈。"""
+    """#6: the volume slider must give feedback before the player exists.
+
+    buildUI() is synchronous while initPlayer() runs behind a 100 ms timeout;
+    dragging inside that window used to leave the percentage label stale.
+    """
     setup_headless_jukebox_page(mock_page)
 
     result = mock_page.evaluate(
