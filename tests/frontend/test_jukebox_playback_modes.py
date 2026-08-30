@@ -3442,29 +3442,35 @@ def test_jukebox_fuzzy_distance_stays_linear_in_candidate_length(mock_page: Page
     """
     setup_headless_jukebox_page(mock_page)
 
-    elapsed_ms = mock_page.evaluate(
+    measured = mock_page.evaluate(
         """
         () => {
           const J = window.Jukebox;
-          const alphabet = 'abcdefghij0123';
-          const make = (n) => {
+          const make = (n, alphabet) => {
             let s = '';
             for (let i = 0; i < n; i += 1) s += alphabet[(i * 7 + 3) % alphabet.length];
             return s;
           };
-          const query = make(50);
-          const target = make(120) + 'zz' + make(120);
+          // 最坏情况是「查一首曲库里没有的歌」：字符集不相交，一个近似窗口都命
+          // 不中，旧实现的 start x length 枚举全程没有可剪枝的上界。
+          const query = make(50, 'abcdefghij');
+          const target = make(120, '0123456789') + make(120, '0123456789');
           const started = performance.now();
-          for (let i = 0; i < 200; i += 1) {
-            J.getBestFuzzyDistance(query, target);
+          let result = 0;
+          for (let i = 0; i < 20; i += 1) {
+            result = J.getBestFuzzyDistance(query, target);
           }
-          return performance.now() - started;
+          return { elapsed: performance.now() - started, result: result === Infinity ? 'inf' : result };
         }
         """
     )
 
-    # 旧实现单次就要几十 ms 到几秒；200 次线性实现在 1 s 内绰绰有余。
-    assert elapsed_ms < 1000, f"模糊匹配 200 次耗时 {elapsed_ms:.0f} ms，疑似退回二次方实现"
+    # 这个形状下必须判定为不匹配 —— 先确认量的确实是「未命中」这条最坏路径。
+    assert measured["result"] == "inf"
+    # 同一形状实测：旧的双层枚举 20 次要 13 s，线性实现 20 次不到 10 ms。
+    assert measured["elapsed"] < 1000, (
+        f"模糊匹配 20 次耗时 {measured['elapsed']:.0f} ms，疑似退回二次方实现"
+    )
 
 
 @pytest.mark.frontend
