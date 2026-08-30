@@ -432,6 +432,58 @@ async def test_route_start_retires_the_generations_its_retry_left_behind(monkeyp
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_route_start_absorbs_its_locale_only_after_it_wins(monkeypatch):
+    """A start that gets retired must not have moved the session language.
+
+    ``_resolve_game_prompt_locale`` writes ``mgr.user_language`` as a side
+    effect, and it used to run before the tombstone check and before the
+    supersede scan. A delayed original start carrying an older locale therefore
+    re-rendered the live route in that locale on its way to being rejected --
+    the same shape as the silent preload writing the shared render language.
+    """
+    mgr = _LocaleTrackingManager(language="en")
+    _gr_patch_all(monkeypatch, "get_session_manager", lambda: {"Lan": mgr})
+
+    async def fake_pregame_context(**kwargs):
+        return gr_pregame._default_soccer_pregame_context(), "lightweight", ""
+
+    _gr_patch_all(monkeypatch, "_build_soccer_pregame_context", fake_pregame_context)
+
+    with reset_game_route_state():
+        gr_runtime._remember_game_route_end_before_start(
+            "Lan", "soccer", "retired-session", "route-A",
+        )
+        retired = await gr_runtime.game_route_start(
+            "soccer",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "retired-session",
+                "sdk_route_instance_id": "route-A",
+                "i18n_language": "ja",
+            }),
+        )
+
+        assert retired["reason"] == "ended_before_start"
+        assert mgr.language_updates == []
+        assert mgr.user_language == "en"
+
+        # And the winning start still absorbs, so nothing regressed for the
+        # normal path this side effect exists for.
+        accepted = await gr_runtime.game_route_start(
+            "soccer",
+            _FakeRequest({
+                "lanlan_name": "Lan",
+                "session_id": "live-session",
+                "i18n_language": "ja",
+            }),
+        )
+
+        assert accepted["ok"] is True
+        assert mgr.language_updates == ["ja"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_route_start_without_sdk_generations_leaves_no_tombstone(monkeypatch):
     """An ID-less legacy start must not tombstone its own session.
 

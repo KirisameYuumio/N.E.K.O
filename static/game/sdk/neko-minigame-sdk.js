@@ -675,7 +675,15 @@
       ) {
         fail('invalid_contract', `${fieldName} contains an invalid field`, { key });
       }
-      const propertySchema = schema.properties[key];
+      // Own properties only. `schema.properties` is a plain object, so a
+      // payload key named `toString` / `valueOf` / `hasOwnProperty` used to
+      // resolve to the inherited Object.prototype method -- truthy, so it
+      // was treated as a declared schema, and `additionalProperties: true`
+      // never got its chance. The value then failed against an `undefined`
+      // declared type with a message naming a schema nobody wrote.
+      const propertySchema = Object.prototype.hasOwnProperty.call(schema.properties, key)
+        ? schema.properties[key]
+        : undefined;
       if (!propertySchema) {
         if (!schema.additionalProperties) {
           fail('invalid_contract', `${fieldName} contains an undeclared field`, { field: key });

@@ -197,6 +197,12 @@ async function main() {
           properties: { tag: { type: 'string', minLength: 1, maxLength: 4 } },
           required: ['tag'],
         },
+        'round-extra': {
+          type: 'object',
+          properties: { round: { type: 'integer', minimum: 0, maximum: 99 } },
+          required: ['round'],
+          additionalProperties: true,
+        },
       },
       states: {
         score: {
@@ -303,6 +309,31 @@ async function main() {
   catch (error) { tooLongTagError = error; }
   assert(tooLongTagError?.code === 'invalid_contract',
     'a string past its declared code-point maximum was accepted');
+
+  // `schema.properties` is a plain object, so an undeclared payload key named
+  // after an Object.prototype member used to resolve to the inherited method --
+  // truthy, so it was treated as a declared schema and `additionalProperties:
+  // true` never applied. The value then failed against an `undefined` declared
+  // type, with a message naming a schema nobody wrote.
+  const emitsBeforeInherited = protocolMessages.length;
+  await game.events.emit('round-extra', {
+    round: 3,
+    toString: 'label',
+    valueOf: 7,
+    hasOwnProperty: true,
+  });
+  assert(protocolMessages.length === emitsBeforeInherited + 1,
+    'an undeclared key named after an Object.prototype member bypassed additionalProperties');
+  const inheritedPayload = protocolMessages.at(-1).envelope.payload;
+  assert(inheritedPayload.toString === 'label' && inheritedPayload.valueOf === 7
+    && inheritedPayload.hasOwnProperty === true,
+  'inherited-name payload fields were not carried through');
+  // The reserved clone names stay rejected -- this loosens nothing.
+  let reservedKeyError = null;
+  try { await game.events.emit('round-extra', { round: 3, constructor: 'x' }); }
+  catch (error) { reservedKeyError = error; }
+  assert(reservedKeyError?.code === 'invalid_contract',
+    'a clone-reserved payload key was accepted under additionalProperties');
 
   const controls = [];
   const controlErrors = [];

@@ -1878,7 +1878,14 @@ async def game_route_start(game_type: str, request: Request):
         return {"ok": False, "reason": "missing_lanlan_name"}
     # route/start 是有效的新路由入口；解析 prompt locale 时会同步请求中的
     # 显式偏好，并按 session explicit > render fallback 选择本局模板语言。
-    request_prompt_language_full = _resolve_game_prompt_locale(lanlan_name, data)
+    # Pure read here: this request can still be retired as a stale generation
+    # (tombstone -> ended_before_start) or lose the supersede race, and
+    # writing the session language before that decision lets a delayed start
+    # carrying an older locale re-render the live route in it. Absorbed
+    # below, once this start owns the slot.
+    request_prompt_language_full = _resolve_game_prompt_locale(
+        lanlan_name, data, absorb_request_language=False,
+    )
 
     session_id = str(data.get("session_id") or "default")
     route_instance_ids = _sdk_route_instance_ids(data)
@@ -2013,6 +2020,9 @@ async def game_route_start(game_type: str, request: Request):
             ).strip()
             if _SDK_VOICE_CONTROL_CREDENTIAL_PATTERN.fullmatch(voice_control_credential):
                 state["_sdk_voice_control_credential"] = voice_control_credential
+            # This start now owns the slot, so its locale is finally safe to
+            # write onto the shared session (see the pure read at the top).
+            _absorb_request_language(data, lanlan_name)
             _update_game_route_language_from_payload(state, data)
             # Take over the SessionManager: ordinary chat LLM output handlers must
             # stay silent during the game, and any voice transcript that reaches
