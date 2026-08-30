@@ -1050,6 +1050,77 @@ async function main() {
   assert(new Set(collisionStarts).size === 4,
     `separate SDK clients minted colliding route generations: ${JSON.stringify(collisionStarts)}`);
 
+  // The backend deletes a drained batch at response-construction time, so one
+  // output that `publishRuntimeEvent` cannot represent used to take every
+  // remaining output in that batch with it -- the payload validation runs BEFORE
+  // the per-handler try/catch and THROWS. The host feeds this from the game's own
+  // state snapshot, which the backend never bounds, so it is a deterministic
+  // every-poll failure rather than a rare one.
+  const isolationEnvironment = createEnvironment();
+  const isolationOutputs = [
+    { type: 'game_llm_result', text: 'first' },
+    { type: 'game_llm_result', blob: 'y'.repeat(300 * 1024) },
+    { type: 'game_llm_result', text: 'third' },
+  ];
+  const isolationGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-output-isolation',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: {
+      ...transport,
+      logger: logger(),
+      async drain(payload) {
+        return { ok: true, outputs: isolationOutputs.map((item) => ({ ...item })), payload };
+      },
+    },
+    windowImpl: isolationEnvironment.windowImpl,
+    documentImpl: isolationEnvironment.documentImpl,
+  });
+  isolationGame.runtime.configure({ heartbeat: false, outputs: { intervalMs: 700 }, pageExit: false });
+  await isolationGame.runtime.start({ mode: 'isolation' });
+  // start() kicks an initial poll; let it settle or pollOutputs() returns null.
+  for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+  const isolationDelivered = [];
+  isolationGame.events.on('runtime-output', (event) => isolationDelivered.push(event.payload.text));
+  const isolationPoll = await isolationGame.runtime.pollOutputs();
+  assert(isolationPoll !== null, 'the isolation probe never drained');
+  assert(isolationDelivered.join(',') === 'first,third',
+    `one unrepresentable output took the rest of the batch with it: ${JSON.stringify(isolationDelivered)}`);
+  assert(isolationEnvironment.consoleErrors.some((args) => (
+    String(args[0]).includes('runtime-output could not be published')
+  )), 'an output that could not be published was dropped silently');
+  isolationGame.dispose();
+
+  // A generation-mismatch heartbeat is a REJECTED request that still carries
+  // authoritative news: another client superseded this route while keeping the
+  // same session_id. Skipping it left this client locally `running` forever.
+  const mismatchEnvironment = createEnvironment();
+  const mismatchGame = await window.NekoMiniGame.connect({
+    id: 'lifecycle-generation-mismatch',
+    version: '1.0.0',
+    requiredCapabilities: ['runtime', 'logging'],
+  }, {
+    transport: {
+      ...transport,
+      logger: logger(),
+      async heartbeat() {
+        return { ok: false, active: false, reason: 'route_instance_id_mismatch' };
+      },
+    },
+    windowImpl: mismatchEnvironment.windowImpl,
+    documentImpl: mismatchEnvironment.documentImpl,
+  });
+  mismatchGame.runtime.configure({ heartbeat: { intervalMs: 2500 }, outputs: false, pageExit: false });
+  await mismatchGame.runtime.start({ mode: 'mismatch' });
+  // Asserted before the flush: start() establishes the route, and the managed
+  // lifecycle's first heartbeat is what carries the supersede news.
+  assert(mismatchGame.runtime.state === 'running', 'the mismatch probe did not start running');
+  for (let tick = 0; tick < 20; tick += 1) await Promise.resolve();
+  assert(mismatchGame.runtime.state === 'inactive',
+    `a superseded generation left the client running: ${mismatchGame.runtime.state}`);
+  mismatchGame.dispose();
+
   process.stdout.write('mini-game lifecycle runtime test passed\n');
 }
 

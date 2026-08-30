@@ -41,6 +41,8 @@
   // keepalive too. A body past this threshold makes fetch reject before the
   // request leaves the page, so leave headroom rather than sitting on the cap.
   const KEEPALIVE_BODY_BYTES = 60 * 1024;
+  // Cumulative budget for one log payload's `details`, across the whole walk.
+  const LOG_DETAILS_MAX_CHARS = 32 * 1024;
   const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
   const DEFAULT_PENDING_REQUEST_LIMIT = 64;
   const DEFAULT_PROTOCOL_QUEUE_LIMIT = 64;
@@ -2169,15 +2171,33 @@
       }
     }
 
-    _safeLogValue(value, depth = 0, preserve = false) {
+    _safeLogValue(value, depth = 0, preserve = false, budget = null) {
       if (preserve) return value;
+      // Per-leaf truncation alone does not bound the RESULT: three object levels
+      // of 30 keys each keeps 27,000 leaves of up to 1,200 characters, i.e. tens
+      // of megabytes -- and the send queue holds up to 256 bodies. Carry one
+      // cumulative character budget across the whole walk so the shape of the
+      // input cannot multiply its way past the per-leaf caps.
+      const account = budget || { remaining: LOG_DETAILS_MAX_CHARS };
+      const spend = (text) => {
+        const bounded = text.length > account.remaining
+          ? `${text.slice(0, Math.max(0, account.remaining))}...<truncated>`
+          : text;
+        account.remaining = Math.max(0, account.remaining - text.length);
+        return bounded;
+      };
       if (value == null || typeof value === 'boolean' || typeof value === 'number') return value;
       if (typeof value === 'string') {
-        return value.length > 1200 ? `${value.slice(0, 1200)}...<truncated>` : value;
+        return spend(value.length > 1200 ? `${value.slice(0, 1200)}...<truncated>` : value);
       }
-      if (depth >= 3) return String(value).slice(0, 240);
+      if (depth >= 3) return spend(String(value).slice(0, 240));
+      if (account.remaining <= 0) return '...<truncated>';
       if (Array.isArray(value)) {
-        const result = value.slice(0, 20).map((item) => this._safeLogValue(item, depth + 1));
+        const result = [];
+        for (const item of value.slice(0, 20)) {
+          if (account.remaining <= 0) { result.push('...<truncated>'); break; }
+          result.push(this._safeLogValue(item, depth + 1, false, account));
+        }
         if (value.length > 20) result.push({ _truncated: `+${value.length - 20} items` });
         return result;
       }
@@ -2185,12 +2205,15 @@
         const result = {};
         const keys = Object.keys(value);
         for (const key of keys.slice(0, 30)) {
-          result[key] = this._safeLogValue(value[key], depth + 1);
+          if (account.remaining <= 0) { result._truncated = 'budget'; break; }
+          // Keys carry characters too, and a payload can be all keys.
+          account.remaining = Math.max(0, account.remaining - key.length);
+          result[key] = this._safeLogValue(value[key], depth + 1, false, account);
         }
         if (keys.length > 30) result._truncated = `+${keys.length - 30} keys`;
         return result;
       }
-      return String(value).slice(0, 1200);
+      return spend(String(value).slice(0, 1200));
     }
 
     log(level, category, event, message, details = {}, sensitivePossible = false, options = {}) {
@@ -2776,23 +2799,42 @@
           operation: 'route_end',
         });
       }
-      const body = JSON.stringify(this._trustedRuntimePayload(parsedPayload));
+      let body = JSON.stringify(this._trustedRuntimePayload(parsedPayload));
       void this.flushLogger({ final: true });
       if (options.signal?.aborted) {
         throw this._hostError('cancelled', `${this.displayName} host request was cancelled`, {
           operation: 'route_end',
         });
       }
-      if (options.useBeacon && this._navigator.sendBeacon) {
+      const sendEndBeacon = () => {
+        if (!options.useBeacon || !this._navigator.sendBeacon) return false;
         try {
-          const accepted = this._navigator.sendBeacon(
+          return this._navigator.sendBeacon(
             this._gameEndpoint('end'),
             new Blob([body], { type: 'application/json' }),
-          );
-          if (accepted) return { ok: true, beacon: true };
+          ) === true;
         } catch (error) {
           options.onBeaconError?.(error);
+          return false;
         }
+      };
+      if (sendEndBeacon()) return { ok: true, beacon: true };
+      if (options.useBeacon && utf8ByteLength(body) > KEEPALIVE_BODY_BYTES) {
+        // On unload, keepalive is the only delivery with any chance at all, so
+        // shed the CALLER's payload rather than the delivery guarantee. What the
+        // backend needs to finalize the route -- identity, generation, reason --
+        // is tiny; what makes the body oversized is game-supplied. Losing that is
+        // strictly better than losing route cleanup and postgame until the
+        // heartbeat sweep expires the route.
+        const essential = {};
+        for (const key of [
+          'reason', 'session_id', 'lanlan_name',
+          'sdk_route_instance_id', 'sdk_route_instance_ids',
+        ]) {
+          if (parsedPayload[key] !== undefined) essential[key] = parsedPayload[key];
+        }
+        body = JSON.stringify(this._trustedRuntimePayload(essential));
+        if (sendEndBeacon()) return { ok: true, beacon: true, truncated: true };
       }
       // Keepalive only while the body fits the shared quota. Past it, fetch
       // rejects before the request is sent, which turned an oversized-but-valid
@@ -2803,7 +2845,12 @@
       // nothing on the awaited path and is strictly better than certain failure
       // on the unload path.
       const response = await this._post(this._gameEndpoint('end'), body, {
-        keepalive: utf8ByteLength(body) <= KEEPALIVE_BODY_BYTES,
+        // Page-exit keeps keepalive unconditionally: the body was already shed
+        // above if it was oversized, and without keepalive an unloading document
+        // cancels the request outright. The awaited path drops keepalive instead,
+        // where the caller is still there to see the result and an oversized body
+        // would otherwise reject before leaving the page.
+        keepalive: options.useBeacon || utf8ByteLength(body) <= KEEPALIVE_BODY_BYTES,
         operation: 'route_end',
         // Honour a caller-supplied deadline, the way every other networked
         // method here does via `...options`. This one enumerates explicitly on

@@ -1059,6 +1059,33 @@ async function main() {
   assert(capturedLogPayloads.length === 1 && capturedLogPayloads[0].message.length === 4096,
     'an oversized console message was queued verbatim');
 
+  // Per-leaf truncation does not bound the RESULT: three object levels of 30
+  // keys each keeps 27,000 leaves of up to 1,200 characters. One cumulative
+  // budget across the whole walk is what actually bounds the body.
+  const wideDetails = {};
+  for (let outer = 0; outer < 30; outer += 1) {
+    const level2 = {};
+    for (let middle = 0; middle < 30; middle += 1) {
+      const level3 = {};
+      for (let inner = 0; inner < 30; inner += 1) {
+        level3[`k${inner}`] = 'z'.repeat(1200);
+      }
+      level2[`m${middle}`] = level3;
+    }
+    wideDetails[`o${outer}`] = level2;
+  }
+  const wideLogPayloads = [];
+  const realWideRecord = loggerHostOne._recordOrSendLogPayload.bind(loggerHostOne);
+  loggerHostOne._recordOrSendLogPayload = (payload) => { wideLogPayloads.push(payload); };
+  loggerHostOne._logger.enabled = true;
+  loggerHostOne.log('warning', 'frontend', 'wide_details', 'wide', wideDetails);
+  loggerHostOne._logger.enabled = false;
+  loggerHostOne._recordOrSendLogPayload = realWideRecord;
+  assert(wideLogPayloads.length === 1, 'the wide-details probe did not queue a payload');
+  const wideDetailsChars = JSON.stringify(wideLogPayloads[0].details).length;
+  assert(wideDetailsChars < 200 * 1024,
+    `nested log details were not bounded in aggregate: ${wideDetailsChars} chars`);
+
   loggerHostOne.dispose();
   windowMock.console.warn('capture remains after first dispose');
   windowMock.console.error('capture remains after first dispose');
@@ -1305,6 +1332,50 @@ async function main() {
   }
   assert(generatedSessionIds.size === 8,
     `same-millisecond hosts minted colliding session ids: ${JSON.stringify(probeIds)}`);
+
+  // On unload, keepalive is the only delivery with any chance, so an oversized
+  // page-exit body must shed the CALLER's payload rather than the delivery
+  // guarantee -- dropping keepalive there lets the unloading document cancel the
+  // request outright, and route cleanup plus postgame are lost until expiry.
+  const exitHost = createHost({
+    gameType: 'example-game',
+    sessionId: 'page-exit-session',
+    fetchImpl,
+    windowImpl: windowMock,
+    navigatorImpl: { ...windowMock.navigator, sendBeacon: () => false },
+  });
+  exitHost.connectGame({
+    protocolVersions: ['1'],
+    manifest: {
+      id: 'example-game', version: '1.0.0',
+      requiredCapabilities: ['runtime', 'logging'], optionalCapabilities: [],
+    },
+  });
+  await exitHost.end(
+    { reason: 'pagehide', bulk: 'x'.repeat(100 * 1024) },
+    { useBeacon: true },
+  );
+  const exitCall = calls.filter((call) => /\/end$/.test(call.url)).at(-1);
+  assert(exitCall.init.keepalive === true,
+    'an oversized page-exit end lost its keepalive guarantee');
+  assert(exitCall.body.reason === 'pagehide',
+    'the shed page-exit payload dropped the reason the backend finalizes on');
+  assert(exitCall.body.bulk === undefined,
+    'the oversized caller payload was not shed from the page-exit body');
+  assert(exitCall.init.body.length < 60 * 1024,
+    'the page-exit body still exceeds the keepalive quota after shedding');
+  // And when the oversized content is in a field shedding KEEPS (the backend
+  // finalizes on `reason`), page exit still must not fall back to a request the
+  // unloading document can cancel. Shedding is best-effort; keepalive on the
+  // unload path is not conditional on it.
+  await exitHost.end(
+    { reason: `pagehide-${'r'.repeat(100 * 1024)}` },
+    { useBeacon: true },
+  );
+  const unshrinkableExitCall = calls.filter((call) => /\/end$/.test(call.url)).at(-1);
+  assert(unshrinkableExitCall.init.keepalive === true,
+    'a page-exit end whose oversized content survives shedding lost keepalive');
+  exitHost.dispose();
 
   process.stdout.write('mini-game same-origin host runtime test passed\n');
 }

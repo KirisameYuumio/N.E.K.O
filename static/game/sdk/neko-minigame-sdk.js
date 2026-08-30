@@ -2444,7 +2444,22 @@
           heartbeatLifecycle.failures = 0;
           return response;
         }
-        if (response.ok && data.ok !== false && data.active === false) {
+        // A generation-mismatch heartbeat is a REJECTED request that still
+        // carries authoritative news: another client superseded this route while
+        // keeping the same session_id, so the backend answers
+        // {ok:false, active:false, reason:'route_instance_id_mismatch'}. The
+        // `data.ok !== false` condition below would skip it, leaving this client
+        // locally `running` forever -- still polling, with every route-bound
+        // capability failing its generation check and nothing ever telling the
+        // game why.
+        // Deliberately independent of the HTTP framing: the trusted host returns
+        // a Response (so `response.ok` is the 200) while a plain-object transport
+        // returns the body itself (so `response.ok` mirrors `data.ok`). The
+        // authoritative signal is the same in both -- the backend says this
+        // generation is gone.
+        const routeGenerationRetired = data.active === false
+          && String(data.reason || '') === 'route_instance_id_mismatch';
+        if (data.active === false && (routeGenerationRetired || (response.ok && data.ok !== false))) {
           heartbeatLifecycle.failures = 0;
           runtimeRouteEstablished = false;
           // Retire the generation with the route. Capabilities that are allowed
@@ -2512,7 +2527,22 @@
         const outputs = Array.isArray(response.data?.outputs) ? response.data.outputs : [];
         for (const output of outputs) {
           if (disposed || outputLifecycle.controller !== controller) break;
-          await publishRuntimeEvent('runtime-output', output, { waitForHandlers: true });
+          // Per output, deliberately. `publishRuntimeEvent` validates the payload
+          // (node count, array/field width, depth, serialized bytes) BEFORE it
+          // reaches its per-handler try/catch, and a failure there THROWS. The
+          // backend deletes a drained batch at response-construction time, so one
+          // unrepresentable output used to take every remaining output in that
+          // batch with it -- permanently, and with nothing logged. The host feeds
+          // this from the game's own state snapshot, which the backend never
+          // bounds, so it is a deterministic every-poll failure rather than a
+          // rare one.
+          try {
+            await publishRuntimeEvent('runtime-output', output, { waitForHandlers: true });
+          } catch (outputError) {
+            windowImpl.console?.error?.(
+              '[NekoMiniGame] runtime-output could not be published', outputError,
+            );
+          }
         }
         if (disposed || outputLifecycle.controller !== controller) return response;
         if (!response.ok || response.data?.ok === false) {
