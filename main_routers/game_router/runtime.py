@@ -664,6 +664,23 @@ def _character_route_owned_by_another_game(lanlan_name: str, game_type: str) -> 
     whole time another game owns the character. Callers that emit to the user
     must ask this question too, or a second surface's generation-free line lands
     on the owner's stream.
+
+    NOT A SECURITY BOUNDARY, despite how the call sites read
+    (``foreign_route_owner``, ``route_owned_by_other_game``). The "ownership" it
+    consults is self-asserted: the caller supplies ``lanlan_name`` and the
+    ``game_type`` path segment, and anything that can reach this router can take
+    a character's route outright by POSTing ``/route/start``, which carries no
+    local-mutation validation -- after which this returns False for it and True
+    for the real game. It guards ACCIDENTS: two surfaces open on one character,
+    the second falling back to local play after its own start failed. The
+    same-origin adapter is documented as a delivery mechanism rather than an
+    isolation boundary (``static/game/sdk/README.md``), and that is the model
+    this belongs to.
+
+    Its cost is real and deliberate: a route whose window closed without
+    ``/route/end`` keeps its slot for the heartbeat grace period, so a game
+    opened during that window has its opening lines refused. The refusal is
+    visible to the caller (``ok: false`` plus a reason), never silent.
     """
     if not lanlan_name:
         return False
