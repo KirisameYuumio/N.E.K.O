@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 194,
+        "keyCount": 196,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -2460,10 +2460,12 @@ def test_jukebox_execute_control_stop_discards_pending_play(mock_page: Page):
     )
 
     assert result == {
+        # stop 现在推进的是独立的取消世代，这条 play 在预检之前就被判定为
+        # 「已取消」——比原来的 play_superseded 更准，也省掉一次 HEAD 预检。
         "play": {
             "ok": False,
             "action": "play",
-            "message": "play_superseded",
+            "message": "play_cancelled",
             "song": {"id": "song1", "name": "Song 1", "artist": "A"},
         },
         "stop": {"ok": True, "action": "stop"},
@@ -4878,3 +4880,73 @@ def test_jukebox_player_adopts_the_volume_set_before_it_existed(mock_page: Page)
     assert result["playerVolume"] == 0.4
     assert result["slider"] == "0.4"
     assert result["label"] == "40%"
+
+
+@pytest.mark.frontend
+def test_jukebox_stop_cancels_a_play_still_inside_its_awaits(mock_page: Page):
+    """Codex + Greptile, same defect: the cancel was overtaken by the play itself.
+
+    cancelActivePlayback only advanced playRequestId, and executePlayControl's
+    first statement is ``++playRequestId`` — so a play that had not yet
+    allocated its generation minted straight past the cancel and started audio
+    after the stop had completed.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          const sample = async (action, query) => {
+            // 让这条指令卡在 ensureRuntime 里（play 还没轮到分配播放世代）。
+            let release;
+            const gate = new Promise(resolve => { release = resolve; });
+            const originalEnsure = J.ensureRuntime;
+            J.ensureRuntime = async function(options) {
+              await gate;
+              return originalEnsure.call(this, options);
+            };
+
+            const player = J.getPlayer();
+            player.played = false;
+            const pending = J.executeControl({ action, query, headless: true });
+            await new Promise(resolve => setTimeout(resolve, 10));
+
+            // 卡住期间用户说「停」。
+            const stopped = await J.executeControl({ action: 'stop', headless: true });
+            release();
+            const outcome = await pending;
+            J.ensureRuntime = originalEnsure;
+            await new Promise(resolve => setTimeout(resolve, 20));
+
+            return {
+              stopOk: stopped.ok,
+              ok: outcome.ok,
+              message: outcome.message || null,
+              startedAudio: player.played === true,
+              isPlaying: J.State.isPlaying,
+              currentSong: J.State.currentSong && J.State.currentSong.id
+            };
+          };
+
+          const play = await sample('play', 'Song 1');
+          // 先放一首，好让 next 有个当前曲目
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          const next = await sample('next', '');
+
+          return { play, next };
+        }
+        """
+    )
+
+    for label in ("play", "next"):
+        outcome = result[label]
+        assert outcome["stopOk"] is True, label
+        assert outcome["ok"] is False, label
+        assert outcome["message"] == "play_cancelled", label
+        # 关键：stop 之后不许再有声音起来。
+        assert outcome["startedAudio"] is False, label
+        assert outcome["isPlaying"] is False, label
+        assert outcome["currentSong"] is None, label

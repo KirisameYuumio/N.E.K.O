@@ -519,6 +519,9 @@ Object.assign(window.Jukebox, {
     const normalizedAction = String(command.action || '').trim().toLowerCase();
     // 用户可能在这条指令的任何一个 await 里把点歌台整个拆掉。
     const epoch = Jukebox.State.teardownEpoch;
+    // 取消世代要在**进入函数时**就取快照：本条指令后面的每一个 await
+    // （ensureRuntime、曲目检索、曲库刷新）都可能跨过一次 stop。
+    const cancelEpoch = Jukebox.State.playCancelEpoch;
 
     if (!Jukebox.supportedControlActions.includes(normalizedAction)) {
       return {
@@ -529,6 +532,9 @@ Object.assign(window.Jukebox, {
     }
 
     if (normalizedAction === 'stop') {
+      // 拥有者一侧的 stop 直接走到这里（没有前置的 cancelActivePlayback），
+      // 所以取消世代必须在这里也推进，否则那边的 stop 拦不住在途的 play。
+      Jukebox.State.playCancelEpoch += 1;
       Jukebox.State.playRequestId += 1;
       Jukebox.stopPlayback();
       return { ok: true, action: 'stop' };
@@ -552,6 +558,8 @@ Object.assign(window.Jukebox, {
 
     await Jukebox.ensureRuntime({ headless: command.headless !== false });
     if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult(normalizedAction);
+    // 初始化期间来过 stop：不要再往下起播（预检的 HEAD 请求也一并省了）。
+    if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) return Jukebox.cancelledResult(normalizedAction);
 
     if (normalizedAction === 'next' || normalizedAction === 'previous') {
       const direction = normalizedAction === 'previous' ? -1 : 1;
@@ -565,7 +573,11 @@ Object.assign(window.Jukebox, {
           message: normalizedAction === 'previous' ? 'no_previous_song' : 'no_next_song'
         };
       }
-      return Jukebox.executePlayControl(normalizedAction, adjacentSong, { fromQueue: Jukebox.State.playbackMode === 'random' });
+      return Jukebox.executePlayControl(normalizedAction, adjacentSong, {
+        fromQueue: Jukebox.State.playbackMode === 'random',
+        epoch,
+        cancelEpoch
+      });
     }
 
     let song = await Jukebox.findSongForQuery(command.query || '');
@@ -578,11 +590,13 @@ Object.assign(window.Jukebox, {
       song = await Jukebox.findSongForQuery(command.query || '');
     }
     if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult('play');
+    // 检索/刷新期间来过 stop。
+    if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) return Jukebox.cancelledResult('play');
     if (!song) {
       return { ok: false, action: 'play', message: 'song_not_found' };
     }
 
-    return Jukebox.executePlayControl('play', song, { epoch });
+    return Jukebox.executePlayControl('play', song, { epoch, cancelEpoch });
   },
 
   // 0-1 和 0-100 两套量纲共存时，判据不能是「是否大于 1」：那样 value:1 会被
@@ -706,8 +720,21 @@ Object.assign(window.Jukebox, {
   // 就地作废在途播放：推进世代让卡在 await 里的 play 在下一个检查处解开，
   // 同时把已经响起来的声音立刻停掉。stop 指令本身仍会按顺序再执行一次（幂等）。
   cancelActivePlayback: function() {
+    Jukebox.State.playCancelEpoch += 1;
     Jukebox.State.playRequestId += 1;
     Jukebox.stopPlayback();
+  },
+
+  isPlayCancelEpochCurrent: function(cancelEpoch) {
+    return cancelEpoch === Jukebox.State.playCancelEpoch;
+  },
+
+  cancelledResult: function(action, song) {
+    const result = { ok: false, action, message: 'play_cancelled' };
+    // 与 play_superseded 的形状保持一致：拿得到歌就带上，调用方（前端日志、
+    // 插件返回值）不必为这两种同类结局分开处理。
+    if (song) result.song = Jukebox.formatControlSong(song);
+    return result;
   },
 
   tornDownResult: function(action) {
@@ -716,9 +743,16 @@ Object.assign(window.Jukebox, {
 
   executePlayControl: async function(action, song, playOptions = {}) {
     const epoch = Number.isInteger(playOptions.epoch) ? playOptions.epoch : Jukebox.State.teardownEpoch;
+    const cancelEpoch = Number.isInteger(playOptions.cancelEpoch)
+      ? playOptions.cancelEpoch
+      : Jukebox.State.playCancelEpoch;
+    // 必须在 ++playRequestId 之前查：那一句会把取消推进的世代盖过去，之后
+    // 的等值检查就成了自己跟自己比，取消形同没发生。
+    if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) return Jukebox.cancelledResult(action, song);
     const requestId = ++Jukebox.State.playRequestId;
     const preflight = await Jukebox.preflightSongPlayback(song);
     if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult(action);
+    if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) return Jukebox.cancelledResult(action, song);
     if (requestId !== Jukebox.State.playRequestId) {
       return {
         ok: false,
@@ -751,6 +785,11 @@ Object.assign(window.Jukebox, {
       // 起播过程中点歌台被拆了：停掉刚起来的声音，别留下一个没人管的播放器。
       Jukebox.stopPlayback();
       return Jukebox.tornDownResult(action);
+    }
+    if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) {
+      // 起播过程中来过 stop：同样要把刚响起来的声音停掉。
+      Jukebox.stopPlayback();
+      return Jukebox.cancelledResult(action, song);
     }
     if (!playedSong) {
       return {
