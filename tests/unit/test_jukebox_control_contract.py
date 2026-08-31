@@ -769,3 +769,50 @@ def test_jukebox_stop_cancels_on_the_owner_when_one_is_present():
     assert payload["withOwner"] == ["owner-cancel", "forward:stop"]
     # 没有拥有者：就地取消 + 本地执行。
     assert payload["withoutOwner"] == ["local-cancel", "local:stop"]
+
+
+def test_jukebox_plugin_reports_a_rejected_submission():
+    """Codex P2: a synchronously rejected push never reaches the frontend.
+
+    Returning Ok for it makes the model tell the user the command was sent.
+    An absent receipt still counts as success: older SDKs return None after a
+    successful submission, so treating that as failure would report failures
+    for commands that did go out.
+    """
+    from plugin.plugins.jukebox_controller import JukeboxControllerPlugin
+    from plugin.sdk.plugin import Err
+
+    def run(receipt):
+        plugin = JukeboxControllerPlugin.__new__(JukeboxControllerPlugin)
+        pushed = []
+
+        def push(**kwargs):
+            pushed.append(kwargs)
+            return receipt
+
+        plugin.ctx = types.SimpleNamespace(push_message=push, _current_lanlan=None)
+        result = asyncio.run(
+            plugin.control_jukebox(action="next", _ctx={"lanlan_name": "cat"})
+        )
+        return result, pushed
+
+    for rejected in (
+        {"ok": False, "submitted": False, "reason": "backpressure"},
+        {"ok": False, "submitted": False, "reason": "transport_unavailable"},
+        {"ok": False, "submitted": False, "reason": "payload_too_large"},
+        {"submitted": False},
+    ):
+        result, pushed = run(rejected)
+        assert isinstance(result, Err), rejected
+        assert "not submitted" in str(result.error)
+        assert len(pushed) == 1
+
+    reason = str(run({"ok": False, "submitted": False, "reason": "backpressure"})[0].error)
+    assert "backpressure" in reason
+
+    # 成功回执与「没有回执」都算送出去了。
+    for accepted in ({"submitted": True}, None, object()):
+        result, pushed = run(accepted)
+        assert not isinstance(result, Err), accepted
+        assert result.value["action"] == "next"
+        assert len(pushed) == 1

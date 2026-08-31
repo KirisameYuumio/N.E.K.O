@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from plugin.sdk.plugin import Err, NekoPluginBase, Ok, SdkError, neko_plugin, plugin_entry
@@ -10,6 +11,22 @@ from plugin.sdk.plugin import Err, NekoPluginBase, Ok, SdkError, neko_plugin, pl
 _VALID_ACTIONS = {"play", "next", "previous", "stop", "set_volume", "adjust_volume", "set_mode"}
 _VALID_MODES = {"none", "sequence", "single", "random"}
 _VOLUME_ACTIONS = {"set_volume", "adjust_volume"}
+
+
+def _submission_rejection(receipt: object) -> str | None:
+    """Return the rejection reason when the SDK refused the submission.
+
+    Mirrors ``galgame_plugin.agent_sync._require_submitted``: only an explicit
+    ``submitted is False`` counts. Older supported SDKs return ``None`` after a
+    successful synchronous submission, so treating a missing receipt as failure
+    would report a failure for a command that was actually sent.
+    """
+    if not isinstance(receipt, Mapping):
+        return None
+    if receipt.get("submitted") is not False:
+        return None
+    reason = receipt.get("reason")
+    return str(reason) if isinstance(reason, str) and reason else "rejected"
 
 
 def _volume_argument_error(action: str, value: Any) -> str | None:
@@ -143,7 +160,7 @@ class JukeboxControllerPlugin(NekoPluginBase):
             return Err(SdkError(
                 "FAILED_PRECONDITION: jukebox control needs an invocation-local target character"
             ))
-        self.ctx.push_message(
+        receipt = self.ctx.push_message(
             source="jukebox_controller",
             description=f"Jukebox control: {normalized}",
             priority=8,
@@ -167,6 +184,11 @@ class JukeboxControllerPlugin(NekoPluginBase):
             },
             target_lanlan=clean_target_lanlan or None,
         )
+        rejection = _submission_rejection(receipt)
+        if rejection:
+            # 同步就被拒了（背压 / 传输不可用 / 载荷过大），前端根本收不到这条指令。
+            # 不看回执就返回 Ok，模型会跟用户说「已发送」。
+            return Err(SdkError(f"UNAVAILABLE: jukebox control was not submitted: {rejection}"))
 
         if normalized == "play":
             message = f"已发送点歌台播放指令: {clean_query or '第一首'}"
