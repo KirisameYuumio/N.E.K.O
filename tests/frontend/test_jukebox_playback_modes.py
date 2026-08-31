@@ -4676,3 +4676,69 @@ def test_jukebox_standalone_close_tears_down_playback(mock_page: Page):
     assert result["stopped"] == 1
     assert result["headlessAfter"] is False
     assert result["hostLeft"] is False
+
+
+@pytest.mark.frontend
+def test_jukebox_auto_advance_restores_idle_when_the_successor_animation_fails(mock_page: Page):
+    """Greptile P1: the interrupted-dance fact has to survive the transition.
+
+    handleAudioEnded clears isVMDPlaying via stopVMD(true) before calling
+    playSong, so playSong could not tell that a dance had just been cut; if the
+    successor's animation then failed, nobody restored idle and the avatar
+    stayed frozen while audio kept playing.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const idleCalls = [];
+          window.lanlan_config = {
+            model_type: 'live3d',
+            live3d_sub_type: 'vrm',
+            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma']
+          };
+          window.vrmManager = {
+            playVRMAAnimation: async (url, options = {}) => {
+              if (options.isIdle) idleCalls.push(url);
+              return true;
+            },
+            stopVRMAAnimation: () => {}
+          };
+          J.getActionForModel = () => ({ id: 'act', name: 'Dance', file: 'actions/a.vrma' });
+          J.getActionAvailability = async () => ({
+            ok: true,
+            status: 'action_ready',
+            action: { id: 'act', name: 'Dance', file: 'actions/a.vrma' },
+            url: '/api/jukebox/file/actions/a.vrma'
+          });
+          // 接班那首歌的动画起不来（文件在切换前被删掉之类）。
+          J.playVRMA = async () => false;
+
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'sequence', headless: true });
+          J.State.currentSong = J.State.songs[0];
+          J.State.isVMDPlaying = true;
+          const idleBefore = idleCalls.length;
+          const runtimeReady = J.State.isRuntimeReady;
+
+          J.handleAudioEnded(J.getPlayer());
+          await new Promise(resolve => setTimeout(resolve, 60));
+
+          return {
+            idleBefore,
+            runtimeReady,
+            advanced: J.State.currentSong && J.State.currentSong.id,
+            idleRestored: idleCalls.length > idleBefore
+          };
+        }
+        """
+    )
+
+    assert result["idleBefore"] == 0
+    assert result["runtimeReady"] is True
+    # 续播确实发生了（不是走了放弃分支）。
+    assert result["advanced"] == "song2"
+    # 接班动画没起来 -> 待机必须接回去。
+    assert result["idleRestored"] is True

@@ -1175,7 +1175,9 @@ Object.assign(window.Jukebox, {
           abandonTransition();
           return;
         }
-        Jukebox.playSong(nextSong.id, { fromQueue, requestId });
+        // 把「刚才打断了一段舞蹈」的事实带过去：stopVMD 已经把 isVMDPlaying 清了，
+        // playSong 自己看不出来，接班的动画要是起不来就没人恢复待机。
+        Jukebox.playSong(nextSong.id, { fromQueue, requestId, interruptedDance: idleRestoreSuppressed });
       }, 0);
     }
   },
@@ -1231,7 +1233,10 @@ Object.assign(window.Jukebox, {
     // 播放的世代顶掉，于是新歌起播后自己判定「已被取代」：动画不启动，控制面还报
     // play_failed。换歌一律跳过这次恢复，本首没有可播动作时在收尾处补回来 ——
     // 补的条件跟 stopVMD 原本一致：只有真的打断了一段舞蹈才需要回到待机。
-    const interruptedDance = Jukebox.State.isVMDPlaying === true;
+    // 自动续播会先 stopVMD(true) 再调过来，那时 isVMDPlaying 已经是 false 了，
+    // 所以调用方要能把这个事实显式传进来。
+    const interruptedDance = options.interruptedDance === true
+      || Jukebox.State.isVMDPlaying === true;
     Jukebox.stopPlayback({ preserveRandomQueue, skipIdleRestore: true });
 
     try {
