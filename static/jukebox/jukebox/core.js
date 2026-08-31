@@ -143,6 +143,9 @@ Object.assign(window.Jukebox, {
     // 执行却要等就绪——中间到达的指令先攒在 controlOwnerPending 里。
     controlOwnerReady: false,
     controlOwnerPending: [],
+    // 拥有者侧的顶替世代。就绪之后请求直接挂上 serveChain，就再也拿不下来了，
+    // 只能让它自己在开跑前发现「我已经过期了」。
+    controlOwnerSupersedeGeneration: 0,
     fuzzySearchWorker: null,
     fuzzySearchWorkerUrl: null,
     fuzzySearchToken: 0,

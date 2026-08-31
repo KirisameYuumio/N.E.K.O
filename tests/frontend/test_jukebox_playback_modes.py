@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 199,
+        "keyCount": 202,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -2056,6 +2056,9 @@ def test_jukebox_random_audio_end_advances_queue_and_skips_idle_restore(mock_pag
           J.playSong = async (songId, options = {}) => {
             played.push({ songId, fromQueue: options.fromQueue === true });
             J.State.currentSong = J.State.songs.find((song) => song.id === songId) || null;
+            // 真实的 playSong 成功时返回歌曲、失败返回 null，自动续播据此决定要不要
+            // 回滚随机队列。桩必须照这个契约来，否则这里会被当成「这首没播成」。
+            return J.State.currentSong;
           };
           J.getModelType = () => 'mmd';
           J.State.isOpen = true;
@@ -6362,3 +6365,174 @@ def test_jukebox_plays_the_song_revision_that_passed_preflight(mock_page: Page):
     # 曲库里已经是新一版了，但播的必须是通过预检的那一版。
     assert result["tableAudio"] == "songs/reuploaded.mp3"
     assert result["loaded"] == ["songs/song1.mp3"], result["loaded"]
+
+
+@pytest.mark.frontend
+def test_jukebox_abandoned_auto_advance_keeps_the_anchor_repair(mock_page: Page):
+    """The rollback must undo the speculative step, not the repair before it.
+
+    getNextSongToPlay calls ensureRandomQueueAnchor first, which resets a queue
+    that has drifted out of sync with the song that just ended -- a fact that
+    holds whether or not the next song plays.  Restoring the raw snapshot put
+    the stale queue back, so leaving random mode would anchor the exit on an
+    entry the player had already moved past.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          // 队列跟当前曲目脱节：正是 ensureRandomQueueAnchor 存在的理由。
+          J.State.randomQueue = ['song3', 'song2'];
+          J.State.randomQueueIndex = 1;
+          const stale = { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex };
+
+          J.handleAudioEnded(J.getPlayer());
+          J.State.playbackMode = 'none';
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          const queue = J.State.randomQueue.slice();
+          const index = J.State.randomQueueIndex;
+          return { stale, queue, index, anchored: queue[index] || null };
+        }
+        """
+    )
+
+    # 锚点修复保留：队列指向刚播完的那一首。
+    assert result["anchored"] == "song1", result
+    # 而那一步投机性的前进仍然被撤销了：队列没有停在从没播过的下一首上。
+    assert result["queue"] == ["song1"], result["queue"]
+    assert result["index"] == 0
+    assert result["queue"] != result["stale"]["queue"]
+
+
+@pytest.mark.frontend
+def test_jukebox_owner_cancel_reaches_the_ready_state_queue_too(mock_page: Page):
+    """Greptile P1: only the pre-ready queue could be cancelled.
+
+    Once the owner is ready a request goes straight onto serveChain and can no
+    longer be taken off it, so a queued play outlived the cancellation and then
+    read the already-advanced epoch as current when its turn came.  Volume and
+    mode commands must survive the same cancellation.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          const posted = [];
+          const channel = {
+            postMessage: (message) => { posted.push(message); },
+            close: () => {},
+            onmessage: null
+          };
+          const OriginalBC = window.BroadcastChannel;
+          window.BroadcastChannel = function() { return channel; };
+
+          const executed = [];
+          const originalExecute = J.executeControl;
+          let releaseSlow;
+          const slowGate = new Promise(resolve => { releaseSlow = resolve; });
+          J.executeControl = async (command) => {
+            executed.push(command.action + ':' + (command.query || ''));
+            if (command.query === 'slow') await slowGate;
+            return { ok: true, action: command.action };
+          };
+
+          try {
+            J.startControlOwnerService();
+            J.State.controlOwnerReady = true;
+
+            // 第一条慢指令占住 serveChain。
+            channel.onmessage({ data: {
+              type: 'jukebox_control_request', requestId: 'r1',
+              command: { action: 'play', query: 'slow' }
+            } });
+            await new Promise(resolve => setTimeout(resolve, 5));
+            // 排在它后面的一条 play，以及一条与取消无关的音量。
+            channel.onmessage({ data: {
+              type: 'jukebox_control_request', requestId: 'r2',
+              command: { action: 'play', query: 'queued' }
+            } });
+            channel.onmessage({ data: {
+              type: 'jukebox_control_request', requestId: 'r3',
+              command: { action: 'set_volume', value: 40 }
+            } });
+            // 独立的取消信号：它越过正在执行的那条，也必须作废排队的那条 play。
+            channel.onmessage({ data: { type: 'jukebox_cancel_request' } });
+            releaseSlow();
+            await new Promise(resolve => setTimeout(resolve, 40));
+
+            return {
+              executed,
+              results: posted
+                .filter(m => m.type === 'jukebox_control_result')
+                .map(m => ({ requestId: m.requestId, message: m.result.message, ok: m.result.ok }))
+            };
+          } finally {
+            J.executeControl = originalExecute;
+            J.stopControlOwnerService();
+            window.BroadcastChannel = OriginalBC;
+            window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          }
+        }
+        """
+    )
+
+    # 排队的那条 play 不许开跑；音量照常执行。
+    assert result["executed"] == ["play:slow", "set_volume:"], result["executed"]
+    # 而且被作废的那条要有回执，调用方才不用干等转发超时。
+    assert {"requestId": "r2", "message": "play_cancelled", "ok": False} in result["results"]
+    assert [r for r in result["results"] if r["requestId"] == "r3"][0]["ok"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_random_queue_rewinds_when_the_auto_advance_itself_fails(mock_page: Page):
+    """CodeRabbit: the scheduled playSong is fire-and-forget and can fail.
+
+    Audio load errors and a blocked autoplay both make playSong return null,
+    but getNextSongToPlay had already advanced the position -- so the next skip
+    started past a song that never played.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          const before = {
+            queue: J.State.randomQueue.slice(),
+            index: J.State.randomQueueIndex
+          };
+
+          // 自动续播那一首起播失败。
+          const originalPlaySong = J.playSong;
+          J.playSong = async () => null;
+          try {
+            J.handleAudioEnded(J.getPlayer());
+            await new Promise(resolve => setTimeout(resolve, 20));
+          } finally {
+            J.playSong = originalPlaySong;
+          }
+
+          return {
+            before,
+            after: { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex }
+          };
+        }
+        """
+    )
+
+    # 没播起来就不许把位置留在它身上，否则下一次随机导航跳过一首。
+    assert result["after"] == result["before"], result

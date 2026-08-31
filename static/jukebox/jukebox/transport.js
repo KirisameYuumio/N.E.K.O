@@ -469,6 +469,16 @@ Object.assign(window.Jukebox, {
     };
 
     const serve = async (data) => {
+      // 排队期间被顶替了：后来的 stop / play，或者一条独立的取消信号。挂上
+      // serveChain 之后就没法把它摘下来，所以由它自己在开跑前退出。
+      if (Jukebox.isControlOwnerRequestSuperseded(data)) {
+        reply(data, {
+          ok: false,
+          action: (data.command && data.command.action) || '',
+          message: 'play_cancelled'
+        });
+        return;
+      }
       // 调用方已经不等了（它那边 forwardControl 有超时预算）：别再让一条过期指令
       // 静默生效。ttlMs 由请求方随消息带来，这里不另存一份常量。
       const ttl = Number(data.ttlMs);
@@ -514,15 +524,23 @@ Object.assign(window.Jukebox, {
         // 独立的取消信号：它必须能越过正在执行的那条指令，所以不走
         // jukebox_control_request 的路径，直接就地作废在途播放。
         //
-        // 攒着的指令里只丢播放类的：set_volume / set_mode 跟这次取消无关，
-        // 整队丢掉等于把用户先发的音量调整也吞了。而且每条被丢的都要回执，
-        // 否则调用方那边的 forwardControl 会一直占着队列干等超时。
+        // 排队中的播放指令也要一并作废，两条队列都得覆盖：还没就绪时攒在
+        // controlOwnerPending 里的，以及就绪后已经挂上 serveChain、再也摘不下来
+        // 的。后者由 serve 自己在开跑前退出，靠的就是这个世代。
+        //
+        // set_volume / set_mode 从不记世代，所以两条路上都不会被顺手丢掉 ——
+        // 它们跟这次取消无关，整队丢掉等于把用户先发的音量调整也吞了。
+        // 攒着的那些还要逐条回执，否则调用方的 forwardControl 会一直占着队列
+        // 干等超时。
+        Jukebox.State.controlOwnerSupersedeGeneration += 1;
         const keep = [];
         for (const queued of Jukebox.State.controlOwnerPending) {
-          const queuedAction = String((queued.command && queued.command.action) || '')
-            .trim().toLowerCase();
-          if (Jukebox.PLAYBACK_CONTROL_ACTIONS.includes(queuedAction)) {
-            reply(queued, { ok: false, action: queuedAction, message: 'play_cancelled' });
+          if (Jukebox.isControlOwnerRequestSuperseded(queued)) {
+            reply(queued, {
+              ok: false,
+              action: String((queued.command && queued.command.action) || '').trim().toLowerCase(),
+              message: 'play_cancelled'
+            });
           } else {
             keep.push(queued);
           }
@@ -534,6 +552,7 @@ Object.assign(window.Jukebox, {
       if (data.type !== 'jukebox_control_request') return;
 
       data.queuedAt = Date.now();
+      Jukebox.stampControlOwnerRequest(data);
       if (!Jukebox.State.controlOwnerReady) {
         // 窗口已经宣告归属，但曲库还没拉完、播放器还没建好。直接执行会用默认的
         // live2d 去选动作、把该跳的舞跳过去；直接不接又会让角色窗口自己起一个
@@ -560,8 +579,30 @@ Object.assign(window.Jukebox, {
     return true;
   },
 
-  // 「播放类」指令：取消会把攒着的这些丢掉，音量/模式这类与取消无关的保留。
-  PLAYBACK_CONTROL_ACTIONS: ['play', 'next', 'previous', 'stop'],
+  // 拥有者侧的顶替语义，与发件侧（app-websocket.js）同一套「绝对 / 相对」：
+  //   绝对——stop 要静音、play 点名要这首，排在它们前面还没开跑的播放指令作废；
+  //   相对——next / previous 是相对当前曲目算的，只被顶替、不顶替别人，否则它算
+  //   的就是被吞掉那条本该替换掉的旧位置。
+  // 两张表都不含 set_volume / set_mode：它们既不顶替也不被顶替。
+  SUPERSEDING_CONTROL_ACTIONS: ['stop', 'play'],
+  SUPERSEDABLE_CONTROL_ACTIONS: ['play', 'next', 'previous'],
+
+  stampControlOwnerRequest: function(data) {
+    const action = String((data.command && data.command.action) || '').trim().toLowerCase();
+    // 自增在前、取号在后：顶替者自己记的是新世代，不会被自己顶掉。
+    if (Jukebox.SUPERSEDING_CONTROL_ACTIONS.includes(action)) {
+      Jukebox.State.controlOwnerSupersedeGeneration += 1;
+    }
+    if (Jukebox.SUPERSEDABLE_CONTROL_ACTIONS.includes(action)) {
+      data.supersedeGeneration = Jukebox.State.controlOwnerSupersedeGeneration;
+    }
+  },
+
+  isControlOwnerRequestSuperseded: function(data) {
+    return !!data
+      && data.supersedeGeneration != null
+      && data.supersedeGeneration !== Jukebox.State.controlOwnerSupersedeGeneration;
+  },
 
   markControlOwnerReady: function() {
     if (!window.__NEKO_JUKEBOX_STANDALONE__) return false;
@@ -1365,6 +1406,11 @@ Object.assign(window.Jukebox, {
       if (!randomSnapshot) return;
       Jukebox.State.randomQueue = randomSnapshot.queue;
       Jukebox.State.randomQueueIndex = randomSnapshot.index;
+      // 只撤销那一步投机性的前进，不撤销 getNextSongToPlay 里那次锚点修复：
+      // 队列跟当前曲目脱节时（曲库变过、用户手点过）它会把队列重置到刚播完的
+      // 这一首，而「这首播完了」是既成事实，跟下一首播不播无关。这次调用是
+      // 幂等的 —— 队列本来就锚在这首上时它什么都不做。
+      Jukebox.ensureRandomQueueAnchor(endedSong.id);
     };
 
     const nextSong = Jukebox.getNextSongToPlay(endedSong);
@@ -1403,7 +1449,22 @@ Object.assign(window.Jukebox, {
           Jukebox.settleIdleRestore();
           return;
         }
-        Jukebox.playSong(nextSong.id, { fromQueue, requestId, song: nextSong });
+        // playSong 是即发即忘的，它自己也可能失败（音频加载报错、自动播放被拦、
+        // 曲目已不在），而队列位置早在 getNextSongToPlay 那一步就推进了。失败同样
+        // 是「这首没播」，判据与上面三个放弃出口一致：只有这次自动续播仍然作数时
+        // 才回滚，否则接手的那一方自己会安排。
+        const abandonAutoAdvance = () => {
+          if (requestId !== Jukebox.State.playRequestId) return;
+          if (Jukebox.State.playbackMode !== scheduledMode) return;
+          restoreRandomQueue();
+          Jukebox.settleIdleRestore();
+        };
+        Promise.resolve(
+          Jukebox.playSong(nextSong.id, { fromQueue, requestId, song: nextSong })
+        ).then(
+          playedSong => { if (!playedSong) abandonAutoAdvance(); },
+          abandonAutoAdvance
+        );
       }, 0);
     }
   },
