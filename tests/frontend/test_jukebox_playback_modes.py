@@ -5531,3 +5531,44 @@ def test_jukebox_owner_queues_controls_that_arrive_before_it_is_ready(mock_page:
     # 就绪之后按到达顺序放出去。
     assert result["servedAfterReady"] is True
     assert result["modeAfterReady"] == "random"
+
+
+@pytest.mark.frontend
+def test_jukebox_standalone_bootstrap_claims_ownership_immediately(mock_page: Page):
+    """The claim has to happen as the window loads, not after its init settles.
+
+    A gap with no owner is what let the character window start a hidden runtime
+    the visible player could never take over.
+    """
+    standalone_source = (REPO_ROOT / "static" / "jukebox" / "jukebox-standalone.js").read_text(
+        encoding="utf-8"
+    )
+
+    result = mock_page.evaluate(
+        """
+        (source) => {
+          const run = (isStandalone) => {
+            const calls = [];
+            window.__NEKO_JUKEBOX_STANDALONE__ = isStandalone;
+            window.Jukebox = {
+              startControlOwnerService: () => { calls.push('claimed'); return true; },
+              // 宣告的那一刻绝不能顺带把「可以执行了」也标上。
+              markControlOwnerReady: () => { calls.push('ready'); return true; }
+            };
+            try {
+              new Function(source)();
+            } catch (error) {
+              return { calls, error: String(error && error.message || error) };
+            }
+            return { calls, error: null };
+          };
+          return { standalone: run(true), embedded: run(false) };
+        }
+        """,
+        standalone_source,
+    )
+
+    assert result["standalone"]["error"] is None
+    assert result["standalone"]["calls"] == ["claimed"]
+    # 嵌在角色窗口里的点歌台不是拥有者，绝不能去抢这个身份。
+    assert result["embedded"]["calls"] == []
