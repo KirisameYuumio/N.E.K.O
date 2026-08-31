@@ -5572,3 +5572,96 @@ def test_jukebox_standalone_bootstrap_claims_ownership_immediately(mock_page: Pa
     assert result["standalone"]["calls"] == ["claimed"]
     # 嵌在角色窗口里的点歌台不是拥有者，绝不能去抢这个身份。
     assert result["embedded"]["calls"] == []
+
+
+@pytest.mark.frontend
+def test_jukebox_stale_play_spares_a_successor_mid_startup(mock_page: Page):
+    """Greptile P1: currentSong is cleared while the replacement is starting.
+
+    That window — successor's audio already audible, its currentSong not yet
+    committed — is exactly where a "nobody claimed this" predicate misfires and
+    the stale request stops the successor's sound.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          const player = J.getPlayer();
+
+          // A 卡在自己的 playAudio 里。
+          let releaseA;
+          const gateA = new Promise(resolve => { releaseA = resolve; });
+          // B 卡在起播之后、提交 currentSong 之前。
+          let releaseB;
+          const gateB = new Promise(resolve => { releaseB = resolve; });
+
+          // A 的 hold 点在它自己的 playAudio 之后。
+          // B 的 hold 点要落在「认领音频之后、提交 currentSong 之前」——
+          // 动画那一段正好在这中间。用一个显式开关切换，不靠调用顺序区分：
+          // A 的 confirm 反而排在 B 之后，按顺序判会互等死锁。
+          let holdAnimation = false;
+          const originalPlayAudio = J.playAudio;
+          let firstPlay = true;
+          J.playAudio = async function(song) {
+            await originalPlayAudio.call(this, song);
+            if (firstPlay) { firstPlay = false; await gateA; }
+          };
+          J.getActionForModel = () => ({ id: 'act', name: 'Dance', file: 'actions/a.vrma' });
+          J.getActionAvailability = async () => ({
+            ok: true,
+            status: 'action_ready',
+            action: { id: 'act', name: 'Dance', file: 'actions/a.vrma' },
+            url: '/api/jukebox/file/actions/a.vrma'
+          });
+          J.getModelType = () => 'vrm';
+          J.playVRMA = async function() {
+            if (holdAnimation) await gateB;
+            return true;
+          };
+
+          const a = J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 10));
+          await J.executeControl({ action: 'stop', headless: true });
+
+          holdAnimation = true;
+          const b = J.executeControl({ action: 'play', query: 'Song 2', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 20));
+          const midStartup = {
+            audible: player.audio.paused === false,
+            currentSong: J.State.currentSong,
+            audioOwner: J.State.audioOwnerRequestId !== null
+          };
+
+          // A 正好在这个窗口里醒来。
+          releaseA();
+          const aOutcome = await a;
+          await new Promise(resolve => setTimeout(resolve, 10));
+          const afterStaleWoke = { audible: player.audio.paused === false };
+
+          releaseB();
+          const bOutcome = await b;
+          J.playAudio = originalPlayAudio;
+
+          return {
+            midStartup,
+            aOk: aOutcome.ok,
+            afterStaleWoke,
+            bOk: bOutcome.ok,
+            current: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    # B 的音频已经在响，但 currentSong 还没提交——正是判据最容易misfire 的窗口。
+    assert result["midStartup"]["audible"] is True
+    assert result["midStartup"]["currentSong"] is None
+    assert result["midStartup"]["audioOwner"] is True
+    assert result["aOk"] is False
+    # 过期的 A 醒来不许把 B 的声音停掉。
+    assert result["afterStaleWoke"]["audible"] is True
+    assert result["bOk"] is True
+    assert result["current"] == "song2"

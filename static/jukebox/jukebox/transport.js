@@ -815,22 +815,25 @@ Object.assign(window.Jukebox, {
       forceReplay: true,
       requestId
     });
-    // 收尾清理只能停「无人认领的那份声音」。这条请求在 await 里的时候可能已经有
-    // 更新的一条接手并提交了播放（stop 之后紧跟一条新的 play 就是这个形态），
-    // 那时无条件 stopPlayback() 停掉的是别人的播放。
+    // 收尾清理只能停「我自己起的那份声音」。这条请求在 await 里的时候可能已经有
+    // 更新的一条接手并起播了（stop 之后紧跟一条新的 play 就是这个形态），那时
+    // 无条件 stopPlayback() 停掉的是别人的播放。
     //
-    // 判据不能用 requestId === playRequestId：取消本身也会推进那个计数器，于是
-    // 「没有接班者、只是被取消」的情形会被误判成「别人接手了」，A 自己起的那份
-    // 孤儿音频就没人停。State.currentSong 只有真正提交播放的一方才会写。
-    const orphanedPlayback = !Jukebox.State.currentSong;
+    // 判据试过两版都不对：
+    //   requestId === playRequestId —— 取消本身也推进那个计数器，于是「没有接班者、
+    //   只是被取消」会被误判成「别人接手了」，孤儿音频反而没人停；
+    //   !State.currentSong —— 接班者的 playSong 起播期间会先把 currentSong 清空，
+    //   旧请求这时醒来同样会误判成无人认领，照样停掉接班者。
+    // 真正稳的是「这份音频是谁起的」：playAudio 一返回就认领，stopPlayback 清掉。
+    const ownsCurrentAudio = Jukebox.State.audioOwnerRequestId === requestId;
     if (!Jukebox.isControlEpochCurrent(epoch)) {
       // 起播过程中点歌台被拆了：停掉刚起来的声音，别留下一个没人管的播放器。
-      if (orphanedPlayback) Jukebox.stopPlayback();
+      if (ownsCurrentAudio) Jukebox.stopPlayback();
       return Jukebox.tornDownResult(action);
     }
     if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) {
       // 起播过程中来过 stop：同样要把刚响起来的声音停掉。
-      if (orphanedPlayback) Jukebox.stopPlayback();
+      if (ownsCurrentAudio) Jukebox.stopPlayback();
       return Jukebox.cancelledResult(action, song);
     }
     if (!playedSong) {
@@ -1323,6 +1326,14 @@ Object.assign(window.Jukebox, {
       // 挂在这个标志上，等到 playSong 末尾再置的话，动画加载期间来的 stop 会
       // 停不掉声音，还报成功。
       Jukebox.State.isPlaying = true;
+      // 认领这份声音：收尾清理靠它区分「我起的」和「接班者起的」。
+      // 判据是「还没人认领」，不是「我仍是当前世代」：取消和拆除也会推进
+      // playRequestId，那两种情形下这份音频确实是我起的、得由我来收；而真有
+      // 接班者时它已经先认领过了，这里就不能把它覆盖掉——否则收尾反而去停
+      // 接班者的声音。stopPlayback 会把认领清空，所以两边都自洽。
+      if (Jukebox.State.audioOwnerRequestId === null) {
+        Jukebox.State.audioOwnerRequestId = requestId;
+      }
 
       // APlayer 的 play() 不返回 promise，自动播放被拦时它把 NotAllowedError
       // 内部吞掉，await 照样立刻 resolve —— 于是没有声音却报成功。
@@ -1782,6 +1793,7 @@ Object.assign(window.Jukebox, {
     Jukebox.State.isPlaying = false;
     Jukebox.State.isPaused = false;
     Jukebox.State.isVMDPlaying = false;
+    Jukebox.State.audioOwnerRequestId = null;
     if (!preserveRandomQueue) {
       Jukebox.clearRandomQueue();
     }

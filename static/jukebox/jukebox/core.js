@@ -127,6 +127,9 @@ Object.assign(window.Jukebox, {
     // （正卡在 ensureRuntime / 曲目检索的 await 里）会在恢复后自己 ++，
     // 把取消推进的那一格盖过去，等值检查照样通过。
     playCancelEpoch: 0,
+    // 当前这份音频是哪条播放请求起的。收尾清理只认它 —— currentSong 在接班者
+    // 起播期间会被临时清空，拿它当判据会把接班者的声音误停。
+    audioOwnerRequestId: null,
     // 「欠着一次待机恢复」：stopVMD(true) 把舞蹈停掉却跳过恢复时置真，
     // 由真正接上动画或真正回到静止的那一方清账。见 transport.js 的 settleIdleRestore。
     idleRestorePending: false,
