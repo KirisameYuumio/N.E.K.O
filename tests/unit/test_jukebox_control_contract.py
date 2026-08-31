@@ -709,12 +709,16 @@ def test_jukebox_stop_preempts_a_queued_playback():
     result = _run_node(harness)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    assert payload["beforeStop"] == ["play"]
+    # play 自己也是替换类指令，进来时先就地作废一次（此刻没有在播）。
+    assert payload["beforeStop"] == ["cancel", "play"]
     # 作废是就地做的：play 还卡在动画加载里，声音已经停了，不必等它 settle。
-    assert payload["cancelled"] == 1
-    assert payload["beforeRelease"] == ["play", "cancel"]
+    # stop 与随后的 next 各带一次，所以一共三次。
+    assert payload["cancelled"] == 3
+    assert payload["beforeRelease"] == ["cancel", "play", "cancel", "cancel"]
     # 次序不变：stop 仍排在它要取消的那个 play 之后，next 再之后。
-    assert payload["order"] == ["play", "cancel", "stop", "next"]
+    assert payload["order"] == [
+        "cancel", "play", "cancel", "cancel", "stop", "next",
+    ]
 
 
 def test_jukebox_stop_cancels_on_the_owner_when_one_is_present():
@@ -883,7 +887,11 @@ def test_jukebox_handoff_cancels_the_local_playback_too():
     result = _run_node(harness)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    # 两个可能的播放方都要取消；stop 本身仍按当下归属转发。
-    assert payload["log"] == ["local:play", "owner-cancel", "local-cancel", "forward:stop"]
+    # 替换类指令一律先就地作废，所以开头那条 play 自己也会带一次（此刻没有在播，
+    # 是空操作）。关键仍是 stop 那一拍：两个可能的播放方都取消，指令本身按当下
+    # 归属转发。
+    assert payload["log"] == [
+        "local-cancel", "local:play", "owner-cancel", "local-cancel", "forward:stop",
+    ]
     # 关键：本窗口那条播放没有在 stop 之后活下来。
     assert payload["localAudible"] is False

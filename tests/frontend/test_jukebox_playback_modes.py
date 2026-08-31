@@ -5853,3 +5853,140 @@ def test_jukebox_owner_drops_a_request_the_caller_stopped_waiting_for(mock_page:
     assert result["executed"] == 0
     assert result["replies"] == [["stale", "jukebox_request_expired"]]
     assert result["mode"] == "sequence"
+
+
+@pytest.mark.frontend
+def test_jukebox_random_queue_rewinds_when_the_pick_never_plays(mock_page: Page):
+    """Codex P2: the queue advanced before the song was known to be playable.
+
+    getRandomAdjacentSong moves the index (or appends) up front, so a pick whose
+    preflight fails left the queue claiming a song that never played, and the
+    next skip started from the wrong place.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          const before = {
+            queue: J.State.randomQueue.slice(),
+            index: J.State.randomQueueIndex
+          };
+
+          // 下一首的音频文件已经不在了。
+          const originalPreflight = J.preflightSongPlayback;
+          J.preflightSongPlayback = async () => ({ ok: false, message: 'audio_not_found', audioUrl: '' });
+          const outcome = await J.executeControl({ action: 'next', headless: true });
+          J.preflightSongPlayback = originalPreflight;
+
+          return {
+            before,
+            ok: outcome.ok,
+            message: outcome.message,
+            after: { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex },
+            current: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    assert result["ok"] is False
+    assert result["message"] == "audio_not_found"
+    # 没播起来就不许推进队列，否则下一次 next 会从错的位置继续、跳过一首。
+    assert result["after"] == result["before"]
+    assert result["current"] == "song1"
+
+
+@pytest.mark.frontend
+def test_jukebox_stale_match_refreshes_before_reporting_failure(mock_page: Page):
+    """Codex P2: a cached hit whose file is gone never triggered a refresh.
+
+    Refreshing only when the search found nothing meant a stale match failed
+    preflight forever, because the search kept returning that same object.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          let configFetches = 0;
+          let servePath = 'songs/old.mp3';
+          window.fetch = async (url, options = {}) => {
+            if (options.method === 'HEAD') {
+              // 旧路径已经不在了，新路径还在。
+              const ok = !String(url).includes('old.mp3');
+              return { ok, status: ok ? 200 : 404 };
+            }
+            if (url === '/api/jukebox/config') {
+              configFetches += 1;
+              return {
+                ok: true,
+                json: async () => ({
+                  configRevision: 'rev-' + servePath,
+                  songs: {
+                    moved: { name: 'Moved Song', artist: 'A', audio: servePath, visible: true }
+                  },
+                  actions: {},
+                  bindings: {}
+                })
+              };
+            }
+            throw new Error('Unexpected fetch: ' + url);
+          };
+
+          await J.ensureRuntime({ headless: true });
+          const cachedAudio = J.State.songs[0].audio;
+
+          // 后端那边这首歌已经换了音频路径。
+          servePath = 'songs/new.mp3';
+          const outcome = await J.executeControl({ action: 'play', query: 'Moved', headless: true });
+
+          return {
+            cachedAudio,
+            ok: outcome.ok,
+            message: outcome.message || null,
+            current: J.State.currentSong && J.State.currentSong.id,
+            audioNow: J.State.songs[0].audio,
+            configFetches
+          };
+        }
+        """
+    )
+
+    assert result["cachedAudio"] == "songs/old.mp3"
+    # 命中的是陈旧对象、预检失败 -> 刷新一次再试，这次能播。
+    assert result["ok"] is True
+    assert result["current"] == "moved"
+    assert result["audioNow"] == "songs/new.mp3"
+    # 一次运行时初始化 + 一次陈旧刷新。
+    assert result["configFetches"] == 2
+
+
+@pytest.mark.frontend
+def test_jukebox_fbx_reports_that_no_animation_started(mock_page: Page):
+    """Codex P2: playFBX returned true while its implementation is a TODO.
+
+    playSong then cleared the idle debt as if a replacement animation had taken
+    over, leaving the avatar on the interrupted dance's last frame.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          window.fbxManager = {};
+          const started = await J.playFBX('/api/jukebox/file/actions/a.fbx', {});
+          return { started };
+        }
+        """
+    )
+
+    # 一帧都没播，就不能报「起播了」——否则待机欠账会被错误地清掉。
+    assert result["started"] is False

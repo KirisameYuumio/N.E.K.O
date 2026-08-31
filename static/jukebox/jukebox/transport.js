@@ -644,23 +644,44 @@ Object.assign(window.Jukebox, {
 
     if (normalizedAction === 'next' || normalizedAction === 'previous') {
       const direction = normalizedAction === 'previous' ? -1 : 1;
+      // 随机模式下选曲这一步就已经推进了队列位置（或往队尾追加）。如果这首歌
+      // 根本没播起来（文件没了、预检失败、被取消），队列却把它当成了当前曲目，
+      // 下一次 next 会从错误的位置继续、跳过一首。位置只在真的播起来时才前进。
+      const randomSnapshot = Jukebox.State.playbackMode === 'random'
+        ? {
+            queue: (Jukebox.State.randomQueue || []).slice(),
+            index: Jukebox.State.randomQueueIndex
+          }
+        : null;
+      const restoreRandomQueue = () => {
+        if (!randomSnapshot) return;
+        Jukebox.State.randomQueue = randomSnapshot.queue;
+        Jukebox.State.randomQueueIndex = randomSnapshot.index;
+      };
+
       const adjacentSong = Jukebox.State.playbackMode === 'random'
         ? Jukebox.getRandomAdjacentSong(direction)
         : Jukebox.getManualAdjacentSong(direction);
       if (!adjacentSong) {
+        restoreRandomQueue();
         return {
           ok: false,
           action: normalizedAction,
           message: normalizedAction === 'previous' ? 'no_previous_song' : 'no_next_song'
         };
       }
-      return Jukebox.executePlayControl(normalizedAction, adjacentSong, {
+      const outcome = await Jukebox.executePlayControl(normalizedAction, adjacentSong, {
         fromQueue: Jukebox.State.playbackMode === 'random',
         epoch,
         cancelEpoch
       });
+      if (!outcome || outcome.ok !== true) {
+        restoreRandomQueue();
+      }
+      return outcome;
     }
 
+    let refreshedLibrary = false;
     let song = await Jukebox.findSongForQuery(command.query || '');
     if (!song) {
       // 运行时是记忆化的，无头会话里可能一直用着开机时那份曲库；只有在真的
@@ -668,6 +689,7 @@ Object.assign(window.Jukebox, {
       // 「songs 非空」前置条件：运行时初始化那一刻曲库为空的话，那个条件会让
       // 之后每一条 play 都直接 song_not_found，永远等不到刷新。
       await Jukebox.loadSongData();
+      refreshedLibrary = true;
       song = await Jukebox.findSongForQuery(command.query || '');
     }
     if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult('play');
@@ -677,7 +699,23 @@ Object.assign(window.Jukebox, {
       return { ok: false, action: 'play', message: 'song_not_found' };
     }
 
-    return Jukebox.executePlayControl('play', song, { epoch, cancelEpoch });
+    let outcome = await Jukebox.executePlayControl('play', song, { epoch, cancelEpoch });
+    // 「搜到了」不等于「还在」：缓存里那首可能已经被删掉或换了音频路径，预检
+    // 因此失败。只在没搜到时刷新是不够的——陈旧的命中会让之后每一条 play 都
+    // 卡在同一个 audio_not_found 上，永远等不到刷新。
+    const staleMatch = outcome && outcome.ok !== true
+      && (outcome.message === 'audio_not_found' || outcome.message === 'audio_missing');
+    if (staleMatch && !refreshedLibrary) {
+      await Jukebox.loadSongData();
+      if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult('play');
+      const refreshedSong = await Jukebox.findSongForQuery(command.query || '');
+      if (refreshedSong) {
+        outcome = await Jukebox.executePlayControl('play', refreshedSong, { epoch, cancelEpoch });
+      } else {
+        outcome = { ok: false, action: 'play', message: 'song_not_found' };
+      }
+    }
+    return outcome;
   },
 
   // 0-1 和 0-100 两套量纲共存时，判据不能是「是否大于 1」：那样 value:1 会被
@@ -1607,7 +1645,9 @@ Object.assign(window.Jukebox, {
       // await window.fbxManager.loadAnimation(fbxPath);
       // window.fbxManager.playAnimation();
       console.warn('[Jukebox] FBX 动画播放尚未实现');
-      return true;
+      // 返回 false：这里一帧都没播。报 true 的话 playSong 会当成「新动画接上了」
+      // 并把待机欠账清掉，于是打断了旧舞蹈、又没有新动画，模型僵在原地。
+      return false;
     } catch (error) {
       console.error('[Jukebox] FBX 播放失败:', error);
       return false;
