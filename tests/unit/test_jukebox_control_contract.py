@@ -120,6 +120,9 @@ def _websocket_jukebox_handler_source() -> str:
     source = APP_WEBSOCKET_PATH.read_text(encoding="utf-8")
     queue_decl = "let _jukeboxControlQueue = Promise.resolve();"
     assert queue_decl in source, "jukebox control queue declaration moved"
+    seq_decl = "let _jukeboxStopGeneration = 0;"
+    assert seq_decl in source, "jukebox stop generation declaration moved"
+    queue_decl = queue_decl + "\n" + seq_decl
     # 路由判定和处理器一起切出来：谁执行这条指令由它们两个共同决定。
     handler_start = "    function isSecondaryJukeboxControlSurface() {"
     handler_end = "    function readNewUserIcebreakerStore() {"
@@ -1057,3 +1060,106 @@ def test_chat_surface_can_receive_jukebox_control():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload["log"] == ["local:play"]
+
+
+def test_jukebox_stop_also_cancels_a_playback_command_still_in_the_queue():
+    """Codex P2: the in-place cancel only reaches the command already running.
+
+    play B queued behind a slow play A had captured no cancellation generation
+    yet.  A stop arriving while B waited cancelled A, and B then read the
+    already-advanced generation as current, started playing, and left the
+    user's final stop queued behind it — new audio after the last stop.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              let cancelGeneration = 0;
+              window.Jukebox = {
+                cancelActivePlayback: () => { cancelGeneration += 1; },
+                executeControl: (c) => {
+                  log.push(c.action + ':' + (c.query || ''));
+                  if (c.action !== 'play') return Promise.resolve({ ok: true });
+                  // A 很慢：B 和 stop 都在它还在途的时候到达。
+                  const mine = cancelGeneration;
+                  return new Promise(resolve => setTimeout(() => {
+                    // 在途的那条自己会在闸门处作废；这里只建模「跑完了」。
+                    resolve({ ok: mine === cancelGeneration });
+                  }, 40));
+                }
+              };
+              window.__nekoJukeboxLoader = { hasControlOwner: () => false };
+
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'A' } });
+              await new Promise(resolve => setTimeout(resolve, 5));
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'B' } });
+              handleJukeboxControlResponse({ command: { action: 'stop' } });
+              await new Promise(resolve => setTimeout(resolve, 120));
+
+              emit(JSON.stringify({ log }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # B 在队列里就被 stop 顶掉了，绝不能在用户最后一条 stop 之后再响一声。
+    assert payload["log"] == ["play:A", "stop:"], payload["log"]
+
+
+def test_jukebox_volume_survives_a_stop_that_arrives_behind_it():
+    """The queued-command cancellation must not swallow unrelated commands.
+
+    set_volume and set_mode have nothing to do with cancelling playback;
+    dropping the whole queue on stop would eat a volume change the user sent
+    first.  Only playback commands take an arrival number, so only they can be
+    superseded.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              window.Jukebox = {
+                cancelActivePlayback: () => {},
+                executeControl: (c) => {
+                  log.push(c.action);
+                  if (c.action !== 'play') return Promise.resolve({ ok: true });
+                  return new Promise(resolve => setTimeout(() => resolve({ ok: true }), 40));
+                }
+              };
+              window.__nekoJukeboxLoader = { hasControlOwner: () => false };
+
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'A' } });
+              await new Promise(resolve => setTimeout(resolve, 5));
+              handleJukeboxControlResponse({ command: { action: 'set_volume', value: 40 } });
+              handleJukeboxControlResponse({ command: { action: 'stop' } });
+              await new Promise(resolve => setTimeout(resolve, 120));
+
+              emit(JSON.stringify({ log }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["log"] == ["play", "set_volume", "stop"], payload["log"]
