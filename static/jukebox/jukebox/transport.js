@@ -86,7 +86,7 @@ Object.assign(window.Jukebox, {
     }
 
     const epoch = Jukebox.State.teardownEpoch;
-    Jukebox.State.runtimeInitPromise = (async () => {
+    const runtimeInit = (async () => {
       Jukebox.loadPlaybackPreferences();
       await Jukebox.loadSongData();
       // 拉配置期间点歌台被整个拆掉了：绝不能再往下建隐藏宿主和播放器，否则用户
@@ -105,11 +105,17 @@ Object.assign(window.Jukebox, {
         headless
       };
     })();
+    Jukebox.State.runtimeInitPromise = runtimeInit;
 
     try {
-      return await Jukebox.State.runtimeInitPromise;
+      return await runtimeInit;
     } finally {
-      Jukebox.State.runtimeInitPromise = null;
+      // 只有槽位还指向自己时才清。拆除会把槽位清掉，随后的指令可能已经起了第二次
+      // 初始化；这里无条件清的话就把那一次也解锁了，两次配置加载会乱序覆盖
+      // State.songs，而此刻正有指令在里面检索。
+      if (Jukebox.State.runtimeInitPromise === runtimeInit) {
+        Jukebox.State.runtimeInitPromise = null;
+      }
     }
   },
 
@@ -573,7 +579,26 @@ Object.assign(window.Jukebox, {
   stopControlOwnerService: function() {
     const state = Jukebox.State;
     state.controlOwnerReady = false;
+    // 攒着还没服务的那些必须逐条回执再清空：调用方的 forwardControl 在等 promise，
+    // 而它的整条指令队列都排在那个 promise 后面 —— 静默丢弃等于让本地执行也停摆
+    // 到 TTL 到期为止。
+    const abandoned = state.controlOwnerPending;
     state.controlOwnerPending = [];
+    if (state.controlOwnerChannel && abandoned.length) {
+      for (const queued of abandoned) {
+        try {
+          state.controlOwnerChannel.postMessage({
+            type: 'jukebox_control_result',
+            requestId: queued.requestId,
+            result: {
+              ok: false,
+              action: String((queued.command && queued.command.action) || ''),
+              message: 'jukebox_owner_gone'
+            }
+          });
+        } catch (_) {}
+      }
+    }
     if (state.controlOwnerHeartbeatTimer) {
       clearInterval(state.controlOwnerHeartbeatTimer);
       state.controlOwnerHeartbeatTimer = null;
@@ -902,6 +927,8 @@ Object.assign(window.Jukebox, {
     const playedSong = await Jukebox.playSong(song.id, {
       ...playOptions,
       epoch: undefined,
+      // 把通过预检的那一版原样交下去，别让 playSong 拿 id 再解析一次。
+      song,
       actionAvailability: preflight.actionAvailability,
       // next / previous 在单曲曲库下会绕回当前这首，走进 playSong 的「同曲即停」
       // 分支：音乐停了，却因为拿到了 song 对象而报 ok:true，猫娘照样说「已切歌」。
@@ -1324,6 +1351,22 @@ Object.assign(window.Jukebox, {
       playbackMode: Jukebox.State.playbackMode
     });
 
+    // 随机模式下 getNextSongToPlay 会先把队列位置推进（或往队尾追加）。下面的
+    // 定时器有三个放弃出口，任何一个走掉都意味着这首从没播过，位置却已经落在了
+    // 它身上 —— 退出随机模式时它会被记成 randomQueueExitSongId，再切回来就把这
+    // 首没播过的当成当前曲目。与 next / previous 那条路径同一处理。
+    const randomSnapshot = Jukebox.State.playbackMode === 'random'
+      ? {
+          queue: (Jukebox.State.randomQueue || []).slice(),
+          index: Jukebox.State.randomQueueIndex
+        }
+      : null;
+    const restoreRandomQueue = () => {
+      if (!randomSnapshot) return;
+      Jukebox.State.randomQueue = randomSnapshot.queue;
+      Jukebox.State.randomQueueIndex = randomSnapshot.index;
+    };
+
     const nextSong = Jukebox.getNextSongToPlay(endedSong);
     const nextAction = nextSong ? Jukebox.getActionForModel(nextSong) : null;
     Jukebox.stopVMD(!!nextAction);
@@ -1342,28 +1385,36 @@ Object.assign(window.Jukebox, {
       // 的话，账由随后回到静止的那一方（stopPlayback / playSong 收尾）结清。
       setTimeout(() => {
         if (!Jukebox.State.isOpen && !Jukebox.State.isRuntimeReady && !window.__NEKO_JUKEBOX_STANDALONE__) {
+          restoreRandomQueue();
           Jukebox.settleIdleRestore();
           return;
         }
         if (requestId !== Jukebox.State.playRequestId) {
           // 被新请求取代。接手的如果是另一次播放，它自己会接上动画并清账；
           // 如果是 stop，stopPlayback 已经把账结了。这里不必也不该抢着恢复。
+          restoreRandomQueue();
           return;
         }
         // nextSong 是按排队时的模式选出来的，而 set_mode 不动 playRequestId。
         // 模式在这一个宏任务的空档里变了，这次自动续播就作废 —— 尤其是改成
         // none 之后不该再自动播下一首。
         if (Jukebox.State.playbackMode !== scheduledMode) {
+          restoreRandomQueue();
           Jukebox.settleIdleRestore();
           return;
         }
-        Jukebox.playSong(nextSong.id, { fromQueue, requestId });
+        Jukebox.playSong(nextSong.id, { fromQueue, requestId, song: nextSong });
       }, 0);
     }
   },
 
   playSong: async function(songId, options = {}) {
-    const song = Jukebox.State.songs.find(s => s.id === songId);
+    // 调用方已经拿着一份校验过的曲目对象时，用它，不要拿 id 去重新解析：面板的
+    // 配置轮询会在预检的那几个 await 里刷掉 State.songs，重传或改绑定之后同一个
+    // id 指向的已经是新一版，于是拿旧版的预检结论去加载新版的音频/动作。
+    const song = (options.song && options.song.id === songId)
+      ? options.song
+      : Jukebox.State.songs.find(s => s.id === songId);
     if (!song) {
       console.error('[Jukebox]', window.t('Jukebox.notFound', '找不到歌曲'), songId);
       return null;

@@ -6088,3 +6088,277 @@ def test_jukebox_control_refresh_rerenders_the_open_panel(mock_page: Page):
     assert result["songCount"] == 2
     # 刷新之后面板必须跟着重画，否则它会永久停在旧的那批行上。
     assert result["rowsAfter"] == 2
+
+
+@pytest.mark.frontend
+def test_jukebox_owner_answers_the_forwards_it_abandons_on_shutdown(mock_page: Page):
+    """Codex P2: clearing the pending queue left the caller waiting out the TTL.
+
+    The character window's forwardControl awaits a reply, and its whole command
+    queue sits behind that promise -- so discarding a queued forward silently
+    stalls local execution for the full five-second timeout.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          const posted = [];
+          const channel = {
+            postMessage: (message) => { posted.push(message); },
+            close: () => {},
+            onmessage: null
+          };
+          const OriginalBC = window.BroadcastChannel;
+          window.BroadcastChannel = function() { return channel; };
+          try {
+            J.startControlOwnerService();
+            // 还没就绪：转发进来的指令攒在队列里。
+            channel.onmessage({ data: {
+              type: 'jukebox_control_request',
+              requestId: 'req-1',
+              command: { action: 'play', query: 'Song 1' }
+            } });
+            channel.onmessage({ data: {
+              type: 'jukebox_control_request',
+              requestId: 'req-2',
+              command: { action: 'set_volume', value: 40 }
+            } });
+            const queued = J.State.controlOwnerPending.length;
+            J.stopControlOwnerService();
+            return {
+              queued,
+              results: posted
+                .filter(m => m.type === 'jukebox_control_result')
+                .map(m => ({ requestId: m.requestId, message: m.result.message, ok: m.result.ok })),
+              pendingAfter: J.State.controlOwnerPending.length
+            };
+          } finally {
+            window.BroadcastChannel = OriginalBC;
+            window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          }
+        }
+        """
+    )
+
+    assert result["queued"] == 2
+    assert result["pendingAfter"] == 0
+    # 每一条被丢掉的都要有回执，调用方才不用干等 TTL；而且回执要能分辨是哪一条。
+    assert result["results"] == [
+        {"requestId": "req-1", "message": "jukebox_owner_gone", "ok": False},
+        {"requestId": "req-2", "message": "jukebox_owner_gone", "ok": False},
+    ]
+
+
+@pytest.mark.frontend
+def test_jukebox_loader_settles_in_flight_forwards_when_the_owner_goes_away(mock_page: Page):
+    """The owner can also vanish after it has taken the command.
+
+    Zeroing the TTL was not enough: the promise the caller is awaiting only ever
+    settled on a result message or the five-second timeout, so the command queue
+    behind it stalled even though the owner had already announced it was gone.
+    """
+    mock_page.set_content(
+        """
+        <script>
+          window.t = (key, fallback) => typeof fallback === 'string' ? fallback : key;
+        </script>
+        """
+    )
+    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const loader = window.__nekoJukeboxLoader;
+          const owner = new BroadcastChannel('neko-jukebox-control');
+          owner.onmessage = (event) => {
+            const data = event && event.data;
+            if (!data) return;
+            if (data.type === 'jukebox_owner_query') {
+              owner.postMessage({ type: 'jukebox_owner_alive' });
+            }
+            // 收下指令但永不回执：模拟拥有者接了活之后窗口就关了。
+          };
+          owner.postMessage({ type: 'jukebox_owner_alive' });
+          await new Promise(resolve => setTimeout(resolve, 60));
+          if (!loader.hasControlOwner()) return { ownerSeen: false };
+
+          const started = Date.now();
+          const forwarded = loader.forwardControl({ action: 'play', query: 'x' });
+          await new Promise(resolve => setTimeout(resolve, 60));
+          owner.postMessage({ type: 'jukebox_owner_gone' });
+          const settled = await forwarded;
+          const elapsed = Date.now() - started;
+          owner.close();
+          return { ownerSeen: true, settled, elapsed };
+        }
+        """
+    )
+
+    assert result["ownerSeen"] is True
+    assert result["settled"]["ok"] is False
+    assert result["settled"]["message"] == "jukebox_owner_gone"
+    # 关键是「不必等满 TTL」：转发超时是 5000ms。
+    assert result["elapsed"] < 2000, result["elapsed"]
+
+
+@pytest.mark.frontend
+def test_jukebox_runtime_init_slot_is_cleared_only_by_its_own_initialization(mock_page: Page):
+    """Codex P2: the finally cleared a slot that already held a replacement.
+
+    Teardown clears runtimeInitPromise while initialization A is still awaiting
+    its configuration, so a later command starts B.  When A then resumed, its
+    unconditional finally released the slot B was occupying, letting a third
+    command start yet another concurrent load -- and the loads overwrite
+    State.songs out of order while commands are searching it.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const originalLoad = J.loadSongData;
+          const gates = [];
+          let loads = 0;
+          J.loadSongData = async function() {
+            loads += 1;
+            let release;
+            const gate = new Promise(resolve => { release = resolve; });
+            gates.push(release);
+            await gate;
+            return originalLoad.apply(this, arguments);
+          };
+          try {
+            const a = J.ensureRuntime({ headless: true });
+            await new Promise(resolve => setTimeout(resolve, 10));
+            // 拆除：槽位被清掉，A 还卡在配置加载里。
+            J.prepareForUnload();
+            const b = J.ensureRuntime({ headless: true });
+            await new Promise(resolve => setTimeout(resolve, 10));
+            const loadsBeforeAResumes = loads;
+
+            // A 收尾。它不能把 B 占着的槽位清掉。
+            gates[0]();
+            await a.catch(() => {});
+            await new Promise(resolve => setTimeout(resolve, 10));
+            const slotStillHeld = J.State.runtimeInitPromise !== null;
+
+            // 第三条指令必须挂在 B 上，而不是再起一次并发的配置加载。
+            const c = J.ensureRuntime({ headless: true });
+            await new Promise(resolve => setTimeout(resolve, 10));
+            const loadsAfterThirdCommand = loads;
+
+            gates.slice(1).forEach(release => release());
+            await b.catch(() => {});
+            await c.catch(() => {});
+            return { loadsBeforeAResumes, slotStillHeld, loadsAfterThirdCommand };
+          } finally {
+            J.loadSongData = originalLoad;
+          }
+        }
+        """
+    )
+
+    assert result["loadsBeforeAResumes"] == 2
+    # A 的 finally 只有在槽位还指向它自己时才该清。
+    assert result["slotStillHeld"] is True
+    # 第三条指令复用 B：没有第三次并发的配置加载去乱序覆盖 State.songs。
+    assert result["loadsAfterThirdCommand"] == 2, result["loadsAfterThirdCommand"]
+
+
+@pytest.mark.frontend
+def test_jukebox_random_queue_rewinds_when_the_auto_advance_is_abandoned(mock_page: Page):
+    """Codex P2: the dual of the next/previous rollback was missing.
+
+    getNextSongToPlay advances the random position before the scheduled
+    transition runs.  Abandoning that transition -- a mode change in the gap --
+    left the queue anchored to a song that never played, and leaving random mode
+    then records it as the exit anchor.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          const before = {
+            queue: J.State.randomQueue.slice(),
+            index: J.State.randomQueueIndex
+          };
+
+          J.handleAudioEnded(J.getPlayer());
+          // 定时器还没跑，模式在这个空档里变了：这次自动续播作废。
+          J.State.playbackMode = 'none';
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          return {
+            before,
+            after: { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex },
+            currentSong: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    # 那首从没播过，队列位置不许停在它身上。
+    assert result["after"] == result["before"]
+    assert result["currentSong"] is None
+
+
+@pytest.mark.frontend
+def test_jukebox_plays_the_song_revision_that_passed_preflight(mock_page: Page):
+    """Codex P2: playSong re-resolved the id after preflight had validated it.
+
+    The visible panel's configuration poll can refresh State.songs during the
+    HEAD preflight, so a re-upload or a binding edit made playback load a
+    different audio path than the one that was actually checked.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          const loaded = [];
+          const originalPlayAudio = J.playAudio;
+          J.playAudio = function(song) {
+            loaded.push(song && song.audio);
+            return originalPlayAudio.apply(this, arguments);
+          };
+
+          // 预检通过之后、起播之前，面板的轮询把同一个 id 换成了新一版。
+          const originalPreflight = J.preflightSongPlayback;
+          J.preflightSongPlayback = async function(song) {
+            const outcome = await originalPreflight.apply(this, arguments);
+            const replaced = J.State.songs.map(s => (
+              s.id === song.id ? Object.assign({}, s, { audio: 'songs/reuploaded.mp3' }) : s
+            ));
+            J.State.songs = replaced;
+            return outcome;
+          };
+
+          try {
+            await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          } finally {
+            J.preflightSongPlayback = originalPreflight;
+            J.playAudio = originalPlayAudio;
+          }
+
+          return { loaded, tableAudio: J.State.songs.find(s => s.id === 'song1').audio };
+        }
+        """
+    )
+
+    # 曲库里已经是新一版了，但播的必须是通过预检的那一版。
+    assert result["tableAudio"] == "songs/reuploaded.mp3"
+    assert result["loaded"] == ["songs/song1.mp3"], result["loaded"]

@@ -491,6 +491,16 @@
       }
       if (data.type === 'jukebox_owner_gone') {
         controlOwnerExpiresAt = 0;
+        // 已经交出去的那些也要立刻了结：它们等的是拥有者的回执，而拥有者刚说自己
+        // 没了。干等 TTL 的话，本地队列里排在后面的指令一并卡住。逐条结掉之后
+        // 迟到的 jukebox_control_result 会因为已从表里删掉而成为空操作。
+        var abandoned = Array.from(pendingForwards.values());
+        pendingForwards.clear();
+        abandoned.forEach(function(settle) {
+          try {
+            settle({ ok: false, action: '', message: 'jukebox_owner_gone' });
+          } catch (_) {}
+        });
         return;
       }
       if (data.type === 'jukebox_control_result') {

@@ -51,18 +51,21 @@
     let _musicPlayUrlCoordBeforeUnloadBound = false;
     let _musicPlayUrlBroadcastUnavailableWarned = false;
     let _jukeboxControlQueue = Promise.resolve();
-    // stop 的到达世代。就地取消只够停住「已经在跑」的那条；还在队列里等着的那条
-    // 尚未取到任何取消世代，轮到它时会把此刻的世代当成最新的，于是在用户最后那条
-    // stop 之后又响起来——而 play 要等运行时初始化、预检、动画加载，这一响可能是
-    // 好几秒。播放类指令到达时记下当时的世代，轮到执行时对不上就整条跳过。
+    // 「顶替」世代。就地取消只够停住「已经在跑」的那条；还在队列里等着的那条尚未
+    // 取到任何取消世代，轮到它时会把此刻的世代当成最新的，于是在用户最后那条指令
+    // 之后又响起来——而 play 要等运行时初始化、预检、动画加载，这一响可能是好几秒。
+    // 播放类指令到达时记下当时的世代，轮到执行时对不上就整条跳过。
     //
-    // 只认 stop，不认所有播放类指令：next 是「相对当前曲目取下一首」，把排在它
-    // 前面那条还没开跑的 play 吞掉的话，它算的就是旧位置了。stop 要的是静音，
-    // 队列里那条 play 在它之后再响就是纯粹的错。
+    // 谁能顶替，按「绝对 / 相对」分：
+    //   stop 与 play 是绝对的——一个要静音，一个点名要这首，排在它们前面还没开跑
+    //   的播放指令一律作废；
+    //   next / previous 是相对当前曲目算的，把排在它前面那条 play 吞掉的话，它算
+    //   的就是旧位置了，所以它们只被顶替、不顶替别人。
+    // set_volume / set_mode 两头都不沾，永远不会被顺手丢掉。
     //
     // 放在这里而不是 Jukebox 里：转发出去的指令在拥有者窗口用的是另一套计数器，
     // 作废判定必须留在发件的这一侧。
-    let _jukeboxStopGeneration = 0;
+    let _jukeboxSupersedeGeneration = 0;
     const MUSIC_PLAY_URL_SENDER_ID = (Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
 
     function gameRouteStateRevision() {
@@ -843,10 +846,11 @@
             return;
         }
 
-        var arrivalStopGeneration = null;
+        var arrivalSupersedeGeneration = null;
         var runCommand = function () {
-            // 排队期间来过 stop：整条跳过，别等轮到自己才把声音放出来。
-            if (arrivalStopGeneration !== null && arrivalStopGeneration !== _jukeboxStopGeneration) {
+            // 排队期间被顶替了：整条跳过，别等轮到自己才把声音放出来。
+            if (arrivalSupersedeGeneration !== null
+                && arrivalSupersedeGeneration !== _jukeboxSupersedeGeneration) {
                 console.log('[Jukebox] 跳过点歌台控制：排队期间已被后来的指令作废');
                 return Promise.resolve();
             }
@@ -866,15 +870,14 @@
         // 声音立刻停，卡住的那条也会在下一个世代检查处解开——指令本身仍然按顺序
         // 排队执行，次序不变。
         var normalizedControlAction = String(payload.action || '').trim().toLowerCase();
-        if (normalizedControlAction === 'stop') {
-            _jukeboxStopGeneration += 1;
-        } else if (normalizedControlAction === 'play'
+        if (normalizedControlAction === 'stop' || normalizedControlAction === 'play') {
+            _jukeboxSupersedeGeneration += 1;
+        }
+        if (normalizedControlAction === 'play'
             || normalizedControlAction === 'next'
             || normalizedControlAction === 'previous') {
-            // 自增在前、取号在后，所以这条 stop 之后到达的播放指令记的是新世代，
-            // 不会被它自己顶掉。set_volume / set_mode 不记——它们跟取消无关，
-            // 不该被一条 stop 顺手丢掉。
-            arrivalStopGeneration = _jukeboxStopGeneration;
+            // 自增在前、取号在后，所以顶替者自己记的是新世代，不会被自己顶掉。
+            arrivalSupersedeGeneration = _jukeboxSupersedeGeneration;
         }
         var preemptingActions = ['stop', 'play', 'next', 'previous'];
         if (preemptingActions.indexOf(normalizedControlAction) >= 0) {
