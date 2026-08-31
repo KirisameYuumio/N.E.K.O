@@ -560,8 +560,9 @@ Object.assign(window.Jukebox, {
   markControlOwnerReady: function() {
     if (!window.__NEKO_JUKEBOX_STANDALONE__) return false;
     if (Jukebox.State.controlOwnerReady) return false;
-    // 先把攒着的挂上链子，再开闸：反过来的话，drain 还没跑到就到达的新请求
-    // 会插到它们前面。
+    // 顺序保证来自 drain 是同步入链的：它把攒着的按序挂上 serveChain，之后到达
+    // 的请求只能排在后面。这两句谁先谁后其实不产生差别（中间没有 await），
+    // 这么写只是把「先接管旧的、再接受新的」摆明；真正的不变量在 serveChain。
     if (typeof Jukebox.drainControlOwnerQueue === 'function') {
       Jukebox.drainControlOwnerQueue();
     }
