@@ -1258,3 +1258,59 @@ def test_jukebox_next_does_not_swallow_the_play_queued_in_front_of_it():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload["log"] == ["play:A", "play:B", "next:"], payload["log"]
+
+
+def test_jukebox_supersession_is_rechecked_after_the_parts_load():
+    """Codex P2: the in-place cancel cannot reach a command inside the load.
+
+    bootstrap.js swaps the lazy facade for an empty object while the parts
+    load, so a later stop's cancelActivePlayback() is a silent no-op -- the
+    method does not exist yet.  The command had already passed runCommand's
+    only generation check, so it started the obsolete playback once the parts
+    landed, with the stop still queued behind it.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              // 分片加载中：bootstrap.js 已经把门面换成空对象，注意它没有
+              // cancelActivePlayback —— 这正是就地取消够不着的原因。
+              window.Jukebox = {};
+              let resolveLoad;
+              const loadGate = new Promise(resolve => { resolveLoad = resolve; });
+              window.__nekoJukeboxLoader = {
+                hasControlOwner: () => false,
+                load: () => loadGate
+              };
+
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'x' } });
+              await new Promise(resolve => setTimeout(resolve, 20));
+              // 分片还没落地，用户就叫停了。
+              handleJukeboxControlResponse({ command: { action: 'stop' } });
+
+              const loaded = {
+                executeControl: (c) => { log.push(c.action); return Promise.resolve({ ok: true }); }
+              };
+              window.Jukebox = loaded;
+              resolveLoad(loaded);
+              await new Promise(resolve => setTimeout(resolve, 20));
+
+              emit(JSON.stringify({ log }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # 那条 play 不许在分片落地之后才把声音放出来；stop 照常执行。
+    assert payload["log"] == ["stop"], payload["log"]

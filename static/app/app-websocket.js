@@ -793,7 +793,7 @@
             && /^\/chat(?:_full)?(?:\/|$)/.test(window.location.pathname || '');
     }
 
-    function dispatchJukeboxControl(payload) {
+    function dispatchJukeboxControl(payload, isNotSuperseded) {
         // 归属必须在真正要执行的这一刻算，不能用入队之前的快照：排队期间独立
         // 点唱机窗口可能刚打开（那就该转发，否则会在隐藏窗口里另起一条音轨），
         // 也可能刚关闭（那就该本地执行，否则白等一次转发超时）。
@@ -807,9 +807,19 @@
             // loader 等分片加载完再执行。
             if (loader && typeof loader.load === 'function') {
                 return Promise.resolve(loader.load()).then(function (jukebox) {
-                    // 分片加载是几百毫秒到数秒的窗口，独立点唱机窗口完全可能在这
-                    // 中间打开并宣告归属。函数开头那次判定到这里已经过期，得按同样
-                    // 的理由再算一次，否则这条指令会在本窗口另起一条隐藏音轨。
+                    // 分片加载是几百毫秒到数秒的窗口，入队之前算好的两件事到这里
+                    // 都可能已经过期，都要重算。
+                    //
+                    // 顶替：这段时间里来的 stop / play 推进了顶替世代，但它那次
+                    // 就地取消对本条毫无作用 —— 分片加载期间 window.Jukebox 是
+                    // bootstrap 换上的空对象，cancelActivePlayback 还不存在，那次
+                    // 调用是静默空操作。runCommand 入口那次判定也早过去了。
+                    if (typeof isNotSuperseded === 'function' && !isNotSuperseded()) {
+                        console.log('[Jukebox] 跳过点歌台控制：分片加载期间已被后来的指令作废');
+                        return null;
+                    }
+                    // 归属：独立点唱机窗口可能刚打开并宣告归属，否则这条指令会在
+                    // 本窗口另起一条隐藏音轨。
                     if (typeof loader.hasControlOwner === 'function' && loader.hasControlOwner()) {
                         return loader.forwardControl(payload);
                     }
@@ -847,14 +857,18 @@
         }
 
         var arrivalSupersedeGeneration = null;
+        // 判据只写一处，两个检查点共用：入队等待期间，以及分片加载的等待期间。
+        var isNotSuperseded = function () {
+            return arrivalSupersedeGeneration === null
+                || arrivalSupersedeGeneration === _jukeboxSupersedeGeneration;
+        };
         var runCommand = function () {
             // 排队期间被顶替了：整条跳过，别等轮到自己才把声音放出来。
-            if (arrivalSupersedeGeneration !== null
-                && arrivalSupersedeGeneration !== _jukeboxSupersedeGeneration) {
+            if (!isNotSuperseded()) {
                 console.log('[Jukebox] 跳过点歌台控制：排队期间已被后来的指令作废');
                 return Promise.resolve();
             }
-            return Promise.resolve(dispatchJukeboxControl(payload)).then(function (result) {
+            return Promise.resolve(dispatchJukeboxControl(payload, isNotSuperseded)).then(function (result) {
                 console.log('[Jukebox] 点歌台控制完成:', result);
             }).catch(function (error) {
                 console.warn('[Jukebox] 点歌台控制失败:', error);
