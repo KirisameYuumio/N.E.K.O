@@ -5665,3 +5665,59 @@ def test_jukebox_stale_play_spares_a_successor_mid_startup(mock_page: Page):
     assert result["afterStaleWoke"]["audible"] is True
     assert result["bOk"] is True
     assert result["current"] == "song2"
+
+
+@pytest.mark.frontend
+def test_jukebox_audio_claim_is_released_by_a_stop(mock_page: Page):
+    """The claim has to be cleared when playback stops.
+
+    A claim left behind by an earlier request blocks the next one from taking
+    it, and then nothing cleans that request's audio up when it is cancelled.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          const player = J.getPlayer();
+
+          // 第一条播放会认领这份音频。
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          const claimedByFirst = J.State.audioOwnerRequestId !== null;
+
+          await J.executeControl({ action: 'stop', headless: true });
+          const claimAfterStop = J.State.audioOwnerRequestId;
+
+          // 第二条播放卡在起播里，然后被取消——它得能认领到，才收得掉自己的声音。
+          let release;
+          const gate = new Promise(resolve => { release = resolve; });
+          const originalPlayAudio = J.playAudio;
+          J.playAudio = async function(song) {
+            await originalPlayAudio.call(this, song);
+            await gate;
+          };
+          const pending = J.executeControl({ action: 'play', query: 'Song 2', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 10));
+          J.cancelActivePlayback();
+          release();
+          const outcome = await pending;
+          J.playAudio = originalPlayAudio;
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          return {
+            claimedByFirst,
+            claimAfterStop,
+            secondOk: outcome.ok,
+            stillAudible: player.audio.paused === false
+          };
+        }
+        """
+    )
+
+    assert result["claimedByFirst"] is True
+    # stop 必须把认领清掉，否则下一条播放永远认领不到。
+    assert result["claimAfterStop"] is None
+    assert result["secondOk"] is False
+    assert result["stillAudible"] is False
