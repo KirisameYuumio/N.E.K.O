@@ -829,7 +829,16 @@
         // 本身仍然按顺序排队执行，次序不变。
         if (String(payload.action || '').trim().toLowerCase() === 'stop') {
             try {
-                if (window.Jukebox && typeof window.Jukebox.cancelActivePlayback === 'function') {
+                // 取消也得按归属走：在途的那条 play 可能正跑在独立点唱机窗口里，
+                // 本窗口的 cancelActivePlayback 够不着它，队列里的 stop 就只能干等
+                // 一次转发超时。
+                var cancelLoader = window.__nekoJukeboxLoader;
+                var cancelOwnerAlive = !!(cancelLoader
+                    && typeof cancelLoader.hasControlOwner === 'function'
+                    && cancelLoader.hasControlOwner());
+                if (cancelOwnerAlive && typeof cancelLoader.cancelOnOwner === 'function') {
+                    cancelLoader.cancelOnOwner();
+                } else if (window.Jukebox && typeof window.Jukebox.cancelActivePlayback === 'function') {
                     window.Jukebox.cancelActivePlayback();
                 }
             } catch (error) {

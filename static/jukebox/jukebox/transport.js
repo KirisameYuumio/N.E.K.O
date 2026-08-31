@@ -459,6 +459,12 @@ Object.assign(window.Jukebox, {
         announce();
         return;
       }
+      if (data.type === 'jukebox_cancel_request') {
+        // 独立的取消信号：它必须能越过正在执行的那条指令，所以不走
+        // jukebox_control_request 的路径，直接就地作废在途播放。
+        Jukebox.cancelActivePlayback();
+        return;
+      }
       if (data.type !== 'jukebox_control_request') return;
 
       let result;

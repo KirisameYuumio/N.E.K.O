@@ -715,3 +715,57 @@ def test_jukebox_stop_preempts_a_queued_playback():
     assert payload["beforeRelease"] == ["play", "cancel"]
     # 次序不变：stop 仍排在它要取消的那个 play 之后，next 再之后。
     assert payload["order"] == ["play", "cancel", "stop", "next"]
+
+
+def test_jukebox_stop_cancels_on_the_owner_when_one_is_present():
+    """CodeRabbit Major: a local cancel cannot reach playback running elsewhere.
+
+    With a standalone owner the in-flight play lives in that window, so the
+    cancel has to be routed there too or the queued stop just waits out the
+    forward timeout.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              let ownerAlive = true;
+              window.Jukebox = {
+                cancelActivePlayback: () => log.push('local-cancel'),
+                executeControl: (c) => { log.push('local:' + c.action); return Promise.resolve({ ok: true }); }
+              };
+              window.__nekoJukeboxLoader = {
+                hasControlOwner: () => ownerAlive,
+                cancelOnOwner: () => { log.push('owner-cancel'); return true; },
+                forwardControl: (c) => { log.push('forward:' + c.action); return Promise.resolve({ ok: true }); }
+              };
+
+              handleJukeboxControlResponse({ command: { action: 'stop' } });
+              await new Promise(resolve => setTimeout(resolve, 20));
+              const withOwner = log.slice();
+
+              log.length = 0;
+              ownerAlive = false;
+              handleJukeboxControlResponse({ command: { action: 'stop' } });
+              await new Promise(resolve => setTimeout(resolve, 20));
+
+              emit(JSON.stringify({ withOwner, withoutOwner: log }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # 有拥有者：取消投给拥有者，不碰本窗口；stop 本身仍按顺序转发过去。
+    assert payload["withOwner"] == ["owner-cancel", "forward:stop"]
+    # 没有拥有者：就地取消 + 本地执行。
+    assert payload["withoutOwner"] == ["local-cancel", "local:stop"]

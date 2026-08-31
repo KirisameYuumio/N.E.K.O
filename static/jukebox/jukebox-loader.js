@@ -513,6 +513,18 @@
     return Date.now() < controlOwnerExpiresAt;
   }
 
+  function cancelControlOnOwner() {
+    var channel = ensureControlChannel();
+    if (!channel) return false;
+    try {
+      // 只是一个信号，不等回执：它要在拥有者那条在途指令还没结束时就生效。
+      channel.postMessage({ type: 'jukebox_cancel_request' });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function forwardControlToOwner(command) {
     var channel = ensureControlChannel();
     if (!channel) {
@@ -799,6 +811,7 @@
     unload: unloadJukebox,
     getState: getState,
     hasControlOwner: hasControlOwner,
-    forwardControl: forwardControlToOwner
+    forwardControl: forwardControlToOwner,
+    cancelOnOwner: cancelControlOnOwner
   };
 })();
