@@ -915,7 +915,12 @@
             }
             if (window.Jukebox && typeof window.Jukebox.cancelActivePlayback === 'function') {
                 try {
-                    window.Jukebox.cancelActivePlayback();
+                    // 相对导航不静音：目标可能不存在，那时这条指令是空操作，
+                    // 不该把正在放的歌停掉。判据与顶替那套一致。
+                    window.Jukebox.cancelActivePlayback({
+                        silenceAudio: normalizedControlAction !== 'next'
+                            && normalizedControlAction !== 'previous'
+                    });
                 } catch (error) {
                     console.warn('[Jukebox] 作废本地在途播放失败:', error);
                 }

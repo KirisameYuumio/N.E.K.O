@@ -559,7 +559,7 @@ Object.assign(window.Jukebox, {
           }
         }
         Jukebox.State.controlOwnerPending = keep;
-        Jukebox.cancelActivePlayback();
+        Jukebox.cancelActivePlayback({ silenceAudio: !cancelIsRelative });
         return;
       }
       if (data.type !== 'jukebox_control_request') return;
@@ -960,9 +960,13 @@ Object.assign(window.Jukebox, {
 
   // 就地作废在途播放：推进世代让卡在 await 里的 play 在下一个检查处解开，
   // 同时把已经响起来的声音立刻停掉。stop 指令本身仍会按顺序再执行一次（幂等）。
-  cancelActivePlayback: function() {
+  cancelActivePlayback: function(options = {}) {
     Jukebox.State.playCancelEpoch += 1;
     Jukebox.State.playRequestId += 1;
+    // 相对导航（next / previous）只作废在途的那条，不动已经在响的声音：目标
+    // 可能根本不存在 —— 随机历史的头部、空的播放列表 —— 那时这条指令是空操作，
+    // 却已经把音乐停了。真选出了下一首时 playSong 自己会停掉当前这首。
+    if (options.silenceAudio === false) return;
     // 保留导航锚点：随后那条指令自己会处置它 —— stop 走 stopPlayback 全清，
     // play 会围绕新曲目重置随机队列，而 next / previous 正需要它。
     Jukebox.stopPlayback({ preserveNavigationAnchor: true });
@@ -1164,6 +1168,11 @@ Object.assign(window.Jukebox, {
 
   loadSongData: async function() {
     const Jukebox = window.Jukebox || this;
+    // 拉配置期间点歌台可能被整个拆掉、随后又被下一条指令重建。那种情况下这份
+    // 响应属于上一个运行时：提交它会把接班运行时刚拉好的曲库覆盖成旧的，而且
+    // 要等到下一次刷新才纠正得回来。守住槽位（只清自己那次初始化）挡得住第三次
+    // 并发初始化，挡不住已经在飞的这一次把结果落盘。
+    const epoch = Jukebox.State.teardownEpoch;
     // 从后端API加载配置
     const response = await fetch('/api/jukebox/config');
     if (!response.ok) {
@@ -1171,6 +1180,11 @@ Object.assign(window.Jukebox, {
     }
 
     const data = await response.json();
+
+    if (Jukebox.State.teardownEpoch !== epoch) {
+      console.log('[Jukebox] 曲库响应属于已拆除的运行时，丢弃');
+      return Jukebox.State.songs;
+    }
 
     // 保存完整的配置数据
     Jukebox.State.config = data;
@@ -1551,7 +1565,15 @@ Object.assign(window.Jukebox, {
       Jukebox.clearRandomQueue();
     }
 
-    const requestId = Number.isInteger(options.requestId) ? options.requestId : ++Jukebox.State.playRequestId;
+    // 没带 requestId 就是「用户在面板上按了什么」——行内播放键、上一首/下一首、
+    // 播放键都走这条。这时要连取消世代一起推进：远端来的那条 play 可能正卡在
+    // 模糊检索里还没取号，光推进 playRequestId 拦不住它，它醒来后会取一个更新的
+    // 号，反过来把用户刚选的这首顶掉。用户永远赢。
+    const isUserInitiated = !Number.isInteger(options.requestId);
+    if (isUserInitiated) {
+      Jukebox.State.playCancelEpoch += 1;
+    }
+    const requestId = isUserInitiated ? ++Jukebox.State.playRequestId : options.requestId;
     if (requestId !== Jukebox.State.playRequestId) {
       console.log('[Jukebox] 播放请求已被新请求取代，取消播放');
       return null;

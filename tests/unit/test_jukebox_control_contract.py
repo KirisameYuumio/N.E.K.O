@@ -1314,3 +1314,48 @@ def test_jukebox_supersession_is_rechecked_after_the_parts_load():
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     # 那条 play 不许在分片落地之后才把声音放出来；stop 照常执行。
     assert payload["log"] == ["stop"], payload["log"]
+
+
+def test_jukebox_relative_navigation_cancel_does_not_silence():
+    """The sender decides whether the cancellation silences the audio.
+
+    next/previous may resolve to no target at all -- the head of the random
+    history, an empty playlist -- and then the command is a no-op that has
+    already stopped the music.  Absolute commands still silence: stop wants
+    exactly that, and play replaces the audio anyway.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const cancels = [];
+              window.Jukebox = {
+                cancelActivePlayback: (options) => {
+                  cancels.push(options && options.silenceAudio);
+                },
+                executeControl: () => Promise.resolve({ ok: true })
+              };
+              window.__nekoJukeboxLoader = { hasControlOwner: () => false };
+
+              for (const action of ['next', 'previous', 'stop', 'play']) {
+                handleJukeboxControlResponse({ command: { action, query: 'x' } });
+                await new Promise(resolve => setTimeout(resolve, 5));
+              }
+              emit(JSON.stringify({ cancels }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # next / previous 不静音；stop / play 静音。
+    assert payload["cancels"] == [False, False, True, True], payload["cancels"]

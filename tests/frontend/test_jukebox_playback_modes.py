@@ -7035,3 +7035,177 @@ def test_jukebox_stale_audio_ended_without_a_current_song_still_cleans_up(mock_p
     assert result["idleRestorePending"] is False
     # 但队列不该被推进 —— 没有「刚播完的那首」可言。
     assert result["queueUnchanged"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_torn_down_runtime_does_not_commit_its_library(mock_page: Page):
+    """Codex P2: guarding the promise slot did not stop the in-flight load.
+
+    Teardown clears runtimeInitPromise while initialization A is still fetching
+    the configuration, so a later command starts B.  A then resumed and
+    committed its own response over B's, and the replacement runtime kept a
+    stale library until something else refreshed it.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const originalFetch = window.fetch;
+          let releaseStale;
+          const staleGate = new Promise(resolve => { releaseStale = resolve; });
+          let call = 0;
+          window.fetch = async (url, options = {}) => {
+            if (url === '/api/jukebox/config') {
+              call += 1;
+              const mine = call;
+              if (mine === 1) await staleGate;
+              return {
+                ok: true,
+                json: async () => ({
+                  configRevision: 'rev-' + mine,
+                  songs: mine === 1
+                    ? { stale: { name: 'Stale', artist: 'A', audio: 'songs/stale.mp3', visible: true } }
+                    : { fresh: { name: 'Fresh', artist: 'B', audio: 'songs/fresh.mp3', visible: true } },
+                  actions: {},
+                  bindings: {}
+                })
+              };
+            }
+            return originalFetch(url, options);
+          };
+
+          try {
+            const stale = J.loadSongData();
+            await new Promise(resolve => setTimeout(resolve, 10));
+            // 运行时被拆掉，随后的指令重建了它并拉到了新的曲库。
+            J.prepareForUnload();
+            await J.loadSongData();
+            const afterFresh = J.State.songs.map(s => s.id);
+
+            // 上一份响应现在才到货。
+            releaseStale();
+            await stale;
+            return {
+              afterFresh,
+              afterStaleArrived: J.State.songs.map(s => s.id),
+              revision: J.State.configRevision
+            };
+          } finally {
+            window.fetch = originalFetch;
+          }
+        }
+        """
+    )
+
+    assert result["afterFresh"] == ["fresh"]
+    # 属于已拆除运行时的那份响应不许落盘。
+    assert result["afterStaleArrived"] == ["fresh"], result
+    assert result["revision"] == "rev-2"
+
+
+@pytest.mark.frontend
+def test_jukebox_panel_selection_beats_a_pending_remote_play(mock_page: Page):
+    """Codex P2: the user has to win, and playRequestId alone could not deliver it.
+
+    A control-side play awaiting the fuzzy search has not allocated its
+    generation yet, so bumping playRequestId from the panel did not mark it
+    stale -- it allocated a newer one when the search returned and replaced the
+    song the user had just picked.  A play with no explicit requestId is by
+    definition a panel action, and now advances the cancellation epoch too.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          // 远端的 play 卡在检索里。
+          let releaseSearch;
+          const searchGate = new Promise(resolve => { releaseSearch = resolve; });
+          const originalFind = J.findSongForQuery;
+          J.findSongForQuery = async function(query) {
+            await searchGate;
+            return originalFind.call(this, query);
+          };
+
+          const remote = J.executeControl({ action: 'play', query: 'Song 3', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 10));
+
+          // 用户在面板上点了另一首。
+          await J.playSong('song1');
+          const userChoice = J.State.currentSong && J.State.currentSong.id;
+
+          releaseSearch();
+          const outcome = await remote;
+          J.findSongForQuery = originalFind;
+          await new Promise(resolve => setTimeout(resolve, 10));
+
+          return {
+            userChoice,
+            remoteOk: outcome.ok,
+            remoteMessage: outcome.message,
+            current: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    assert result["userChoice"] == "song1"
+    # 迟到的远端指令不许把用户刚选的这首顶掉。
+    assert result["remoteOk"] is False
+    assert result["remoteMessage"] == "play_cancelled", result["remoteMessage"]
+    assert result["current"] == "song1", result["current"]
+
+
+@pytest.mark.frontend
+def test_jukebox_targetless_previous_leaves_the_music_playing(mock_page: Page):
+    """Codex P2: preempting relative navigation stopped audio it never replaced.
+
+    At the head of the random history `previous` has no target, so the command
+    is a no-op -- but the arrival-time cancellation had already paused the
+    audio and seeked it to zero, and returning `no_previous_song` restores
+    nothing.  Relative navigation now invalidates the in-flight command without
+    silencing what is already playing; the replacement song, when there is one,
+    stops it through playSong as usual.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          const before = {
+            playing: J.State.isPlaying,
+            song: J.State.currentSong && J.State.currentSong.id
+          };
+
+          // 随机历史的头部：previous 没有目标。
+          J.cancelActivePlayback({ silenceAudio: false });
+          const outcome = await J.executeControl({ action: 'previous', headless: true });
+
+          return {
+            before,
+            ok: outcome.ok,
+            message: outcome.message,
+            afterPlaying: J.State.isPlaying,
+            afterSong: J.State.currentSong && J.State.currentSong.id,
+            audioPaused: J.getPlayer().audio.paused
+          };
+        }
+        """
+    )
+
+    assert result["before"] == {"playing": True, "song": "song1"}
+    assert result["ok"] is False
+    assert result["message"] == "no_previous_song"
+    # 空操作的导航不该把音乐停掉。
+    assert result["afterPlaying"] is True, result
+    assert result["afterSong"] == "song1"
+    assert result["audioPaused"] is False, result
