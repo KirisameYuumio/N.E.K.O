@@ -908,7 +908,7 @@
                 && cancelLoader.hasControlOwner());
             if (cancelOwnerAlive && typeof cancelLoader.cancelOnOwner === 'function') {
                 try {
-                    cancelLoader.cancelOnOwner();
+                    cancelLoader.cancelOnOwner(normalizedControlAction);
                 } catch (error) {
                     console.warn('[Jukebox] 作废拥有者在途播放失败:', error);
                 }

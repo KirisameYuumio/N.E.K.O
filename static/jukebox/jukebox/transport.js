@@ -532,7 +532,20 @@ Object.assign(window.Jukebox, {
         // 它们跟这次取消无关，整队丢掉等于把用户先发的音量调整也吞了。
         // 攒着的那些还要逐条回执，否则调用方的 forwardControl 会一直占着队列
         // 干等超时。
-        Jukebox.State.controlOwnerSupersedeGeneration += 1;
+        // 只有绝对指令（stop / play）才顶替排队中的播放指令。next / previous
+        // 同样会发这个信号来作废「在途」的那条，但它们是相对当前曲目算的，把排
+        // 在前面还没开跑的那条吞掉，它们算的就是旧位置了 —— 判据必须和发件侧
+        // 一模一样。
+        //
+        // 「相对」就是「可被顶替但自己不顶替」，由那两张表推出来，不另立第三张。
+        // 认不出发起动作时按绝对取消处理：漏顶替的代价是用户喊停之后声音又起来，
+        // 比多顶替一次严重得多。
+        const cancelAction = String(data.action || '').trim().toLowerCase();
+        const cancelIsRelative = Jukebox.SUPERSEDABLE_CONTROL_ACTIONS.includes(cancelAction)
+          && !Jukebox.SUPERSEDING_CONTROL_ACTIONS.includes(cancelAction);
+        if (!cancelIsRelative) {
+          Jukebox.State.controlOwnerSupersedeGeneration += 1;
+        }
         const keep = [];
         for (const queued of Jukebox.State.controlOwnerPending) {
           if (Jukebox.isControlOwnerRequestSuperseded(queued)) {
@@ -596,6 +609,51 @@ Object.assign(window.Jukebox, {
     if (Jukebox.SUPERSEDABLE_CONTROL_ACTIONS.includes(action)) {
       data.supersedeGeneration = Jukebox.State.controlOwnerSupersedeGeneration;
     }
+  },
+
+  // 随机队列「投机性前进」的回滚器。选下一首这一步就已经推进了队列位置（或往
+  // 队尾追加），可这首未必播得起来；没播起来就得把位置放回去，否则下一次导航从
+  // 错的地方继续、跳过一首。
+  //
+  // 归属判据是队列本身：只有它仍然停在「这次前进留下的样子」时才回滚。不能用
+  // playRequestId ——
+  //   起播失败时会先结清待机欠账，而结账里的 restoreIdleAnimation 自己就
+  //   ++playRequestId，用它当判据的话回滚在唯一该生效的路径上永远不生效；
+  //   而接手的那条 play 已经围绕新曲目重置了队列，硬把旧快照盖回去会抹掉它的
+  //   历史。别的请求接手一定会重置队列，那才是「谁拥有它」的事实。
+  //
+  // anchorSongId 只有自动续播那条要传：getNextSongToPlay 在前进之前会先做一次
+  // 锚点修复（队列与刚播完那首脱节时重置到它），那是既成事实，回滚不该连它一起
+  // 撤掉，所以回滚之后再幂等地重做一次。
+  beginRandomQueueRollback: function(options = {}) {
+    const noop = { markAdvanced: function() {}, restore: function() {} };
+    if (Jukebox.State.playbackMode !== 'random') return noop;
+
+    const anchorSongId = options.anchorSongId || null;
+    const before = {
+      queue: (Jukebox.State.randomQueue || []).slice(),
+      index: Jukebox.State.randomQueueIndex
+    };
+    let advanced = null;
+
+    return {
+      markAdvanced: function() {
+        advanced = {
+          queue: (Jukebox.State.randomQueue || []).slice(),
+          index: Jukebox.State.randomQueueIndex
+        };
+      },
+      restore: function() {
+        if (!advanced) return;
+        const queue = Jukebox.State.randomQueue || [];
+        if (Jukebox.State.randomQueueIndex !== advanced.index) return;
+        if (queue.length !== advanced.queue.length) return;
+        if (!queue.every(function(songId, i) { return songId === advanced.queue[i]; })) return;
+        Jukebox.State.randomQueue = before.queue;
+        Jukebox.State.randomQueueIndex = before.index;
+        if (anchorSongId) Jukebox.ensureRandomQueueAnchor(anchorSongId);
+      }
+    };
   },
 
   isControlOwnerRequestSuperseded: function(data) {
@@ -720,26 +778,14 @@ Object.assign(window.Jukebox, {
 
     if (normalizedAction === 'next' || normalizedAction === 'previous') {
       const direction = normalizedAction === 'previous' ? -1 : 1;
-      // 随机模式下选曲这一步就已经推进了队列位置（或往队尾追加）。如果这首歌
-      // 根本没播起来（文件没了、预检失败、被取消），队列却把它当成了当前曲目，
-      // 下一次 next 会从错误的位置继续、跳过一首。位置只在真的播起来时才前进。
-      const randomSnapshot = Jukebox.State.playbackMode === 'random'
-        ? {
-            queue: (Jukebox.State.randomQueue || []).slice(),
-            index: Jukebox.State.randomQueueIndex
-          }
-        : null;
-      const restoreRandomQueue = () => {
-        if (!randomSnapshot) return;
-        Jukebox.State.randomQueue = randomSnapshot.queue;
-        Jukebox.State.randomQueueIndex = randomSnapshot.index;
-      };
+      const rollback = Jukebox.beginRandomQueueRollback();
 
       const adjacentSong = Jukebox.State.playbackMode === 'random'
         ? Jukebox.getRandomAdjacentSong(direction)
         : Jukebox.getManualAdjacentSong(direction);
+      rollback.markAdvanced();
       if (!adjacentSong) {
-        restoreRandomQueue();
+        rollback.restore();
         return {
           ok: false,
           action: normalizedAction,
@@ -752,7 +798,7 @@ Object.assign(window.Jukebox, {
         cancelEpoch
       });
       if (!outcome || outcome.ok !== true) {
-        restoreRandomQueue();
+        rollback.restore();
       }
       return outcome;
     }
@@ -1394,51 +1440,14 @@ Object.assign(window.Jukebox, {
       playbackMode: Jukebox.State.playbackMode
     });
 
-    // 随机模式下 getNextSongToPlay 会先把队列位置推进（或往队尾追加）。下面的
-    // 定时器有三个放弃出口，任何一个走掉都意味着这首从没播过，位置却已经落在了
-    // 它身上 —— 退出随机模式时它会被记成 randomQueueExitSongId，再切回来就把这
-    // 首没播过的当成当前曲目。与 next / previous 那条路径同一处理。
-    const randomSnapshot = Jukebox.State.playbackMode === 'random'
-      ? {
-          queue: (Jukebox.State.randomQueue || []).slice(),
-          index: Jukebox.State.randomQueueIndex
-        }
-      : null;
-    // 回滚的归属判据：队列是不是还停在「这次前进留下的样子」。
-    //
-    // 不能用 playRequestId 判：
-    //   —— 它在本该回滚的那条路径上必然对不上。playSong 失败时会先结清待机
-    //      欠账，而结账里的 restoreIdleAnimation 自己就 ++playRequestId；
-    //   —— 而在不该回滚的那条路径上它又拦不住该拦的。接手的那条 play 已经围绕
-    //      新曲目重置了随机队列，硬把旧快照盖回去会抹掉它的历史。
-    // 队列本身才是那个「谁拥有它」的事实：任何别的请求接手都会重置它。
-    const isRandomQueueStillOurs = () => {
-      if (!advancedSnapshot) return false;
-      const queue = Jukebox.State.randomQueue || [];
-      if (Jukebox.State.randomQueueIndex !== advancedSnapshot.index) return false;
-      if (queue.length !== advancedSnapshot.queue.length) return false;
-      return queue.every((songId, i) => songId === advancedSnapshot.queue[i]);
-    };
-    const restoreRandomQueue = () => {
-      if (!randomSnapshot) return;
-      if (!isRandomQueueStillOurs()) return;
-      Jukebox.State.randomQueue = randomSnapshot.queue;
-      Jukebox.State.randomQueueIndex = randomSnapshot.index;
-      // 只撤销那一步投机性的前进，不撤销 getNextSongToPlay 里那次锚点修复：
-      // 队列跟当前曲目脱节时（曲库变过、用户手点过）它会把队列重置到刚播完的
-      // 这一首，而「这首播完了」是既成事实，跟下一首播不播无关。这次调用是
-      // 幂等的 —— 队列本来就锚在这首上时它什么都不做。
-      Jukebox.ensureRandomQueueAnchor(endedSong.id);
-    };
+    // 与 next / previous 那条路径同一个回滚器：定时器有几个放弃出口，任何一个
+    // 走掉都意味着这首从没播过，位置却已经落在了它身上 —— 退出随机模式时它会被
+    // 记成 randomQueueExitSongId，再切回来就把这首没播过的当成当前曲目。
+    const rollback = Jukebox.beginRandomQueueRollback({ anchorSongId: endedSong.id });
+    const restoreRandomQueue = rollback.restore;
 
     const nextSong = Jukebox.getNextSongToPlay(endedSong);
-    // 前进之后的样子。回滚前拿它跟当下比对，一致才说明队列还没被别人接手。
-    const advancedSnapshot = randomSnapshot
-      ? {
-          queue: (Jukebox.State.randomQueue || []).slice(),
-          index: Jukebox.State.randomQueueIndex
-        }
-      : null;
+    rollback.markAdvanced();
     const nextAction = nextSong ? Jukebox.getActionForModel(nextSong) : null;
     Jukebox.stopVMD(!!nextAction);
     Jukebox.State.isPlaying = false;
@@ -1588,6 +1597,11 @@ Object.assign(window.Jukebox, {
         return null;
       }
 
+      // 声音已经在响了，这一刻起它就是「用户听到的那首」，也就是 next / previous
+      // 的导航锚点。等动画那几个 await 走完再记的话，加载期间到达的相对导航会拿
+      // 到一个空锚点，只能退回第一首 / 最后一首。
+      Jukebox.State.currentSong = song;
+
       // 根据模型类型播放对应格式的动画；动作缺失时只跳过动作，不阻断歌曲播放。
       const actionAvailability = options.actionAvailability || await Jukebox.getActionAvailability(song);
       if (requestId !== Jukebox.State.playRequestId) {
@@ -1620,7 +1634,6 @@ Object.assign(window.Jukebox, {
         return null;
       }
 
-      Jukebox.State.currentSong = song;
       Jukebox.State.isPlaying = true;
       Jukebox.State.lastPlaybackReport = {
         song: Jukebox.formatControlSong(song),

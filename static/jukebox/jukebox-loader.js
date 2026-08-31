@@ -523,12 +523,17 @@
     return Date.now() < controlOwnerExpiresAt;
   }
 
-  function cancelControlOnOwner() {
+  function cancelControlOnOwner(action) {
     var channel = ensureControlChannel();
     if (!channel) return false;
     try {
       // 只是一个信号，不等回执：它要在拥有者那条在途指令还没结束时就生效。
-      channel.postMessage({ type: 'jukebox_cancel_request' });
+      // 带上发起动作：拥有者据此决定要不要顶替它排队中的播放指令 —— 判据必须
+      // 跟发件侧一致，否则 next / previous 在本地不顶替、转发出去却顶替。
+      channel.postMessage({
+        type: 'jukebox_cancel_request',
+        action: String(action || '').trim().toLowerCase()
+      });
       return true;
     } catch (_) {
       return false;

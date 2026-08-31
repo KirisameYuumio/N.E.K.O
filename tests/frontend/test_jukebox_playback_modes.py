@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 202,
+        "keyCount": 203,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -5602,10 +5602,12 @@ def test_jukebox_stale_play_spares_a_successor_mid_startup(mock_page: Page):
           const gateB = new Promise(resolve => { releaseB = resolve; });
 
           // A 的 hold 点在它自己的 playAudio 之后。
-          // B 的 hold 点要落在「认领音频之后、提交 currentSong 之前」——
-          // 动画那一段正好在这中间。用一个显式开关切换，不靠调用顺序区分：
-          // A 的 confirm 反而排在 B 之后，按顺序判会互等死锁。
-          let holdAnimation = false;
+          // B 的 hold 点要落在「认领音频之后、提交 currentSong 之前」。自从导航
+          // 锚点提前到「音频一响就记」之后，这一段只剩 confirmAudioStarted 那个
+          // await —— 动画那一段已经排在锚点提交之后了，挂在那里就测不到这个窗口。
+          // 用一个显式开关切换，不靠调用顺序区分：A 的 confirm 反而排在 B 之后，
+          // 按顺序判会互等死锁。
+          let holdConfirm = false;
           const originalPlayAudio = J.playAudio;
           let firstPlay = true;
           J.playAudio = async function(song) {
@@ -5620,16 +5622,19 @@ def test_jukebox_stale_play_spares_a_successor_mid_startup(mock_page: Page):
             url: '/api/jukebox/file/actions/a.vrma'
           });
           J.getModelType = () => 'vrm';
-          J.playVRMA = async function() {
-            if (holdAnimation) await gateB;
-            return true;
+          J.playVRMA = async function() { return true; };
+          const originalConfirm = J.confirmAudioStarted;
+          J.confirmAudioStarted = async function() {
+            const started = await originalConfirm.apply(this, arguments);
+            if (holdConfirm) { holdConfirm = false; await gateB; }
+            return started;
           };
 
           const a = J.executeControl({ action: 'play', query: 'Song 1', headless: true });
           await new Promise(resolve => setTimeout(resolve, 10));
           await J.executeControl({ action: 'stop', headless: true });
 
-          holdAnimation = true;
+          holdConfirm = true;
           const b = J.executeControl({ action: 'play', query: 'Song 2', headless: true });
           await new Promise(resolve => setTimeout(resolve, 20));
           const midStartup = {
@@ -5647,6 +5652,7 @@ def test_jukebox_stale_play_spares_a_successor_mid_startup(mock_page: Page):
           releaseB();
           const bOutcome = await b;
           J.playAudio = originalPlayAudio;
+          J.confirmAudioStarted = originalConfirm;
 
           return {
             midStartup,
@@ -5659,7 +5665,8 @@ def test_jukebox_stale_play_spares_a_successor_mid_startup(mock_page: Page):
         """
     )
 
-    # B 的音频已经在响，但 currentSong 还没提交——正是判据最容易misfire 的窗口。
+    # B 的音频已经在响、也已认领，但 currentSong 还没提交——正是「没人认领这份
+    # 声音」这类判据最容易 misfire 的窗口。
     assert result["midStartup"]["audible"] is True
     assert result["midStartup"]["currentSong"] is None
     assert result["midStartup"]["audioOwner"] is True
@@ -6700,3 +6707,188 @@ def test_jukebox_auto_advance_rewind_yields_to_a_replacement_play(mock_page: Pag
     # 队列已经归接手的那条 play 了，陈旧快照不许盖回去。
     assert result["after"] == result["replacement"], result
     assert result["after"]["queue"] == ["song3"]
+
+
+@pytest.mark.frontend
+def test_jukebox_owner_cancel_from_relative_navigation_spares_the_queued_play(mock_page: Page):
+    """Codex P2: the owner's cancel rule disagreed with the sender's.
+
+    next/previous send the same cancellation signal as stop and play, so the
+    owner's unconditional bump superseded a queued play that the sender had
+    deliberately left alone -- and the navigation then ran relative to the
+    stale song instead of the queued one.  The signal now carries the action.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          const OriginalBC = window.BroadcastChannel;
+
+          const run = async (cancelAction) => {
+            const posted = [];
+            const channel = {
+              postMessage: (m) => { posted.push(m); },
+              close: () => {},
+              onmessage: null
+            };
+            window.BroadcastChannel = function() { return channel; };
+            const executed = [];
+            const originalExecute = J.executeControl;
+            let releaseSlow;
+            const slowGate = new Promise(resolve => { releaseSlow = resolve; });
+            J.executeControl = async (command) => {
+              executed.push(command.action + ':' + (command.query || ''));
+              if (command.query === 'slow') await slowGate;
+              return { ok: true, action: command.action };
+            };
+            try {
+              J.startControlOwnerService();
+              J.State.controlOwnerReady = true;
+              channel.onmessage({ data: {
+                type: 'jukebox_control_request', requestId: 'r1',
+                command: { action: 'play', query: 'slow' }
+              } });
+              await new Promise(resolve => setTimeout(resolve, 5));
+              channel.onmessage({ data: {
+                type: 'jukebox_control_request', requestId: 'r2',
+                command: { action: 'play', query: 'queued' }
+              } });
+              channel.onmessage({ data: { type: 'jukebox_cancel_request', action: cancelAction } });
+              releaseSlow();
+              await new Promise(resolve => setTimeout(resolve, 40));
+              return executed;
+            } finally {
+              J.executeControl = originalExecute;
+              J.stopControlOwnerService();
+            }
+          };
+
+          try {
+            const relative = await run('next');
+            const absolute = await run('stop');
+            const unlabelled = await run('');
+            return { relative, absolute, unlabelled };
+          } finally {
+            window.BroadcastChannel = OriginalBC;
+            window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          }
+        }
+        """
+    )
+
+    # 相对导航不顶替排队中的 play：判据必须和发件侧一致。
+    assert result["relative"] == ["play:slow", "play:queued"], result["relative"]
+    # 绝对指令照旧顶替。
+    assert result["absolute"] == ["play:slow"], result["absolute"]
+    # 认不出动作时按绝对处理：漏顶替会让用户喊停之后声音又起来。
+    assert result["unlabelled"] == ["play:slow"], result["unlabelled"]
+
+
+@pytest.mark.frontend
+def test_jukebox_navigation_anchor_is_recorded_when_the_audio_starts(mock_page: Page):
+    """Codex P2: the preserved anchor was still empty during startup.
+
+    currentSong used to be committed only after the animation awaits, so a
+    next/previous arriving while the action was still loading cancelled the
+    startup request and then found no anchor -- falling back to the first or
+    last library entry instead of the audible song.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          // 动作还在加载：起播卡在动画那一步。
+          let releaseAnimation;
+          const animationGate = new Promise(resolve => { releaseAnimation = resolve; });
+          J.getActionForModel = () => ({ id: 'act', name: 'Dance', file: 'actions/a.vrma' });
+          J.getActionAvailability = async () => ({
+            ok: true,
+            status: 'action_ready',
+            action: { id: 'act', name: 'Dance', file: 'actions/a.vrma' },
+            url: '/api/jukebox/file/actions/a.vrma'
+          });
+          J.getModelType = () => 'vrm';
+          J.playVRMA = async () => { await animationGate; return true; };
+
+          const pending = J.executeControl({ action: 'play', query: 'Song 2', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 20));
+          const midStartup = {
+            audible: J.getPlayer().audio.paused === false,
+            anchor: J.State.currentSong && J.State.currentSong.id
+          };
+
+          // 相对导航正好落在这个窗口里。
+          J.cancelActivePlayback();
+          const anchorAfterCancel = J.State.currentSong && J.State.currentSong.id;
+          const adjacent = J.getManualAdjacentSong(1);
+
+          releaseAnimation();
+          await pending;
+          return { midStartup, anchorAfterCancel, adjacent: adjacent && adjacent.id };
+        }
+        """
+    )
+
+    # 声音已经在响，锚点此刻就该记上了，不必等动画。
+    assert result["midStartup"]["audible"] is True
+    assert result["midStartup"]["anchor"] == "song2"
+    assert result["anchorAfterCancel"] == "song2"
+    # 于是 next 走的是 song2 的下一首，而不是退回第一首。
+    assert result["adjacent"] == "song3", result["adjacent"]
+
+
+@pytest.mark.frontend
+def test_jukebox_manual_navigation_rollback_yields_to_a_replacement(mock_page: Page):
+    """Codex P2: the manual rollback had no ownership check.
+
+    The auto-advance rollback learned to ask whether the queue is still the one
+    its own advance produced; the next/previous path -- which is the same
+    speculative advance -- kept restoring unconditionally, so a song the user
+    picked from the panel meanwhile had its fresh queue overwritten by the old
+    snapshot.  Both now share one rollback.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          // 远端的 next 卡在预检里，期间用户从面板点了另一首：那次播放围绕它
+          // 重置了随机队列。
+          const originalPreflight = J.preflightSongPlayback;
+          J.preflightSongPlayback = async function() {
+            J.resetRandomQueue('song4');
+            J.State.playRequestId += 1;
+            return { ok: false, message: 'play_superseded', audioUrl: '' };
+          };
+          let outcome;
+          try {
+            outcome = await J.executeControl({ action: 'next', headless: true });
+          } finally {
+            J.preflightSongPlayback = originalPreflight;
+          }
+
+          return {
+            ok: outcome.ok,
+            queue: J.State.randomQueue.slice(),
+            index: J.State.randomQueueIndex
+          };
+        }
+        """
+    )
+
+    assert result["ok"] is False
+    # 队列已经归接手的那次播放了，陈旧快照不许盖回去。
+    assert result["queue"] == ["song4"], result["queue"]
+    assert result["index"] == 0
