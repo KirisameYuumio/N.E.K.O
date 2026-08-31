@@ -310,7 +310,8 @@ Object.assign(window.Jukebox, {
     if (typeof state.fuzzySearchSettle === 'function') {
       const settle = state.fuzzySearchSettle;
       state.fuzzySearchSettle = null;
-      settle(-1);
+      // 被取代 ≠ 失败：新查询接手了，这一次直接作废，不要再去跑一遍主线程匹配。
+      settle({ superseded: true });
     }
     if (state.fuzzySearchWorker) {
       try { state.fuzzySearchWorker.terminate(); } catch (_) {}
@@ -369,20 +370,20 @@ Object.assign(window.Jukebox, {
         if (data.token !== token) return;
         if (data.error) {
           console.warn('[Jukebox] 模糊搜索 worker 报错:', data.error);
-          finish(-1);
+          finish({ failed: true });
           return;
         }
-        finish(Number.isInteger(data.index) ? data.index : -1);
+        finish(Number.isInteger(data.index) ? { index: data.index } : { failed: true });
       };
       worker.onerror = (error) => {
         console.warn('[Jukebox] 模糊搜索 worker 异常:', error && error.message);
-        finish(-1);
+        finish({ failed: true });
       };
       try {
         worker.postMessage({ token, query: normalizedQuery, songs });
       } catch (error) {
         console.warn('[Jukebox] 模糊搜索 worker 投递失败:', error);
-        finish(-1);
+        finish({ failed: true });
       }
     });
   },
@@ -402,11 +403,18 @@ Object.assign(window.Jukebox, {
 
     const workerResult = Jukebox.findSongByFuzzyWorker(songs, normalizedQuery);
     if (workerResult) {
-      const index = await workerResult;
-      return index >= 0 ? songs[index] : null;
+      const outcome = await workerResult;
+      // 被新查询取代：本次作废。
+      if (outcome && outcome.superseded) return null;
+      // worker 真的算出了结果才用它。建成之后才失败（比如宿主策略禁 blob worker）
+      // 不能当成「没这首歌」，否则控制面会报 song_not_found，而主线程明明能匹配。
+      if (outcome && Number.isInteger(outcome.index)) {
+        return outcome.index >= 0 ? songs[outcome.index] : null;
+      }
     }
 
-    // 没有 Worker（老宿主 / 创建失败）时才退回主线程，此时算法已是 O(|q|*|t|)。
+    // 没有 Worker（老宿主 / 创建失败），或 worker 起来之后出错：退回主线程，
+    // 此时算法已是 O(|q|*|t|)。
     const index = Jukebox.findBestSongIndex(songs, normalizedQuery);
     return index >= 0 ? songs[index] : null;
   },
@@ -678,6 +686,13 @@ Object.assign(window.Jukebox, {
 
   isPlaybackRequestCurrent: function(requestId) {
     return !Number.isInteger(requestId) || requestId === Jukebox.State.playRequestId;
+  },
+
+  // 就地作废在途播放：推进世代让卡在 await 里的 play 在下一个检查处解开，
+  // 同时把已经响起来的声音立刻停掉。stop 指令本身仍会按顺序再执行一次（幂等）。
+  cancelActivePlayback: function() {
+    Jukebox.State.playRequestId += 1;
+    Jukebox.stopPlayback();
   },
 
   tornDownResult: function(action) {
@@ -1226,18 +1241,21 @@ Object.assign(window.Jukebox, {
         return null;
       }
       const action = actionAvailability.action;
-      const startsAnimation = !!(action && actionAvailability.ok);
-      if (startsAnimation) {
+      // 文件可用不等于动画真的起来了：HEAD 预检过了，加载仍可能失败，或者
+      // 模型管理器根本不在。要看播放方法的返回值，否则「动画没起来」也会被当成
+      // 「接了动画」，收尾处就不会恢复待机，模型停在原地。
+      let startsAnimation = false;
+      if (action && actionAvailability.ok) {
         const actionUrl = actionAvailability.url;
         console.log('[Jukebox] 播放动画:', action.name, '格式:', action.format || 'vmd', '路径:', actionUrl);
 
         const modelType = Jukebox.getModelType();
         if (modelType === 'mmd' || modelType === 'live3d') {
-          await Jukebox.playVMD(actionUrl, { requestId });
+          startsAnimation = (await Jukebox.playVMD(actionUrl, { requestId })) !== false;
         } else if (modelType === 'vrm') {
-          await Jukebox.playVRMA(actionUrl, { requestId });
+          startsAnimation = (await Jukebox.playVRMA(actionUrl, { requestId })) !== false;
         } else if (modelType === 'fbx') {
-          await Jukebox.playFBX(actionUrl, { requestId });
+          startsAnimation = (await Jukebox.playFBX(actionUrl, { requestId })) !== false;
         }
       } else if (action) {
         console.warn('[Jukebox] 动作文件不可用，跳过动作:', actionAvailability.status, action.file || action.id);

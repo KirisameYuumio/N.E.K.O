@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 192,
+        "keyCount": 193,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -4434,3 +4434,117 @@ def test_jukebox_standalone_bootstrap_starts_the_control_owner_service(mock_page
     assert result["standalone"]["calls"] == ["started"]
     # 嵌在角色窗口里的点歌台不是拥有者，绝不能去抢这个身份。
     assert result["embedded"]["calls"] == []
+
+
+@pytest.mark.frontend
+def test_jukebox_restores_idle_when_the_replacement_animation_fails(mock_page: Page):
+    """Codex P2: file availability is not proof the animation started.
+
+    The HEAD preflight can pass while the load fails or no model manager is
+    around; the previous dance was already stopped with idle restoration
+    suppressed, so the avatar was left standing there.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const idleCalls = [];
+          window.lanlan_config = {
+            model_type: 'live3d',
+            live3d_sub_type: 'vrm',
+            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma']
+          };
+          window.vrmManager = {
+            playVRMAAnimation: async (url, options = {}) => {
+              if (options.isIdle) { idleCalls.push(url); return true; }
+              return true;
+            },
+            stopVRMAAnimation: () => {}
+          };
+          J.getActionAvailability = async () => ({
+            ok: true,
+            status: 'action_ready',
+            action: { id: 'act', name: 'Dance', file: 'actions/a.vrma' },
+            url: '/api/jukebox/file/actions/a.vrma'
+          });
+
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          const dancing = J.State.isVMDPlaying;
+          const idleAfterDance = idleCalls.length;
+
+          // 换歌：文件预检照样通过，但动画真的起不来（返回 false）。
+          J.playVRMA = async () => false;
+          const switched = await J.executeControl({ action: 'play', query: 'Song 2', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 30));
+
+          return {
+            dancing,
+            idleAfterDance,
+            switchedOk: switched.ok,
+            current: J.State.currentSong && J.State.currentSong.id,
+            idleRestored: idleCalls.length > idleAfterDance
+          };
+        }
+        """
+    )
+
+    assert result["dancing"] is True
+    assert result["idleAfterDance"] == 0
+    assert result["switchedOk"] is True
+    assert result["current"] == "song2"
+    # 动画没起来 -> 必须把待机接回去，不能让模型僵在原地。
+    assert result["idleRestored"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_falls_back_to_main_thread_when_the_worker_fails(mock_page: Page):
+    """Codex P2: a worker that dies after construction is not a miss.
+
+    Creation-time failure already fell back; a host policy that kills the blob
+    worker later resolved as index -1, and the control reported song_not_found
+    even though the main-thread matcher would have found it.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          // worker 建得出来，但一投递就报错（宿主策略拦 blob worker 的表现）。
+          const NativeWorker = window.Worker;
+          window.Worker = class {
+            constructor() {
+              this.onmessage = null;
+              this.onerror = null;
+              setTimeout(() => {
+                if (this.onerror) this.onerror({ message: 'blocked by policy' });
+              }, 0);
+            }
+            postMessage() {}
+            terminate() {}
+          };
+
+          // '桃园' 不是 '桃源恋歌' 的子串，只能靠模糊匹配。
+          const found = await J.findSongForQuery('桃园');
+          const played = await J.executeControl({ action: 'play', query: '桃园', headless: true });
+
+          window.Worker = NativeWorker;
+          return {
+            foundId: found && found.id,
+            ok: played.ok,
+            message: played.message || null,
+            current: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    # worker 失败不等于没这首歌：主线程匹配得出来。
+    assert result["foundId"] == "song4"
+    assert result["ok"] is True
+    assert result["message"] is None
+    assert result["current"] == "song4"

@@ -778,6 +778,20 @@
             && /^\/chat(?:_full)?(?:\/|$)/.test(window.location.pathname || '');
     }
 
+    function dispatchJukeboxControl(payload) {
+        // 归属必须在真正要执行的这一刻算，不能用入队之前的快照：排队期间独立
+        // 点唱机窗口可能刚打开（那就该转发，否则会在隐藏窗口里另起一条音轨），
+        // 也可能刚关闭（那就该本地执行，否则白等一次转发超时）。
+        var loader = window.__nekoJukeboxLoader;
+        var ownerAlive = !!(loader && typeof loader.hasControlOwner === 'function' && loader.hasControlOwner());
+        if (ownerAlive) return loader.forwardControl(payload);
+        if (!window.Jukebox || typeof window.Jukebox.executeControl !== 'function') {
+            console.log('[Jukebox] 跳过点歌台控制：当前窗口没有点歌台控制入口');
+            return Promise.resolve(null);
+        }
+        return window.Jukebox.executeControl(payload);
+    }
+
     function handleJukeboxControlResponse(response) {
         if (!response) return;
 
@@ -789,28 +803,39 @@
             mode: command.mode,
             headless: true
         };
-        var loader = window.__nekoJukeboxLoader;
-        var ownerAlive = !!(loader && typeof loader.hasControlOwner === 'function' && loader.hasControlOwner());
 
-        if (!ownerAlive && isSecondaryJukeboxControlSurface()) {
+        // 让位判据与有没有拥有者无关：同一条消息会被 RAW_MESSAGE 转给多个角色
+        // 窗口，它们都能看见同一个拥有者，于是会各转发一次、拥有者执行两遍 ——
+        // 一条 adjust_volume 被叠加，play 和切歌互相抢。只有主控制窗口能继续。
+        if (isSecondaryJukeboxControlSurface()) {
             console.log('[Jukebox] 跳过点歌台控制：多窗口下由主窗口执行');
-            return;
-        }
-        if (!ownerAlive && (!window.Jukebox || typeof window.Jukebox.executeControl !== 'function')) {
-            console.log('[Jukebox] 跳过点歌台控制：当前窗口没有点歌台控制入口');
             return;
         }
 
         var runCommand = function () {
-            var executed = ownerAlive
-                ? loader.forwardControl(payload)
-                : window.Jukebox.executeControl(payload);
-            return Promise.resolve(executed).then(function (result) {
+            return Promise.resolve(dispatchJukeboxControl(payload)).then(function (result) {
                 console.log('[Jukebox] 点歌台控制完成:', result);
             }).catch(function (error) {
                 console.warn('[Jukebox] 点歌台控制失败:', error);
             });
         };
+
+        // stop 是取消动作，排在它要取消的那个操作后面毫无意义：一条卡在慢动画加载
+        // 里的 play 会把 stop 和之后所有指令一起堵死，而声音早就出来了。
+        //
+        // 但直接让 stop 插队执行会把同一拍到达的 play/stop 颠倒（入队走的是微任务，
+        // 插队是同步的），结果反而变成「停完再播」。所以只把「作废在途播放」这一步
+        // 就地做掉——声音立刻停，卡住的 play 也会在下一个世代检查处解开——stop 命令
+        // 本身仍然按顺序排队执行，次序不变。
+        if (String(payload.action || '').trim().toLowerCase() === 'stop') {
+            try {
+                if (window.Jukebox && typeof window.Jukebox.cancelActivePlayback === 'function') {
+                    window.Jukebox.cancelActivePlayback();
+                }
+            } catch (error) {
+                console.warn('[Jukebox] 作废在途播放失败:', error);
+            }
+        }
         _jukeboxControlQueue = _jukeboxControlQueue.then(runCommand, runCommand);
     }
 

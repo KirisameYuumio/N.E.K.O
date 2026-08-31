@@ -549,3 +549,160 @@ def test_jukebox_control_routes_to_exactly_one_executor():
     assert not [entry for entry in log if entry["scenario"].startswith("chat")]
     # 转发出去的仍是规范化命令，不是原始 response。
     assert log[0]["command"] == {"action": "next", "query": "", "headless": True}
+
+
+def test_jukebox_control_defers_from_secondary_window_even_with_an_owner():
+    """CodeRabbit Major: deferral must not hang off whether an owner exists.
+
+    Every character window that receives the forwarded message can see the same
+    owner, so gating the deferral on "no owner" made both of them forward and
+    the owner run the command twice.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/chat' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              window.__NEKO_MULTI_WINDOW__ = true;
+              window.Jukebox = {
+                executeControl: (c) => { log.push(['local', c.action]); return Promise.resolve({ ok: true }); }
+              };
+              window.__nekoJukeboxLoader = {
+                hasControlOwner: () => true,
+                forwardControl: (c) => { log.push(['forward', c.action]); return Promise.resolve({ ok: true }); }
+              };
+
+              handleJukeboxControlResponse({ command: { action: 'adjust_volume', value: 10 } });
+              handleJukeboxControlResponse({ command: { action: 'stop' } });
+              await new Promise(resolve => setTimeout(resolve, 20));
+              emit(JSON.stringify(log));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    # 有拥有者也一样让位：一条都不能发出去。
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == []
+
+
+def test_jukebox_control_resolves_ownership_when_the_command_runs():
+    """Codex P2: ownership snapshotted outside the queue goes stale.
+
+    The standalone window can open or close while an earlier command occupies
+    the serialized queue.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              let ownerAlive = false;
+              let releaseFirst;
+              const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+
+              window.Jukebox = {
+                executeControl: (c) => {
+                  log.push(['local', c.action]);
+                  return c.action === 'play' ? firstGate : Promise.resolve({ ok: true });
+                }
+              };
+              window.__nekoJukeboxLoader = {
+                hasControlOwner: () => ownerAlive,
+                forwardControl: (c) => { log.push(['forward', c.action]); return Promise.resolve({ ok: true }); }
+              };
+
+              // 第一条在没有拥有者时进来 -> 本地执行，并卡住队列
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'x' } });
+              await new Promise(resolve => setTimeout(resolve, 10));
+              // 第二条排队期间独立点唱机窗口打开了
+              handleJukeboxControlResponse({ command: { action: 'next' } });
+              ownerAlive = true;
+              releaseFirst();
+              await new Promise(resolve => setTimeout(resolve, 20));
+
+              emit(JSON.stringify(log));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    log = json.loads(result.stdout.strip().splitlines()[-1])
+    # 排队时还没有拥有者，真跑起来时有了 -> 必须转发，不能在隐藏窗口里另起一条。
+    assert log == [["local", "play"], ["forward", "next"]], log
+
+
+def test_jukebox_stop_preempts_a_queued_playback():
+    """Codex P2: a cancel action queued behind what it cancels is useless.
+
+    A play stuck on a slow animation load kept the stop -- and every command
+    behind it -- waiting, while the audio was already audible.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const order = [];
+              let releasePlay;
+              let cancelled = 0;
+              const playGate = new Promise(resolve => { releasePlay = resolve; });
+              window.__nekoJukeboxLoader = { hasControlOwner: () => false };
+              window.Jukebox = {
+                cancelActivePlayback: () => { cancelled += 1; order.push('cancel'); },
+                executeControl: (c) => {
+                  order.push(c.action);
+                  if (c.action === 'play') return playGate;
+                  return Promise.resolve({ ok: true });
+                }
+              };
+
+              // 先让 play 真正跑起来并卡在慢动画加载上，再来 stop —— 这才是评审
+              // 描述的场景（同一拍到达的话，作废甚至发生在 play 起步之前）。
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'x' } });
+              await new Promise(resolve => setTimeout(resolve, 10));
+              const beforeStop = order.slice();
+              handleJukeboxControlResponse({ command: { action: 'stop' } });
+              handleJukeboxControlResponse({ command: { action: 'next' } });
+              await new Promise(resolve => setTimeout(resolve, 20));
+              const beforeRelease = order.slice();
+              releasePlay();
+              await new Promise(resolve => setTimeout(resolve, 20));
+              emit(JSON.stringify({ beforeStop, beforeRelease, order, cancelled }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["beforeStop"] == ["play"]
+    # 作废是就地做的：play 还卡在动画加载里，声音已经停了，不必等它 settle。
+    assert payload["cancelled"] == 1
+    assert payload["beforeRelease"] == ["play", "cancel"]
+    # 次序不变：stop 仍排在它要取消的那个 play 之后，next 再之后。
+    assert payload["order"] == ["play", "cancel", "stop", "next"]
