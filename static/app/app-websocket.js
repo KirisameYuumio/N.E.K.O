@@ -828,26 +828,30 @@
         // 就地做掉——声音立刻停，卡住的 play 也会在下一个世代检查处解开——stop 命令
         // 本身仍然按顺序排队执行，次序不变。
         if (String(payload.action || '').trim().toLowerCase() === 'stop') {
-            try {
-                // 取消也得按归属走：在途的那条 play 可能正跑在独立点唱机窗口里，
-                // 本窗口的 cancelActivePlayback 够不着它，队列里的 stop 就只能干等
-                // 一次转发超时。
-                var cancelLoader = window.__nekoJukeboxLoader;
-                var cancelOwnerAlive = !!(cancelLoader
-                    && typeof cancelLoader.hasControlOwner === 'function'
-                    && cancelLoader.hasControlOwner());
-                // 两个可能的播放方都要取消，不能二选一：归属允许在指令排队期间
-                // 变化。本窗口先无头起播过、随后用户才打开独立点唱机窗口时，
-                // 「只取消拥有者」会让本窗口那条已经在响的播放没人认领——而且
-                // 之后每条指令都转发给拥有者，用户再也停不掉它。
-                if (cancelOwnerAlive && typeof cancelLoader.cancelOnOwner === 'function') {
+            // 取消也得按归属走：在途的那条 play 可能正跑在独立点唱机窗口里，
+            // 本窗口的 cancelActivePlayback 够不着它，队列里的 stop 就只能干等
+            // 一次转发超时。
+            //
+            // 两个可能的播放方都要取消，不能二选一（归属允许在指令排队期间变化），
+            // 而且必须各自包 try —— 共用一个的话前一个抛异常会把后一个整个跳过，
+            // 那正是这段代码要堵的洞。
+            var cancelLoader = window.__nekoJukeboxLoader;
+            var cancelOwnerAlive = !!(cancelLoader
+                && typeof cancelLoader.hasControlOwner === 'function'
+                && cancelLoader.hasControlOwner());
+            if (cancelOwnerAlive && typeof cancelLoader.cancelOnOwner === 'function') {
+                try {
                     cancelLoader.cancelOnOwner();
+                } catch (error) {
+                    console.warn('[Jukebox] 作废拥有者在途播放失败:', error);
                 }
-                if (window.Jukebox && typeof window.Jukebox.cancelActivePlayback === 'function') {
+            }
+            if (window.Jukebox && typeof window.Jukebox.cancelActivePlayback === 'function') {
+                try {
                     window.Jukebox.cancelActivePlayback();
+                } catch (error) {
+                    console.warn('[Jukebox] 作废本地在途播放失败:', error);
                 }
-            } catch (error) {
-                console.warn('[Jukebox] 作废在途播放失败:', error);
             }
         }
         _jukeboxControlQueue = _jukeboxControlQueue.then(runCommand, runCommand);

@@ -452,7 +452,29 @@ Object.assign(window.Jukebox, {
       } catch (_) {}
     };
 
+    const reply = (data, result) => {
+      try {
+        channel.postMessage({
+          type: 'jukebox_control_result',
+          requestId: data.requestId,
+          result: result
+        });
+      } catch (_) {}
+    };
+
     const serve = async (data) => {
+      // 调用方已经不等了（它那边 forwardControl 有超时预算）：别再让一条过期指令
+      // 静默生效。ttlMs 由请求方随消息带来，这里不另存一份常量。
+      const ttl = Number(data.ttlMs);
+      if (Number.isFinite(ttl) && ttl > 0 && Number.isFinite(data.queuedAt)
+          && Date.now() - data.queuedAt > ttl) {
+        reply(data, {
+          ok: false,
+          action: (data.command && data.command.action) || '',
+          message: 'jukebox_request_expired'
+        });
+        return;
+      }
       let result;
       try {
         result = await Jukebox.executeControl(data.command || {});
@@ -463,13 +485,16 @@ Object.assign(window.Jukebox, {
           message: String((error && error.message) || error)
         };
       }
-      try {
-        channel.postMessage({
-          type: 'jukebox_control_result',
-          requestId: data.requestId,
-          result: result
-        });
-      } catch (_) {}
+      reply(data, result);
+    };
+
+    // onmessage 是 async 的，浏览器不会替你串行化：drain 里每条都 await serve，
+    // 这段等待期间新到的请求会直接执行、插到攒着的那些前面。所有指令统一走这条
+    // promise 链，到达顺序才作数。
+    let serveChain = Promise.resolve();
+    const enqueueServe = (data) => {
+      serveChain = serveChain.then(() => serve(data), () => serve(data));
+      return serveChain;
     };
 
     channel.onmessage = async (event) => {
@@ -482,13 +507,27 @@ Object.assign(window.Jukebox, {
       if (data.type === 'jukebox_cancel_request') {
         // 独立的取消信号：它必须能越过正在执行的那条指令，所以不走
         // jukebox_control_request 的路径，直接就地作废在途播放。
-        // 还没就绪时也要把攒着的指令丢掉——它们已经被取消了。
-        Jukebox.State.controlOwnerPending = [];
+        //
+        // 攒着的指令里只丢播放类的：set_volume / set_mode 跟这次取消无关，
+        // 整队丢掉等于把用户先发的音量调整也吞了。而且每条被丢的都要回执，
+        // 否则调用方那边的 forwardControl 会一直占着队列干等超时。
+        const keep = [];
+        for (const queued of Jukebox.State.controlOwnerPending) {
+          const queuedAction = String((queued.command && queued.command.action) || '')
+            .trim().toLowerCase();
+          if (Jukebox.PLAYBACK_CONTROL_ACTIONS.includes(queuedAction)) {
+            reply(queued, { ok: false, action: queuedAction, message: 'play_cancelled' });
+          } else {
+            keep.push(queued);
+          }
+        }
+        Jukebox.State.controlOwnerPending = keep;
         Jukebox.cancelActivePlayback();
         return;
       }
       if (data.type !== 'jukebox_control_request') return;
 
+      data.queuedAt = Date.now();
       if (!Jukebox.State.controlOwnerReady) {
         // 窗口已经宣告归属，但曲库还没拉完、播放器还没建好。直接执行会用默认的
         // live2d 去选动作、把该跳的舞跳过去；直接不接又会让角色窗口自己起一个
@@ -496,15 +535,17 @@ Object.assign(window.Jukebox, {
         Jukebox.State.controlOwnerPending.push(data);
         return;
       }
-      await serve(data);
+      enqueueServe(data);
     };
 
-    Jukebox.drainControlOwnerQueue = async function() {
+    Jukebox.drainControlOwnerQueue = function() {
+      // 同步地把攒着的按顺序挂上链子：此后到达的新请求只会排在它们后面。
       const queued = Jukebox.State.controlOwnerPending;
       Jukebox.State.controlOwnerPending = [];
       for (const data of queued) {
-        await serve(data);
+        enqueueServe(data);
       }
+      return serveChain;
     };
 
     announce();
@@ -513,13 +554,18 @@ Object.assign(window.Jukebox, {
     return true;
   },
 
+  // 「播放类」指令：取消会把攒着的这些丢掉，音量/模式这类与取消无关的保留。
+  PLAYBACK_CONTROL_ACTIONS: ['play', 'next', 'previous', 'stop'],
+
   markControlOwnerReady: function() {
     if (!window.__NEKO_JUKEBOX_STANDALONE__) return false;
     if (Jukebox.State.controlOwnerReady) return false;
-    Jukebox.State.controlOwnerReady = true;
+    // 先把攒着的挂上链子，再开闸：反过来的话，drain 还没跑到就到达的新请求
+    // 会插到它们前面。
     if (typeof Jukebox.drainControlOwnerQueue === 'function') {
       Jukebox.drainControlOwnerQueue();
     }
+    Jukebox.State.controlOwnerReady = true;
     return true;
   },
 

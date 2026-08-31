@@ -546,7 +546,14 @@
         finish({ ok: false, action: (command && command.action) || '', message: 'jukebox_owner_timeout' });
       }, CONTROL_FORWARD_TIMEOUT_MS);
       try {
-        channel.postMessage({ type: 'jukebox_control_request', requestId: requestId, command: command || {} });
+        // 把超时预算随请求带过去：拥有者据此丢弃「调用方已经不等了」的陈旧请求。
+        // 常量只在这里定义一份，不在两个文件各存一份。
+        channel.postMessage({
+          type: 'jukebox_control_request',
+          requestId: requestId,
+          command: command || {},
+          ttlMs: CONTROL_FORWARD_TIMEOUT_MS
+        });
       } catch (_) {
         finish({ ok: false, action: (command && command.action) || '', message: 'jukebox_owner_unreachable' });
       }

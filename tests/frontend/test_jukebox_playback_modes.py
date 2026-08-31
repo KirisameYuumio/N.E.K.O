@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 197,
+        "keyCount": 198,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -5721,3 +5721,135 @@ def test_jukebox_audio_claim_is_released_by_a_stop(mock_page: Page):
     assert result["claimAfterStop"] is None
     assert result["secondOk"] is False
     assert result["stillAudible"] is False
+
+
+@pytest.mark.frontend
+def test_jukebox_owner_queue_keeps_order_and_spares_non_playback(mock_page: Page):
+    """Three follow-ups on the owner queue, in one scenario.
+
+    onmessage is async, so nothing serialised the served commands; a cancel
+    discarded the whole backlog including volume/mode commands; and discarded
+    requests were never answered, so the caller's forward sat until its timeout.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const peer = new BroadcastChannel('neko-jukebox-control');
+          const replies = [];
+          peer.onmessage = (event) => {
+            const data = event.data;
+            if (data && data.type === 'jukebox_control_result') replies.push(data);
+          };
+
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          J.startControlOwnerService();
+
+          const order = [];
+          const originalExecute = J.executeControl;
+          J.executeControl = async function(command) {
+            order.push('start:' + command.action);
+            await new Promise(resolve => setTimeout(resolve, 20));
+            order.push('end:' + command.action);
+            return { ok: true, action: command.action };
+          };
+
+          const send = (id, command) => peer.postMessage({
+            type: 'jukebox_control_request', requestId: id, command, ttlMs: 5000
+          });
+
+          // 就绪之前攒下：一条音量、一条播放。
+          send('q-vol', { action: 'set_volume', value: 40 });
+          send('q-play', { action: 'play', query: 'Song 1' });
+          await new Promise(resolve => setTimeout(resolve, 30));
+          const queuedBeforeReady = J.State.controlOwnerPending.length;
+
+          // 取消：只该丢掉播放那条，并给它回执；音量那条要留着。
+          peer.postMessage({ type: 'jukebox_cancel_request' });
+          await new Promise(resolve => setTimeout(resolve, 20));
+          const afterCancel = {
+            pending: J.State.controlOwnerPending.map(
+              item => item.command.action),
+            replied: replies.map(r => [r.requestId, r.result.message || 'ok'])
+          };
+
+          // 开闸；紧接着再来一条，它必须排在攒着的那条后面。
+          J.markControlOwnerReady();
+          send('late', { action: 'next' });
+          await new Promise(resolve => setTimeout(resolve, 200));
+
+          J.executeControl = originalExecute;
+          J.stopControlOwnerService();
+          peer.close();
+          window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          return { queuedBeforeReady, afterCancel, order };
+        }
+        """
+    )
+
+    assert result["queuedBeforeReady"] == 2
+    # 取消只丢播放类，音量那条留下；被丢的那条立刻有回执，调用方不必干等超时。
+    assert result["afterCancel"]["pending"] == ["set_volume"]
+    assert result["afterCancel"]["replied"] == [["q-play", "play_cancelled"]]
+    # 串行：后到的 next 不许插到攒着的 set_volume 中间。
+    assert result["order"] == [
+        "start:set_volume", "end:set_volume", "start:next", "end:next",
+    ]
+
+
+@pytest.mark.frontend
+def test_jukebox_owner_drops_a_request_the_caller_stopped_waiting_for(mock_page: Page):
+    """A queued request outliving the caller's timeout must not act silently."""
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const peer = new BroadcastChannel('neko-jukebox-control');
+          const replies = [];
+          peer.onmessage = (event) => {
+            const data = event.data;
+            if (data && data.type === 'jukebox_control_result') replies.push(data);
+          };
+
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          J.startControlOwnerService();
+
+          let executed = 0;
+          const originalExecute = J.executeControl;
+          J.executeControl = async function(command) {
+            executed += 1;
+            return originalExecute.call(this, command);
+          };
+
+          // ttl 极短：等它过期之后才开闸。
+          peer.postMessage({
+            type: 'jukebox_control_request',
+            requestId: 'stale',
+            command: { action: 'set_mode', mode: 'random' },
+            ttlMs: 20
+          });
+          await new Promise(resolve => setTimeout(resolve, 80));
+          J.markControlOwnerReady();
+          await new Promise(resolve => setTimeout(resolve, 60));
+
+          J.executeControl = originalExecute;
+          J.stopControlOwnerService();
+          peer.close();
+          window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          return {
+            executed,
+            replies: replies.map(r => [r.requestId, r.result.message]),
+            mode: J.State.playbackMode
+          };
+        }
+        """
+    )
+
+    # 调用方早就不等了：不执行，但要明确回执。
+    assert result["executed"] == 0
+    assert result["replies"] == [["stale", "jukebox_request_expired"]]
+    assert result["mode"] == "sequence"
