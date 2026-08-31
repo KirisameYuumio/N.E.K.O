@@ -4818,3 +4818,45 @@ def test_jukebox_standalone_teardown_delegates_idle_restore_to_the_pet_window(mo
     assert result["stopsAfterElectronStop"] == 1
     # 欠账不会留在原地拖着。
     assert result["pendingSettled"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_player_adopts_the_volume_set_before_it_existed(mock_page: Page):
+    """Codex P2: a drag during the pre-player window was recorded, then discarded.
+
+    initPlayer built APlayer at volume 1 and initVolumeSlider then wrote that
+    back over the slider and label, so the user's setting vanished.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        () => {
+          const J = window.Jukebox;
+          document.body.insertAdjacentHTML('beforeend',
+            '<input id="jukebox-volume-slider" type="range" min="0" max="1" step="0.01" value="1">'
+            + '<span id="jukebox-volume-value">100%</span>');
+
+          // buildUI 之后、initPlayer 之前拖滑条。
+          const hadPlayerWhenDragged = !!J.getPlayer();
+          J.updateVolume(0.4);
+
+          J.initPlayer({ headless: true });
+          J.initVolumeSlider();
+
+          const player = J.getPlayer();
+          return {
+            hadPlayerWhenDragged,
+            playerVolume: player && player.audio.volume,
+            slider: document.getElementById('jukebox-volume-slider').value,
+            label: document.getElementById('jukebox-volume-value').textContent
+          };
+        }
+        """
+    )
+
+    assert result["hadPlayerWhenDragged"] is False
+    # 播放器按用户拖到的值建，滑条和标签也不会被 100% 反向覆盖。
+    assert result["playerVolume"] == 0.4
+    assert result["slider"] == "0.4"
+    assert result["label"] == "40%"
