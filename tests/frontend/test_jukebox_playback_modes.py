@@ -4794,6 +4794,12 @@ def test_jukebox_standalone_teardown_delegates_idle_restore_to_the_pet_window(mo
           };
 
           window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          // 没有这个桩的话 stopVMD 的独立分支会短路，测试其实走的是本地路径，
+          // 跟 docstring 说的完全不是一回事。
+          const bridgeCalls = [];
+          window.nekoJukeboxBridge = {
+            stopVMD: (skipIdleRestore) => bridgeCalls.push(skipIdleRestore)
+          };
           await J.executeControl({ action: 'set_volume', value: 40, headless: true });
           J.State.isVMDPlaying = true;
 
@@ -4806,15 +4812,22 @@ def test_jukebox_standalone_teardown_delegates_idle_restore_to_the_pet_window(mo
 
           J.close();
           await new Promise(resolve => setTimeout(resolve, 30));
-          const afterClose = { idle: idleCalls.length, stops: stopCalls, vmd: J.State.isVMDPlaying };
+          const afterClose = {
+            idle: idleCalls.length,
+            stops: stopCalls,
+            vmd: J.State.isVMDPlaying,
+            bridge: bridgeCalls.slice()
+          };
 
           // 桌面端随后从主进程发来的那一下（skipIdleRestore: false）。
           J.stopVMD(false);
           await new Promise(resolve => setTimeout(resolve, 30));
 
           window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          delete window.nekoJukeboxBridge;
           return {
             afterClose,
+            bridgeAfterElectronStop: bridgeCalls.slice(),
             idleAfterElectronStop: idleCalls.length,
             stopsAfterElectronStop: stopCalls,
             pendingSettled: J.State.idleRestorePending === false
@@ -4823,11 +4836,13 @@ def test_jukebox_standalone_teardown_delegates_idle_restore_to_the_pet_window(mo
         """
     )
 
-    # 本地真的把舞蹈停了，但不在本窗口恢复待机——那是 Pet 侧的事。
-    assert result["afterClose"] == {"idle": 0, "stops": 1, "vmd": False}
-    # 桌面端补发的那一下是空操作，不会重复停、也不会在这里恢复待机。
+    # 走的确实是独立窗口分支：停止经 IPC 发给 Pet，本地既不动 vrmManager
+    # 也不在本窗口恢复待机。
+    assert result["afterClose"] == {"idle": 0, "stops": 0, "vmd": False, "bridge": [False]}
+    # 桌面端补发的那一下：本地没有欠账，所以不会再多发一条。
+    assert result["bridgeAfterElectronStop"] == [False]
     assert result["idleAfterElectronStop"] == 0
-    assert result["stopsAfterElectronStop"] == 1
+    assert result["stopsAfterElectronStop"] == 0
     # 欠账不会留在原地拖着。
     assert result["pendingSettled"] is True
 
@@ -5154,3 +5169,158 @@ def test_jukebox_execute_play_control_refuses_a_stale_cancel_epoch(mock_page: Pa
     assert result["songId"] == "song1"
     assert result["mintedGeneration"] is False
     assert result["currentSong"] is None
+
+
+@pytest.mark.frontend
+def test_jukebox_failed_startup_settles_the_idle_debt(mock_page: Page):
+    """Codex + Greptile: playSong's catch never settled the deferred restoration.
+
+    Switching away from a dance suppresses idle restoration because a
+    replacement is coming; if startup then throws (blocked autoplay, a load
+    error) nobody ever puts the idle animation back.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const idleCalls = [];
+          window.lanlan_config = {
+            model_type: 'live3d',
+            live3d_sub_type: 'vrm',
+            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma']
+          };
+          window.vrmManager = {
+            playVRMAAnimation: async (url, options = {}) => {
+              if (options.isIdle) idleCalls.push(url);
+              return true;
+            },
+            stopVRMAAnimation: () => {}
+          };
+
+          await J.ensureRuntime({ headless: true });
+          J.State.currentSong = J.State.songs[0];
+          J.State.isVMDPlaying = true;
+          const idleBefore = idleCalls.length;
+
+          // 换歌：旧舞蹈被停掉且跳过待机恢复，然后起播失败。
+          J.playAudio = async () => { throw new Error('autoplay_blocked'); };
+          const played = await J.playSong('song2');
+          await new Promise(resolve => setTimeout(resolve, 30));
+
+          return {
+            idleBefore,
+            played,
+            debtSettled: J.State.idleRestorePending === false,
+            idleRestored: idleCalls.length > idleBefore
+          };
+        }
+        """
+    )
+
+    assert result["idleBefore"] == 0
+    assert result["played"] is None
+    assert result["debtSettled"] is True
+    # 起播失败之后模型必须回到待机，不能停在舞蹈最后一帧。
+    assert result["idleRestored"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_standalone_forwards_the_idle_restore_to_the_pet(mock_page: Page):
+    """Codex: settling the debt was a no-op in the standalone window.
+
+    restoreIdleAnimation returns early there, so the ledger was cleared while
+    the pet stayed on the dance's last frame. The restore has to be forwarded.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const bridgeCalls = [];
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          window.nekoJukeboxBridge = {
+            stopVMD: (skipIdleRestore) => bridgeCalls.push({ stop: skipIdleRestore }),
+            playVMD: (url) => bridgeCalls.push({ play: url })
+          };
+
+          await J.ensureRuntime({ headless: true });
+          J.State.isVMDPlaying = true;
+
+          // 换歌到一首没有可播动作的歌：先抑制恢复地停掉旧舞蹈……
+          J.stopVMD(true);
+          const afterSuppressedStop = {
+            calls: bridgeCalls.slice(),
+            debt: J.State.idleRestorePending
+          };
+
+          // ……然后没有动画接上，收尾处结账。
+          J.settleIdleRestore();
+          const afterSettle = bridgeCalls.slice();
+
+          window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          delete window.nekoJukeboxBridge;
+          return { afterSuppressedStop, afterSettle, debtAfter: J.State.idleRestorePending };
+        }
+        """
+    )
+
+    # 抑制恢复的那一下确实记了账。
+    assert result["afterSuppressedStop"]["calls"] == [{"stop": True}]
+    assert result["afterSuppressedStop"]["debt"] is True
+    # 结账必须真的把恢复转发给 Pet，而不是清个标志了事。
+    assert result["afterSettle"] == [{"stop": True}, {"stop": False}]
+    assert result["debtAfter"] is False
+
+
+@pytest.mark.frontend
+def test_jukebox_compensating_stop_settles_an_outstanding_debt(mock_page: Page):
+    """A stop that arrives with nothing playing is the compensating one.
+
+    Both arms of stopVMD returned before the ledger, so the desktop shell's
+    VMD_STOP after a failed switch could never settle the debt.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const idleCalls = [];
+          window.lanlan_config = {
+            model_type: 'live3d',
+            live3d_sub_type: 'vrm',
+            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma']
+          };
+          window.vrmManager = {
+            playVRMAAnimation: async (url, options = {}) => {
+              if (options.isIdle) idleCalls.push(url);
+              return true;
+            },
+            stopVRMAAnimation: () => {}
+          };
+
+          // 本地路径：欠着账，且已经没有舞蹈在播。
+          J.State.isVMDPlaying = false;
+          J.State.idleRestorePending = true;
+          J.stopVMD(false);
+          await new Promise(resolve => setTimeout(resolve, 20));
+          const local = { idle: idleCalls.length, debt: J.State.idleRestorePending };
+
+          // 抑制恢复的那种停止不该结账 —— 它本来就是记账的那一方。
+          J.State.idleRestorePending = true;
+          J.stopVMD(true);
+          await new Promise(resolve => setTimeout(resolve, 20));
+          const suppressed = { idle: idleCalls.length, debt: J.State.idleRestorePending };
+
+          return { local, suppressed };
+        }
+        """
+    )
+
+    # 补发的停止把账结了，待机接回去。
+    assert result["local"] == {"idle": 1, "debt": False}
+    # 抑制恢复的停止不结账，也不会多恢复一次。
+    assert result["suppressed"] == {"idle": 1, "debt": True}

@@ -1352,6 +1352,12 @@ Object.assign(window.Jukebox, {
       }
       return song;
     } catch (error) {
+      // 这次换歌把旧舞蹈停掉时跳过了待机恢复，起播却失败了（自动播放被拦、
+      // 音频加载报错……）。没人会再接上动画，账必须在这里结掉，否则模型僵在
+      // 舞蹈最后一帧。放在世代检查之前：被取代的情况下接手的那条自己会安排。
+      if (requestId === Jukebox.State.playRequestId) {
+        Jukebox.settleIdleRestore();
+      }
       if (requestId !== Jukebox.State.playRequestId) {
         return null;
       }
@@ -1769,12 +1775,23 @@ Object.assign(window.Jukebox, {
         window.nekoJukeboxBridge.stopVMD(skipIdleRestore);
         Jukebox.State.isVMDPlaying = false;
         Jukebox.State.isPaused = false;
+        // 记账口径与本地路径同构：抑制了 Pet 侧的待机恢复，就欠一笔。
+        Jukebox.State.idleRestorePending = skipIdleRestore === true;
+        return;
       }
+      // 没在跳舞却收到一条不抑制恢复的停止 —— 这正是「补发」的形态
+      // （桌面端关点唱机窗口时会发一条）。欠着账就在这里结掉。
+      if (!skipIdleRestore) Jukebox.settleIdleRestore();
       return;
     }
 
     // 没有在播放舞蹈动画时，不要停止当前动画（可能是 idle 待机）
-    if (!Jukebox.State.isVMDPlaying) return;
+    if (!Jukebox.State.isVMDPlaying) {
+      // 同上：本地路径的补发停止也要能结账。纯 pet 窗口、完全不涉及独立窗口时
+      // 同样走这里 —— 换歌起播失败留下的欠账原本会永远挂着。
+      if (!skipIdleRestore) Jukebox.settleIdleRestore();
+      return;
+    }
 
     // 根据模型类型停止对应的动画模块
     var modelType = Jukebox.getModelType();
@@ -1816,8 +1833,19 @@ Object.assign(window.Jukebox, {
     const Jukebox = window.Jukebox || this;
     // 无论谁触发的，账到此为止。
     Jukebox.State.idleRestorePending = false;
-    // 独立窗口模式：Pet 侧在 stopVMD 时自动恢复，此处无需操作
-    if (window.__NEKO_JUKEBOX_STANDALONE__) return;
+    // 独立窗口模式：模型在 Pet 窗口里，本窗口自己恢复不了任何东西。
+    // 直接 return 等于「账清了却什么都没发生」，Pet 会停在舞蹈最后一帧。
+    // 补发一条不抑制恢复的停止过去，让 Pet 自己回到待机。
+    if (window.__NEKO_JUKEBOX_STANDALONE__) {
+      try {
+        if (window.nekoJukeboxBridge && typeof window.nekoJukeboxBridge.stopVMD === 'function') {
+          window.nekoJukeboxBridge.stopVMD(false);
+        }
+      } catch (error) {
+        console.warn('[Jukebox] 转发待机恢复失败:', error);
+      }
+      return;
+    }
 
     // VRM 模式：恢复 VRM 待机动画
     var modelType = Jukebox.getModelType();
