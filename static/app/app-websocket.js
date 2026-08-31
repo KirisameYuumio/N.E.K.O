@@ -792,6 +792,12 @@
             // loader 等分片加载完再执行。
             if (loader && typeof loader.load === 'function') {
                 return Promise.resolve(loader.load()).then(function (jukebox) {
+                    // 分片加载是几百毫秒到数秒的窗口，独立点唱机窗口完全可能在这
+                    // 中间打开并宣告归属。函数开头那次判定到这里已经过期，得按同样
+                    // 的理由再算一次，否则这条指令会在本窗口另起一条隐藏音轨。
+                    if (typeof loader.hasControlOwner === 'function' && loader.hasControlOwner()) {
+                        return loader.forwardControl(payload);
+                    }
                     if (!jukebox || typeof jukebox.executeControl !== 'function') {
                         console.log('[Jukebox] 跳过点歌台控制：分片加载后仍无控制入口');
                         return null;

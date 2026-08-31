@@ -949,3 +949,111 @@ def test_jukebox_control_waits_for_the_parts_instead_of_dropping():
     assert payload["executedWhileLoading"] == 0
     # 分片加载完之后必须补上，而不是把指令丢掉。
     assert payload["executed"] == ["play"]
+
+
+def test_jukebox_control_rechecks_ownership_after_the_parts_load():
+    """CodeRabbit: the ownership snapshot is stale by the time the parts land.
+
+    Waiting for the parts instead of dropping the command opened a window of
+    hundreds of milliseconds to seconds.  The standalone jukebox window can be
+    opened inside it, and executing locally afterwards starts a second, hidden
+    audio track that nothing can reach.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              let ownerAlive = false;
+              // 分片加载中：bootstrap.js 已经把门面换成空对象。
+              window.Jukebox = {};
+              let resolveLoad;
+              const loadGate = new Promise(resolve => { resolveLoad = resolve; });
+              window.__nekoJukeboxLoader = {
+                hasControlOwner: () => ownerAlive,
+                forwardControl: (c) => { log.push('forward:' + c.action); return Promise.resolve({ ok: true }); },
+                load: () => loadGate
+              };
+
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'x' } });
+              await new Promise(resolve => setTimeout(resolve, 20));
+
+              // 加载还没完，用户打开了独立点唱机窗口。
+              ownerAlive = true;
+
+              const loaded = {
+                executeControl: (c) => { log.push('local:' + c.action); return Promise.resolve({ ok: true }); }
+              };
+              window.Jukebox = loaded;
+              resolveLoad(loaded);
+              await new Promise(resolve => setTimeout(resolve, 20));
+
+              emit(JSON.stringify({ log }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # 必须转发给刚出现的拥有者，而不是在本窗口另起一条隐藏音轨。
+    assert payload["log"] == ["forward:play"]
+
+
+def test_chat_surface_can_receive_jukebox_control():
+    """Codex P2: /chat and /chat_full drop every AI-issued jukebox command.
+
+    ``dispatchJukeboxControl`` needs either ``window.Jukebox`` or the loader to
+    do anything at all, and both come from ``jukebox-loader.js`` — which
+    ``templates/chat.html`` did not load.  The deferral to the primary window
+    only fires under ``__NEKO_MULTI_WINDOW__``, so on the web ``/chat`` route
+    the chat page is the sole recipient and the command died there.
+    """
+    chat_html = (ROOT / "templates" / "chat.html").read_text(encoding="utf-8")
+    index_html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+    loader_tag = "/static/jukebox/jukebox-loader.js"
+    assert loader_tag in index_html, "index.html 不再加载点歌台门面，这条判据要重写"
+    assert loader_tag in chat_html, (
+        "chat.html 必须加载 jukebox-loader.js，否则 /chat 收到的点播指令无处可去"
+    )
+    # 顺序也要和 index.html 一致：门面依赖 music_ui.js 的样式与 APlayer 全局。
+    assert chat_html.index("/static/jukebox/music_ui.js") < chat_html.index(loader_tag)
+    assert "/static/libs/APlayer.min.js" in chat_html
+
+    # 加载了门面之后，网页端 /chat（非多窗口）必须真的执行，而不是让位。
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/chat' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              window.Jukebox = {
+                executeControl: (c) => { log.push('local:' + c.action); return Promise.resolve({ ok: true }); }
+              };
+              window.__nekoJukeboxLoader = { hasControlOwner: () => false };
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'x' } });
+              await new Promise(resolve => setTimeout(resolve, 20));
+              emit(JSON.stringify({ log }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["log"] == ["local:play"]
