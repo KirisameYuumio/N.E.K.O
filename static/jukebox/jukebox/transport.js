@@ -1443,7 +1443,13 @@ Object.assign(window.Jukebox, {
     // 与 next / previous 那条路径同一个回滚器：定时器有几个放弃出口，任何一个
     // 走掉都意味着这首从没播过，位置却已经落在了它身上 —— 退出随机模式时它会被
     // 记成 randomQueueExitSongId，再切回来就把这首没播过的当成当前曲目。
-    const rollback = Jukebox.beginRandomQueueRollback({ anchorSongId: endedSong.id });
+    // endedSong 可能为空：stopPlayback 清掉 currentSong 之后，播放器仍可能补发
+    // 一次陈旧的 ended。这里不能整条早退 —— 下面的结账、状态清理和 UI 刷新在这
+    // 种情况下照样该做（getNextSongToPlay 自己也是返回 null 而不是抛错）；不做
+    // 的只是「推进队列」这件事，所以锚点传空即可，回滚器也就没什么可回滚的。
+    const rollback = Jukebox.beginRandomQueueRollback({
+      anchorSongId: endedSong && endedSong.id
+    });
     const restoreRandomQueue = rollback.restore;
 
     const nextSong = Jukebox.getNextSongToPlay(endedSong);

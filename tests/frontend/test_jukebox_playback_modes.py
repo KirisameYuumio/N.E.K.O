@@ -6968,3 +6968,70 @@ def test_jukebox_loader_labels_the_cancel_signal_with_its_action(mock_page: Page
 
     # 动作原样带过去，并且归一化过大小写；没有动作时是空串（拥有者按绝对处理）。
     assert result["seen"] == ["next", "stop", ""], result["seen"]
+
+
+@pytest.mark.frontend
+def test_jukebox_stale_audio_ended_without_a_current_song_still_cleans_up(mock_page: Page):
+    """CodeRabbit: a crash this PR introduced.
+
+    The player can emit a stale `ended` after stopPlayback has already cleared
+    currentSong.  getNextSongToPlay has always guarded that (`if (!endedSong)`),
+    but the shared rollback hoisted `endedSong.id` above the guard and threw a
+    TypeError, aborting the handler.  Returning early is not the fix either:
+    the rest of the callback -- settling the idle debt, clearing the flags,
+    refreshing the stopped status -- is still the right thing to do for a stale
+    ended.  Only the queue advance is skipped.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          const queueBefore = J.State.randomQueue.slice();
+          const indexBefore = J.State.randomQueueIndex;
+
+          // 陈旧的 ended：currentSong 已经被清掉了。
+          J.State.currentSong = null;
+          J.State.isPlaying = true;
+          J.State.idleRestorePending = true;
+          let stoppedStatusRefreshed = false;
+          const originalStopped = J.updateStoppedStatus;
+          J.updateStoppedStatus = function() {
+            stoppedStatusRefreshed = true;
+            return originalStopped.apply(this, arguments);
+          };
+
+          let threw = null;
+          try {
+            J.handleAudioEnded(J.getPlayer());
+          } catch (error) {
+            threw = String(error && error.message || error);
+          } finally {
+            J.updateStoppedStatus = originalStopped;
+          }
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          return {
+            threw,
+            isPlaying: J.State.isPlaying,
+            stoppedStatusRefreshed,
+            idleRestorePending: J.State.idleRestorePending,
+            queueUnchanged: JSON.stringify(J.State.randomQueue) === JSON.stringify(queueBefore)
+              && J.State.randomQueueIndex === indexBefore
+          };
+        }
+        """
+    )
+
+    assert result["threw"] is None, result["threw"]
+    # 清理照做。
+    assert result["isPlaying"] is False
+    assert result["stoppedStatusRefreshed"] is True
+    assert result["idleRestorePending"] is False
+    # 但队列不该被推进 —— 没有「刚播完的那首」可言。
+    assert result["queueUnchanged"] is True
