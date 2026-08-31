@@ -4950,3 +4950,166 @@ def test_jukebox_stop_cancels_a_play_still_inside_its_awaits(mock_page: Page):
         assert outcome["startedAudio"] is False, label
         assert outcome["isPlaying"] is False, label
         assert outcome["currentSong"] is None, label
+
+
+@pytest.mark.frontend
+def test_jukebox_cancel_active_playback_stops_a_play_in_its_awaits(mock_page: Page):
+    """The websocket route cancels through cancelActivePlayback, not through stop.
+
+    app-websocket.js calls it out of band before queueing the stop, so it has
+    to advance the cancel epoch on its own.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          const player = J.getPlayer();
+          player.played = false;
+
+          let release;
+          const gate = new Promise(resolve => { release = resolve; });
+          const originalFind = J.findSongForQuery;
+          J.findSongForQuery = async function(query) {
+            await gate;
+            return originalFind.call(this, query);
+          };
+
+          const pending = J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 10));
+
+          // 这正是 app-websocket 收到 stop 时先做的那一步。
+          J.cancelActivePlayback();
+          release();
+          const outcome = await pending;
+          J.findSongForQuery = originalFind;
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          return {
+            ok: outcome.ok,
+            message: outcome.message || null,
+            startedAudio: player.played === true,
+            currentSong: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    assert result["ok"] is False
+    assert result["message"] == "play_cancelled"
+    assert result["startedAudio"] is False
+    assert result["currentSong"] is None
+
+
+@pytest.mark.frontend
+def test_jukebox_cancel_during_preflight_and_startup_stops_the_play(mock_page: Page):
+    """The later gates cover cancels that land after the play took its generation.
+
+    One during the preflight HEAD requests, one while the audio is starting —
+    the latter must also stop the sound it just made.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          const runWithCancelDuring = async (hookName) => {
+            const player = J.getPlayer();
+            player.played = false;
+            J.State.currentSong = null;
+            J.State.isPlaying = false;
+
+            let release;
+            const gate = new Promise(resolve => { release = resolve; });
+            const original = J[hookName];
+            J[hookName] = async function(...a) {
+              const result = await original.apply(this, a);
+              await gate;
+              return result;
+            };
+
+            const pending = J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+            await new Promise(resolve => setTimeout(resolve, 10));
+            J.cancelActivePlayback();
+            release();
+            const outcome = await pending;
+            J[hookName] = original;
+            await new Promise(resolve => setTimeout(resolve, 20));
+
+            return {
+              ok: outcome.ok,
+              message: outcome.message || null,
+              isPlaying: J.State.isPlaying,
+              currentSong: J.State.currentSong && J.State.currentSong.id
+            };
+          };
+
+          return {
+            duringPreflight: await runWithCancelDuring('preflightSongPlayback'),
+            duringStartup: await runWithCancelDuring('playAudio')
+          };
+        }
+        """
+    )
+
+    for label in ("duringPreflight", "duringStartup"):
+        outcome = result[label]
+        assert outcome["ok"] is False, label
+        assert outcome["message"] == "play_cancelled", label
+        # 起播中途被取消时，刚响起来的声音也必须停掉。
+        assert outcome["isPlaying"] is False, label
+        assert outcome["currentSong"] is None, label
+
+
+@pytest.mark.frontend
+def test_jukebox_cancelled_play_skips_the_preflight_requests(mock_page: Page):
+    """The early short-circuits exist to skip work, and that is observable.
+
+    A play cancelled while it waited on the runtime must not go on to issue the
+    preflight HEAD requests for a song it will never start.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          let headRequests = 0;
+          const originalFetch = window.fetch;
+          window.fetch = async (url, options = {}) => {
+            if (options.method === 'HEAD') headRequests += 1;
+            return originalFetch(url, options);
+          };
+
+          let release;
+          const gate = new Promise(resolve => { release = resolve; });
+          const originalEnsure = J.ensureRuntime;
+          J.ensureRuntime = async function(options) {
+            await gate;
+            return originalEnsure.call(this, options);
+          };
+
+          const pending = J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 10));
+          J.cancelActivePlayback();
+          release();
+          const outcome = await pending;
+          J.ensureRuntime = originalEnsure;
+          window.fetch = originalFetch;
+
+          return { ok: outcome.ok, message: outcome.message || null, headRequests };
+        }
+        """
+    )
+
+    assert result["ok"] is False
+    assert result["message"] == "play_cancelled"
+    # 取消之后不该再为一首永远不会播的歌发预检请求。
+    assert result["headRequests"] == 0
