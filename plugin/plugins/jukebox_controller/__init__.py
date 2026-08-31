@@ -42,14 +42,20 @@ class JukeboxControllerPlugin(NekoPluginBase):
     name = "jukebox_controller"
 
     def _resolve_target_lanlan(self, kwargs: dict[str, Any]) -> str | None:
-        """Resolve which character this command belongs to.
+        """Resolve which character this command belongs to, invocation-locally.
 
-        ``ctx._current_lanlan`` lives on the shared plugin context, so two
-        triggers running as separate tasks can overwrite each other's value.
-        Each invocation carries its own ``_ctx``; prefer that. Mirrors
-        ``music_pusher._resolve_target_lanlan``, minus the env/config
-        fallbacks -- an unscoped jukebox command is dropped by the backend on
-        purpose, so guessing a character here would be worse than failing.
+        Deliberately no ``ctx._current_lanlan`` fallback. That attribute has
+        exactly two writers (``plugin/core/host.py``), both of which set it
+        from some invocation's ``_ctx["lanlan_name"]``. So whenever *this*
+        invocation carries no ``lanlan_name``, whatever sits there was left by
+        a different one -- reading it can only ever scope the command to
+        somebody else's character, and the event bus would then faithfully
+        deliver it to that character's websocket. A jukebox command routed to
+        the wrong session is worse than one that fails.
+
+        (``music_pusher._resolve_target_lanlan`` still keeps that tier plus env
+        and config fallbacks; it is a different delivery contract and is not
+        changed here.)
         """
         explicit = kwargs.get("target_lanlan")
         if isinstance(explicit, str) and explicit.strip():
@@ -60,10 +66,6 @@ class JukeboxControllerPlugin(NekoPluginBase):
             lanlan_name = ctx_obj.get("lanlan_name")
             if isinstance(lanlan_name, str) and lanlan_name.strip():
                 return lanlan_name.strip()
-
-        current_lanlan = getattr(getattr(self, "ctx", None), "_current_lanlan", None)
-        if isinstance(current_lanlan, str) and current_lanlan.strip():
-            return current_lanlan.strip()
 
         return None
 
@@ -135,6 +137,12 @@ class JukeboxControllerPlugin(NekoPluginBase):
                 + ", ".join(sorted(_VALID_MODES))
             ))
         clean_target_lanlan = self._resolve_target_lanlan(kwargs) or ""
+        if not clean_target_lanlan:
+            # 无归属的指令后端本来就会丢。返回 Ok 会让模型跟用户说「已发送」，
+            # 所以这里必须明确失败。
+            return Err(SdkError(
+                "FAILED_PRECONDITION: jukebox control needs an invocation-local target character"
+            ))
         self.ctx.push_message(
             source="jukebox_controller",
             description=f"Jukebox control: {normalized}",

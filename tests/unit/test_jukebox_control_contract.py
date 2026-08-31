@@ -250,7 +250,10 @@ def test_jukebox_plugin_normalizes_and_rejects_actions():
     )
 
     result = asyncio.run(
-        plugin.control_jukebox(action="  PLAY  ", query="  桃源  ", mode=" RANDOM ")
+        plugin.control_jukebox(
+            action="  PLAY  ", query="  桃源  ", mode=" RANDOM ",
+            _ctx={"lanlan_name": "cat"},
+        )
     )
     assert result.value["action"] == "play"
     assert result.value["query"] == "桃源"
@@ -271,7 +274,9 @@ def test_jukebox_plugin_normalizes_and_rejects_actions():
     assert pushed[0]["target_lanlan"] == "cat"
 
     for unsupported in ("skip", "shuffle", "", "pause "):
-        rejected = asyncio.run(plugin.control_jukebox(action=unsupported))
+        rejected = asyncio.run(
+            plugin.control_jukebox(action=unsupported, _ctx={"lanlan_name": "cat"})
+        )
         assert isinstance(rejected, Err), unsupported
     # A rejected action must not reach the frontend at all.
     assert len(pushed) == 1
@@ -402,7 +407,9 @@ def test_jukebox_plugin_rejects_incomplete_action_arguments():
         ("set_mode", {"mode": "shuffle"}),
     ]
     for action, kwargs in rejected:
-        result = asyncio.run(plugin.control_jukebox(action=action, **kwargs))
+        result = asyncio.run(
+            plugin.control_jukebox(action=action, _ctx={"lanlan_name": "cat"}, **kwargs)
+        )
         assert isinstance(result, Err), (action, kwargs)
     # 被拒的调用一条都不该推到前端。
     assert pushed == []
@@ -419,7 +426,9 @@ def test_jukebox_plugin_rejects_incomplete_action_arguments():
         ("stop", {}),
     ]
     for action, kwargs in accepted:
-        result = asyncio.run(plugin.control_jukebox(action=action, **kwargs))
+        result = asyncio.run(
+            plugin.control_jukebox(action=action, _ctx={"lanlan_name": "cat"}, **kwargs)
+        )
         assert not isinstance(result, Err), (action, kwargs)
     assert len(pushed) == len(accepted)
 
@@ -453,17 +462,17 @@ def test_jukebox_plugin_scopes_command_to_the_invoking_context():
     )
     assert pushed[-1]["target_lanlan"] == "fox"
 
-    # 没有 _ctx 时才回落到共享上下文。
-    asyncio.run(plugin.control_jukebox(action="next"))
-    assert pushed[-1]["target_lanlan"] == "dog"
+    # 本次调用没带归属时，绝不回落到共享上下文：那上面只可能是别的调用留下的
+    # 角色名（它唯一的写入点就是某次调用的 _ctx["lanlan_name"]），用它等于把指令
+    # 投到别人的会话。宁可明确失败。
+    from plugin.sdk.plugin import Err as _Err
 
-    # 什么都没有就不猜：后端会丢掉无归属的点歌台指令。
-    plugin.ctx = types.SimpleNamespace(
-        push_message=lambda **kwargs: pushed.append(kwargs),
-        _current_lanlan=None,
-    )
-    asyncio.run(plugin.control_jukebox(action="next"))
-    assert pushed[-1]["target_lanlan"] is None
+    before = len(pushed)
+    orphan = asyncio.run(plugin.control_jukebox(action="next"))
+    assert isinstance(orphan, _Err)
+    assert "invocation-local target" in str(orphan.error)
+    # 失败的指令一条都不该推出去。
+    assert len(pushed) == before
 
 
 def test_jukebox_control_routes_to_exactly_one_executor():
