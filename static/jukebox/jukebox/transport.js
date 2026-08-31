@@ -1138,6 +1138,7 @@ Object.assign(window.Jukebox, {
 
     const nextSong = Jukebox.getNextSongToPlay(endedSong);
     const nextAction = nextSong ? Jukebox.getActionForModel(nextSong) : null;
+    const wasDancing = Jukebox.State.isVMDPlaying === true;
     Jukebox.stopVMD(!!nextAction);
     Jukebox.State.isPlaying = false;
     Jukebox.State.isPaused = false;
@@ -1149,13 +1150,31 @@ Object.assign(window.Jukebox, {
       const requestId = Jukebox.State.playRequestId;
       const scheduledMode = Jukebox.State.playbackMode;
       const fromQueue = scheduledMode === 'random';
+      // 上面的 stopVMD(!!nextAction) 在「有下一段舞蹈要接」时跳过了待机恢复。
+      // 这次续播如果被放弃，就没人把待机接回去，模型会僵在原地 —— 所有放弃的
+      // 出口都要补这一下。
+      const idleRestoreSuppressed = wasDancing && !!nextAction;
+      const abandonTransition = () => {
+        if (idleRestoreSuppressed) {
+          Jukebox.restoreIdleAnimation();
+        }
+      };
       setTimeout(() => {
-        if (!Jukebox.State.isOpen && !Jukebox.State.isRuntimeReady && !window.__NEKO_JUKEBOX_STANDALONE__) return;
-        if (requestId !== Jukebox.State.playRequestId) return;
+        if (!Jukebox.State.isOpen && !Jukebox.State.isRuntimeReady && !window.__NEKO_JUKEBOX_STANDALONE__) {
+          abandonTransition();
+          return;
+        }
+        if (requestId !== Jukebox.State.playRequestId) {
+          // 被新请求取代：接手的那条自己会安排动画，不要在这里抢着恢复待机。
+          return;
+        }
         // nextSong 是按排队时的模式选出来的，而 set_mode 不动 playRequestId。
         // 模式在这一个宏任务的空档里变了，这次自动续播就作废 —— 尤其是改成
         // none 之后不该再自动播下一首。
-        if (Jukebox.State.playbackMode !== scheduledMode) return;
+        if (Jukebox.State.playbackMode !== scheduledMode) {
+          abandonTransition();
+          return;
+        }
         Jukebox.playSong(nextSong.id, { fromQueue, requestId });
       }, 0);
     }

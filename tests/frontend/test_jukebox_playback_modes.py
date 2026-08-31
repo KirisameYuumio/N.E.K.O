@@ -4398,42 +4398,44 @@ def test_jukebox_loader_discovers_and_forwards_to_the_owner(mock_page: Page):
 
 
 @pytest.mark.frontend
-def test_jukebox_standalone_bootstrap_starts_the_control_owner_service(mock_page: Page):
-    """#4 call site: owning the player is worthless if nobody announces it.
+def test_jukebox_open_starts_the_control_owner_service_only_when_standalone(mock_page: Page):
+    """#4 call site: ownership must be announced, and not before the runtime exists.
 
-    The service itself is covered elsewhere; this pins that
-    jukebox-standalone.js actually starts it, and only in the standalone window.
+    Announcing at script load raced the standalone page's async model-config
+    fetch, so the first forwarded command could hit a jukebox whose model type
+    was still the default.
     """
-    standalone_source = (REPO_ROOT / "static" / "jukebox" / "jukebox-standalone.js").read_text(
-        encoding="utf-8"
-    )
+    setup_headless_jukebox_page(mock_page)
 
     result = mock_page.evaluate(
         """
-        (source) => {
-          const run = (isStandalone) => {
-            const calls = [];
+        async () => {
+          const J = window.Jukebox;
+          const run = async (isStandalone) => {
             window.__NEKO_JUKEBOX_STANDALONE__ = isStandalone;
-            window.Jukebox = {
-              startControlOwnerService: () => { calls.push('started'); return true; }
-            };
+            J.State.controlOwnerChannel = null;
+            let started = 0;
+            const original = J.startControlOwnerService;
+            J.startControlOwnerService = function() { started += 1; return original.call(this); };
             try {
-              new Function(source)();
-            } catch (error) {
-              return { calls, error: String(error && error.message || error) };
+              J.open();
+              await new Promise(resolve => setTimeout(resolve, 20));
+            } finally {
+              J.startControlOwnerService = original;
+              J.stopControlOwnerService();
+              J.close();
             }
-            return { calls, error: null };
+            return started;
           };
-          return { standalone: run(true), embedded: run(false) };
+
+          return { standalone: await run(true), embedded: await run(false) };
         }
-        """,
-        standalone_source,
+        """
     )
 
-    assert result["standalone"]["error"] is None
-    assert result["standalone"]["calls"] == ["started"]
+    assert result["standalone"] == 1
     # 嵌在角色窗口里的点歌台不是拥有者，绝不能去抢这个身份。
-    assert result["embedded"]["calls"] == []
+    assert result["embedded"] == 0
 
 
 @pytest.mark.frontend
@@ -4548,3 +4550,110 @@ def test_jukebox_falls_back_to_main_thread_when_the_worker_fails(mock_page: Page
     assert result["ok"] is True
     assert result["message"] is None
     assert result["current"] == "song4"
+
+
+@pytest.mark.frontend
+def test_jukebox_abandoned_auto_advance_restores_idle(mock_page: Page):
+    """Codex P2: the mode-change abort left the avatar with no animation.
+
+    handleAudioEnded stops the old dance with idle restoration suppressed
+    because a replacement is coming; abandoning that transition has to put the
+    idle animation back.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const idleCalls = [];
+          window.lanlan_config = {
+            model_type: 'live3d',
+            live3d_sub_type: 'vrm',
+            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma']
+          };
+          window.vrmManager = {
+            playVRMAAnimation: async (url, options = {}) => {
+              if (options.isIdle) idleCalls.push(url);
+              return true;
+            },
+            stopVRMAAnimation: () => {}
+          };
+          J.getActionForModel = () => ({ id: 'act', name: 'Dance', file: 'actions/a.vrma' });
+
+          await J.executeControl({ action: 'set_mode', mode: 'sequence', headless: true });
+          J.State.currentSong = J.State.songs[0];
+          J.State.isVMDPlaying = true;
+          const idleBefore = idleCalls.length;
+
+          // 歌放完 -> 自动续播排上，旧舞蹈已被 stopVMD(true) 停掉且跳过待机恢复。
+          J.handleAudioEnded(J.getPlayer());
+          // 回调跑之前把模式改掉，这次续播作废。
+          J.State.playbackMode = 'none';
+          await new Promise(resolve => setTimeout(resolve, 30));
+
+          return {
+            idleBefore,
+            idleRestored: idleCalls.length > idleBefore,
+            current: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    assert result["idleBefore"] == 0
+    # 续播作废了，待机必须接回去，模型不能僵在原地。
+    assert result["idleRestored"] is True
+    assert result["current"] is None
+
+
+@pytest.mark.frontend
+def test_jukebox_standalone_close_tears_down_playback(mock_page: Page):
+    """Codex P2: preserving a runtime inside a window that is about to die.
+
+    Every forwarded command carries headless:true, so even a volume change set
+    the headless flag; close() then skipped stopPlayback and with it the IPC
+    stopVMD, leaving the avatar dancing after the window was gone.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          // 一条转发过来的音量指令就足以把 headlessRuntimeRequested 置真。
+          await J.executeControl({ action: 'set_volume', value: 40, headless: true });
+          const headlessFlag = J.State.headlessRuntimeRequested;
+
+          let stopped = 0;
+          const originalStop = J.stopPlayback;
+          J.stopPlayback = function(...args) { stopped += 1; return originalStop.apply(this, args); };
+
+          const wrapper = document.createElement('div');
+          wrapper.className = 'jukebox-wrapper';
+          wrapper.innerHTML = '<div class="jukebox-container"></div>';
+          document.body.appendChild(wrapper);
+          J.State.container = wrapper;
+          J.State.isOpen = true;
+
+          J.close();
+          J.stopPlayback = originalStop;
+          window.__NEKO_JUKEBOX_STANDALONE__ = false;
+
+          return {
+            headlessFlag,
+            stopped,
+            // 完整拆除：运行时标记清掉、宿主不留。
+            headlessAfter: J.State.headlessRuntimeRequested,
+            hostLeft: !!document.getElementById('neko-jukebox-runtime-host')
+          };
+        }
+        """
+    )
+
+    assert result["headlessFlag"] is True
+    # 独立窗口整个要销毁，不存在保活：必须走完整停播路径。
+    assert result["stopped"] == 1
+    assert result["headlessAfter"] is False
+    assert result["hostLeft"] is False

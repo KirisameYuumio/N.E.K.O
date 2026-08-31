@@ -179,6 +179,13 @@ Object.assign(window.Jukebox, {
 
     Jukebox.startConfigPolling();
 
+    // 独立窗口在这里才算「可见运行时已就绪」（模型类型已拉到、播放器已建好）。
+    // 在此之前宣告归属，转发来的第一条指令会撞上未初始化的状态：getModelType()
+    // 还是默认的 live2d，选动作时会把该跳的舞跳过去。
+    if (window.__NEKO_JUKEBOX_STANDALONE__) {
+      Jukebox.startControlOwnerService();
+    }
+
     const jukeboxButton = document.getElementById('jukeboxButton');
     if (jukeboxButton) {
       jukeboxButton.classList.add('active');
@@ -328,7 +335,11 @@ Object.assign(window.Jukebox, {
   },
 
   close: function() {
-    const preserveRuntime = Jukebox.hasHeadlessRuntime();
+    // 独立点唱机窗口的关闭会把整个窗口销毁：「保活」的运行时根本活不下来，而
+    // 跳过 stopPlayback 还会连带跳过 IPC 的 stopVMD，让 Pet 那边的舞蹈继续跳。
+    // 转发过来的 AI 指令一律带 headless:true，连调个音量都会把
+    // headlessRuntimeRequested 置真，所以这里必须显式排除独立窗口。
+    const preserveRuntime = !window.__NEKO_JUKEBOX_STANDALONE__ && Jukebox.hasHeadlessRuntime();
     if (preserveRuntime) {
       Jukebox.adoptPlayerIntoRuntimeHost();
       Jukebox.cleanupUiRuntimeShell();
