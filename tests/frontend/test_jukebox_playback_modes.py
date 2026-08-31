@@ -6685,28 +6685,49 @@ def test_jukebox_auto_advance_rewind_yields_to_a_replacement_play(mock_page: Pag
           await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
           await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
 
-          J.handleAudioEnded(J.getPlayer());
-          // 定时器还没跑，用户自己点了另一首：那条 play 围绕它重置了随机队列，
-          // 并推进了世代。
-          J.resetRandomQueue('song3');
-          J.State.playRequestId += 1;
-          const replacement = {
-            queue: J.State.randomQueue.slice(),
-            index: J.State.randomQueueIndex
+          // 接手可能有几种形态，回滚器的三道比对各挡一种：
+          //   reset —— 长度变了（用户点了另一首，队列围绕它重建）
+          //   reindex —— 长度和内容都没变，只有位置动了（在同一条队列里往回导航）
+          const shapes = {
+            reset: () => { J.resetRandomQueue('song3'); },
+            reindex: () => { J.State.randomQueueIndex = Math.max(0, J.State.randomQueueIndex - 1); }
           };
-          await new Promise(resolve => setTimeout(resolve, 20));
-
-          return {
-            replacement,
-            after: { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex }
-          };
+          const results = {};
+          for (const name of Object.keys(shapes)) {
+            await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+            await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+            J.handleAudioEnded(J.getPlayer());
+            const advanced = {
+              queue: J.State.randomQueue.slice(),
+              index: J.State.randomQueueIndex
+            };
+            // 定时器还没跑，接手的一方已经动了队列并推进了世代。
+            shapes[name]();
+            J.State.playRequestId += 1;
+            const replacement = {
+              queue: J.State.randomQueue.slice(),
+              index: J.State.randomQueueIndex
+            };
+            await new Promise(resolve => setTimeout(resolve, 20));
+            results[name] = {
+              advanced,
+              replacement,
+              after: { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex }
+            };
+          }
+          return results;
         }
         """
     )
 
-    # 队列已经归接手的那条 play 了，陈旧快照不许盖回去。
-    assert result["after"] == result["replacement"], result
-    assert result["after"]["queue"] == ["song3"]
+    # 队列已经归接手的那一方了，陈旧快照不许盖回去 —— 三种形态都要认得出。
+    assert result["reset"]["after"] == result["reset"]["replacement"], result["reset"]
+    assert result["reset"]["after"]["queue"] == ["song3"]
+    # reindex 这一种长度和内容都没变，只有位置动了：只有位置比对能守住。
+    reindex = result["reindex"]
+    assert reindex["replacement"]["queue"] == reindex["advanced"]["queue"], reindex
+    assert reindex["replacement"]["index"] != reindex["advanced"]["index"], reindex
+    assert reindex["after"] == reindex["replacement"], reindex
 
 
 @pytest.mark.frontend
@@ -6866,9 +6887,18 @@ def test_jukebox_manual_navigation_rollback_yields_to_a_replacement(mock_page: P
 
           // 远端的 next 卡在预检里，期间用户从面板点了另一首：那次播放围绕它
           // 重置了随机队列。
+          let replacedQueue = null;
+          let replacedIndex = -1;
           const originalPreflight = J.preflightSongPlayback;
           J.preflightSongPlayback = async function() {
-            J.resetRandomQueue('song4');
+            // 换成「长度相同、位置相同、内容不同」的一份：曲库刷新剪枝就是这个
+            // 形态。只有逐项比对才认得出它已经不是我这次前进留下的队列了。
+            const replaced = J.State.randomQueue.slice();
+            const swapAt = replaced.length - 1;
+            replaced[swapAt] = replaced[swapAt] === 'song4' ? 'song3' : 'song4';
+            J.State.randomQueue = replaced;
+            replacedQueue = replaced.slice();
+            replacedIndex = J.State.randomQueueIndex;
             J.State.playRequestId += 1;
             return { ok: false, message: 'play_superseded', audioUrl: '' };
           };
@@ -6882,13 +6912,59 @@ def test_jukebox_manual_navigation_rollback_yields_to_a_replacement(mock_page: P
           return {
             ok: outcome.ok,
             queue: J.State.randomQueue.slice(),
-            index: J.State.randomQueueIndex
+            index: J.State.randomQueueIndex,
+            replaced: replacedQueue,
+            replacedIndex: replacedIndex
           };
         }
         """
     )
 
     assert result["ok"] is False
-    # 队列已经归接手的那次播放了，陈旧快照不许盖回去。
-    assert result["queue"] == ["song4"], result["queue"]
-    assert result["index"] == 0
+    # 队列已经归接手的那一方了，陈旧快照不许盖回去 —— 注意长度和位置都没变，
+    # 只有内容变了，所以这条只有逐项比对能守住。
+    assert result["queue"][-1] in ("song3", "song4")
+    assert result["queue"] == result["replaced"], result
+    assert result["index"] == result["replacedIndex"]
+
+
+@pytest.mark.frontend
+def test_jukebox_loader_labels_the_cancel_signal_with_its_action(mock_page: Page):
+    """The owner's rule is only as good as what the sender tells it.
+
+    The owner decides whether a cancellation supersedes queued playback from
+    the action that initiated it.  If the loader drops that label, every cancel
+    reads as absolute again and relative navigation goes back to swallowing the
+    play queued in front of it.
+    """
+    mock_page.set_content(
+        """
+        <script>
+          window.t = (key, fallback) => typeof fallback === 'string' ? fallback : key;
+        </script>
+        """
+    )
+    mock_page.add_script_tag(content=JUKEBOX_LOADER_SCRIPT)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const loader = window.__nekoJukeboxLoader;
+          const seen = [];
+          const owner = new BroadcastChannel('neko-jukebox-control');
+          owner.onmessage = (event) => {
+            const data = event && event.data;
+            if (data && data.type === 'jukebox_cancel_request') seen.push(data.action);
+          };
+          loader.cancelOnOwner('next');
+          loader.cancelOnOwner('STOP');
+          loader.cancelOnOwner();
+          await new Promise(resolve => setTimeout(resolve, 60));
+          owner.close();
+          return { seen };
+        }
+        """
+    )
+
+    # 动作原样带过去，并且归一化过大小写；没有动作时是空串（拥有者按绝对处理）。
+    assert result["seen"] == ["next", "stop", ""], result["seen"]
