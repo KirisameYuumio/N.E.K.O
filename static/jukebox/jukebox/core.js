@@ -132,6 +132,10 @@ Object.assign(window.Jukebox, {
     idleRestorePending: false,
     controlOwnerChannel: null,
     controlOwnerHeartbeatTimer: null,
+    // 拥有者是否已经能真的执行指令（曲库拉完、播放器建好）。宣告归属要尽早，
+    // 执行却要等就绪——中间到达的指令先攒在 controlOwnerPending 里。
+    controlOwnerReady: false,
+    controlOwnerPending: [],
     fuzzySearchWorker: null,
     fuzzySearchWorkerUrl: null,
     fuzzySearchToken: 0,

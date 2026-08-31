@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 196,
+        "keyCount": 197,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -4272,6 +4272,9 @@ def test_jukebox_standalone_window_serves_forwarded_controls(mock_page: Page):
           const J = window.Jukebox;
           window.__NEKO_JUKEBOX_STANDALONE__ = true;
           const started = J.startControlOwnerService();
+          // 归属宣告与「能执行」现在是两件事：窗口一起来就宣告，曲库和播放器
+          // 就绪后才放行。这条用例测的是就绪之后的服务行为。
+          J.markControlOwnerReady();
 
           // 扮演角色窗口：BroadcastChannel 不会把消息投回发送它的那个对象，
           // 但同页面里另一个 channel 对象收得到，足以驱动完整协议。
@@ -4410,12 +4413,13 @@ def test_jukebox_loader_discovers_and_forwards_to_the_owner(mock_page: Page):
 
 
 @pytest.mark.frontend
-def test_jukebox_open_starts_the_control_owner_service_only_when_standalone(mock_page: Page):
-    """#4 call site: ownership must be announced, and not before the runtime exists.
+def test_jukebox_open_marks_the_control_owner_ready_only_when_standalone(mock_page: Page):
+    """#4 call site: readiness is declared once the runtime can actually serve.
 
-    Announcing at script load raced the standalone page's async model-config
-    fetch, so the first forwarded command could hit a jukebox whose model type
-    was still the default.
+    Ownership itself is announced as soon as the window exists (otherwise the
+    character window sees no owner and starts a hidden runtime); executing has
+    to wait until the library and player are up, or the first command picks its
+    action with the default model type.
     """
     setup_headless_jukebox_page(mock_page)
 
@@ -4427,18 +4431,16 @@ def test_jukebox_open_starts_the_control_owner_service_only_when_standalone(mock
             window.__NEKO_JUKEBOX_STANDALONE__ = isStandalone;
             J.State.controlOwnerChannel = null;
             let started = 0;
-            // 宣告那一刻的状态：光数「有没有调用」挡不住提前宣告。
+            // 标记就绪那一刻的状态：光数「有没有调用」挡不住提前放行。
             const stateAtAnnounce = [];
-            const original = J.startControlOwnerService;
-            J.startControlOwnerService = function() {
+            const original = J.markControlOwnerReady;
+            J.markControlOwnerReady = function() {
               const snapshot = {
                 hasPlayer: !!J.getPlayer(),
                 songCount: (J.State.songs || []).length
               };
               const ok = original.call(this);
-              // 只在服务真的起来了才算数：BroadcastChannel 不可用时它返回 false，
-              // 光数调用次数会把「没起来」也算成成功。
-              if (ok === true && J.State.controlOwnerChannel) {
+              if (ok === true && J.State.controlOwnerReady) {
                 started += 1;
                 stateAtAnnounce.push(snapshot);
               }
@@ -4449,7 +4451,7 @@ def test_jukebox_open_starts_the_control_owner_service_only_when_standalone(mock
               // open() 的实际初始化挂在 rAF + 100ms 的 setTimeout 里，必须等过去。
               await new Promise(resolve => setTimeout(resolve, 400));
             } finally {
-              J.startControlOwnerService = original;
+              J.markControlOwnerReady = original;
               J.stopControlOwnerService();
               J.close();
             }
@@ -5448,3 +5450,84 @@ def test_jukebox_teardown_during_startup_stops_the_orphaned_audio(mock_page: Pag
     # 拆除之后不许留下一份还在响、没人管的音频。
     assert result["stillAudible"] is False
     assert result["isPlaying"] is False
+
+
+@pytest.mark.frontend
+def test_jukebox_owner_queues_controls_that_arrive_before_it_is_ready(mock_page: Page):
+    """Both reviewers, same race: the window was open but nobody owned it.
+
+    Announcing after the deferred init left a gap in which the character window
+    saw no owner and started a hidden runtime; later commands went to the
+    visible player, orphaning that first stream. Ownership is claimed as soon
+    as the window exists, and commands arriving before it can serve are queued.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          // peer 必须先建：BroadcastChannel 不补发历史消息，晚建就收不到开场
+          // 那次宣告，只能等 2 秒后的心跳。
+          const peer = new BroadcastChannel('neko-jukebox-control');
+          const seen = [];
+          peer.onmessage = (event) => seen.push(event.data);
+
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          J.startControlOwnerService();
+          const waitFor = async (predicate, ms) => {
+            const deadline = Date.now() + ms;
+            while (Date.now() < deadline) {
+              if (predicate()) return true;
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+            return false;
+          };
+
+          // 窗口刚起来：归属已经宣告，但还没就绪。
+          const announcedBeforeReady = await waitFor(
+            () => seen.some(m => m && m.type === 'jukebox_owner_alive'), 1000);
+          const readyBefore = J.State.controlOwnerReady;
+
+          peer.postMessage({
+            type: 'jukebox_control_request',
+            requestId: 'early-1',
+            command: { action: 'set_mode', mode: 'random', headless: true }
+          });
+          await new Promise(resolve => setTimeout(resolve, 50));
+          const servedWhileNotReady = seen.some(
+            m => m && m.type === 'jukebox_control_result' && m.requestId === 'early-1');
+          const queued = J.State.controlOwnerPending.length;
+          const modeBeforeReady = J.State.playbackMode;
+
+          // 曲库与播放器就绪，攒着的指令放出去。
+          J.markControlOwnerReady();
+          const servedAfterReady = await waitFor(
+            () => seen.some(m => m && m.type === 'jukebox_control_result' && m.requestId === 'early-1'), 2000);
+
+          J.stopControlOwnerService();
+          peer.close();
+          window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          return {
+            announcedBeforeReady,
+            readyBefore,
+            servedWhileNotReady,
+            queued,
+            modeBeforeReady,
+            servedAfterReady,
+            modeAfterReady: J.State.playbackMode
+          };
+        }
+        """
+    )
+
+    # 窗口一存在就有主，角色窗口不会以为没人管而自己起隐藏运行时。
+    assert result["announcedBeforeReady"] is True
+    assert result["readyBefore"] is False
+    # 就绪之前只排队，不执行——否则会用默认模型类型选动作。
+    assert result["servedWhileNotReady"] is False
+    assert result["queued"] == 1
+    assert result["modeBeforeReady"] == "sequence"
+    # 就绪之后按到达顺序放出去。
+    assert result["servedAfterReady"] is True
+    assert result["modeAfterReady"] == "random"

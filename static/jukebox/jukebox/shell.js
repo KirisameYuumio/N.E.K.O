@@ -154,11 +154,11 @@ Object.assign(window.Jukebox, {
         Jukebox.initPlayer();
         Jukebox.initVolumeSlider();
         Jukebox.updateCalibrationVisibility();
-        // 独立窗口到这里才算真的能接指令：曲库拉完了、播放器建好了。放在 open()
-        // 的同步尾部还是太早——那时这一段要 100ms 之后才跑，转发进来的第一条指令
-        // 会撞上没有播放器、曲库为空的状态。播放器没建起来就不宣告，宁可不接。
+        // 到这里才算真的能执行指令：曲库拉完了、播放器建好了。归属本身在窗口
+        // 一起来时就宣告过了（见 jukebox-standalone.js），这中间到达的指令攒在
+        // 队列里，此刻按到达顺序放出去。
         if (window.__NEKO_JUKEBOX_STANDALONE__ && Jukebox.getPlayer()) {
-          Jukebox.startControlOwnerService();
+          Jukebox.markControlOwnerReady();
         }
         if (Jukebox.State.currentSong && Jukebox.State.isPaused) {
           Jukebox.updatePausedStatus(Jukebox.State.currentSong);

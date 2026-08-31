@@ -452,21 +452,7 @@ Object.assign(window.Jukebox, {
       } catch (_) {}
     };
 
-    channel.onmessage = async (event) => {
-      const data = event && event.data;
-      if (!data || typeof data !== 'object') return;
-      if (data.type === 'jukebox_owner_query') {
-        announce();
-        return;
-      }
-      if (data.type === 'jukebox_cancel_request') {
-        // 独立的取消信号：它必须能越过正在执行的那条指令，所以不走
-        // jukebox_control_request 的路径，直接就地作废在途播放。
-        Jukebox.cancelActivePlayback();
-        return;
-      }
-      if (data.type !== 'jukebox_control_request') return;
-
+    const serve = async (data) => {
       let result;
       try {
         result = await Jukebox.executeControl(data.command || {});
@@ -486,14 +472,61 @@ Object.assign(window.Jukebox, {
       } catch (_) {}
     };
 
+    channel.onmessage = async (event) => {
+      const data = event && event.data;
+      if (!data || typeof data !== 'object') return;
+      if (data.type === 'jukebox_owner_query') {
+        announce();
+        return;
+      }
+      if (data.type === 'jukebox_cancel_request') {
+        // 独立的取消信号：它必须能越过正在执行的那条指令，所以不走
+        // jukebox_control_request 的路径，直接就地作废在途播放。
+        // 还没就绪时也要把攒着的指令丢掉——它们已经被取消了。
+        Jukebox.State.controlOwnerPending = [];
+        Jukebox.cancelActivePlayback();
+        return;
+      }
+      if (data.type !== 'jukebox_control_request') return;
+
+      if (!Jukebox.State.controlOwnerReady) {
+        // 窗口已经宣告归属，但曲库还没拉完、播放器还没建好。直接执行会用默认的
+        // live2d 去选动作、把该跳的舞跳过去；直接不接又会让角色窗口自己起一个
+        // 隐藏运行时。先攒着，就绪时按到达顺序放出去。
+        Jukebox.State.controlOwnerPending.push(data);
+        return;
+      }
+      await serve(data);
+    };
+
+    Jukebox.drainControlOwnerQueue = async function() {
+      const queued = Jukebox.State.controlOwnerPending;
+      Jukebox.State.controlOwnerPending = [];
+      for (const data of queued) {
+        await serve(data);
+      }
+    };
+
     announce();
     Jukebox.State.controlOwnerHeartbeatTimer = setInterval(announce, Jukebox.CONTROL_OWNER_HEARTBEAT_MS);
     window.addEventListener('beforeunload', Jukebox.stopControlOwnerService);
     return true;
   },
 
+  markControlOwnerReady: function() {
+    if (!window.__NEKO_JUKEBOX_STANDALONE__) return false;
+    if (Jukebox.State.controlOwnerReady) return false;
+    Jukebox.State.controlOwnerReady = true;
+    if (typeof Jukebox.drainControlOwnerQueue === 'function') {
+      Jukebox.drainControlOwnerQueue();
+    }
+    return true;
+  },
+
   stopControlOwnerService: function() {
     const state = Jukebox.State;
+    state.controlOwnerReady = false;
+    state.controlOwnerPending = [];
     if (state.controlOwnerHeartbeatTimer) {
       clearInterval(state.controlOwnerHeartbeatTimer);
       state.controlOwnerHeartbeatTimer = null;
