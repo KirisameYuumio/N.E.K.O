@@ -895,3 +895,57 @@ def test_jukebox_handoff_cancels_the_local_playback_too():
     ]
     # 关键：本窗口那条播放没有在 stop 之后活下来。
     assert payload["localAudible"] is False
+
+
+def test_jukebox_control_waits_for_the_parts_instead_of_dropping():
+    """Codex P2: bootstrap.js replaces the lazy facade with an empty object.
+
+    executeControl only exists in the fifth of six serially loaded parts, so a
+    command arriving mid-load hit the "no control entry point" branch and was
+    discarded outright rather than waiting for the load already in flight.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const executed = [];
+              // 分片加载中：bootstrap.js 已经把门面换成空对象。
+              window.Jukebox = {};
+              let resolveLoad;
+              const loadGate = new Promise(resolve => { resolveLoad = resolve; });
+              window.__nekoJukeboxLoader = {
+                hasControlOwner: () => false,
+                load: () => loadGate
+              };
+
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'x' } });
+              await new Promise(resolve => setTimeout(resolve, 20));
+              const executedWhileLoading = executed.length;
+
+              // 第五个分片落地，executeControl 出现了。
+              const loaded = {
+                executeControl: (c) => { executed.push(c.action); return Promise.resolve({ ok: true }); }
+              };
+              window.Jukebox = loaded;
+              resolveLoad(loaded);
+              await new Promise(resolve => setTimeout(resolve, 20));
+
+              emit(JSON.stringify({ executedWhileLoading, executed }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    assert payload["executedWhileLoading"] == 0
+    # 分片加载完之后必须补上，而不是把指令丢掉。
+    assert payload["executed"] == ["play"]

@@ -591,6 +591,16 @@ Object.assign(window.Jukebox, {
     }
   },
 
+  // 控制面刷新曲库之后，面板开着就得跟着重渲染：refresh 会换掉 State.songs 并
+  // 推进 configRevision，而 10 秒轮询的 checkConfigUpdates 之后只会看到「已经是
+  // 最新版本」，再也不会自己去 loadSongs —— 面板就永久停在旧的那批行上。
+  refreshLibraryForControl: async function() {
+    await Jukebox.loadSongData();
+    if (Jukebox.State.isOpen) {
+      Jukebox.renderList();
+    }
+  },
+
   isControlEpochCurrent: function(epoch) {
     return epoch === Jukebox.State.teardownEpoch;
   },
@@ -688,7 +698,7 @@ Object.assign(window.Jukebox, {
       // 找不到时才多花一次请求重新拉，避免每条指令都重拉。这里不能再加
       // 「songs 非空」前置条件：运行时初始化那一刻曲库为空的话，那个条件会让
       // 之后每一条 play 都直接 song_not_found，永远等不到刷新。
-      await Jukebox.loadSongData();
+      await Jukebox.refreshLibraryForControl();
       refreshedLibrary = true;
       song = await Jukebox.findSongForQuery(command.query || '');
     }
@@ -706,7 +716,7 @@ Object.assign(window.Jukebox, {
     const staleMatch = outcome && outcome.ok !== true
       && (outcome.message === 'audio_not_found' || outcome.message === 'audio_missing');
     if (staleMatch && !refreshedLibrary) {
-      await Jukebox.loadSongData();
+      await Jukebox.refreshLibraryForControl();
       if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult('play');
       const refreshedSong = await Jukebox.findSongForQuery(command.query || '');
       if (refreshedSong) {

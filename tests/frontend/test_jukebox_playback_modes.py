@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 198,
+        "keyCount": 199,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -6027,3 +6027,64 @@ def test_jukebox_cold_start_keeps_the_persisted_volume(mock_page: Page):
     assert result["constructedWith"] is False
     # 上次会话的 30% 必须留住，不能被 savedVolume 的默认值 1 抹掉。
     assert result["playerVolume"] == 0.3
+
+
+@pytest.mark.frontend
+def test_jukebox_control_refresh_rerenders_the_open_panel(mock_page: Page):
+    """Codex P2: the refresh replaced the songs but never repainted the panel.
+
+    It also advances configRevision, so the 10-second poll then sees itself as
+    current and never calls loadSongs — the panel stays on the old rows for good.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          let serveLate = false;
+          window.fetch = async (url, options = {}) => {
+            if (options.method === 'HEAD') return { ok: true, status: 200 };
+            if (url === '/api/jukebox/config') {
+              const songs = { early: { name: 'Early', artist: 'A', audio: 'songs/e.mp3', visible: true } };
+              if (serveLate) songs.late = { name: 'Late Arrival', artist: 'B', audio: 'songs/l.mp3', visible: true };
+              return {
+                ok: true,
+                json: async () => ({ configRevision: serveLate ? 'rev-2' : 'rev-1', songs, actions: {}, bindings: {} })
+              };
+            }
+            throw new Error('Unexpected fetch: ' + url);
+          };
+
+          await J.ensureRuntime({ headless: true });
+
+          // 面板开着（用最小的 DOM 骨架，renderList 只需要这个容器）。
+          document.body.insertAdjacentHTML('beforeend', '<table><tbody id="jukebox-song-list"></tbody></table>');
+          J.State.isOpen = true;
+          J.renderList();
+          const rowsBefore = document.querySelectorAll('#jukebox-song-list .song-row, #jukebox-song-list tr').length;
+
+          // 用户上传了一首新歌，然后让 AI 播它——控制面会刷新曲库。
+          serveLate = true;
+          const played = await J.executeControl({ action: 'play', query: 'Late Arrival', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          const rowsAfter = document.querySelectorAll('#jukebox-song-list .song-row, #jukebox-song-list tr').length;
+          J.State.isOpen = false;
+          return {
+            rowsBefore,
+            ok: played.ok,
+            current: J.State.currentSong && J.State.currentSong.id,
+            songCount: J.State.songs.length,
+            rowsAfter
+          };
+        }
+        """
+    )
+
+    assert result["rowsBefore"] == 1
+    assert result["ok"] is True
+    assert result["current"] == "late"
+    assert result["songCount"] == 2
+    # 刷新之后面板必须跟着重画，否则它会永久停在旧的那批行上。
+    assert result["rowsAfter"] == 2

@@ -786,6 +786,19 @@
         var ownerAlive = !!(loader && typeof loader.hasControlOwner === 'function' && loader.hasControlOwner());
         if (ownerAlive) return loader.forwardControl(payload);
         if (!window.Jukebox || typeof window.Jukebox.executeControl !== 'function') {
+            // 分片正在加载：bootstrap.js 一落地就把带 executeControl 的惰性门面
+            // 换成了空对象，而 executeControl 定义在第五个分片里。这中间到达的
+            // 指令不该被丢掉（冷缓存/慢盘下这个窗口有几百毫秒到数秒），交给
+            // loader 等分片加载完再执行。
+            if (loader && typeof loader.load === 'function') {
+                return Promise.resolve(loader.load()).then(function (jukebox) {
+                    if (!jukebox || typeof jukebox.executeControl !== 'function') {
+                        console.log('[Jukebox] 跳过点歌台控制：分片加载后仍无控制入口');
+                        return null;
+                    }
+                    return jukebox.executeControl(payload);
+                });
+            }
             console.log('[Jukebox] 跳过点歌台控制：当前窗口没有点歌台控制入口');
             return Promise.resolve(null);
         }
