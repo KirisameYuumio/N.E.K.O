@@ -2113,15 +2113,23 @@ Object.assign(window.Jukebox, {
     playerContainer.style.display = 'none';
     host.appendChild(playerContainer);
 
+    // 面板建好到这里之间用户可能已经拖过滑条：那时还没有 player，值只落在
+    // State.savedVolume / isMuted 上。必须拿它来构造，否则紧接着的
+    // initVolumeSlider 会用 player 的音量反向覆盖滑条和标签，用户的设置就丢了。
+    const initialVolume = Jukebox.getCurrentVolume();
     Jukebox.State.player = new APlayer({
       container: playerContainer,
       autoplay: false,
       theme: Jukebox.Config.container.background,
       preload: 'auto',
       listFolded: true,
-      volume: 1,
+      volume: initialVolume,
       audio: []
     });
+    // 光给构造参数不够：APlayer 会用 localStorage['aplayer-setting'] 里存的音量
+    // 覆盖 options.volume（`this.data.volume = this.data.volume || options.volume`），
+    // 所以建好之后必须再显式设一次，才压得住上一次会话留下的值。
+    Jukebox.setRuntimeVolume(initialVolume);
     console.log('[Jukebox] APlayer已创建，音量:', Jukebox.State.player.audio.volume);
     return Jukebox.State.player;
   },

@@ -2259,7 +2259,17 @@ def setup_headless_jukebox_page(mock_page: Page) -> None:
           window.APlayer = class {
             constructor(options) {
               this.options = options;
-              this.audio = { volume: options.volume || 1, duration: 0, currentTime: 0, paused: true };
+              // 真实 APlayer 的 storage 层是 `data.volume = data.volume || options.volume`，
+              // 也就是上一次会话存下的音量优先于构造参数。不照着建模的话，只改
+              // 构造参数的「假修复」也能骗过测试。
+              let stored = null;
+              try {
+                const raw = localStorage.getItem('aplayer-setting');
+                stored = raw ? (JSON.parse(raw) || {}).volume : null;
+              } catch (_) {}
+              const effective = (typeof stored === 'number' ? stored : null)
+                ?? (typeof options.volume === 'number' ? options.volume : 1);
+              this.audio = { volume: effective, duration: 0, currentTime: 0, paused: true };
               this.events = {};
               this.list = {
                 items: [],
@@ -4836,6 +4846,10 @@ def test_jukebox_player_adopts_the_volume_set_before_it_existed(mock_page: Page)
           document.body.insertAdjacentHTML('beforeend',
             '<input id="jukebox-volume-slider" type="range" min="0" max="1" step="0.01" value="1">'
             + '<span id="jukebox-volume-value">100%</span>');
+
+          // 上一次会话在 localStorage 里留下的音量——真实 APlayer 会用它覆盖
+          // 构造参数，所以「只改构造参数」的修法在这里必须失败。
+          localStorage.setItem('aplayer-setting', JSON.stringify({ volume: 0.9 }));
 
           // buildUI 之后、initPlayer 之前拖滑条。
           const hadPlayerWhenDragged = !!J.getPlayer();
