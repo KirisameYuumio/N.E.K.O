@@ -836,9 +836,14 @@
                 var cancelOwnerAlive = !!(cancelLoader
                     && typeof cancelLoader.hasControlOwner === 'function'
                     && cancelLoader.hasControlOwner());
+                // 两个可能的播放方都要取消，不能二选一：归属允许在指令排队期间
+                // 变化。本窗口先无头起播过、随后用户才打开独立点唱机窗口时，
+                // 「只取消拥有者」会让本窗口那条已经在响的播放没人认领——而且
+                // 之后每条指令都转发给拥有者，用户再也停不掉它。
                 if (cancelOwnerAlive && typeof cancelLoader.cancelOnOwner === 'function') {
                     cancelLoader.cancelOnOwner();
-                } else if (window.Jukebox && typeof window.Jukebox.cancelActivePlayback === 'function') {
+                }
+                if (window.Jukebox && typeof window.Jukebox.cancelActivePlayback === 'function') {
                     window.Jukebox.cancelActivePlayback();
                 }
             } catch (error) {

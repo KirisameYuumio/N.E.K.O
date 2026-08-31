@@ -765,8 +765,9 @@ def test_jukebox_stop_cancels_on_the_owner_when_one_is_present():
     result = _run_node(harness)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    # 有拥有者：取消投给拥有者，不碰本窗口；stop 本身仍按顺序转发过去。
-    assert payload["withOwner"] == ["owner-cancel", "forward:stop"]
+    # 有拥有者：取消投给拥有者，同时也取消本窗口——归属可以在指令排队期间变，
+    # 本窗口可能正握着一条更早起播、没人认领的播放。stop 本身仍按顺序转发过去。
+    assert payload["withOwner"] == ["owner-cancel", "local-cancel", "forward:stop"]
     # 没有拥有者：就地取消 + 本地执行。
     assert payload["withoutOwner"] == ["local-cancel", "local:stop"]
 
@@ -816,3 +817,73 @@ def test_jukebox_plugin_reports_a_rejected_submission():
         assert not isinstance(result, Err), accepted
         assert result.value["action"] == "next"
         assert len(pushed) == 1
+
+
+def test_jukebox_handoff_cancels_the_local_playback_too():
+    """Codex P2: ownership may change while a command is queued.
+
+    A play that started locally before the standalone window opened is still
+    audible in this window; cancelling only the newly announced owner leaves it
+    unowned, and every later command is forwarded away from it.
+    """
+    harness = (
+        textwrap.dedent(
+            """
+            const emit = console.log;
+            const window = { Jukebox: null, location: { pathname: '/' } };
+            globalThis.window = window;
+            """
+        )
+        + _websocket_jukebox_handler_source()
+        + textwrap.dedent(
+            """
+            (async () => {
+              const log = [];
+              let ownerAlive = false;
+              let localAudible = false;
+              let cancelled = false;
+
+              window.Jukebox = {
+                // 真实的 cancelActivePlayback 推进取消世代，在途的那条 play 随后
+                // 在自己的闸门处作废——所以这里用 cancelled 建模，而不是去
+                // resolve play 的 gate（那样反而会让 play 在取消之后才置真）。
+                cancelActivePlayback: () => { log.push('local-cancel'); cancelled = true; },
+                executeControl: (c) => {
+                  log.push('local:' + c.action);
+                  if (c.action !== 'play') return Promise.resolve({ ok: true });
+                  // 这条 play 要 40ms 才走完，stop 必须落在它还在途的时候；
+                  // 没被取消的话声音就留下了。
+                  return new Promise(resolve => setTimeout(() => {
+                    if (!cancelled) localAudible = true;
+                    resolve({ ok: !cancelled });
+                  }, 40));
+                }
+              };
+              window.__nekoJukeboxLoader = {
+                hasControlOwner: () => ownerAlive,
+                cancelOnOwner: () => { log.push('owner-cancel'); return true; },
+                forwardControl: (c) => { log.push('forward:' + c.action); return Promise.resolve({ ok: true }); }
+              };
+
+              // 本窗口先起播（此刻还没有独立点唱机窗口）。
+              handleJukeboxControlResponse({ command: { action: 'play', query: 'x' } });
+              await new Promise(resolve => setTimeout(resolve, 10));
+
+              // 用户打开独立点唱机窗口，归属易主。
+              ownerAlive = true;
+              handleJukeboxControlResponse({ command: { action: 'stop' } });
+              // 等到那条 play 也走完，确认它没有在 stop 之后把声音留下。
+              await new Promise(resolve => setTimeout(resolve, 80));
+
+              emit(JSON.stringify({ log, localAudible }));
+            })();
+            """
+        )
+    )
+    result = _run_node(harness)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+    # 两个可能的播放方都要取消；stop 本身仍按当下归属转发。
+    assert payload["log"] == ["local:play", "owner-cancel", "local-cancel", "forward:stop"]
+    # 关键：本窗口那条播放没有在 stop 之后活下来。
+    assert payload["localAudible"] is False
