@@ -5990,3 +5990,40 @@ def test_jukebox_fbx_reports_that_no_animation_started(mock_page: Page):
 
     # 一帧都没播，就不能报「起播了」——否则待机欠账会被错误地清掉。
     assert result["started"] is False
+
+
+@pytest.mark.frontend
+def test_jukebox_cold_start_keeps_the_persisted_volume(mock_page: Page):
+    """CodeRabbit: State.savedVolume defaults to 1, which is not a user setting.
+
+    Re-applying it on a cold start overwrote the volume APlayer had persisted
+    from the previous session, resetting everyone to 100%.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        () => {
+          const J = window.Jukebox;
+          // 上次会话留下的音量。
+          localStorage.setItem('aplayer-setting', JSON.stringify({ volume: 0.3 }));
+
+          // 冷启动：用户这一轮没碰过滑条。
+          const pendingBefore = J.State.pendingVolume;
+          J.initPlayer({ headless: true });
+          const player = J.getPlayer();
+
+          return {
+            pendingBefore,
+            // 一个字都不该提音量，让 APlayer 自己恢复。
+            constructedWith: Object.prototype.hasOwnProperty.call(player.options, 'volume'),
+            playerVolume: player.audio.volume
+          };
+        }
+        """
+    )
+
+    assert result["pendingBefore"] is None
+    assert result["constructedWith"] is False
+    # 上次会话的 30% 必须留住，不能被 savedVolume 的默认值 1 抹掉。
+    assert result["playerVolume"] == 0.3

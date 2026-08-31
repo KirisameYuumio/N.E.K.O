@@ -106,6 +106,10 @@ Object.assign(window.Jukebox, {
     isPaused: false,
     savedIdleAnimationUrl: null,
     savedVolume: 1,
+    // 面板建好、播放器还没建出来的窗口里用户拖过的音量。只有它非空时才在建
+    // 播放器后强行覆盖 —— savedVolume 的默认值是 1，拿它当「用户设过」会在冷
+    // 启动时把 APlayer 存在 localStorage 里的音量抹成 100%。
+    pendingVolume: null,
     isMuted: false,
     progressTimer: null,
     isSeeking: false,

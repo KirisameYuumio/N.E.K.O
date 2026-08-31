@@ -1669,6 +1669,9 @@ Object.assign(window.Jukebox, {
     } else {
       Jukebox.State.isMuted = true;
     }
+    // 记成「待应用」：播放器建出来时按它来，冷启动没拖过就别去动 APlayer 自己
+    // 持久化的音量。
+    Jukebox.State.pendingVolume = clampedVolume;
     const volumeSlider = document.getElementById('jukebox-volume-slider');
     if (volumeSlider) {
       volumeSlider.value = clampedVolume;
@@ -2322,22 +2325,30 @@ Object.assign(window.Jukebox, {
     host.appendChild(playerContainer);
 
     // 面板建好到这里之间用户可能已经拖过滑条：那时还没有 player，值只落在
-    // State.savedVolume / isMuted 上。必须拿它来构造，否则紧接着的
-    // initVolumeSlider 会用 player 的音量反向覆盖滑条和标签，用户的设置就丢了。
-    const initialVolume = Jukebox.getCurrentVolume();
-    Jukebox.State.player = new APlayer({
+    // State.pendingVolume 上。有的话必须拿它来构造，否则紧接着的 initVolumeSlider
+    // 会用 player 的音量反向覆盖滑条和标签，用户的设置就丢了。
+    //
+    // 没拖过就一个字都别提音量：APlayer 自己会从 localStorage 恢复上次会话的值，
+    // 而 State.savedVolume 的默认是 1 —— 拿它去「恢复」等于把用户存的音量抹成 100%。
+    const pendingVolume = Jukebox.State.pendingVolume;
+    const hasPendingVolume = typeof pendingVolume === 'number' && Number.isFinite(pendingVolume);
+    const playerOptions = {
       container: playerContainer,
       autoplay: false,
       theme: Jukebox.Config.container.background,
       preload: 'auto',
       listFolded: true,
-      volume: initialVolume,
       audio: []
-    });
+    };
+    if (hasPendingVolume) playerOptions.volume = pendingVolume;
+    Jukebox.State.player = new APlayer(playerOptions);
     // 光给构造参数不够：APlayer 会用 localStorage['aplayer-setting'] 里存的音量
     // 覆盖 options.volume（`this.data.volume = this.data.volume || options.volume`），
     // 所以建好之后必须再显式设一次，才压得住上一次会话留下的值。
-    Jukebox.setRuntimeVolume(initialVolume);
+    if (hasPendingVolume) {
+      Jukebox.setRuntimeVolume(pendingVolume);
+      Jukebox.State.pendingVolume = null;
+    }
     console.log('[Jukebox] APlayer已创建，音量:', Jukebox.State.player.audio.volume);
     return Jukebox.State.player;
   },
