@@ -5392,3 +5392,59 @@ def test_jukebox_cancelled_play_does_not_stop_its_successor(mock_page: Page):
     assert result["firstMessage"] == "play_cancelled"
     assert result["current"] == "song2"
     assert result["isPlaying"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_teardown_during_startup_stops_the_orphaned_audio(mock_page: Page):
+    """Teardown reached after the audio already started has to stop it.
+
+    The existing teardown guard aborts earlier, inside ensureRuntime, so this
+    pins the late branch: nothing else will ever stop that player.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          let release;
+          const gate = new Promise(resolve => { release = resolve; });
+          // hook 必须落在 playSong **内部**：包在外面的话 playSong 已经跑完并提交了
+          // currentSong，拆除就走不到「起播中途」那条分支了。
+          const originalPlayAudio = J.playAudio;
+          J.playAudio = async function(song) {
+            await originalPlayAudio.call(this, song);
+            await gate;
+          };
+
+          const pending = J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 10));
+          const player = J.getPlayer();
+          const audibleBeforeTeardown = player.audio.paused === false;
+
+          // 音频已经在响，这时用户把点歌台整个拆掉。
+          J.prepareForUnload();
+          release();
+          const outcome = await pending;
+          J.playAudio = originalPlayAudio;
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          return {
+            audibleBeforeTeardown,
+            ok: outcome.ok,
+            message: outcome.message || null,
+            stillAudible: player.audio.paused === false,
+            isPlaying: J.State.isPlaying
+          };
+        }
+        """
+    )
+
+    assert result["audibleBeforeTeardown"] is True
+    assert result["ok"] is False
+    assert result["message"] == "jukebox_torn_down"
+    # 拆除之后不许留下一份还在响、没人管的音频。
+    assert result["stillAudible"] is False
+    assert result["isPlaying"] is False
