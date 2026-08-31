@@ -6617,7 +6617,13 @@ def test_jukebox_auto_advance_rewind_survives_the_idle_settlement(mock_page: Pag
             index: J.State.randomQueueIndex
           };
 
-          // 只替换动画层：真实的 restoreIdleAnimation 在 VRM 分支里 ++playRequestId。
+          // 只替换动画层。要点是让世代**只**在 playSong 里被推进：
+          // stopVMD 打成「抑制恢复、记一笔欠账」，它自己不推世代，否则
+          // handleAudioEnded 里那一下就会让定时器走「被取代」出口，回滚由那里
+          // 完成，这条用例就测不到 abandonAutoAdvance 了。
+          const originalStopVMD = J.stopVMD;
+          J.stopVMD = () => { J.State.idleRestorePending = true; };
+          // 真实的 restoreIdleAnimation 在 VRM 分支里 ++playRequestId。
           const originalRestore = J.restoreIdleAnimation;
           J.restoreIdleAnimation = async () => {
             J.State.idleRestorePending = false;
@@ -6626,23 +6632,29 @@ def test_jukebox_auto_advance_rewind_survives_the_idle_settlement(mock_page: Pag
           const originalPlaySong = J.playSong;
           // 起播失败，而且失败路上先结清了待机欠账 —— 正是 Codex 描述的形态。
           J.playSong = async () => { J.settleIdleRestore(); return null; };
+          let generationMovedInPlaySong = false;
           try {
-            J.State.idleRestorePending = true;
+            const before = J.State.playRequestId;
             J.handleAudioEnded(J.getPlayer());
             await new Promise(resolve => setTimeout(resolve, 20));
+            generationMovedInPlaySong = J.State.playRequestId !== before;
           } finally {
             J.playSong = originalPlaySong;
             J.restoreIdleAnimation = originalRestore;
+            J.stopVMD = originalStopVMD;
           }
 
           return {
             before,
+            generationMovedInPlaySong,
             after: { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex }
           };
         }
         """
     )
 
+    # 先确认这条用例真的走到了那个形态：世代是在 playSong 里被推进的。
+    assert result["generationMovedInPlaySong"] is True
     # 结账推进了世代，但队列仍然归这次自动续播所有，所以回滚必须发生。
     assert result["after"] == result["before"], result
 
