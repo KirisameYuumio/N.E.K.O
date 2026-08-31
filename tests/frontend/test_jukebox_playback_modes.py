@@ -6536,3 +6536,155 @@ def test_jukebox_random_queue_rewinds_when_the_auto_advance_itself_fails(mock_pa
 
     # 没播起来就不许把位置留在它身上，否则下一次随机导航跳过一首。
     assert result["after"] == result["before"], result
+
+
+@pytest.mark.frontend
+def test_jukebox_cancelling_playback_keeps_the_navigation_anchor(mock_page: Page):
+    """Codex P1: making next/previous preempting cost them their anchor.
+
+    cancelActivePlayback ran the plain stopPlayback, which clears currentSong
+    and the random queue.  next and previous are computed relative to the song
+    that was playing, so the queued command fell back to the first song and
+    random navigation lost its history.  Cancellation exists to silence the
+    audio and unwedge the in-flight command; deciding the playback position is
+    the following command's job.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          // 顺序模式：next 相对当前曲目取下一首。
+          await J.executeControl({ action: 'play', query: 'Song 2', headless: true });
+          J.cancelActivePlayback();
+          const anchorAfterCancel = J.State.currentSong && J.State.currentSong.id;
+          const audibleAfterCancel = J.State.isPlaying;
+          const next = await J.executeControl({ action: 'next', headless: true });
+
+          // 随机模式：历史也要活下来。
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          await J.executeControl({ action: 'next', headless: true });
+          const queueBefore = J.State.randomQueue.slice();
+          J.cancelActivePlayback();
+
+          return {
+            anchorAfterCancel,
+            audibleAfterCancel,
+            nextSong: next.song && next.song.id,
+            queueBefore,
+            queueAfterCancel: J.State.randomQueue.slice()
+          };
+        }
+        """
+    )
+
+    # 作废把声音停了，但没把「用户在哪儿」也一起抹掉。
+    assert result["audibleAfterCancel"] is False
+    assert result["anchorAfterCancel"] == "song2"
+    # 于是排在后面的 next 走的是 song2 的下一首，而不是退回第一首。
+    assert result["nextSong"] == "song3", result["nextSong"]
+    # 随机历史同理：作废不该清空它。
+    assert len(result["queueBefore"]) >= 2
+    assert result["queueAfterCancel"] == result["queueBefore"]
+
+
+@pytest.mark.frontend
+def test_jukebox_auto_advance_rewind_survives_the_idle_settlement(mock_page: Page):
+    """Codex P2: the rollback was blocked by the generation it advances itself.
+
+    A failed auto-advance settles the pending idle restoration on its way out,
+    and restoreIdleAnimation increments playRequestId (the VRM branch does this
+    explicitly).  Keying the rollback on that counter therefore made it fail on
+    the one path it was written for.  Ownership is now decided by the queue
+    itself.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          const before = {
+            queue: J.State.randomQueue.slice(),
+            index: J.State.randomQueueIndex
+          };
+
+          // 只替换动画层：真实的 restoreIdleAnimation 在 VRM 分支里 ++playRequestId。
+          const originalRestore = J.restoreIdleAnimation;
+          J.restoreIdleAnimation = async () => {
+            J.State.idleRestorePending = false;
+            J.State.playRequestId += 1;
+          };
+          const originalPlaySong = J.playSong;
+          // 起播失败，而且失败路上先结清了待机欠账 —— 正是 Codex 描述的形态。
+          J.playSong = async () => { J.settleIdleRestore(); return null; };
+          try {
+            J.State.idleRestorePending = true;
+            J.handleAudioEnded(J.getPlayer());
+            await new Promise(resolve => setTimeout(resolve, 20));
+          } finally {
+            J.playSong = originalPlaySong;
+            J.restoreIdleAnimation = originalRestore;
+          }
+
+          return {
+            before,
+            after: { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex }
+          };
+        }
+        """
+    )
+
+    # 结账推进了世代，但队列仍然归这次自动续播所有，所以回滚必须发生。
+    assert result["after"] == result["before"], result
+
+
+@pytest.mark.frontend
+def test_jukebox_auto_advance_rewind_yields_to_a_replacement_play(mock_page: Page):
+    """Codex P2: the other side of the same rule.
+
+    If the user starts another song before the scheduled transition runs, that
+    play has already reset the random queue around its own track.  Restoring
+    the pre-advance snapshot over it would overwrite valid history, and the
+    next random navigation would proceed from the song that ended long ago.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          await J.executeControl({ action: 'set_mode', mode: 'random', headless: true });
+          await J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+
+          J.handleAudioEnded(J.getPlayer());
+          // 定时器还没跑，用户自己点了另一首：那条 play 围绕它重置了随机队列，
+          // 并推进了世代。
+          J.resetRandomQueue('song3');
+          J.State.playRequestId += 1;
+          const replacement = {
+            queue: J.State.randomQueue.slice(),
+            index: J.State.randomQueueIndex
+          };
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          return {
+            replacement,
+            after: { queue: J.State.randomQueue.slice(), index: J.State.randomQueueIndex }
+          };
+        }
+        """
+    )
+
+    # 队列已经归接手的那条 play 了，陈旧快照不许盖回去。
+    assert result["after"] == result["replacement"], result
+    assert result["after"]["queue"] == ["song3"]
