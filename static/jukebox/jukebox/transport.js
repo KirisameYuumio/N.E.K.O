@@ -694,6 +694,15 @@ Object.assign(window.Jukebox, {
     return !Number.isInteger(requestId) || requestId === Jukebox.State.playRequestId;
   },
 
+  // 结清「欠着的待机恢复」：走到静止状态却还欠着账，就把待机接回去。
+  // 所有放弃/失败/取消的路径最终都会经过 stopPlayback 或 playSong 的收尾，
+  // 所以不需要每个提前返回各自记得这件事。
+  settleIdleRestore: function() {
+    if (!Jukebox.State.idleRestorePending) return false;
+    Jukebox.restoreIdleAnimation();
+    return true;
+  },
+
   // 就地作废在途播放：推进世代让卡在 await 里的 play 在下一个检查处解开，
   // 同时把已经响起来的声音立刻停掉。stop 指令本身仍会按顺序再执行一次（幂等）。
   cancelActivePlayback: function() {
@@ -1138,7 +1147,6 @@ Object.assign(window.Jukebox, {
 
     const nextSong = Jukebox.getNextSongToPlay(endedSong);
     const nextAction = nextSong ? Jukebox.getActionForModel(nextSong) : null;
-    const wasDancing = Jukebox.State.isVMDPlaying === true;
     Jukebox.stopVMD(!!nextAction);
     Jukebox.State.isPlaying = false;
     Jukebox.State.isPaused = false;
@@ -1150,34 +1158,27 @@ Object.assign(window.Jukebox, {
       const requestId = Jukebox.State.playRequestId;
       const scheduledMode = Jukebox.State.playbackMode;
       const fromQueue = scheduledMode === 'random';
-      // 上面的 stopVMD(!!nextAction) 在「有下一段舞蹈要接」时跳过了待机恢复。
-      // 这次续播如果被放弃，就没人把待机接回去，模型会僵在原地 —— 所有放弃的
-      // 出口都要补这一下。
-      const idleRestoreSuppressed = wasDancing && !!nextAction;
-      const abandonTransition = () => {
-        if (idleRestoreSuppressed) {
-          Jukebox.restoreIdleAnimation();
-        }
-      };
+      // 上面的 stopVMD(!!nextAction) 若跳过了待机恢复，那笔账已经记在
+      // State.idleRestorePending 上。下面每个放弃的出口都只管 return：接不上动画
+      // 的话，账由随后回到静止的那一方（stopPlayback / playSong 收尾）结清。
       setTimeout(() => {
         if (!Jukebox.State.isOpen && !Jukebox.State.isRuntimeReady && !window.__NEKO_JUKEBOX_STANDALONE__) {
-          abandonTransition();
+          Jukebox.settleIdleRestore();
           return;
         }
         if (requestId !== Jukebox.State.playRequestId) {
-          // 被新请求取代：接手的那条自己会安排动画，不要在这里抢着恢复待机。
+          // 被新请求取代。接手的如果是另一次播放，它自己会接上动画并清账；
+          // 如果是 stop，stopPlayback 已经把账结了。这里不必也不该抢着恢复。
           return;
         }
         // nextSong 是按排队时的模式选出来的，而 set_mode 不动 playRequestId。
         // 模式在这一个宏任务的空档里变了，这次自动续播就作废 —— 尤其是改成
         // none 之后不该再自动播下一首。
         if (Jukebox.State.playbackMode !== scheduledMode) {
-          abandonTransition();
+          Jukebox.settleIdleRestore();
           return;
         }
-        // 把「刚才打断了一段舞蹈」的事实带过去：stopVMD 已经把 isVMDPlaying 清了，
-        // playSong 自己看不出来，接班的动画要是起不来就没人恢复待机。
-        Jukebox.playSong(nextSong.id, { fromQueue, requestId, interruptedDance: idleRestoreSuppressed });
+        Jukebox.playSong(nextSong.id, { fromQueue, requestId });
       }, 0);
     }
   },
@@ -1231,12 +1232,8 @@ Object.assign(window.Jukebox, {
       );
     // stopVMD 的待机恢复会自己 ++playRequestId 当作废令牌。换歌时那一下会把本次
     // 播放的世代顶掉，于是新歌起播后自己判定「已被取代」：动画不启动，控制面还报
-    // play_failed。换歌一律跳过这次恢复，本首没有可播动作时在收尾处补回来 ——
-    // 补的条件跟 stopVMD 原本一致：只有真的打断了一段舞蹈才需要回到待机。
-    // 自动续播会先 stopVMD(true) 再调过来，那时 isVMDPlaying 已经是 false 了，
-    // 所以调用方要能把这个事实显式传进来。
-    const interruptedDance = options.interruptedDance === true
-      || Jukebox.State.isVMDPlaying === true;
+    // play_failed。所以换歌一律跳过这次恢复 —— 它变成一笔欠账，由下面「接上了动画」
+    // 或「收尾时还没接上」来结清。
     Jukebox.stopPlayback({ preserveRandomQueue, skipIdleRestore: true });
 
     try {
@@ -1305,10 +1302,13 @@ Object.assign(window.Jukebox, {
 
       Jukebox.updatePlayingStatus(song);
       Jukebox.updateCalibrationDisplay();
-      if (!startsAnimation && interruptedDance) {
-        // 打断了一段舞蹈、这首歌又没有要接的动作。所有世代检查都过完了，此时
-        // 再恢复待机，它的 ++playRequestId 不会反过来作废本次播放。
-        Jukebox.restoreIdleAnimation();
+      if (startsAnimation) {
+        // 新动画接上了，欠账两清。
+        Jukebox.State.idleRestorePending = false;
+      } else {
+        // 没接上（这首没动作，或动画起不来）。所有世代检查都过完了，此时再恢复
+        // 待机，它的 ++playRequestId 不会反过来作废本次播放。
+        Jukebox.settleIdleRestore();
       }
       return song;
     } catch (error) {
@@ -1700,6 +1700,12 @@ Object.assign(window.Jukebox, {
     }
 
     Jukebox.updateStoppedStatus();
+    // 只有「停到底」才结账。skipIdleRestore 意味着调用方马上要接一段新动画
+    // （换歌路径），这时结账等于 restoreIdleAnimation 去 ++playRequestId，
+    // 反手把调用它的那次播放作废掉 —— 这个坑前面已经踩过一次。
+    if (options.skipIdleRestore !== true) {
+      Jukebox.settleIdleRestore();
+    }
   },
 
   stopAudio: function() {
@@ -1745,7 +1751,12 @@ Object.assign(window.Jukebox, {
     Jukebox.State.isVMDPlaying = false;
     Jukebox.State.isPaused = false;
 
-    if (!skipIdleRestore) {
+    if (skipIdleRestore) {
+      // 这一下把舞蹈停了却没恢复待机，因为「马上要接一段新动画」。记成欠账：
+      // 接上了就由起播方清掉，接不上（换歌失败 / 模式变了 / 被 stop 取代 /
+      // 运行时没就绪）就由回到静止的那一方补上。逐个出口去记得这件事已经漏过四次。
+      Jukebox.State.idleRestorePending = true;
+    } else {
       Jukebox.restoreIdleAnimation();
     }
   },
@@ -1763,6 +1774,8 @@ Object.assign(window.Jukebox, {
 
   restoreIdleAnimation: async function() {
     const Jukebox = window.Jukebox || this;
+    // 无论谁触发的，账到此为止。
+    Jukebox.State.idleRestorePending = false;
     // 独立窗口模式：Pet 侧在 stopVMD 时自动恢复，此处无需操作
     if (window.__NEKO_JUKEBOX_STANDALONE__) return;
 

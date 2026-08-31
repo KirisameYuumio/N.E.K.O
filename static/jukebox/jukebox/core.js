@@ -123,6 +123,9 @@ Object.assign(window.Jukebox, {
     isRuntimeReady: false,
     headlessRuntimeRequested: false,
     teardownEpoch: 0,
+    // 「欠着一次待机恢复」：stopVMD(true) 把舞蹈停掉却跳过恢复时置真，
+    // 由真正接上动画或真正回到静止的那一方清账。见 transport.js 的 settleIdleRestore。
+    idleRestorePending: false,
     controlOwnerChannel: null,
     controlOwnerHeartbeatTimer: null,
     fuzzySearchWorker: null,

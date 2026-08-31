@@ -452,7 +452,7 @@ def test_jukebox_loader_fetches_all_parts_sequentially(mock_page: Page):
 
     assert loaded_parts == [part.name for part in JUKEBOX_PARTS]
     assert result == {
-        "keyCount": 193,
+        "keyCount": 194,
         "hasLoadSongs": True,
         "hasManager": True,
         "hasScriptTag": True,
@@ -4419,12 +4419,18 @@ def test_jukebox_open_starts_the_control_owner_service_only_when_standalone(mock
             const stateAtAnnounce = [];
             const original = J.startControlOwnerService;
             J.startControlOwnerService = function() {
-              started += 1;
-              stateAtAnnounce.push({
+              const snapshot = {
                 hasPlayer: !!J.getPlayer(),
                 songCount: (J.State.songs || []).length
-              });
-              return original.call(this);
+              };
+              const ok = original.call(this);
+              // 只在服务真的起来了才算数：BroadcastChannel 不可用时它返回 false，
+              // 光数调用次数会把「没起来」也算成成功。
+              if (ok === true && J.State.controlOwnerChannel) {
+                started += 1;
+                stateAtAnnounce.push(snapshot);
+              }
+              return ok;
             };
             try {
               J.open();
@@ -4742,3 +4748,73 @@ def test_jukebox_auto_advance_restores_idle_when_the_successor_animation_fails(m
     assert result["advanced"] == "song2"
     # 接班动画没起来 -> 待机必须接回去。
     assert result["idleRestored"] is True
+
+
+@pytest.mark.frontend
+def test_jukebox_standalone_teardown_delegates_idle_restore_to_the_pet_window(mock_page: Page):
+    """Idle restoration is not this window's job when it runs standalone.
+
+    ``restoreIdleAnimation`` returns immediately under
+    ``__NEKO_JUKEBOX_STANDALONE__`` because the pet window restores idle when it
+    receives the stop; the desktop shell also sends VMD_STOP with
+    ``skipIdleRestore: false`` from ``jukeboxWindow.on('close')``. What matters
+    here is that the local teardown neither duplicates that nor throws.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          const idleCalls = [];
+          window.lanlan_config = {
+            model_type: 'live3d',
+            live3d_sub_type: 'vrm',
+            vrmIdleAnimations: ['/static/vrm/animation/wait03.vrma']
+          };
+          let stopCalls = 0;
+          window.vrmManager = {
+            playVRMAAnimation: async (url, options = {}) => {
+              if (options.isIdle) idleCalls.push(url);
+              return true;
+            },
+            stopVRMAAnimation: () => { stopCalls += 1; }
+          };
+
+          window.__NEKO_JUKEBOX_STANDALONE__ = true;
+          await J.executeControl({ action: 'set_volume', value: 40, headless: true });
+          J.State.isVMDPlaying = true;
+
+          const wrapper = document.createElement('div');
+          wrapper.className = 'jukebox-wrapper';
+          wrapper.innerHTML = '<div class="jukebox-container"></div>';
+          document.body.appendChild(wrapper);
+          J.State.container = wrapper;
+          J.State.isOpen = true;
+
+          J.close();
+          await new Promise(resolve => setTimeout(resolve, 30));
+          const afterClose = { idle: idleCalls.length, stops: stopCalls, vmd: J.State.isVMDPlaying };
+
+          // 桌面端随后从主进程发来的那一下（skipIdleRestore: false）。
+          J.stopVMD(false);
+          await new Promise(resolve => setTimeout(resolve, 30));
+
+          window.__NEKO_JUKEBOX_STANDALONE__ = false;
+          return {
+            afterClose,
+            idleAfterElectronStop: idleCalls.length,
+            stopsAfterElectronStop: stopCalls,
+            pendingSettled: J.State.idleRestorePending === false
+          };
+        }
+        """
+    )
+
+    # 本地真的把舞蹈停了，但不在本窗口恢复待机——那是 Pet 侧的事。
+    assert result["afterClose"] == {"idle": 0, "stops": 1, "vmd": False}
+    # 桌面端补发的那一下是空操作，不会重复停、也不会在这里恢复待机。
+    assert result["idleAfterElectronStop"] == 0
+    assert result["stopsAfterElectronStop"] == 1
+    # 欠账不会留在原地拖着。
+    assert result["pendingSettled"] is True
