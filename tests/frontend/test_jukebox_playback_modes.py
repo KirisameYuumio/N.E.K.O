@@ -4581,10 +4581,14 @@ def test_jukebox_abandoned_auto_advance_restores_idle(mock_page: Page):
           };
           J.getActionForModel = () => ({ id: 'act', name: 'Dance', file: 'actions/a.vrma' });
 
+          // 运行时必须真的就绪：否则回调会走「面板没开且运行时未就绪」那个提前
+          // 返回，根本到不了模式变更那条判据，护栏就成了哑的。
+          await J.ensureRuntime({ headless: true });
           await J.executeControl({ action: 'set_mode', mode: 'sequence', headless: true });
           J.State.currentSong = J.State.songs[0];
           J.State.isVMDPlaying = true;
           const idleBefore = idleCalls.length;
+          const runtimeReady = J.State.isRuntimeReady;
 
           // 歌放完 -> 自动续播排上，旧舞蹈已被 stopVMD(true) 停掉且跳过待机恢复。
           J.handleAudioEnded(J.getPlayer());
@@ -4594,6 +4598,7 @@ def test_jukebox_abandoned_auto_advance_restores_idle(mock_page: Page):
 
           return {
             idleBefore,
+            runtimeReady,
             idleRestored: idleCalls.length > idleBefore,
             current: J.State.currentSong && J.State.currentSong.id
           };
@@ -4602,6 +4607,8 @@ def test_jukebox_abandoned_auto_advance_restores_idle(mock_page: Page):
     )
 
     assert result["idleBefore"] == 0
+    # 钉住走的确实是模式变更那条出口，而不是「运行时未就绪」那条。
+    assert result["runtimeReady"] is True
     # 续播作废了，待机必须接回去，模型不能僵在原地。
     assert result["idleRestored"] is True
     assert result["current"] is None
