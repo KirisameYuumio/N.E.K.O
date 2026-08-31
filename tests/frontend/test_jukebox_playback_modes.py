@@ -5324,3 +5324,71 @@ def test_jukebox_compensating_stop_settles_an_outstanding_debt(mock_page: Page):
     assert result["local"] == {"idle": 1, "debt": False}
     # 抑制恢复的停止不结账，也不会多恢复一次。
     assert result["suppressed"] == {"idle": 1, "debt": True}
+
+
+@pytest.mark.frontend
+def test_jukebox_cancelled_play_does_not_stop_its_successor(mock_page: Page):
+    """CodeRabbit: the cleanup on a cancelled play was unconditional.
+
+    A stop followed immediately by a new play means the older request wakes up
+    after the newer one is already audible; stopping "its" playback then kills
+    the successor's.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+
+          // 让 A 卡在 playSong 里。
+          let release;
+          const gate = new Promise(resolve => { release = resolve; });
+          const originalPlaySong = J.playSong;
+          let hooked = true;
+          J.playSong = async function(songId, options) {
+            if (hooked) {
+              hooked = false;
+              const played = await originalPlaySong.call(this, songId, options);
+              await gate;
+              return played;
+            }
+            return originalPlaySong.call(this, songId, options);
+          };
+
+          const first = J.executeControl({ action: 'play', query: 'Song 1', headless: true });
+          await new Promise(resolve => setTimeout(resolve, 10));
+
+          // stop，紧接着一条新的 play —— B 起播并成为当前曲目。
+          await J.executeControl({ action: 'stop', headless: true });
+          const second = await J.executeControl({ action: 'play', query: 'Song 2', headless: true });
+          const afterSecond = {
+            ok: second.ok,
+            current: J.State.currentSong && J.State.currentSong.id,
+            isPlaying: J.State.isPlaying
+          };
+
+          // A 这时才醒过来收尾。
+          release();
+          const firstOutcome = await first;
+          J.playSong = originalPlaySong;
+          await new Promise(resolve => setTimeout(resolve, 20));
+
+          return {
+            afterSecond,
+            firstOk: firstOutcome.ok,
+            firstMessage: firstOutcome.message || null,
+            // B 的播放不能被 A 的收尾停掉。
+            current: J.State.currentSong && J.State.currentSong.id,
+            isPlaying: J.State.isPlaying
+          };
+        }
+        """
+    )
+
+    assert result["afterSecond"] == {"ok": True, "current": "song2", "isPlaying": True}
+    assert result["firstOk"] is False
+    assert result["firstMessage"] == "play_cancelled"
+    assert result["current"] == "song2"
+    assert result["isPlaying"] is True

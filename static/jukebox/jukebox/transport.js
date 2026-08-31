@@ -782,14 +782,18 @@ Object.assign(window.Jukebox, {
       forceReplay: true,
       requestId
     });
+    // 收尾清理只能停「自己起的那份声音」。这条请求在 await 里的时候可能已经有
+    // 更新的一条接手并开始播放了（stop 之后紧跟一条新的 play 就是这个形态），
+    // 那时无条件 stopPlayback() 停掉的是别人的播放。
+    const stillOurs = requestId === Jukebox.State.playRequestId;
     if (!Jukebox.isControlEpochCurrent(epoch)) {
       // 起播过程中点歌台被拆了：停掉刚起来的声音，别留下一个没人管的播放器。
-      Jukebox.stopPlayback();
+      if (stillOurs) Jukebox.stopPlayback();
       return Jukebox.tornDownResult(action);
     }
     if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) {
       // 起播过程中来过 stop：同样要把刚响起来的声音停掉。
-      Jukebox.stopPlayback();
+      if (stillOurs) Jukebox.stopPlayback();
       return Jukebox.cancelledResult(action, song);
     }
     if (!playedSong) {
