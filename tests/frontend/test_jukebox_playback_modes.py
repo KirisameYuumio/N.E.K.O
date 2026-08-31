@@ -4861,6 +4861,9 @@ def test_jukebox_player_adopts_the_volume_set_before_it_existed(mock_page: Page)
           const player = J.getPlayer();
           return {
             hadPlayerWhenDragged,
+            // 构造参数与最终音量分别断言：只有建后补设的话，构造那一瞬间仍是
+            // 上一次会话的音量；只给构造参数的话，storage 会把它覆盖掉。
+            constructedWith: player && player.options && player.options.volume,
             playerVolume: player && player.audio.volume,
             slider: document.getElementById('jukebox-volume-slider').value,
             label: document.getElementById('jukebox-volume-value').textContent
@@ -4871,6 +4874,7 @@ def test_jukebox_player_adopts_the_volume_set_before_it_existed(mock_page: Page)
 
     assert result["hadPlayerWhenDragged"] is False
     # 播放器按用户拖到的值建，滑条和标签也不会被 100% 反向覆盖。
+    assert result["constructedWith"] == 0.4
     assert result["playerVolume"] == 0.4
     assert result["slider"] == "0.4"
     assert result["label"] == "40%"
