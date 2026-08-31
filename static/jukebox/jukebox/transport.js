@@ -591,8 +591,8 @@ Object.assign(window.Jukebox, {
       song = await Jukebox.findSongForQuery(command.query || '');
     }
     if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult('play');
-    // 检索/刷新期间来过 stop。
-    if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) return Jukebox.cancelledResult('play');
+    // 检索/刷新期间来的 stop 由 executePlayControl 的契约闸拦下（它到那里之间
+    // 没有 await），这里不再重复一道钉不住的检查。
     if (!song) {
       return { ok: false, action: 'play', message: 'song_not_found' };
     }
