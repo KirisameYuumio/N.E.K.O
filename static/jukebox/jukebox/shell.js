@@ -154,6 +154,12 @@ Object.assign(window.Jukebox, {
         Jukebox.initPlayer();
         Jukebox.initVolumeSlider();
         Jukebox.updateCalibrationVisibility();
+        // 独立窗口到这里才算真的能接指令：曲库拉完了、播放器建好了。放在 open()
+        // 的同步尾部还是太早——那时这一段要 100ms 之后才跑，转发进来的第一条指令
+        // 会撞上没有播放器、曲库为空的状态。播放器没建起来就不宣告，宁可不接。
+        if (window.__NEKO_JUKEBOX_STANDALONE__ && Jukebox.getPlayer()) {
+          Jukebox.startControlOwnerService();
+        }
         if (Jukebox.State.currentSong && Jukebox.State.isPaused) {
           Jukebox.updatePausedStatus(Jukebox.State.currentSong);
         } else if (Jukebox.State.currentSong && (Jukebox.State.isPlaying || Jukebox.State.isVMDPlaying)) {
@@ -178,13 +184,6 @@ Object.assign(window.Jukebox, {
     } catch (e) {}
 
     Jukebox.startConfigPolling();
-
-    // 独立窗口在这里才算「可见运行时已就绪」（模型类型已拉到、播放器已建好）。
-    // 在此之前宣告归属，转发来的第一条指令会撞上未初始化的状态：getModelType()
-    // 还是默认的 live2d，选动作时会把该跳的舞跳过去。
-    if (window.__NEKO_JUKEBOX_STANDALONE__) {
-      Jukebox.startControlOwnerService();
-    }
 
     const jukeboxButton = document.getElementById('jukeboxButton');
     if (jukeboxButton) {

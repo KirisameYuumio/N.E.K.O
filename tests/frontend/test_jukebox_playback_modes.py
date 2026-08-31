@@ -4415,17 +4415,27 @@ def test_jukebox_open_starts_the_control_owner_service_only_when_standalone(mock
             window.__NEKO_JUKEBOX_STANDALONE__ = isStandalone;
             J.State.controlOwnerChannel = null;
             let started = 0;
+            // 宣告那一刻的状态：光数「有没有调用」挡不住提前宣告。
+            const stateAtAnnounce = [];
             const original = J.startControlOwnerService;
-            J.startControlOwnerService = function() { started += 1; return original.call(this); };
+            J.startControlOwnerService = function() {
+              started += 1;
+              stateAtAnnounce.push({
+                hasPlayer: !!J.getPlayer(),
+                songCount: (J.State.songs || []).length
+              });
+              return original.call(this);
+            };
             try {
               J.open();
-              await new Promise(resolve => setTimeout(resolve, 20));
+              // open() 的实际初始化挂在 rAF + 100ms 的 setTimeout 里，必须等过去。
+              await new Promise(resolve => setTimeout(resolve, 400));
             } finally {
               J.startControlOwnerService = original;
               J.stopControlOwnerService();
               J.close();
             }
-            return started;
+            return { started, stateAtAnnounce };
           };
 
           return { standalone: await run(true), embedded: await run(false) };
@@ -4433,9 +4443,11 @@ def test_jukebox_open_starts_the_control_owner_service_only_when_standalone(mock
         """
     )
 
-    assert result["standalone"] == 1
+    assert result["standalone"]["started"] == 1
+    # 宣告的那一刻，可见运行时必须真的就位：播放器建好、曲库拉完。
+    assert result["standalone"]["stateAtAnnounce"] == [{"hasPlayer": True, "songCount": 4}]
     # 嵌在角色窗口里的点歌台不是拥有者，绝不能去抢这个身份。
-    assert result["embedded"] == 0
+    assert result["embedded"]["started"] == 0
 
 
 @pytest.mark.frontend
