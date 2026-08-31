@@ -558,8 +558,9 @@ Object.assign(window.Jukebox, {
 
     await Jukebox.ensureRuntime({ headless: command.headless !== false });
     if (!Jukebox.isControlEpochCurrent(epoch)) return Jukebox.tornDownResult(normalizedAction);
-    // 初始化期间来过 stop：不要再往下起播（预检的 HEAD 请求也一并省了）。
-    if (!Jukebox.isPlayCancelEpochCurrent(cancelEpoch)) return Jukebox.cancelledResult(normalizedAction);
+    // 这里刻意不再单独查一次取消世代：下面 play 路径查完才走 executePlayControl，
+    // next/previous 则由 executePlayControl 自己在铸世代之前查，两条路都覆盖到了。
+    // 多一道查不出任何行为差异的分支，只会变成没人钉得住的死代码。
 
     if (normalizedAction === 'next' || normalizedAction === 'previous') {
       const direction = normalizedAction === 'previous' ? -1 : 1;

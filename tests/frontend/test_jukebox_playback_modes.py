@@ -5113,3 +5113,44 @@ def test_jukebox_cancelled_play_skips_the_preflight_requests(mock_page: Page):
     assert result["message"] == "play_cancelled"
     # 取消之后不该再为一首永远不会播的歌发预检请求。
     assert result["headRequests"] == 0
+
+
+@pytest.mark.frontend
+def test_jukebox_execute_play_control_refuses_a_stale_cancel_epoch(mock_page: Page):
+    """executePlayControl owns the "never mint a generation past a cancel" rule.
+
+    Its callers check first, so no current path reaches this gate — it is the
+    contract every future caller relies on, so it is pinned directly.
+    """
+    setup_headless_jukebox_page(mock_page)
+
+    result = mock_page.evaluate(
+        """
+        async () => {
+          const J = window.Jukebox;
+          await J.ensureRuntime({ headless: true });
+          const song = J.State.songs[0];
+
+          const staleEpoch = J.State.playCancelEpoch;
+          J.cancelActivePlayback();          // 世代前进，手里的那个就过期了
+          const requestIdBefore = J.State.playRequestId;
+
+          const outcome = await J.executePlayControl('play', song, { cancelEpoch: staleEpoch });
+
+          return {
+            ok: outcome.ok,
+            message: outcome.message || null,
+            songId: outcome.song && outcome.song.id,
+            // 关键不变量：过期的取消世代下，播放世代一格都不许铸出去。
+            mintedGeneration: J.State.playRequestId !== requestIdBefore,
+            currentSong: J.State.currentSong && J.State.currentSong.id
+          };
+        }
+        """
+    )
+
+    assert result["ok"] is False
+    assert result["message"] == "play_cancelled"
+    assert result["songId"] == "song1"
+    assert result["mintedGeneration"] is False
+    assert result["currentSong"] is None
