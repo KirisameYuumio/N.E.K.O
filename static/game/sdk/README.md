@@ -881,7 +881,7 @@ Avatar initialization failure leaves runtime/logging usable; a game requiring
 `avatar-renderer` fails its capability handshake instead.
 
 **Game integrations use this trusted factory registration and the public
-`game.avatar` discovery methods below.** Soccer now follows this path. The
+`game.avatar` discovery methods below.** Soccer and watch-together now follow this path. The
 transitional `avatarHost` constructor injection and raw host `getCharacter()`
 entry point have been removed. Bind the character with `game.runtime.bindCharacter()`
 before character-dependent gameplay; a discovery read does not implicitly bind
