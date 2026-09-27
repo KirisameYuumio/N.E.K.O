@@ -1182,7 +1182,35 @@ async function fallbackOwnershipChangeDuringWorkletCase() {
          'losing selection ownership during setup must remain a benign cancellation');
 }
 
+async function microphoneGainConstraintsCase() {
+  for (const selectedDevice of [null, 'selected-device', 'missing-device']) {
+    const env = loadModule();
+    env.S.selectedMicrophoneId = selectedDevice;
+    if (selectedDevice === 'missing-device') {
+      const error = new Error('device disconnected');
+      error.name = 'NotFoundError';
+      env.failNextGetUserMedia(error);
+    }
+    const started = await env.mod.startMicCapture();
+    assert(started === true, 'microphone must start with AGC disabled');
+    assert(env.getUserMediaCalls.length === (selectedDevice === 'missing-device' ? 2 : 1),
+           'default, selected, and fallback capture must be exercised');
+    for (const constraints of env.getUserMediaCalls) {
+      assert(constraints.audio.autoGainControl === false,
+             'every microphone open must disable browser AGC to preserve system input volume');
+      assert(constraints.audio.echoCancellation === true,
+             'disabling AGC must preserve echo cancellation');
+      assert(constraints.audio.noiseSuppression === false && constraints.audio.channelCount === 1,
+             'disabling AGC must preserve the RNNoise input contract');
+    }
+    env.mod.stopRecording();
+    assert(env.streams.every(stream => stream.track.stopped),
+           'stopping capture must still release microphone tracks');
+  }
+}
+
 (async () => {
+  await microphoneGainConstraintsCase();
   await raceCase();
   await preWorkletSetupFailureCase();
   await postCommitFailureCase();

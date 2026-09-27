@@ -280,7 +280,7 @@ def test_browser_capture_is_one_permission_four_segment_pcm16_and_cancels_on_clo
         "neko_mic_gain_db",
         "noiseSuppression: false",
         "echoCancellation: true",
-        "autoGainControl: true",
+        "autoGainControl: false",
         "X-CSRF-Token",
         "window.nekoBeforeWindowClose",
         "pagehide",

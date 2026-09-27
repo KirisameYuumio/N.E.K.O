@@ -1125,7 +1125,7 @@ test('one click PUTs three reference captures plus one exact five-second verific
         audio: {
             noiseSuppression: false,
             echoCancellation: true,
-            autoGainControl: true,
+            autoGainControl: false,
             channelCount: 1,
             deviceId: { exact: 'selected-microphone' },
         },
@@ -1383,7 +1383,7 @@ test('an unavailable saved device falls back to runtime default constraints', as
         audio: {
             noiseSuppression: false,
             echoCancellation: true,
-            autoGainControl: true,
+            autoGainControl: false,
             channelCount: 1,
         },
         video: false,
@@ -1999,7 +1999,7 @@ test('web enrollment and Electron runtime keep one desktop microphone contract',
     for (const constraint of [
         'noiseSuppression: false',
         'echoCancellation: true',
-        'autoGainControl: true',
+        'autoGainControl: false',
         'channelCount: 1',
     ]) {
         assert.equal(source.includes(constraint), true, constraint);

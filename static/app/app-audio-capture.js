@@ -2023,7 +2023,8 @@
             const baseAudioConstraints = {
                 noiseSuppression: false,
                 echoCancellation: true,
-                autoGainControl: true,
+                // Browser AGC can change the system microphone level.
+                autoGainControl: false,
                 channelCount: 1
             };
 
@@ -2840,7 +2841,9 @@
             return cachedMicDevices;
         }
         try {
-            var tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            var tempStream = await navigator.mediaDevices.getUserMedia({
+                audio: { autoGainControl: false }
+            });
             tempStream.getTracks().forEach(function (track) { track.stop(); });
             micPermissionGranted = true;
             console.log('麦克风权限已获取');

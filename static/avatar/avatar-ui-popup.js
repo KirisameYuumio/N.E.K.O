@@ -3280,7 +3280,9 @@ const AvatarPopupMixin = {
             const t = window.t || ((k, opt) => k);
 
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: { autoGainControl: false }
+                });
                 stream.getTracks().forEach(track => track.stop());
 
                 const devices = await navigator.mediaDevices.enumerateDevices();

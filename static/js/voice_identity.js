@@ -604,7 +604,8 @@
         const audio = {
             noiseSuppression: false,
             echoCancellation: true,
-            autoGainControl: true,
+            // Match live capture without changing the system microphone level.
+            autoGainControl: false,
             channelCount: 1
         };
         if (deviceId) audio.deviceId = { exact: deviceId };
