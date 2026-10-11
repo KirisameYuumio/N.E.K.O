@@ -3936,6 +3936,59 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    async function detectUploadedVrmOrientation(modelUrl) {
+        const manager = window.vrmManager;
+        const isAlive = () => !vrmSelectionLoadsDisposed && !manager?._isDisposed && window.vrmManager === manager;
+        if (!manager || !isAlive()) return false;
+        if (!manager.scene) {
+            await manager.initThreeJS('vrm-canvas', 'vrm-container');
+            if (!isAlive()) return false;
+        }
+        // The manager increments its token synchronously when this call starts.
+        const loading = loadVrmModelWithCatalogReset(vrmMotionCatalogPlayer, manager, modelUrl,
+            { autoPlay: false, addShadow: false });
+        const loadToken = manager._activeLoadToken;
+        const result = await loading;
+        const isCurrent = () => isAlive() && manager._activeLoadToken === loadToken && Boolean(result?.vrm)
+            && manager.currentModel?.vrm === result.vrm
+            && new URL(manager.currentModel.url, window.location.href).href === new URL(modelUrl, window.location.href).href;
+        if (!isCurrent()) return false;
+        for (let i = 0; i < 3; i++) {
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            if (!isCurrent()) return false;
+        }
+        const vrm = result.vrm;
+        const detectedRotation = { x: vrm.scene.rotation.x, y: vrm.scene.rotation.y, z: vrm.scene.rotation.z };
+        window.VRMOrientationDetector.applyRotation(vrm, detectedRotation);
+        await new Promise(resolve => requestAnimationFrame(resolve));
+        if (!isCurrent()) return false;
+        if (manager.core && typeof manager.core.saveUserPreferences === 'function') {
+            const position = vrm.scene.position.clone();
+            const scale = vrm.scene.scale.clone();
+            const saveSuccess = await manager.core.saveUserPreferences(modelUrl,
+                { x: position.x, y: position.y, z: position.z },
+                { x: scale.x, y: scale.y, z: scale.z }, detectedRotation, null);
+            // A dispatched save may finish, but must never clean up a newer model.
+            if (!isCurrent()) return false;
+            if (saveSuccess) {
+                const rotationDegrees = (detectedRotation.y * 180 / Math.PI).toFixed(1);
+                uploadStatus.textContent = t('live2d.vrmUpload.orientationFixed',
+                    `✓ 模型朝向已修正并保存 (${rotationDegrees}度)`, { degrees: rotationDegrees });
+            } else {
+                uploadStatus.textContent = t('live2d.vrmUpload.orientationFixedButSaveFailed', '⚠ 朝向已修正但保存失败');
+                console.error(`[上传检测] 保存失败: ${modelUrl}`);
+            }
+        } else {
+            uploadStatus.textContent = t('live2d.vrmUpload.cannotSaveOrientation', '⚠ 无法保存朝向配置');
+            console.error('[上传检测] saveUserPreferences方法不存在');
+        }
+        if (!isCurrent()) return false;
+        manager.scene.remove(vrm.scene);
+        manager.core.disposeVRM();
+        manager.currentModel = null;
+        return true;
+    }
+
     function mergeVrmAnimationLists(importedAnimations, catalogAnimations) {
         const result = [];
         const byPath = new Map();
@@ -8521,76 +8574,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                         // 使用 ModelPathHelper 标准化路径（处理 Windows 路径、相对路径等）
                         modelUrl = ModelPathHelper.normalizeModelPath(modelUrl, 'model');
 
-                        // 初始化Three.js（如果还没初始化）
-                        if (!window.vrmManager.scene) {
-                            await window.vrmManager.initThreeJS('vrm-canvas', 'vrm-container');
-                        }
-
-                        // 临时加载模型
-                        await loadVrmModelWithCatalogReset(
-                            vrmMotionCatalogPlayer,
-                            window.vrmManager,
-                            modelUrl,
-                            { autoPlay: false, addShadow: false }
-                        );
-
-                        // 等待几帧，确保模型完全加载、骨骼位置计算完成
-                        for (let i = 0; i < 3; i++) {
-                            await new Promise(resolve => requestAnimationFrame(resolve));
-                        }
-
-                        // 保存加载管线处理后的朝向到 preferences
-                        if (window.vrmManager.currentModel && window.vrmManager.currentModel.vrm) {
-                            const vrm = window.vrmManager.currentModel.vrm;
-
-                            // loadModel 已经完成 VRM0.x 版本兼容和启发式朝向处理。
-                            // 这里保存最终旋转，避免上传流程再次用旧启发式覆盖加载结果。
-                            const detectedRotation = {
-                                x: vrm.scene.rotation.x,
-                                y: vrm.scene.rotation.y,
-                                z: vrm.scene.rotation.z
-                            };
-
-                            // 应用旋转
-                            window.VRMOrientationDetector.applyRotation(vrm, detectedRotation);
-
-                            // 等待一帧，确保旋转已应用
-                            await new Promise(resolve => requestAnimationFrame(resolve));
-
-                            // 保存到preferences（使用与vrm-core.js相同的逻辑）
-                            if (window.vrmManager.core && typeof window.vrmManager.core.saveUserPreferences === 'function') {
-                                const currentPosition = vrm.scene.position.clone();
-                                const currentScale = vrm.scene.scale.clone();
-
-                                const saveSuccess = await window.vrmManager.core.saveUserPreferences(
-                                    modelUrl,
-                                    { x: currentPosition.x, y: currentPosition.y, z: currentPosition.z },
-                                    { x: currentScale.x, y: currentScale.y, z: currentScale.z },
-                                    detectedRotation,
-                                    null
-                                );
-
-                                if (saveSuccess) {
-                                    const rotationDegrees = (detectedRotation.y * 180 / Math.PI).toFixed(1);
-                                    uploadStatus.textContent = t('live2d.vrmUpload.orientationFixed', `✓ 模型朝向已修正并保存 (${rotationDegrees}度)`, { degrees: rotationDegrees });
-                                } else {
-                                    uploadStatus.textContent = t('live2d.vrmUpload.orientationFixedButSaveFailed', '⚠ 朝向已修正但保存失败');
-                                    console.error(`[上传检测] 保存失败: ${modelUrl}`);
-                                }
-                            } else {
-                                uploadStatus.textContent = t('live2d.vrmUpload.cannotSaveOrientation', '⚠ 无法保存朝向配置');
-                                console.error(`[上传检测] saveUserPreferences方法不存在`);
-                            }
-
-                            // 清理临时加载的模型
-                            if (window.vrmManager.currentModel && window.vrmManager.currentModel.vrm) {
-                                window.vrmManager.scene.remove(window.vrmManager.currentModel.vrm.scene);
-                                window.vrmManager.core.disposeVRM();
-                                window.vrmManager.currentModel = null;
-                            }
-                        } else {
-                            uploadStatus.textContent = t('live2d.vrmUpload.cannotGetModelInstance', '⚠ 无法获取模型实例');
-                            console.error(`[上传检测] 无法获取模型实例`);
+                        if (!await detectUploadedVrmOrientation(modelUrl) && !vrmSelectionLoadsDisposed) {
+                            uploadStatus.textContent = t('live2d.vrmUpload.orientationDetectionFailed', '⚠ 朝向检测失败，但模型已上传');
                         }
                     } catch (orientationError) {
                         console.warn('检测模型朝向时出错，将继续添加到列表:', orientationError);

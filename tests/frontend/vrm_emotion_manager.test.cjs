@@ -27,10 +27,9 @@ function installController(parent, manager, models, options, calls) {
     const selectionEnd = code.indexOf('    function currentMotionLocale()', selectionStart);
     const resetStart = code.indexOf('    async function loadVrmModelWithCatalogReset(');
     const resetEnd = code.indexOf('    function mergeVrmAnimationLists(', resetStart);
-    const uploadStart = code.indexOf('                        await loadVrmModelWithCatalogReset(', code.indexOf('// 临时加载模型'));
-    const uploadEnd = code.indexOf('                        );', uploadStart) + '                        );'.length;
     assert.ok(selectionStart >= 0 && selectionEnd > selectionStart && resetStart >= 0 && resetEnd > resetStart);
-    assert.ok(uploadStart >= 0 && uploadEnd > uploadStart);
+    assert.ok(code.slice(resetStart, resetEnd).includes('async function detectUploadedVrmOrientation('));
+    assert.ok(/await\s+detectUploadedVrmOrientation\(modelUrl\)/.test(code.slice(code.indexOf("fetch('/api/model/vrm/upload'"))));
     parent.vrmManager = manager;
     const select = parent.document.createElement('select');
     for (const model of models) {
@@ -43,7 +42,7 @@ function installController(parent, manager, models, options, calls) {
     }
     parent.document.body.appendChild(select);
     const run = new parent.Function('deps', `
-        const { vrmModelSelect, vrmContainer, mmdContainer, savePositionBtn,
+        const { vrmModelSelect, vrmContainer, mmdContainer, savePositionBtn, uploadStatus,
             checkVoiceModeStatus, loadVRMAnimations, loadCharacterLighting, vrmMotionCatalogPlayer } = deps;
         let vrmManager = deps.manager, currentModelType = 'live3d', currentLive3dSubType = 'vrm';
         let userModelSelectionGeneration = 0;
@@ -64,9 +63,12 @@ function installController(parent, manager, models, options, calls) {
             get retainedLoadCount() { return typeof vrmSelectionLoads !== 'undefined'
                 ? vrmSelectionLoads.size : Number(Boolean(vrmSelectionLoad)); },
             get playbackRequestId() { return vrmAnimationPlaybackRequestId; }, select: vrmModelSelect,
-            uploadProbe: async modelUrl => { ${code.slice(uploadStart, uploadEnd)} } };
+            uploadStatus,
+            uploadProbe: modelUrl => loadVrmModelWithCatalogReset(vrmMotionCatalogPlayer, vrmManager, modelUrl,
+                { autoPlay: false, addShadow: false }),
+            orientUpload: detectUploadedVrmOrientation };
     `);
-    return run({ manager, calls, vrmModelSelect: select,
+    return run({ manager, calls, vrmModelSelect: select, uploadStatus: parent.document.createElement('span'),
         vrmContainer: parent.document.createElement('div'), mmdContainer: parent.document.createElement('div'),
         savePositionBtn: parent.document.createElement('button'),
         checkVoiceModeStatus: options.voiceCheck || (async () => ({ isCurrent: false, isVoiceMode: false })),
@@ -112,6 +114,8 @@ function surface(t, options = {}) {
         const parent = new JSDOM('', { url: 'http://localhost:48911/model_manager', runScripts: 'outside-only' });
         parent.window.console = w.console;
         parent.window.Date.now = () => now;
+        parent.window.requestAnimationFrame = fn => options.frameWait ? options.frameWait(fn) : fn();
+        parent.window.VRMOrientationDetector = { applyRotation: vrm => calls.push({ rotation: vrm.scene.modelUrl }) };
         parent.window.eval(fs.readFileSync(path.join(root, 'static/js/model_manager/vrm-emotion-source.js'), 'utf8'));
         const manager = {
             get currentModel() { return { url: activeUrl, vrm: {} }; },
@@ -121,22 +125,36 @@ function surface(t, options = {}) {
         };
         if (options.actualController) {
             let loadedUrl = activeUrl;
+            const model = url => ({ url, vrm: { scene: { modelUrl: url, rotation: { x: 0, y: 0.5, z: 0 },
+                position: { clone: () => ({ x: 1, y: 2, z: 3 }) },
+                scale: { clone: () => ({ x: 1, y: 1, z: 1 }) } } } });
+            let loadedModel = model(loadedUrl);
             const realManager = {
-                scene: {}, camera: {}, renderer: {},
-                get currentModel() { return { url: loadedUrl, vrm: {} }; },
+                scene: { remove: scene => calls.push({ removed: scene.modelUrl }) }, camera: {}, renderer: {},
+                get currentModel() { return loadedModel; },
+                set currentModel(value) { loadedModel = value; },
                 get _activeLoadToken() { return token; },
                 get _isModelReadyForInteraction() { return state === 'ready'; },
                 expression: { ...manager.expression, loadMoodMap: name => calls.push({ moodMap: name }) },
+                core: {
+                    saveUserPreferences: async (url, position, scale, rotation) => {
+                        calls.push({ preferences: url, position, scale, rotation });
+                        return options.preferenceSave ? options.preferenceSave() : true;
+                    },
+                    disposeVRM: () => calls.push({ disposedModel: loadedModel?.url })
+                },
                 async loadModel(url, loadOptions) {
                     calls.push({ load: url, loadOptions }); const loadToken = ++token; state = 'loading';
                     try {
                         if (options.modelLoad) await options.modelLoad({ url });
-                        if (loadToken !== token) return;
-                        loadedUrl = url; state = 'ready';
+                        if (loadToken !== token) return null;
+                        loadedUrl = url; loadedModel = model(url); state = 'ready';
+                        return loadedModel;
                     } catch (error) { if (loadToken === token) state = 'failed'; throw error; }
                 }
             };
             controller = installController(parent.window, realManager, models, options, calls);
+            controller.manager = realManager;
         } else {
             let loadingTask = null;
             parent.window.VRMEmotionSource = parent.window.createVrmEmotionSource({
@@ -668,4 +686,57 @@ test('opener close clears an upload slot and rejects late and future upload work
     await assert.rejects(s.controller.uploadProbe('/user_vrm/next.vrm'), error => error.errorCode === 'sourceUnavailable');
     assert.equal(s.calls.filter(x => x.load).length, 1);
     assert.equal(s.controller.playbackRequestId, playbackRequestId);
+});
+
+for (const stage of ['parse', 'frame', 'beforeSave', 'save']) test(`superseded upload cannot save or dispose the selected model (stage=${stage})`, async t => {
+    const jobs = [], frames = [], saving = deferred();
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; },
+        frameWait: fn => frames.push(fn), preferenceSave: () => saving.promise });
+    const uploadUrl = '/user_vrm/upload.vrm';
+    const probe = s.controller.orientUpload(uploadUrl); const observed = probe.catch(error => error);
+    if (stage !== 'parse') {
+        jobs[0].resolve(); await flush();
+        const steps = stage === 'frame' ? 0 : stage === 'beforeSave' ? 3 : 4;
+        for (let i = 0; i < steps; i++) { frames.shift()(); await flush(); }
+    }
+    s.controller.select.value = '/static/vrm/B.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    jobs[1].resolve(); await flush();
+    if (stage === 'parse') jobs[0].resolve();
+    saving.resolve(true); await flush();
+    for (let i = 0; frames.length && i < 10; i++) { frames.shift()(); await flush(); }
+    await observed;
+    assert.equal(s.calls.filter(x => x.preferences).length, stage === 'save' ? 1 : 0);
+    assert.equal(s.calls.filter(x => x.disposedModel || x.removed).length, 0);
+    assert.equal(s.controller.manager.currentModel.url, '/static/vrm/B.vrm');
+    assert.ok(!s.controller.uploadStatus.textContent.includes('已修正并保存'));
+});
+
+for (const invalidation of ['sameUrl', 'close', 'managerReplacement']) test(`upload frame continuation respects ownership (invalidation=${invalidation})`, async t => {
+    const jobs = [], frames = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; }, frameWait: fn => frames.push(fn) });
+    const uploadUrl = '/user_vrm/upload.vrm';
+    const probe = s.controller.orientUpload(uploadUrl); const observed = probe.catch(error => error);
+    jobs[0].resolve(); await flush();
+    if (invalidation === 'sameUrl') {
+        const replacement = s.controller.manager.loadModel(uploadUrl); jobs[1].resolve(); await replacement;
+    } else if (invalidation === 'close') s.w.opener.dispatchEvent(new s.w.opener.Event('pagehide'));
+    else s.w.opener.vrmManager = { currentModel: s.controller.manager.currentModel };
+    for (let i = 0; frames.length && i < 10; i++) { frames.shift()(); await flush(); }
+    await observed;
+    assert.equal(s.calls.filter(x => x.preferences || x.rotation || x.disposedModel || x.removed).length, 0);
+});
+
+test('current upload saves its own transform and disposes only its temporary model', async t => {
+    const s = surface(t, { state: 'ready', actualController: true });
+    await s.controller.orientUpload('/user_vrm/upload.vrm');
+    const saves = s.calls.filter(x => x.preferences);
+    assert.equal(saves.length, 1); assert.equal(saves[0].preferences, '/user_vrm/upload.vrm');
+    assert.equal(saves[0].rotation.y, 0.5);
+    assert.equal(s.calls.filter(x => x.disposedModel).length, 1);
+    assert.equal(s.calls.find(x => x.removed).removed, '/user_vrm/upload.vrm');
+    assert.equal(s.controller.manager.currentModel, null);
+    assert.equal(s.controller.retainedLoadCount, 0);
 });
