@@ -23,7 +23,7 @@ function deferred() {
 function installController(parent, manager, models, options, calls) {
     const code = fs.readFileSync(path.join(root, 'static/js/model_manager/page-controller.js'), 'utf8');
     const pathHelpers = fs.readFileSync(path.join(root, 'static/js/model_manager/path-request-fullscreen.js'), 'utf8');
-    const selectionStart = code.indexOf('    let vrmSelectionLoadCount = 0;');
+    const selectionStart = code.indexOf('    let vrmSelectionLoad');
     const selectionEnd = code.indexOf('    function currentMotionLocale()', selectionStart);
     const resetStart = code.indexOf('    async function loadVrmModelWithCatalogReset(');
     const resetEnd = code.indexOf('    function mergeVrmAnimationLists(', resetStart);
@@ -54,7 +54,8 @@ function installController(parent, manager, models, options, calls) {
         ${pathHelpers}
         ${code.slice(selectionStart, selectionEnd)}
         ${code.slice(resetStart, resetEnd)}
-        return { get loadCount() { return vrmSelectionLoadCount; },
+        return { get loadCount() { return typeof vrmSelectionLoadCount === 'number'
+            ? vrmSelectionLoadCount : Number(Boolean(vrmSelectionLoad)); },
             get playbackRequestId() { return vrmAnimationPlaybackRequestId; }, select: vrmModelSelect };
     `);
     return run({ manager, calls, vrmModelSelect: select,
@@ -102,6 +103,7 @@ function surface(t, options = {}) {
     if (options.actualSource || options.actualController) {
         const parent = new JSDOM('', { url: 'http://localhost:48911/model_manager', runScripts: 'outside-only' });
         parent.window.console = w.console;
+        parent.window.Date.now = () => now;
         parent.window.eval(fs.readFileSync(path.join(root, 'static/js/model_manager/vrm-emotion-source.js'), 'utf8'));
         const manager = {
             get currentModel() { return { url: activeUrl, vrm: {} }; },
@@ -118,11 +120,12 @@ function surface(t, options = {}) {
                 get _isModelReadyForInteraction() { return state === 'ready'; },
                 expression: { ...manager.expression, loadMoodMap: name => calls.push({ moodMap: name }) },
                 async loadModel(url, loadOptions) {
-                    calls.push({ load: url, loadOptions }); token++; state = 'loading';
+                    calls.push({ load: url, loadOptions }); const loadToken = ++token; state = 'loading';
                     try {
                         if (options.modelLoad) await options.modelLoad({ url });
+                        if (loadToken !== token) return;
                         loadedUrl = url; state = 'ready';
-                    } catch (error) { state = 'failed'; throw error; }
+                    } catch (error) { if (loadToken === token) state = 'failed'; throw error; }
                 }
             };
             controller = installController(parent.window, realManager, models, options, calls);
@@ -237,6 +240,36 @@ test('unsupported existing bindings remain reference data and survive ordinary s
     assert.equal(s.w.document.querySelector('input[value="customMissing"]'), null);
     await s.w.VRMEmotionManager.saveEmotionMapping();
     assert.deepEqual(JSON.parse(s.posts()[0].body), { happy: ['happy', 'customMissing'] });
+});
+test('explicit default reset removes unavailable bindings and their notice before saving', async t => {
+    const s = surface(t, { state: 'ready', config: { happy: ['happy', 'customMissing'] } }); await s.select('A');
+    s.w.document.getElementById('reset-btn').click();
+    await s.w.VRMEmotionManager.saveEmotionMapping();
+    assert.equal(JSON.stringify(JSON.parse(s.posts()[0].body)).includes('customMissing'), false);
+    assert.equal(s.w.document.getElementById('unavailable-bindings').hidden, true);
+});
+test('configuration stylesheet has the same cache version as the page scripts', () => {
+    const html = fs.readFileSync(path.join(root, 'templates/vrm_emotion_manager.html'), 'utf8');
+    const css = html.match(/href="\/static\/css\/vrm_emotion_manager\.css(\?v=[^"]+)"/);
+    const script = html.match(/src="\/static\/js\/vrm_emotion_manager\.js(\?v=[^"]+)"/);
+    assert.ok(css); assert.equal(css[1], script[1]);
+});
+test('save timeout reports an unconfirmed result and releases the save deadline', async t => {
+    const s = surface(t, { state: 'ready' }); await s.select('A');
+    s.w.fetch = (_url, init) => new Promise((_, reject) => init.signal.addEventListener('abort',
+        () => reject(new s.w.DOMException('Aborted', 'AbortError')), { once: true }));
+    const saving = s.w.VRMEmotionManager.saveEmotionMapping();
+    await s.advance(120001); await saving;
+    assert.match(s.w.document.getElementById('status-message').textContent, /保存超时.*未确认/);
+    assert.equal(s.save.disabled, false); await s.advance(4000); assert.equal(s.timers.size, 0);
+});
+test('selection cancellation during save is silent and late response cannot report success', async t => {
+    const s = surface(t, { state: 'ready' }); await s.select('A');
+    const originalFetch = s.w.fetch, response = deferred();
+    s.w.fetch = (url, init) => init?.method === 'POST' ? response.promise : originalFetch(url, init);
+    const saving = s.w.VRMEmotionManager.saveEmotionMapping(); await s.select('B');
+    response.resolve({ ok: true, json: async () => ({ success: true }) }); await saving;
+    assert.doesNotMatch(s.w.document.getElementById('status-message').textContent, /保存成功|保存超时/);
 });
 test('external load token change blocks direct save and stale preview', async t => {
     const s = surface(t, { state: 'ready' }); await s.select('A'); s.setToken(2);
@@ -357,4 +390,32 @@ test('closing configuration during production controller loading releases pollin
     await s.select('B'); s.w.dispatchEvent(new s.w.Event('pagehide')); await flush();
     assert.equal(s.timers.size, 0); load.resolve(); await flush(); await s.advance(250);
     assert.equal(s.controller.loadCount, 0); assert.equal(s.save.disabled, true); assert.equal(s.posts().length, 0);
+});
+
+test('production controller retry recovers a stuck load and ignores late old continuation', async t => {
+    const oldLoad = deferred(); let count = 0;
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => ++count === 1 ? oldLoad.promise : undefined });
+    await s.select('B'); await s.advance(120001);
+    assert.equal(s.phase, 'failed'); assert.equal(s.save.disabled, true);
+    s.w.document.getElementById('retry-load-btn').click(); await flush(); await s.advance(250);
+    assert.equal(count, 2); assert.equal(s.controller.loadCount, 0);
+    assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false);
+    const before = s.calls.filter(x => x.moodMap).length;
+    oldLoad.resolve(); await flush();
+    assert.equal(s.calls.filter(x => x.moodMap).length, before);
+    assert.equal(s.controller.loadCount, 0); assert.equal(s.save.disabled, false);
+});
+
+test('old controller completion cannot clear the replacement loading gate', async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    await s.select('B'); await s.advance(120001);
+    s.w.document.getElementById('retry-load-btn').click(); await flush();
+    assert.equal(jobs.length, 2);
+    jobs[0].resolve(); await flush(); await s.advance(250);
+    assert.equal(s.controller.loadCount, 1); assert.equal(s.phase, 'loading'); assert.equal(s.save.disabled, true);
+    jobs[1].resolve(); await flush(); await s.advance(250);
+    assert.equal(s.controller.loadCount, 0); assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false);
 });

@@ -4728,6 +4728,8 @@
         "waitingForModel": "Cargando el modelo seleccionado. Espera…",
         "retryLoad": "Reintentar carga",
         "loadTimeout": "La carga agotó el tiempo de espera. Reinténtalo; la configuración guardada no ha cambiado.",
+        "saveTimeout": "El guardado agotó el tiempo de espera; el resultado no está confirmado. Comprueba la configuración antes de reintentarlo.",
+        "recoveryBlocked": "Dos cargas de modelos siguen pendientes. Espera a que terminen o vuelve a abrir la ventana del gestor de modelos antes de reintentarlo.",
         "sourceUnavailable": "Abre esta página desde el Administrador de Modelos y mantén esa ventana abierta.",
         "invalidModel": "Este modelo ya no está disponible. Vuelve a seleccionarlo.",
         "modelLoadFailed": "No se pudo cargar el modelo seleccionado. Reinténtalo.",

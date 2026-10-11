@@ -1,4 +1,4 @@
-/** Model-manager preview capability. One pending load, one failure; no request registry. */
+/** At most one current and one superseded load; no request queue or registry. */
 (function () {
     'use strict';
     function canonicalUrl(value) {
@@ -9,6 +9,7 @@
 
     window.createVrmEmotionSource = function ({ getManager, getSelectedUrl, isLoading, loadModel }) {
         let pending = null;
+        let superseded = null;
         let failure = null;
         let disposed = false;
 
@@ -30,14 +31,25 @@
         function request(info, force = false) {
             const modelUrl = canonicalUrl(info?.url);
             if (!modelUrl) return { state: 'failed', errorCode: 'invalidModel' };
+            if (disposed) return { state: 'failed', errorCode: 'sourceUnavailable' };
+            let replacing = false;
+            if (pending && (force || Date.now() - pending.startedAt >= 120000)) {
+                // VRMLoader cannot abort parsing. Permit one replacement using the
+                // manager's load token, but never accumulate abandoned promises.
+                if (superseded) return { state: 'failed', errorCode: 'recoveryBlocked' };
+                superseded = pending;
+                pending = null;
+                replacing = true;
+            }
             const current = snapshot(modelUrl);
-            if (current?.state === 'loading' || disposed) return current;
-            if (current && !force) return current;
+            if (!replacing && current?.state === 'loading') return current;
+            if (!replacing && current && !force) return current;
             failure = null;
-            const job = { modelUrl };
+            const job = { modelUrl, startedAt: Date.now() };
             pending = job;
-            // A replaced client polls for its new selection; it never queues another load.
-            Promise.resolve().then(() => loadModel(info)).then(result => {
+            Promise.resolve().then(() => {
+                if (!disposed && pending === job) return loadModel(info);
+            }).then(result => {
                 if (disposed || pending !== job) return;
                 if (result?.error) throw new Error(result.error);
                 const manager = getManager();
@@ -50,7 +62,10 @@
                     modelUrl, loadToken: getManager()?._activeLoadToken,
                     error: error.message, errorCode: 'modelLoadFailed'
                 };
-            }).finally(() => { if (pending === job) pending = null; });
+            }).finally(() => {
+                if (pending === job) pending = null;
+                if (superseded === job) superseded = null;
+            });
             return { state: 'loading', modelUrl };
         }
 
@@ -71,6 +86,7 @@
         function dispose() {
             disposed = true;
             pending = null;
+            superseded = null;
             failure = null;
             window.removeEventListener('pagehide', dispose);
         }

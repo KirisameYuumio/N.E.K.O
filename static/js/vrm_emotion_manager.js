@@ -326,7 +326,8 @@
             if (signal.aborted) throw signal.reason;
             if (selectionId !== currentSelectionId || disposed) return false;
             if (result.state === 'failed') throw new Error(result.error || t(
-                `vrmEmotionManager.${result.errorCode || 'modelLoadFailed'}`, '所选模型未成功加载，请重试'));
+                `vrmEmotionManager.${result.errorCode || 'modelLoadFailed'}`, result.errorCode === 'recoveryBlocked'
+                    ? '两次模型加载仍未结束，请等待完成或重新打开模型管理窗口后重试' : '所选模型未成功加载，请重试'));
             if (result.state !== 'ready' || !Array.isArray(result.expressions)
                 || new URL(result.modelUrl, window.location.href).href !== new URL(modelInfo.url, window.location.href).href) {
                 throw new Error(t('vrmEmotionManager.sourceChanged', '预览模型已改变或不可用，请重试加载所选模型'));
@@ -571,7 +572,12 @@
         const controller = new AbortController();
         saveController = controller;
         saveBtn.disabled = true;
-        const deadline = setTimeout(() => controller.abort(), LOAD_TIMEOUT_MS);
+        const deadline = setTimeout(() => {
+            controller.abort();
+            if (!disposed && selectionId === currentSelectionId && saveController === controller) {
+                showStatus(t('vrmEmotionManager.saveTimeout', '保存超时，结果未确认；请检查配置后再重试'), 'error');
+            }
+        }, LOAD_TIMEOUT_MS);
         saveDeadline = deadline;
 
         const config = {};
@@ -602,6 +608,7 @@
 
             if (!response.ok) {
                 console.error(`保存情感映射配置失败: HTTP ${response.status}`, await response.text().catch(() => ''));
+                if (disposed || controller.signal.aborted || selectionId !== currentSelectionId) return;
                 showStatus(t('vrmEmotionManager.saveFailed', '保存失败') + `: HTTP ${response.status}`, 'error');
                 return;
             }
@@ -631,6 +638,9 @@
     // 重置配置
     function resetConfig() {
         if (!canOperate()) return;
+        retainedBindings = {};
+        unavailableBindings.hidden = true;
+        unavailableBindings.textContent = '';
         applyDefaultConfig();
         showStatus(t('vrmEmotionManager.configReset', '已重置为默认配置'), 'info');
     }

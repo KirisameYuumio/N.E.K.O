@@ -4728,6 +4728,8 @@
         "waitingForModel": "正在加载所选模型，请稍候…",
         "retryLoad": "重试加载",
         "loadTimeout": "加载超时，请重试；原配置未修改",
+        "saveTimeout": "保存超时，结果未确认；请检查配置后再重试",
+        "recoveryBlocked": "两次模型加载仍未结束，请等待完成或重新打开模型管理窗口后重试",
         "sourceUnavailable": "请从模型管理窗口打开此页面，并保持该窗口开启",
         "invalidModel": "模型已不可用，请重新选择模型",
         "modelLoadFailed": "所选模型未成功加载，请重试",

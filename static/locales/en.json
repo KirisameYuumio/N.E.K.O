@@ -4728,6 +4728,8 @@
         "waitingForModel": "Loading the selected model. Please wait…",
         "retryLoad": "Retry loading",
         "loadTimeout": "Loading timed out. Please retry; your saved configuration is unchanged.",
+        "saveTimeout": "Saving timed out; the result is unconfirmed. Check your configuration before retrying.",
+        "recoveryBlocked": "Two model loads are still waiting. Wait for them to finish or reopen the model manager before retrying.",
         "sourceUnavailable": "Open this page from Model Manager and keep that window open.",
         "invalidModel": "This model is no longer available. Please select it again.",
         "modelLoadFailed": "The selected model did not load successfully. Please retry.",

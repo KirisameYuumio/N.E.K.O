@@ -3425,25 +3425,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     // VRM模型选择按钮点击事件已由 DropdownManager 处理
 
     // VRM 模型选择事件
-    let vrmSelectionLoadCount = 0;
+    let vrmSelectionLoad = null;
     async function loadSelectedVrmModel(e) {
-        vrmSelectionLoadCount += 1;
+        const job = {};
+        vrmSelectionLoad = job;
         try {
-            return await handleSelectedVrmModel(e);
+            return await handleSelectedVrmModel(e, () => vrmSelectionLoad === job);
         } finally {
-            vrmSelectionLoadCount -= 1;
+            if (vrmSelectionLoad === job) vrmSelectionLoad = null;
         }
     }
     if (vrmModelSelect) {
         vrmModelSelect.addEventListener('change', loadSelectedVrmModel);
     }
-    async function handleSelectedVrmModel(e) {
+    async function handleSelectedVrmModel(e, isCurrentSelection) {
             updateVRMModelSelectButtonText();
             const modelPath = e.target.value;
             if (!modelPath) return;
 
             // 检查语音模式状态
             const voiceStatus = await checkVoiceModeStatus();
+            if (!isCurrentSelection()) return;
             if (voiceStatus.isCurrent && voiceStatus.isVoiceMode) {
                 showStatus(t('live2d.cannotChangeModelInVoiceMode', '语音模式下无法切换模型，请先停止语音对话'), 3000);
                 // 恢复之前的选择
@@ -3480,6 +3482,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 localStorage.setItem('live3dSubType', 'mmd');
                 if (!wasAlreadyMmd) {
                     await switchModelDisplay('live3d', 'mmd');
+                    if (!isCurrentSelection()) return;
                 }
 
                 // switchModelDisplay 重建了 vrmModelSelect，需要重新选中当前模型
@@ -3541,6 +3544,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             localStorage.setItem('live3dSubType', 'vrm');
             if (needsSwitch) {
                 await switchModelDisplay('live3d', 'vrm');
+                if (!isCurrentSelection()) return;
                 // switchModelDisplay 重建了 vrmModelSelect，需要重新选中当前模型
                 if (vrmModelSelect) {
                     const reselect = Array.from(vrmModelSelect.options).find(opt => opt.value === modelPath);
@@ -3584,7 +3588,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     // 等待 VRM 模块加载（带超时和错误处理）
                     try {
                         await waitForVRM();
+                        if (!isCurrentSelection()) return;
                     } catch (error) {
+                        if (!isCurrentSelection()) return;
                         // 如果是超时错误，显示更友好的提示
                         if (error.message && error.message.includes('Timeout')) {
                             showStatus(t('live2d.vrmModuleTimeout', 'VRM 模块加载超时，请刷新页面重试'), 5000);
@@ -3608,10 +3614,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                     if (!vrmManager._isInitialized && (!vrmManager.scene || !vrmManager.camera || !vrmManager.renderer)) {
                         await vrmManager.initThreeJS('vrm-canvas', 'vrm-container');
+                        if (!isCurrentSelection()) return;
                     }
 
                     showStatus(t('live2d.vrmInitialized', 'VRM 管理器初始化成功'));
                 } catch (error) {
+                    if (!isCurrentSelection()) return;
                     console.error('VRM 管理器初始化失败:', error);
                     const errMsg = (error && typeof error.message === 'string') ? error.message : String(error ?? 'Unknown error');
                     showStatus(t('live2d.vrmInitFailed', `VRM 管理器初始化失败: ${errMsg}`, { error: errMsg }));
@@ -3624,12 +3632,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                 console.log('[模型管理] VRM 场景未完全初始化，正在初始化...');
                 try {
                     await vrmManager.initThreeJS('vrm-canvas', 'vrm-container');
+                    if (!isCurrentSelection()) return;
                     // 再次验证初始化是否成功
                     if (!vrmManager.scene || !vrmManager.camera || !vrmManager.renderer) {
                         throw new Error('场景初始化后仍缺少必要组件');
                     }
                     console.log('[模型管理] VRM 场景初始化成功');
                 } catch (initError) {
+                    if (!isCurrentSelection()) return;
                     console.error('[模型管理] 场景初始化失败:', initError);
                     const errMsg = (initError && typeof initError.message === 'string') ? initError.message : String(initError ?? 'Unknown error');
                     showStatus(t('live2d.vrmInitFailed', `场景初始化失败: ${errMsg}`, { error: errMsg }), 5000);
@@ -3751,6 +3761,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     addShadow: false,
                     idleAnimation: '/static/vrm/animation/wait03.vrma.gz'
                 });
+                if (!isCurrentSelection()) return;
                 // 加载新模型后，重置播放状态
                 isVrmAnimationPlaying = false;
                 updateVRMAnimationPlayButtonIcon();
@@ -3787,18 +3798,22 @@ document.addEventListener('DOMContentLoaded', async () => {
                 animationsLoaded = false;
                 // 主动加载动作列表，解开下拉菜单的锁定状态
                 await loadVRMAnimations();
+                if (!isCurrentSelection()) return;
 
                 // 自动加载角色的打光配置
                 await loadCharacterLighting();
+                if (!isCurrentSelection()) return;
 
                 showStatus(t('live2d.vrmModelLoaded', `VRM 模型 ${modelPath} 加载成功`, { model: modelPath }));
             } catch (error) {
+                if (!isCurrentSelection()) return;
                 console.error('加载 VRM 模型失败:', error);
                 const errMsg = (error && typeof error.message === 'string') ? error.message : String(error ?? 'Unknown error');
                 showStatus(t('live2d.vrmModelLoadFailed', `加载 VRM 模型失败: ${errMsg}。您仍可以保存模型设置。`, { error: errMsg }));
                 // 即使模型加载失败，也尝试加载动作列表（可能用户想预览其他动作）
                 try {
                     await loadVRMAnimations(false);
+                    if (!isCurrentSelection()) return;
                 } catch (animError) {
                     console.warn('加载动作列表失败:', animError);
                 }
@@ -3810,7 +3825,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.VRMEmotionSource = window.createVrmEmotionSource({
         getManager: () => vrmManager,
         getSelectedUrl: () => vrmModelSelect?.value || '',
-        isLoading: () => vrmSelectionLoadCount > 0,
+        isLoading: () => vrmSelectionLoad !== null,
         loadModel: (info) => {
             const option = Array.from(vrmModelSelect?.options || []).find(opt =>
                 new URL(opt.value, window.location.href).href === new URL(info.url, window.location.href).href

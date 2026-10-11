@@ -9,7 +9,8 @@ function setup(options = {}) {
     const listeners = new Map(), previews = [], loads = [];
     const window = { location: { href: 'http://localhost:48911/model_manager', origin: 'http://localhost:48911' },
         addEventListener: (name, fn) => listeners.set(name, fn), removeEventListener: name => listeners.delete(name) };
-    vm.runInNewContext(source, { window, URL });
+    let now = 0;
+    vm.runInNewContext(source, { window, URL, Date: { now: () => now } });
     let selectedUrl = options.selectedUrl || '/static/vrm/A.vrm';
     let loading = false;
     const manager = { currentModel: { url: selectedUrl, vrm: {} }, _activeLoadToken: 1,
@@ -20,15 +21,17 @@ function setup(options = {}) {
         getSelectedUrl: () => selectedUrl, isLoading: () => loading,
         loadModel: async info => {
             loads.push(info.url); loading = true; selectedUrl = info.url;
-            manager._activeLoadToken++; manager._isModelReadyForInteraction = false;
+            const token = ++manager._activeLoadToken; manager._isModelReadyForInteraction = false;
             try {
                 const result = options.load ? await options.load(info, manager) : undefined;
+                if (token !== manager._activeLoadToken) return;
                 if (result?.error) return result;
                 manager.currentModel = { url: info.url, vrm: {} }; manager._isModelReadyForInteraction = true;
                 return result;
-            } finally { loading = false; }
+            } finally { if (token === manager._activeLoadToken) loading = false; }
         } });
-    return { bridge, manager, previews, loads, listeners, changeSelected: value => { selectedUrl = value; } };
+    return { bridge, manager, previews, loads, listeners, advance: ms => { now += ms; },
+        changeSelected: value => { selectedUrl = value; } };
 }
 test('ready capability is tied to exact URL and load token, with real preview', () => {
     const s = setup(); const snapshot = s.bridge.request({ url: '/static/vrm/A.vrm' });
@@ -87,4 +90,37 @@ test('disposal removes source lifecycle listener and ignores late load completio
     const s = setup({ load: () => pending }); s.bridge.request({ url: '/static/vrm/B.vrm' }); await flush();
     s.bridge.dispose(); assert.equal(s.listeners.size, 0); resolve(); await flush();
     assert.equal(s.bridge.request({ url: '/static/vrm/B.vrm' }).state, 'failed');
+});
+
+test('explicit retry replaces a stuck load and late completion cannot revoke the new capability', async () => {
+    let resolve;
+    const stuck = new Promise(r => { resolve = r; });
+    const s = setup({ load: info => info.url.endsWith('B.vrm') ? stuck : undefined });
+    s.bridge.request({ url: '/static/vrm/B.vrm' }); await flush();
+    s.bridge.request({ url: '/static/vrm/C.vrm' }, true); await flush();
+    const capability = s.bridge.request({ url: '/static/vrm/C.vrm' });
+    assert.equal(capability.state, 'ready'); assert.equal(s.loads.length, 2);
+    resolve(); await flush(); assert.equal(s.bridge.isCurrent(capability), true);
+    s.bridge.dispose(); assert.equal(s.listeners.size, 0);
+});
+test('expired load allows a new selection without forced retry', async () => {
+    const s = setup({ load: info => info.url.endsWith('B.vrm') ? new Promise(() => {}) : undefined });
+    s.bridge.request({ url: '/static/vrm/B.vrm' }); await flush(); s.advance(120001);
+    s.bridge.request({ url: '/static/vrm/C.vrm' }); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/C.vrm' }).state, 'ready');
+    s.bridge.dispose(); assert.equal(s.listeners.size, 0);
+});
+test('replacement capacity is bounded across 100 forced retries and released when old load settles', async () => {
+    const jobs = [];
+    const s = setup({ load: () => new Promise(resolve => jobs.push(resolve)) });
+    s.bridge.request({ url: '/static/vrm/B.vrm' }); await flush();
+    s.bridge.request({ url: '/static/vrm/C.vrm' }, true); await flush();
+    for (let i = 0; i < 100; i++) s.bridge.request({ url: '/static/vrm/D.vrm' }, true);
+    await flush(); assert.equal(s.loads.length, 2);
+    jobs[0](); await flush();
+    s.bridge.request({ url: '/static/vrm/D.vrm' }, true); await flush();
+    assert.equal(s.loads.length, 3);
+    s.bridge.dispose(); assert.equal(s.listeners.size, 0);
+    jobs[1](); jobs[2](); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/D.vrm' }).state, 'failed');
 });
