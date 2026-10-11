@@ -7,7 +7,8 @@
         return url.origin === window.location.origin ? url.href : '';
     }
 
-    window.createVrmEmotionSource = function ({ getManager, getSelectedUrl, getLoadingTask, loadModel }) {
+    window.createVrmEmotionSource = function ({ getManager, getSelectedUrl, getLoadingTask,
+        getLoadingTasks = () => [getLoadingTask()].filter(Boolean), loadModel }) {
         let pending = null;
         let superseded = null;
         let failure = null;
@@ -15,8 +16,9 @@
 
         function unfinishedCount(exclude) {
             // A source job and its opener callback describe the same load.
-            // This temporary set has at most three entries and is never retained.
-            return new Set([pending, superseded, getLoadingTask()]
+            // The opener exposes at most two jobs, including superseded work.
+            // This temporary set has at most four entries and is never retained.
+            return new Set([pending, superseded, ...getLoadingTasks()]
                 .filter(job => job && job !== exclude && !job.settled)
                 .map(job => job.loadingTask || job)
                 .filter(task => !task.settled)).size;
@@ -74,7 +76,7 @@
                 return result;
             }).then(result => {
                 if (disposed || pending !== job) return;
-                if (result?.error) throw new Error(result.error);
+                if (result?.error) throw Object.assign(new Error(result.error), { errorCode: result.errorCode });
                 const manager = getManager();
                 if (canonicalUrl(getSelectedUrl()) !== modelUrl
                     || canonicalUrl(manager?.currentModel?.url) !== modelUrl || !manager?._isModelReadyForInteraction) {

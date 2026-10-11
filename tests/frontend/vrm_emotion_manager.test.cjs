@@ -57,6 +57,8 @@ function installController(parent, manager, models, options, calls) {
         ${code.slice(resetStart, resetEnd)}
         return { get loadCount() { return typeof vrmSelectionLoadCount === 'number'
             ? vrmSelectionLoadCount : Number(Boolean(vrmSelectionLoad)); },
+            get retainedLoadCount() { return typeof vrmSelectionLoads !== 'undefined'
+                ? vrmSelectionLoads.size : Number(Boolean(vrmSelectionLoad)); },
             get playbackRequestId() { return vrmAnimationPlaybackRequestId; }, select: vrmModelSelect };
     `);
     return run({ manager, calls, vrmModelSelect: select,
@@ -481,4 +483,60 @@ test('late veto from a superseded voice check cannot restore an obsolete selecti
     assert.equal(s.controller.select.value, '/static/vrm/A.vrm');
     assert.equal(s.calls.filter(x => x.status?.includes('语音模式')).length, 0);
     assert.equal(s.controller.loadCount, 0);
+});
+
+for (const settlesFirst of [0, 1]) test(`production controller retains both opener loads for recovery capacity (settlesFirst=${settlesFirst})`, async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    for (const name of ['B', 'A']) {
+        s.controller.select.value = `/static/vrm/${name}.vrm`;
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    await s.select('B'); await s.advance(120001);
+    for (let i = 0; i < 100; i++) {
+        s.w.document.getElementById('retry-load-btn').click(); await flush();
+    }
+    assert.equal(jobs.length, 2); assert.equal(s.save.disabled, true); assert.equal(s.controller.retainedLoadCount, 2);
+    jobs[settlesFirst].resolve(); await flush();
+    s.w.document.getElementById('retry-load-btn').click(); await flush();
+    assert.equal(jobs.length, 3);
+    jobs[1 - settlesFirst].resolve(); jobs[2].resolve(); await flush(); await s.advance(250);
+    assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false); assert.equal(s.controller.retainedLoadCount, 0);
+});
+test('production controller direct selections have a hard two-job bound and retain accepted selection', async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    for (const name of ['B', 'A']) {
+        s.controller.select.value = `/static/vrm/${name}.vrm`;
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    for (let i = 0; i < 100; i++) {
+        s.controller.select.value = '/static/vrm/B.vrm';
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    assert.equal(jobs.length, 2); assert.equal(s.controller.retainedLoadCount, 2); assert.equal(s.controller.select.value, '/static/vrm/A.vrm');
+    assert.equal(s.calls.filter(x => 'selectionLabel' in x).at(-1).selectionLabel, '/static/vrm/A.vrm');
+    jobs[0].reject(new Error('old parse failed')); await flush();
+    s.controller.select.value = '/static/vrm/B.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    assert.equal(jobs.length, 3);
+    jobs[1].resolve(); jobs[2].resolve(); await flush();
+    assert.equal(s.controller.loadCount, 0);
+});
+test('closing the opener clears both selection slots and fences late callbacks and future changes', async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    for (const name of ['B', 'A']) {
+        s.controller.select.value = `/static/vrm/${name}.vrm`;
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    s.w.opener.dispatchEvent(new s.w.opener.Event('pagehide'));
+    assert.equal(s.controller.loadCount, 0);
+    assert.equal(s.controller.retainedLoadCount, 0);
+    for (let i = 0; i < 10; i++) s.controller.select.dispatchEvent(new s.w.opener.Event('change'));
+    jobs[0].resolve(); jobs[1].resolve(); await flush();
+    assert.equal(jobs.length, 2); assert.equal(s.calls.filter(x => x.moodMap).length, 0);
 });

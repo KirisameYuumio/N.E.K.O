@@ -3426,15 +3426,40 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // VRM 模型选择事件
     let vrmSelectionLoad = null;
+    // Both entry paths share two unfinished slots; superseded work keeps its
+    // slot until it settles because the underlying parser cannot be aborted.
+    const vrmSelectionLoads = new Set();
+    let vrmSelectionLoadsDisposed = false;
+    function disposeVrmSelectionLoads() {
+        vrmSelectionLoadsDisposed = true;
+        vrmSelectionLoad = null;
+        vrmSelectionLoads.clear();
+        vrmModelSelect?.removeEventListener('change', loadSelectedVrmModel);
+        window.removeEventListener('pagehide', disposeVrmSelectionLoads);
+    }
+    window.addEventListener('pagehide', disposeVrmSelectionLoads);
     async function loadSelectedVrmModel(e, previousValue = currentModelInfo?.url || vrmManager?.currentModel?.url || '') {
+        if (vrmSelectionLoadsDisposed) return {
+            error: t('vrmEmotionManager.sourceUnavailable', '请从模型管理窗口打开此页面，并保持该窗口开启'),
+            errorCode: 'sourceUnavailable'
+        };
         const previousOption = Array.from(vrmModelSelect?.options || []).find(opt => opt.value && previousValue
             && new URL(opt.value, window.location.href).href === new URL(previousValue, window.location.href).href);
-        const job = { startedAt: Date.now(), settled: false };
+        if (vrmSelectionLoads.size >= 2) {
+            e.target.value = vrmSelectionLoad?.modelUrl || previousOption?.value || '';
+            updateVRMModelSelectButtonText();
+            const error = t('vrmEmotionManager.recoveryBlocked', '两次模型加载仍未结束，请等待完成或重新打开模型管理窗口后重试');
+            showStatus(error, 3000);
+            return { error, errorCode: 'recoveryBlocked' };
+        }
+        const job = { modelUrl: e.target.value, startedAt: Date.now(), settled: false };
+        vrmSelectionLoads.add(job);
         vrmSelectionLoad = job;
         try {
-            return await handleSelectedVrmModel(e, () => vrmSelectionLoad === job, previousOption?.value || '');
+            return await handleSelectedVrmModel(e, () => vrmSelectionLoads.has(job) && vrmSelectionLoad === job, previousOption?.value || '');
         } finally {
             job.settled = true;
+            vrmSelectionLoads.delete(job);
             if (vrmSelectionLoad === job) vrmSelectionLoad = null;
         }
     }
@@ -3826,6 +3851,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         getManager: () => vrmManager,
         getSelectedUrl: () => vrmModelSelect?.value || '',
         getLoadingTask: () => vrmSelectionLoad,
+        getLoadingTasks: () => [...vrmSelectionLoads],
         loadModel: (info) => {
             const option = Array.from(vrmModelSelect?.options || []).find(opt =>
                 new URL(opt.value, window.location.href).href === new URL(info.url, window.location.href).href
