@@ -12,6 +12,7 @@
         let pending = null;
         let superseded = null;
         let failure = null;
+        let rejectedModelUrl = '';
         let disposed = false;
 
         function unfinishedCount(exclude) {
@@ -46,6 +47,25 @@
             // An adopted opener task has its own settlement path; release its
             // slot when the owner finishes, even if our replacement is pending.
             if (superseded?.settled) superseded = null;
+            const current = snapshot(modelUrl);
+            const existingAdmission = current?.state === 'ready'
+                || pending?.modelUrl === modelUrl
+                || canonicalUrl(getSelectedUrl()) === modelUrl;
+            // Ordinary polling observes existing work; only an explicit retry
+            // requests a replacement of the same admitted model.
+            if (!force && existingAdmission && current) {
+                if (current.state === 'ready' && rejectedModelUrl === modelUrl) rejectedModelUrl = '';
+                return current;
+            }
+            // One rejected URL is retained separately from parsing errors so a
+            // late failure of admitted work cannot turn rejection into a queue.
+            if (!force && rejectedModelUrl === modelUrl) {
+                return { state: 'failed', modelUrl, errorCode: 'recoveryBlocked' };
+            }
+            if (!existingAdmission && unfinishedCount() >= 2) {
+                rejectedModelUrl = modelUrl;
+                return { state: 'failed', modelUrl, errorCode: 'recoveryBlocked' };
+            }
             let replacing = false;
             const active = pending || getLoadingTask();
             if (active && (force || Date.now() - active.startedAt >= 120000)) {
@@ -56,10 +76,10 @@
                 pending = null;
                 replacing = true;
             }
-            const current = snapshot(modelUrl);
             if (!replacing && current?.state === 'loading') return current;
             if (!replacing && current && !force) return current;
             failure = null;
+            rejectedModelUrl = '';
             const job = { modelUrl, startedAt: Date.now(), settled: false };
             pending = job;
             Promise.resolve().then(() => {
@@ -83,10 +103,13 @@
                     throw new Error(window.t ? window.t('vrmEmotionManager.modelLoadFailed') : '所选模型未成功加载，请重试');
                 }
             }).catch(error => {
-                if (!disposed && pending === job) failure = {
-                    modelUrl, loadToken: getManager()?._activeLoadToken,
-                    error: error.message, errorCode: error.errorCode || 'modelLoadFailed'
-                };
+                if (!disposed && pending === job) {
+                    if (error.errorCode === 'recoveryBlocked') rejectedModelUrl = modelUrl;
+                    failure = {
+                        modelUrl, loadToken: getManager()?._activeLoadToken,
+                        error: error.message, errorCode: error.errorCode || 'modelLoadFailed'
+                    };
+                }
             }).finally(() => {
                 job.settled = true;
                 if (pending === job) pending = null;
@@ -114,6 +137,7 @@
             pending = null;
             superseded = null;
             failure = null;
+            rejectedModelUrl = '';
             window.removeEventListener('pagehide', dispose);
         }
         window.addEventListener('pagehide', dispose);

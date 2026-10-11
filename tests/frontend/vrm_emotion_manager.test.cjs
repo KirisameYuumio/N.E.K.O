@@ -540,3 +540,57 @@ test('closing the opener clears both selection slots and fences late callbacks a
     jobs[0].resolve(); jobs[1].resolve(); await flush();
     assert.equal(jobs.length, 2); assert.equal(s.calls.filter(x => x.moodMap).length, 0);
 });
+
+test('ordinary source polling retains an expired admitted opener model without a capacity error', async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    for (const name of ['B', 'A']) {
+        s.controller.select.value = `/static/vrm/${name}.vrm`;
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    await s.advance(120001);
+    const provider = s.w.opener.VRMEmotionSource;
+    assert.equal(provider.request({ url: '/static/vrm/A.vrm' }).state, 'loading');
+    assert.equal(provider.request({ url: '/static/vrm/A.vrm' }, true).errorCode, 'recoveryBlocked');
+    assert.equal(jobs.length, 2);
+    jobs[1].resolve(); await flush();
+    await s.select('A'); await s.advance(250);
+    assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false); assert.equal(jobs.length, 2);
+    jobs[0].resolve(); await flush();
+});
+test('new URL at full capacity fails immediately and cannot start later until explicit retry', async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    for (const name of ['B', 'A']) {
+        s.controller.select.value = `/static/vrm/${name}.vrm`;
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    await s.select('B');
+    const initialPhase = s.phase;
+    assert.equal(s.save.disabled, true); assert.equal(jobs.length, 2);
+    jobs[1].resolve(); await flush(); await s.advance(500);
+    assert.equal(jobs.length, 2); assert.equal(initialPhase, 'failed');
+    for (let i = 0; i < 100; i++) {
+        const result = s.w.opener.VRMEmotionSource.request({ url: '/static/vrm/B.vrm' });
+        assert.equal(result.state, 'failed'); assert.equal(result.errorCode, 'recoveryBlocked');
+    }
+    await flush(); assert.equal(jobs.length, 2); assert.equal(s.phase, 'failed');
+    s.w.document.getElementById('retry-load-btn').click(); await flush();
+    assert.equal(jobs.length, 3);
+    jobs[0].resolve(); jobs[2].resolve(); await flush(); await s.advance(250);
+    assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false);
+});
+test('ordinary polling of an admitted source job remains loading at full expired capacity', async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    await s.select('B');
+    s.controller.select.value = '/static/vrm/A.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    await s.advance(120001);
+    assert.equal(s.w.opener.VRMEmotionSource.request({ url: '/static/vrm/B.vrm' }).state, 'loading');
+    assert.equal(jobs.length, 2);
+    jobs[0].resolve(); jobs[1].resolve(); await flush();
+});

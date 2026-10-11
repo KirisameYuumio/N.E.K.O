@@ -185,3 +185,19 @@ test('a distinct opener load arriving before the replacement microtask cannot ad
     assert.equal(s.bridge.request({ url: '/static/vrm/C.vrm' }).state, 'ready');
     s.bridge.dispose(); assert.equal(s.listeners.size, 0);
 });
+test('late failure of admitted work cannot erase a capacity rejection or enqueue its URL', async () => {
+    const jobs = [];
+    const s = setup({ load: () => new Promise((resolve, reject) => jobs.push({ resolve, reject })) });
+    s.bridge.request({ url: '/static/vrm/B.vrm' }); await flush();
+    const external = s.startExternalLoad({ url: '/static/vrm/C.vrm' }); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/D.vrm' }).errorCode, 'recoveryBlocked');
+    jobs[0].reject(new Error('late source parse failure')); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/D.vrm' }).errorCode, 'recoveryBlocked');
+    jobs[1].resolve(); await external; await flush();
+    for (let i = 0; i < 100; i++) assert.equal(s.bridge.request({ url: '/static/vrm/D.vrm' }).state, 'failed');
+    await flush(); assert.equal(s.loads.length, 2);
+    s.bridge.request({ url: '/static/vrm/D.vrm' }, true); await flush();
+    assert.equal(s.loads.length, 3); jobs[2].resolve(); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/D.vrm' }).state, 'ready');
+    s.bridge.dispose(); assert.equal(s.listeners.size, 0);
+});
