@@ -27,7 +27,11 @@ function installController(parent, manager, models, options, calls) {
     const selectionEnd = code.indexOf('    function currentMotionLocale()', selectionStart);
     const resetStart = code.indexOf('    async function loadVrmModelWithCatalogReset(');
     const resetEnd = code.indexOf('    function mergeVrmAnimationLists(', resetStart);
+    const uploadStart = code.indexOf('                        await loadVrmModelWithCatalogReset(', code.indexOf('// 临时加载模型'));
+    const uploadEnd = code.indexOf('                        );', uploadStart) + '                        );'.length;
     assert.ok(selectionStart >= 0 && selectionEnd > selectionStart && resetStart >= 0 && resetEnd > resetStart);
+    assert.ok(uploadStart >= 0 && uploadEnd > uploadStart);
+    parent.vrmManager = manager;
     const select = parent.document.createElement('select');
     for (const model of models) {
         const option = parent.document.createElement('option');
@@ -59,7 +63,8 @@ function installController(parent, manager, models, options, calls) {
             ? vrmSelectionLoadCount : Number(Boolean(vrmSelectionLoad)); },
             get retainedLoadCount() { return typeof vrmSelectionLoads !== 'undefined'
                 ? vrmSelectionLoads.size : Number(Boolean(vrmSelectionLoad)); },
-            get playbackRequestId() { return vrmAnimationPlaybackRequestId; }, select: vrmModelSelect };
+            get playbackRequestId() { return vrmAnimationPlaybackRequestId; }, select: vrmModelSelect,
+            uploadProbe: async modelUrl => { ${code.slice(uploadStart, uploadEnd)} } };
     `);
     return run({ manager, calls, vrmModelSelect: select,
         vrmContainer: parent.document.createElement('div'), mmdContainer: parent.document.createElement('div'),
@@ -593,4 +598,74 @@ test('ordinary polling of an admitted source job remains loading at full expired
     assert.equal(s.w.opener.VRMEmotionSource.request({ url: '/static/vrm/B.vrm' }).state, 'loading');
     assert.equal(jobs.length, 2);
     jobs[0].resolve(); jobs[1].resolve(); await flush();
+});
+
+for (const settlesFirst of [0, 1]) test(`upload probe shares editor recovery capacity (settlesFirst=${settlesFirst})`, async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    const probe = s.controller.uploadProbe('/user_vrm/upload.vrm');
+    await flush(); await s.select('B'); await s.advance(120001);
+    for (let i = 0; i < 100; i++) {
+        s.w.document.getElementById('retry-load-btn').click(); await flush();
+    }
+    assert.equal(jobs.length, 2); assert.equal(s.controller.retainedLoadCount, 2);
+    assert.equal(s.save.disabled, true);
+    jobs[settlesFirst].resolve(); await flush();
+    s.w.document.getElementById('retry-load-btn').click(); await flush();
+    assert.equal(jobs.length, 3); assert.equal(s.controller.retainedLoadCount, 2);
+    jobs[1 - settlesFirst].resolve(); jobs[2].resolve(); await probe; await flush(); await s.advance(250);
+    assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false);
+    assert.equal(s.controller.retainedLoadCount, 0);
+});
+
+test('upload at full selection capacity cannot parse or cancel current playback', async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    for (const name of ['B', 'A']) {
+        s.controller.select.value = `/static/vrm/${name}.vrm`;
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    const playbackRequestId = s.controller.playbackRequestId;
+    const cancellations = s.calls.filter(x => x.cancel).length;
+    for (let i = 0; i < 100; i++) {
+        const probe = s.controller.uploadProbe('/user_vrm/upload.vrm');
+        // Resolve any mistakenly admitted old-code call so this failure has no hanging promise.
+        if (jobs[2]) jobs[2].resolve();
+        await assert.rejects(probe, error => error.errorCode === 'recoveryBlocked');
+    }
+    assert.equal(jobs.length, 2); assert.equal(s.controller.retainedLoadCount, 2);
+    assert.equal(s.controller.playbackRequestId, playbackRequestId);
+    assert.equal(s.calls.filter(x => x.cancel).length, cancellations);
+    jobs[0].resolve(); jobs[1].resolve(); await flush();
+});
+
+for (const fails of [false, true]) test(`upload probe releases its shared slot on settlement (fails=${fails})`, async t => {
+    const job = deferred();
+    const s = surface(t, { state: 'ready', actualController: true, modelLoad: () => job.promise });
+    const probe = s.controller.uploadProbe('/user_vrm/upload.vrm');
+    const observed = probe.catch(error => error);
+    await flush();
+    assert.equal(s.controller.retainedLoadCount, 1);
+    if (fails) job.reject(new Error('upload parse failed')); else job.resolve();
+    await observed; await flush();
+    assert.equal(s.controller.retainedLoadCount, 0);
+    assert.equal(s.calls.filter(x => x.load).length, 1);
+});
+
+test('opener close clears an upload slot and rejects late and future upload work', async t => {
+    const job = deferred();
+    const s = surface(t, { state: 'ready', actualController: true, modelLoad: () => job.promise });
+    const probe = s.controller.uploadProbe('/user_vrm/upload.vrm');
+    const observed = probe.catch(error => error);
+    await flush(); s.w.opener.dispatchEvent(new s.w.opener.Event('pagehide'));
+    assert.equal(s.controller.retainedLoadCount, 0);
+    job.resolve();
+    const outcome = await observed;
+    assert.equal(outcome?.errorCode, 'sourceUnavailable');
+    const playbackRequestId = s.controller.playbackRequestId;
+    await assert.rejects(s.controller.uploadProbe('/user_vrm/next.vrm'), error => error.errorCode === 'sourceUnavailable');
+    assert.equal(s.calls.filter(x => x.load).length, 1);
+    assert.equal(s.controller.playbackRequestId, playbackRequestId);
 });

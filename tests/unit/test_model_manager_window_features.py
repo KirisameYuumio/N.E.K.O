@@ -452,7 +452,9 @@ def test_vrm_catalog_player_resets_before_loading_a_new_model():
     script = f"""
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
-const context = {{ vrmAnimationPlaybackRequestId: 7 }};
+const context = {{ vrmAnimationPlaybackRequestId: 7,
+  vrmSelectionLoads: new Set(), vrmSelectionLoadsDisposed: false,
+  t: (_key, fallback) => fallback }};
 vm.runInNewContext({json.dumps(function_source)}, context);
 (async function () {{
   const calls = [];
@@ -470,6 +472,7 @@ vm.runInNewContext({json.dumps(function_source)}, context);
   );
   assert.equal(result, 'loaded');
   assert.equal(context.vrmAnimationPlaybackRequestId, 8);
+  assert.equal(context.vrmSelectionLoads.size, 0);
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[0], ['cancel', 'model_manager_model_load', false]);
   assert.deepEqual(calls[1], ['load', '/user_vrm/model.vrm']);

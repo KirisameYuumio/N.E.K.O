@@ -3426,7 +3426,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // VRM 模型选择事件
     let vrmSelectionLoad = null;
-    // Both entry paths share two unfinished slots; superseded work keeps its
+    // Selection, editor recovery and upload probes share two unfinished slots;
+    // superseded work keeps its
     // slot until it settles because the underlying parser cannot be aborted.
     const vrmSelectionLoads = new Set();
     let vrmSelectionLoadsDisposed = false;
@@ -3456,7 +3457,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         vrmSelectionLoads.add(job);
         vrmSelectionLoad = job;
         try {
-            return await handleSelectedVrmModel(e, () => vrmSelectionLoads.has(job) && vrmSelectionLoad === job, previousOption?.value || '');
+            return await handleSelectedVrmModel(e, () => vrmSelectionLoads.has(job) && vrmSelectionLoad === job, previousOption?.value || '', job);
         } finally {
             job.settled = true;
             vrmSelectionLoads.delete(job);
@@ -3466,7 +3467,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (vrmModelSelect) {
         vrmModelSelect.addEventListener('change', loadSelectedVrmModel);
     }
-    async function handleSelectedVrmModel(e, isCurrentSelection, previousValue) {
+    async function handleSelectedVrmModel(e, isCurrentSelection, previousValue, selectionJob) {
             updateVRMModelSelectButtonText();
             const modelPath = e.target.value;
             if (!modelPath) return;
@@ -3785,7 +3786,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 await loadVrmModelWithCatalogReset(vrmMotionCatalogPlayer, vrmManager, modelUrl, {
                     addShadow: false,
                     idleAnimation: '/static/vrm/animation/wait03.vrma.gz'
-                });
+                }, selectionJob);
                 if (!isCurrentSelection()) return;
                 // 加载新模型后，重置播放状态
                 isVrmAnimationPlaying = false;
@@ -3907,12 +3908,32 @@ document.addEventListener('DOMContentLoaded', async () => {
         return availableValues && availableValues.has(compressed) ? compressed : value;
     }
 
-    async function loadVrmModelWithCatalogReset(catalogPlayer, manager, modelUrl, options) {
-        vrmAnimationPlaybackRequestId += 1;
-        if (catalogPlayer) {
-            catalogPlayer.cancel('model_manager_model_load', { resume: false });
+    async function loadVrmModelWithCatalogReset(catalogPlayer, manager, modelUrl, options, selectionJob) {
+        const unavailable = () => Object.assign(new Error(t('vrmEmotionManager.sourceUnavailable',
+            '请从模型管理窗口打开此页面，并保持该窗口开启')), { errorCode: 'sourceUnavailable' });
+        if (vrmSelectionLoadsDisposed || (selectionJob && !vrmSelectionLoads.has(selectionJob))) throw unavailable();
+        // A selection already owns a slot through voice checks and initialization.
+        // Upload orientation probes use this same wrapper without a selection job.
+        if (!selectionJob && vrmSelectionLoads.size >= 2) {
+            throw Object.assign(new Error(t('vrmEmotionManager.recoveryBlocked',
+                '两次模型加载仍未结束，请等待完成或重新打开模型管理窗口后重试')), { errorCode: 'recoveryBlocked' });
         }
-        return manager.loadModel(modelUrl, options);
+        const job = selectionJob || { modelUrl, startedAt: Date.now(), settled: false };
+        if (!selectionJob) vrmSelectionLoads.add(job);
+        try {
+            vrmAnimationPlaybackRequestId += 1;
+            if (catalogPlayer) {
+                catalogPlayer.cancel('model_manager_model_load', { resume: false });
+            }
+            const result = await manager.loadModel(modelUrl, options);
+            if (vrmSelectionLoadsDisposed || !vrmSelectionLoads.has(job)) throw unavailable();
+            return result;
+        } finally {
+            if (!selectionJob) {
+                job.settled = true;
+                vrmSelectionLoads.delete(job);
+            }
+        }
     }
 
     function mergeVrmAnimationLists(importedAnimations, catalogAnimations) {
