@@ -16,7 +16,7 @@
         window.VRM_DEFAULT_LIGHTING = Object.freeze(JSON.parse(vrmDefaultLightingData?.textContent || '{}'));
     </script>
     <!-- i18next 加载器（统一处理 CDN 加载和初始化） -->
-    <script src="/static/i18n-i18next.js"></script>
+    <script src="/static/i18n-i18next.js?v={{ static_asset_version | default('0') }}"></script>
     <script src="/static/common_dialogs.js"></script>
     <script src="/static/js/model_manager/named-window-registration.js?v={{ static_asset_version | default('0') }}"></script>
     <link rel="stylesheet" href="/static/css/model_manager.css?v={{ static_asset_version | default('0') }}">

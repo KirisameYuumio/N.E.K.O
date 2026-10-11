@@ -46,6 +46,7 @@ import re
 from pathlib import Path
 
 import pytest
+from jinja2 import Environment
 
 ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = ROOT / "static" / "i18n-i18next.js"
@@ -498,6 +499,26 @@ def test_locale_key_signature_pins_the_shipped_key_set() -> None:
     bootstrap = _read_bootstrap()
     signature = _locale_key_signature(_supported_languages(bootstrap))
     assert signature == LOCALE_KEY_SIGNATURE, _BUMP_INSTRUCTIONS
+
+
+@pytest.mark.parametrize("template_name", ["model_manager.html", "vrm_emotion_manager.html"])
+def test_vrm_pages_refresh_the_locale_bootstrap_with_static_assets(template_name: str) -> None:
+    from config import DEFAULT_VRM_LIGHTING
+
+    template = Environment().from_string(
+        (ROOT / "templates" / template_name).read_text(encoding="utf-8")
+    )
+    urls = []
+    for version in ("before-locale-update", "after-locale-update"):
+        rendered = template.render(
+            static_asset_version=version,
+            vrm_defaults=dict(DEFAULT_VRM_LIGHTING),
+        )
+        scripts = re.findall(r'<script\b[^>]*\bsrc="([^"]+)"', rendered)
+        bootstrap_urls = [url for url in scripts if url.startswith("/static/i18n-i18next.js")]
+        assert bootstrap_urls == [f"/static/i18n-i18next.js?v={version}"]
+        urls.extend(bootstrap_urls)
+    assert urls[0] != urls[1], "a locale bootstrap update must change its browser cache key"
 
 
 def test_bump_instructions_name_every_step_of_the_fix() -> None:
