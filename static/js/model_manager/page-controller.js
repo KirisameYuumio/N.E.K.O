@@ -3426,19 +3426,22 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // VRM 模型选择事件
     let vrmSelectionLoad = null;
-    async function loadSelectedVrmModel(e) {
-        const job = {};
+    async function loadSelectedVrmModel(e, previousValue = currentModelInfo?.url || vrmManager?.currentModel?.url || '') {
+        const previousOption = Array.from(vrmModelSelect?.options || []).find(opt => opt.value && previousValue
+            && new URL(opt.value, window.location.href).href === new URL(previousValue, window.location.href).href);
+        const job = { startedAt: Date.now(), settled: false };
         vrmSelectionLoad = job;
         try {
-            return await handleSelectedVrmModel(e, () => vrmSelectionLoad === job);
+            return await handleSelectedVrmModel(e, () => vrmSelectionLoad === job, previousOption?.value || '');
         } finally {
+            job.settled = true;
             if (vrmSelectionLoad === job) vrmSelectionLoad = null;
         }
     }
     if (vrmModelSelect) {
         vrmModelSelect.addEventListener('change', loadSelectedVrmModel);
     }
-    async function handleSelectedVrmModel(e, isCurrentSelection) {
+    async function handleSelectedVrmModel(e, isCurrentSelection, previousValue) {
             updateVRMModelSelectButtonText();
             const modelPath = e.target.value;
             if (!modelPath) return;
@@ -3449,11 +3452,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (voiceStatus.isCurrent && voiceStatus.isVoiceMode) {
                 showStatus(t('live2d.cannotChangeModelInVoiceMode', '语音模式下无法切换模型，请先停止语音对话'), 3000);
                 // 恢复之前的选择
-                if (currentModelInfo && currentModelInfo.name) {
-                    e.target.value = currentModelInfo.name;
-                } else {
-                    e.target.value = '';
-                }
+                e.target.value = previousValue;
+                updateVRMModelSelectButtonText();
                 return { error: t('live2d.cannotChangeModelInVoiceMode', '语音模式下无法切换模型，请先停止语音对话') };
             }
 
@@ -3825,14 +3825,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.VRMEmotionSource = window.createVrmEmotionSource({
         getManager: () => vrmManager,
         getSelectedUrl: () => vrmModelSelect?.value || '',
-        isLoading: () => vrmSelectionLoad !== null,
+        getLoadingTask: () => vrmSelectionLoad,
         loadModel: (info) => {
             const option = Array.from(vrmModelSelect?.options || []).find(opt =>
                 new URL(opt.value, window.location.href).href === new URL(info.url, window.location.href).href
                 && opt.getAttribute('data-sub-type') !== 'mmd');
             if (!option) throw new Error(t('vrmEmotionManager.invalidModel', '模型已不可用，请重新选择模型'));
+            const previousValue = vrmModelSelect.value;
             vrmModelSelect.value = option.value;
-            return loadSelectedVrmModel({ target: vrmModelSelect });
+            return loadSelectedVrmModel({ target: vrmModelSelect }, previousValue);
         }
     });
 

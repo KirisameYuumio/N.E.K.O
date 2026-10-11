@@ -7,7 +7,7 @@
         return url.origin === window.location.origin ? url.href : '';
     }
 
-    window.createVrmEmotionSource = function ({ getManager, getSelectedUrl, isLoading, loadModel }) {
+    window.createVrmEmotionSource = function ({ getManager, getSelectedUrl, getLoadingTask, loadModel }) {
         let pending = null;
         let superseded = null;
         let failure = null;
@@ -16,7 +16,7 @@
         function snapshot(modelUrl) {
             const manager = getManager();
             if (disposed) return { state: 'failed', errorCode: 'sourceUnavailable' };
-            if (pending || isLoading()) return { state: 'loading', modelUrl };
+            if (pending || getLoadingTask()) return { state: 'loading', modelUrl };
             if (failure?.modelUrl === modelUrl && failure.loadToken === manager?._activeLoadToken) {
                 return { state: 'failed', ...failure };
             }
@@ -32,12 +32,16 @@
             const modelUrl = canonicalUrl(info?.url);
             if (!modelUrl) return { state: 'failed', errorCode: 'invalidModel' };
             if (disposed) return { state: 'failed', errorCode: 'sourceUnavailable' };
+            // An adopted opener task has its own settlement path; release its
+            // slot when the owner finishes, even if our replacement is pending.
+            if (superseded?.settled) superseded = null;
             let replacing = false;
-            if (pending && (force || Date.now() - pending.startedAt >= 120000)) {
+            const active = pending || getLoadingTask();
+            if (active && (force || Date.now() - active.startedAt >= 120000)) {
                 // VRMLoader cannot abort parsing. Permit one replacement using the
                 // manager's load token, but never accumulate abandoned promises.
                 if (superseded) return { state: 'failed', errorCode: 'recoveryBlocked' };
-                superseded = pending;
+                superseded = active;
                 pending = null;
                 replacing = true;
             }
@@ -45,7 +49,7 @@
             if (!replacing && current?.state === 'loading') return current;
             if (!replacing && current && !force) return current;
             failure = null;
-            const job = { modelUrl, startedAt: Date.now() };
+            const job = { modelUrl, startedAt: Date.now(), settled: false };
             pending = job;
             Promise.resolve().then(() => {
                 if (!disposed && pending === job) return loadModel(info);
@@ -63,6 +67,7 @@
                     error: error.message, errorCode: 'modelLoadFailed'
                 };
             }).finally(() => {
+                job.settled = true;
                 if (pending === job) pending = null;
                 if (superseded === job) superseded = null;
             });

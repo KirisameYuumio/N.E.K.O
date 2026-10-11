@@ -12,15 +12,15 @@ function setup(options = {}) {
     let now = 0;
     vm.runInNewContext(source, { window, URL, Date: { now: () => now } });
     let selectedUrl = options.selectedUrl || '/static/vrm/A.vrm';
-    let loading = false;
+    let currentTask = null;
     const manager = { currentModel: { url: selectedUrl, vrm: {} }, _activeLoadToken: 1,
         _isModelReadyForInteraction: true, expression: {
             getExpressionList: () => options.expressions || ['happy'], setBaseExpression: value => previews.push(value)
         } };
-    const bridge = window.createVrmEmotionSource({ getManager: () => manager,
-        getSelectedUrl: () => selectedUrl, isLoading: () => loading,
-        loadModel: async info => {
-            loads.push(info.url); loading = true; selectedUrl = info.url;
+    const loadModel = async info => {
+            const task = { startedAt: now, settled: false };
+            currentTask = task;
+            loads.push(info.url); selectedUrl = info.url;
             const token = ++manager._activeLoadToken; manager._isModelReadyForInteraction = false;
             try {
                 const result = options.load ? await options.load(info, manager) : undefined;
@@ -28,10 +28,16 @@ function setup(options = {}) {
                 if (result?.error) return result;
                 manager.currentModel = { url: info.url, vrm: {} }; manager._isModelReadyForInteraction = true;
                 return result;
-            } finally { if (token === manager._activeLoadToken) loading = false; }
-        } });
+            } finally {
+                task.settled = true;
+                if (currentTask === task) currentTask = null;
+            }
+        };
+    const bridge = window.createVrmEmotionSource({ getManager: () => manager,
+        getSelectedUrl: () => selectedUrl,
+        getLoadingTask: () => currentTask, loadModel });
     return { bridge, manager, previews, loads, listeners, advance: ms => { now += ms; },
-        changeSelected: value => { selectedUrl = value; } };
+        changeSelected: value => { selectedUrl = value; }, startExternalLoad: loadModel };
 }
 test('ready capability is tied to exact URL and load token, with real preview', () => {
     const s = setup(); const snapshot = s.bridge.request({ url: '/static/vrm/A.vrm' });
@@ -123,4 +129,26 @@ test('replacement capacity is bounded across 100 forced retries and released whe
     s.bridge.dispose(); assert.equal(s.listeners.size, 0);
     jobs[1](); jobs[2](); await flush();
     assert.equal(s.bridge.request({ url: '/static/vrm/D.vrm' }).state, 'failed');
+});
+
+test('forced retry adopts an external load under the capacity limit and releases it on settlement', async () => {
+    const jobs = [];
+    const s = setup({ load: () => new Promise(resolve => jobs.push(resolve)) });
+    const external = s.startExternalLoad({ url: '/static/vrm/B.vrm' }); await flush();
+    s.bridge.request({ url: '/static/vrm/C.vrm' }, true); await flush();
+    assert.equal(s.loads.length, 2);
+    for (let i = 0; i < 100; i++) s.bridge.request({ url: '/static/vrm/D.vrm' }, true);
+    await flush(); assert.equal(s.loads.length, 2);
+    jobs[0](); await external; await flush();
+    s.bridge.request({ url: '/static/vrm/D.vrm' }, true); await flush(); assert.equal(s.loads.length, 3);
+    jobs[1](); jobs[2](); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/D.vrm' }).state, 'ready');
+    s.bridge.dispose(); assert.equal(s.listeners.size, 0);
+});
+test('external load expiry permits a healthy new selection without forced retry', async () => {
+    const s = setup({ load: info => info.url.endsWith('B.vrm') ? new Promise(() => {}) : undefined });
+    void s.startExternalLoad({ url: '/static/vrm/B.vrm' }); await flush(); s.advance(120001);
+    s.bridge.request({ url: '/static/vrm/C.vrm' }); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/C.vrm' }).state, 'ready');
+    s.bridge.dispose(); assert.equal(s.listeners.size, 0);
 });

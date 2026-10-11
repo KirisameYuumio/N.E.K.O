@@ -47,7 +47,8 @@ function installController(parent, manager, models, options, calls) {
             isVrmExpressionPlaying = false, vrmAnimationPlaybackRequestId = 0;
         const t = (_key, fallback) => fallback;
         const showStatus = message => deps.calls.push({ status: message });
-        const stopIdleRotation = () => {}, updateVRMModelSelectButtonText = () => {},
+        const updateVRMModelSelectButtonText = () => deps.calls.push({ selectionLabel: vrmModelSelect.value });
+        const stopIdleRotation = () => {},
             updateVRMAnimationPlayButtonIcon = () => {}, updateVRMExpressionPlayButtonIcon = () => {},
             loadVRMExpressions = () => {}, markModelChangedForCardFacePrompt = () => {};
         const isSuppressedModelManagerChangeEvent = () => false;
@@ -129,14 +130,20 @@ function surface(t, options = {}) {
                 }
             };
             controller = installController(parent.window, realManager, models, options, calls);
-        } else parent.window.VRMEmotionSource = parent.window.createVrmEmotionSource({
-            getManager: () => manager, getSelectedUrl: () => activeUrl, isLoading: () => state === 'loading',
+        } else {
+            let loadingTask = null;
+            parent.window.VRMEmotionSource = parent.window.createVrmEmotionSource({
+            getManager: () => manager, getSelectedUrl: () => activeUrl, getLoadingTask: () => loadingTask,
             loadModel: async info => {
+                const task = { startedAt: now, settled: false };
+                loadingTask = task;
                 calls.push({ load: info.url }); activeUrl = info.url; token++; state = 'loading';
                 try { if (options.modelLoad) await options.modelLoad(info); state = 'ready'; }
                 catch (error) { state = 'failed'; throw error; }
+                finally { task.settled = true; if (loadingTask === task) loadingTask = null; }
             }
         });
+        }
         w.opener = parent.window;
         t.after(() => { parent.window.VRMEmotionSource.dispose(); parent.window.close(); });
     }
@@ -351,6 +358,8 @@ test('production controller voice check keeps waiting and veto cannot grant stal
     voice.resolve({ isCurrent: true, isVoiceMode: true }); await flush(); await s.advance(250);
     assert.equal(s.phase, 'failed'); assert.equal(s.save.disabled, true); assert.equal(s.controller.loadCount, 0);
     await s.w.VRMEmotionManager.saveEmotionMapping(); assert.equal(s.posts().length, 0);
+    assert.equal(s.controller.select.value, '/static/vrm/A.vrm');
+    assert.equal(s.calls.filter(x => 'selectionLabel' in x).at(-1).selectionLabel, '/static/vrm/A.vrm');
 });
 
 test('production controller rapid B to A selection never edits B while A initialization is pending', async t => {
@@ -418,4 +427,40 @@ test('old controller completion cannot clear the replacement loading gate', asyn
     assert.equal(s.controller.loadCount, 1); assert.equal(s.phase, 'loading'); assert.equal(s.save.disabled, true);
     jobs[1].resolve(); await flush(); await s.advance(250);
     assert.equal(s.controller.loadCount, 0); assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false);
+});
+
+test('production controller retry replaces a model-manager initiated hung load', async t => {
+    const oldLoad = deferred(); let count = 0;
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => ++count === 1 ? oldLoad.promise : undefined });
+    s.controller.select.value = '/static/vrm/B.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    await s.select('B'); await s.advance(120001);
+    assert.equal(s.phase, 'failed'); assert.equal(count, 1);
+    s.w.document.getElementById('retry-load-btn').click(); await flush(); await s.advance(250);
+    assert.equal(count, 2); assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false);
+    oldLoad.resolve(); await flush();
+    assert.equal(s.controller.loadCount, 0); assert.equal(s.calls.filter(x => x.moodMap).length, 1);
+});
+test('ordinary model-manager voice veto restores the previous model URL and label', async t => {
+    const s = surface(t, { state: 'ready', actualController: true,
+        voiceCheck: async () => ({ isCurrent: true, isVoiceMode: true }) });
+    s.controller.select.value = '/static/vrm/B.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    assert.equal(s.controller.select.value, '/static/vrm/A.vrm');
+    assert.equal(s.calls.filter(x => 'selectionLabel' in x).at(-1).selectionLabel, '/static/vrm/A.vrm');
+    assert.equal(s.calls.filter(x => x.load).length, 0); assert.equal(s.controller.loadCount, 0);
+});
+test('late veto from a superseded voice check cannot restore an obsolete selection', async t => {
+    const firstVoice = deferred(); let checks = 0;
+    const s = surface(t, { state: 'ready', actualController: true,
+        voiceCheck: () => ++checks === 1 ? firstVoice.promise : Promise.resolve({ isCurrent: false }) });
+    s.controller.select.value = '/static/vrm/B.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    s.controller.select.value = '/static/vrm/A.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    firstVoice.resolve({ isCurrent: true, isVoiceMode: true }); await flush();
+    assert.equal(s.controller.select.value, '/static/vrm/A.vrm');
+    assert.equal(s.calls.filter(x => x.status?.includes('语音模式')).length, 0);
+    assert.equal(s.controller.loadCount, 0);
 });
