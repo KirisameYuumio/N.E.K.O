@@ -13,6 +13,15 @@
         let failure = null;
         let disposed = false;
 
+        function unfinishedCount(exclude) {
+            // A source job and its opener callback describe the same load.
+            // This temporary set has at most three entries and is never retained.
+            return new Set([pending, superseded, getLoadingTask()]
+                .filter(job => job && job !== exclude && !job.settled)
+                .map(job => job.loadingTask || job)
+                .filter(task => !task.settled)).size;
+        }
+
         function snapshot(modelUrl) {
             const manager = getManager();
             if (disposed) return { state: 'failed', errorCode: 'sourceUnavailable' };
@@ -40,7 +49,7 @@
             if (active && (force || Date.now() - active.startedAt >= 120000)) {
                 // VRMLoader cannot abort parsing. Permit one replacement using the
                 // manager's load token, but never accumulate abandoned promises.
-                if (superseded) return { state: 'failed', errorCode: 'recoveryBlocked' };
+                if (superseded || unfinishedCount() >= 2) return { state: 'failed', errorCode: 'recoveryBlocked' };
                 superseded = active;
                 pending = null;
                 replacing = true;
@@ -52,7 +61,17 @@
             const job = { modelUrl, startedAt: Date.now(), settled: false };
             pending = job;
             Promise.resolve().then(() => {
-                if (!disposed && pending === job) return loadModel(info);
+                if (disposed || pending !== job) return;
+                // An opener selection can arrive after request() but before this
+                // microtask. Recheck before starting any additional work.
+                if (unfinishedCount(job) >= 2) {
+                    const error = new Error('Load recovery capacity exhausted');
+                    error.errorCode = 'recoveryBlocked';
+                    throw error;
+                }
+                const result = loadModel(info);
+                job.loadingTask = getLoadingTask();
+                return result;
             }).then(result => {
                 if (disposed || pending !== job) return;
                 if (result?.error) throw new Error(result.error);
@@ -64,7 +83,7 @@
             }).catch(error => {
                 if (!disposed && pending === job) failure = {
                     modelUrl, loadToken: getManager()?._activeLoadToken,
-                    error: error.message, errorCode: 'modelLoadFailed'
+                    error: error.message, errorCode: error.errorCode || 'modelLoadFailed'
                 };
             }).finally(() => {
                 job.settled = true;

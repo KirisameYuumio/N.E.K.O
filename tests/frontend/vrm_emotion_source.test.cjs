@@ -152,3 +152,36 @@ test('external load expiry permits a healthy new selection without forced retry'
     assert.equal(s.bridge.request({ url: '/static/vrm/C.vrm' }).state, 'ready');
     s.bridge.dispose(); assert.equal(s.listeners.size, 0);
 });
+
+for (const force of [true, false]) for (const settlesFirst of [0, 1]) test(`distinct overlapping opener and source loads block replacement (force=${force}, settlesFirst=${settlesFirst})`, async () => {
+    const jobs = [];
+    const s = setup({ load: () => new Promise(resolve => jobs.push(resolve)) });
+    s.bridge.request({ url: '/static/vrm/B.vrm' }); await flush();
+    const external = s.startExternalLoad({ url: '/static/vrm/C.vrm' }); await flush();
+    s.advance(120001);
+    for (let i = 0; i < 100; i++) {
+        const result = s.bridge.request({ url: '/static/vrm/D.vrm' }, force);
+        assert.equal(result.state, 'failed'); assert.equal(result.errorCode, 'recoveryBlocked');
+    }
+    await flush(); assert.equal(s.loads.length, 2);
+    jobs[settlesFirst](); await flush();
+    s.bridge.request({ url: '/static/vrm/D.vrm' }, true); await flush();
+    assert.equal(s.loads.length, 3);
+    jobs[1 - settlesFirst](); await external; jobs[2](); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/D.vrm' }).state, 'ready');
+    s.bridge.dispose(); assert.equal(s.listeners.size, 0);
+});
+test('a distinct opener load arriving before the replacement microtask cannot admit a third call', async () => {
+    const jobs = [];
+    const s = setup({ load: () => new Promise(resolve => jobs.push(resolve)) });
+    s.bridge.request({ url: '/static/vrm/B.vrm' }); await flush();
+    s.bridge.request({ url: '/static/vrm/C.vrm' }, true);
+    const external = s.startExternalLoad({ url: '/static/vrm/D.vrm' });
+    await flush(); assert.equal(s.loads.length, 2);
+    assert.equal(s.bridge.request({ url: '/static/vrm/C.vrm' }, true).errorCode, 'recoveryBlocked');
+    jobs[0](); jobs[1](); await external; await flush();
+    s.bridge.request({ url: '/static/vrm/C.vrm' }, true); await flush();
+    assert.equal(s.loads.length, 3); jobs[2](); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/C.vrm' }).state, 'ready');
+    s.bridge.dispose(); assert.equal(s.listeners.size, 0);
+});

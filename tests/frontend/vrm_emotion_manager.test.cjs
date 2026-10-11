@@ -451,6 +451,24 @@ test('ordinary model-manager voice veto restores the previous model URL and labe
     assert.equal(s.calls.filter(x => 'selectionLabel' in x).at(-1).selectionLabel, '/static/vrm/A.vrm');
     assert.equal(s.calls.filter(x => x.load).length, 0); assert.equal(s.controller.loadCount, 0);
 });
+test('production controller overlapping source and opener loads block a third parse and recover after settlement', async t => {
+    const jobs = [];
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; } });
+    await s.select('B');
+    s.controller.select.value = '/static/vrm/A.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    await s.advance(120001);
+    for (let i = 0; i < 100; i++) {
+        s.w.document.getElementById('retry-load-btn').click(); await flush();
+    }
+    assert.equal(jobs.length, 2); assert.equal(s.phase, 'failed'); assert.equal(s.save.disabled, true);
+    jobs[0].resolve(); await flush();
+    s.w.document.getElementById('retry-load-btn').click(); await flush();
+    assert.equal(jobs.length, 3); assert.equal(s.phase, 'loading');
+    jobs[1].resolve(); jobs[2].resolve(); await flush(); await s.advance(250);
+    assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false); assert.equal(s.controller.loadCount, 0);
+});
 test('late veto from a superseded voice check cannot restore an obsolete selection', async t => {
     const firstVoice = deferred(); let checks = 0;
     const s = surface(t, { state: 'ready', actualController: true,
