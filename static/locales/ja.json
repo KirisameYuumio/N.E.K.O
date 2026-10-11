@@ -4725,6 +4725,15 @@
         }
     },
     "vrmEmotionManager": {
+        "waitingForModel": "選択したモデルを読み込み中です。お待ちください…",
+        "retryLoad": "読み込みを再試行",
+        "loadTimeout": "読み込みがタイムアウトしました。再試行してください。保存済みの設定は変更されていません。",
+        "sourceUnavailable": "モデル管理からこのページを開き、そのウィンドウを開いたままにしてください。",
+        "invalidModel": "このモデルは利用できなくなりました。もう一度選択してください。",
+        "modelLoadFailed": "選択したモデルを読み込めませんでした。再試行してください。",
+        "sourceChanged": "プレビューモデルが変更されたか利用できません。選択したモデルの読み込みを再試行してください。",
+        "noConfigurableExpressions": "モデルの読み込みは完了しましたが、設定可能な表情がありません。",
+        "retainedBindings": "次の保存済みの割り当てはこのモデルで利用できません。プレビューせずに保持します：",
         "title": "VRM 感情マッピング管理 - Project N.E.K.O.",
         "pageTitle": "VRM 感情マッピング管理",
         "subtitle": "各感情に対応する表情マッピングを設定",

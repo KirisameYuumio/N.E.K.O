@@ -3425,8 +3425,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     // VRM模型选择按钮点击事件已由 DropdownManager 处理
 
     // VRM 模型选择事件
+    let vrmSelectionLoadCount = 0;
+    async function loadSelectedVrmModel(e) {
+        vrmSelectionLoadCount += 1;
+        try {
+            return await handleSelectedVrmModel(e);
+        } finally {
+            vrmSelectionLoadCount -= 1;
+        }
+    }
     if (vrmModelSelect) {
-        vrmModelSelect.addEventListener('change', async (e) => {
+        vrmModelSelect.addEventListener('change', loadSelectedVrmModel);
+    }
+    async function handleSelectedVrmModel(e) {
             updateVRMModelSelectButtonText();
             const modelPath = e.target.value;
             if (!modelPath) return;
@@ -3441,7 +3452,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 } else {
                     e.target.value = '';
                 }
-                return;
+                return { error: t('live2d.cannotChangeModelInVoiceMode', '语音模式下无法切换模型，请先停止语音对话') };
             }
 
             // 真实用户的 Live3D 选择且已通过语音检查（被拒绝的选择不计数，
@@ -3604,7 +3615,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     console.error('VRM 管理器初始化失败:', error);
                     const errMsg = (error && typeof error.message === 'string') ? error.message : String(error ?? 'Unknown error');
                     showStatus(t('live2d.vrmInitFailed', `VRM 管理器初始化失败: ${errMsg}`, { error: errMsg }));
-                    return;
+                    return { error: errMsg };
                 }
             }
 
@@ -3622,7 +3633,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     console.error('[模型管理] 场景初始化失败:', initError);
                     const errMsg = (initError && typeof initError.message === 'string') ? initError.message : String(initError ?? 'Unknown error');
                     showStatus(t('live2d.vrmInitFailed', `场景初始化失败: ${errMsg}`, { error: errMsg }), 5000);
-                    return;
+                    return { error: errMsg };
                 }
             }
 
@@ -3791,9 +3802,24 @@ document.addEventListener('DOMContentLoaded', async () => {
                 } catch (animError) {
                     console.warn('加载动作列表失败:', animError);
                 }
+                return { error: errMsg };
             }
-        });
     }
+
+    // Reuse the full selection pipeline, including voice-mode checks and animation reset.
+    window.VRMEmotionSource = window.createVrmEmotionSource({
+        getManager: () => vrmManager,
+        getSelectedUrl: () => vrmModelSelect?.value || '',
+        isLoading: () => vrmSelectionLoadCount > 0,
+        loadModel: (info) => {
+            const option = Array.from(vrmModelSelect?.options || []).find(opt =>
+                new URL(opt.value, window.location.href).href === new URL(info.url, window.location.href).href
+                && opt.getAttribute('data-sub-type') !== 'mmd');
+            if (!option) throw new Error(t('vrmEmotionManager.invalidModel', '模型已不可用，请重新选择模型'));
+            vrmModelSelect.value = option.value;
+            return loadSelectedVrmModel({ target: vrmModelSelect });
+        }
+    });
 
 
     function currentMotionLocale() {
