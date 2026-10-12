@@ -132,7 +132,8 @@
             return true;
         }
 
-        function dispose() {
+        function dispose(event) {
+            if (event?.persisted) return;
             disposed = true;
             pending = null;
             superseded = null;

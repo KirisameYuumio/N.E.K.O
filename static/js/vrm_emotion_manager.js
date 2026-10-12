@@ -654,7 +654,8 @@
         void loadModelExpressions(currentModelInfo.name, currentModelInfo, currentSelectionId, true);
     });
 
-    function dispose() {
+    function dispose(event) {
+        if (event?.persisted) return;
         disposed = true;
         currentSelectionId += 1;
         cancelOperation();

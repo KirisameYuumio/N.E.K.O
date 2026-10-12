@@ -509,6 +509,63 @@ for (const stage of ['displaySwitch', 'sceneInit']) {
         assert.equal(s.w.opener.VRMEmotionSource.request({ url: '/static/vrm/B.vrm' }).state, 'ready');
     });
 }
+test('cached model manager keeps selection and source alive and still disposes on actual exit', async t => {
+    const s = surface(t, { state: 'ready', actualController: true });
+    const parent = s.w.opener;
+    for (let i = 0; i < 100; i++) {
+        parent.dispatchEvent(new parent.PageTransitionEvent('pagehide', { persisted: true }));
+        parent.dispatchEvent(new parent.PageTransitionEvent('pageshow', { persisted: true }));
+    }
+    s.controller.select.value = '/static/vrm/B.vrm';
+    s.controller.select.dispatchEvent(new parent.Event('change')); await flush();
+    assert.equal(s.controller.manager.currentModel.url, '/static/vrm/B.vrm');
+    assert.equal(s.calls.filter(x => x.load).length, 1);
+    assert.equal(parent.VRMEmotionSource.request({ url: '/static/vrm/B.vrm' }).state, 'ready');
+    parent.dispatchEvent(new parent.PageTransitionEvent('pagehide', { persisted: false }));
+    assert.equal(parent.VRMEmotionSource.request({ url: '/static/vrm/B.vrm' }).errorCode, 'sourceUnavailable');
+    await assert.rejects(s.controller.uploadProbe('/user_vrm/new.vrm'), error => error.errorCode === 'sourceUnavailable');
+    assert.equal(s.controller.retainedLoadCount, 0);
+});
+test('cached editor can load again after restore and clears its timers on actual exit', async t => {
+    const s = surface(t, { state: 'ready' }); await s.select('A');
+    s.w.dispatchEvent(new s.w.PageTransitionEvent('pagehide', { persisted: true }));
+    s.w.dispatchEvent(new s.w.PageTransitionEvent('pageshow', { persisted: true }));
+    await s.select('B');
+    assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false);
+    s.w.dispatchEvent(new s.w.PageTransitionEvent('pagehide', { persisted: false }));
+    assert.equal(s.timers.size, 0);
+});
+test('opening emotion editor from a replacement manager recreates the old named context only once', t => {
+    const code = fs.readFileSync(path.join(root, 'static/js/model_manager/page-controller.js'), 'utf8');
+    const start = code.indexOf('    // Live3D 情感配置按钮');
+    const end = code.indexOf('    // 返回主页/关闭按钮', start);
+    assert.ok(start >= 0 && end > start);
+    let child, opened = 0;
+    const managers = [];
+    t.after(() => managers.forEach(dom => dom.window.close()));
+    const manager = () => {
+        const dom = new JSDOM('<button id="live3d-emotion-config-btn"></button>', {
+            url: 'http://localhost:48911/model_manager', runScripts: 'outside-only' });
+        managers.push(dom); const w = dom.window;
+        w.open = () => {
+            if (!child || child.closed) {
+                const next = { closed: false, opener: w, close() { this.closed = true; }, focus() {} };
+                child = next; opened++;
+            }
+            return child;
+        };
+        w.openOrFocusWindow = w.open;
+        new w.Function('currentModelType', 'vrmModelSelect', 'currentModelInfo', code.slice(start, end))('live3d', null, null);
+        return w;
+    };
+    const first = manager(); first.document.querySelector('button').click();
+    const previous = child; first.close();
+    const replacement = manager(); replacement.document.querySelector('button').click();
+    assert.equal(previous.closed, true);
+    assert.equal(child.opener, replacement); assert.equal(opened, 2);
+    for (let i = 0; i < 100; i++) replacement.document.querySelector('button').click();
+    assert.equal(opened, 2); assert.equal(child.closed, false);
+});
 for (const stage of ['parse', 'lighting']) for (const finishesBeforeVeto of [false, true]) {
     test(`veto preserves admitted B initialization (${stage}, finishesBeforeVeto=${finishesBeforeVeto})`, async t => {
         const pendingStage = deferred(), voice = deferred();

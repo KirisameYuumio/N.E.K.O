@@ -3433,7 +3433,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // slot until it settles because the underlying parser cannot be aborted.
     const vrmSelectionLoads = new Set();
     let vrmSelectionLoadsDisposed = false;
-    function disposeVrmSelectionLoads() {
+    function disposeVrmSelectionLoads(event) {
+        // A cached document is frozen and may resume with the same bounded jobs.
+        if (event?.persisted) return;
         vrmSelectionLoadsDisposed = true;
         vrmSelectionLoad = null;
         vrmAdmittedSelectionLoad = null;
@@ -7841,6 +7843,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // Live3D 情感配置按钮（VRM/MMD 统一）
+    function openVrmEmotionManagerWindow(url, winName, features) {
+        const editor = typeof window.openOrFocusWindow === 'function'
+            ? window.openOrFocusWindow(url, winName, features, {
+                // Obtain a real handle rather than a shared named-window proxy.
+                navigateOnReuse: true, shouldNavigateOnReuse: () => false
+            })
+            : window.open(url, winName, features);
+        try {
+            if (editor && !editor.closed && 'opener' in editor && editor.opener !== window) {
+                // Reusing a named context preserves its original opener. Replace
+                // that one context so recovery binds to this model manager.
+                editor.close();
+                return window.open(url, winName, features);
+            }
+        } catch (_) {
+            // A cross-origin context cannot supply trusted model capabilities.
+        }
+        return editor;
+    }
     const live3dEmotionConfigBtn = document.getElementById('live3d-emotion-config-btn');
     if (live3dEmotionConfigBtn) {
         live3dEmotionConfigBtn.addEventListener('click', () => {
@@ -7863,7 +7884,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
 
             const features = `width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`;
-            if (typeof window.openOrFocusWindow === 'function') {
+            if (winName === 'vrmEmotionManager') {
+                openVrmEmotionManagerWindow(url, winName, features);
+            } else if (typeof window.openOrFocusWindow === 'function') {
                 window.openOrFocusWindow(url, winName, features);
             } else {
                 window.open(url, winName, features);

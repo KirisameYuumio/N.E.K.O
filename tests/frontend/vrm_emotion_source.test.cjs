@@ -46,6 +46,18 @@ test('ready capability is tied to exact URL and load token, with real preview', 
     s.manager._activeLoadToken++; assert.equal(s.bridge.isCurrent(snapshot), false);
     assert.equal(s.bridge.preview(snapshot, 'happy'), false);
 });
+test('persisted pagehide preserves source admission and actual exit still removes its lifecycle listener', async () => {
+    const s = setup(); const snapshot = s.bridge.request({ url: '/static/vrm/A.vrm' });
+    const hide = s.listeners.get('pagehide');
+    for (let i = 0; i < 100; i++) hide({ persisted: true });
+    assert.equal(s.bridge.isCurrent(snapshot), true);
+    assert.equal(s.listeners.size, 1);
+    s.bridge.request({ url: '/static/vrm/B.vrm' }); await flush();
+    assert.equal(s.bridge.request({ url: '/static/vrm/B.vrm' }).state, 'ready');
+    hide({ persisted: false });
+    assert.equal(s.listeners.size, 0);
+    assert.equal(s.bridge.request({ url: '/static/vrm/B.vrm' }).errorCode, 'sourceUnavailable');
+});
 test('same filename in different locations cannot supply the other model capability', async () => {
     const s = setup(); const r = s.bridge.request({ url: '/user_vrm/A.vrm' });
     assert.equal(r.state, 'loading'); await flush();
