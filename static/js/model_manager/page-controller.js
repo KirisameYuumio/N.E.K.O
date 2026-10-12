@@ -3953,37 +3953,55 @@ document.addEventListener('DOMContentLoaded', async () => {
     async function detectUploadedVrmOrientation(modelUrl) {
         const manager = window.vrmManager;
         const isAlive = () => !vrmSelectionLoadsDisposed && !manager?._isDisposed && window.vrmManager === manager;
-        if (!manager || !isAlive()) return false;
+        if (!manager) return false;
+        if (!isAlive()) return null;
         if (!manager.scene) {
             await manager.initThreeJS('vrm-canvas', 'vrm-container');
-            if (!isAlive()) return false;
+            if (!isAlive()) return null;
         }
         // The manager increments its token synchronously when this call starts.
         const loading = loadVrmModelWithCatalogReset(vrmMotionCatalogPlayer, manager, modelUrl,
             { autoPlay: false, addShadow: false });
         const loadToken = manager._activeLoadToken;
-        const result = await loading;
+        let result;
+        try {
+            result = await loading;
+        } catch (error) {
+            if (!isAlive() || manager._activeLoadToken !== loadToken) return null;
+            throw error;
+        }
+        if (!isAlive() || manager._activeLoadToken !== loadToken) return null;
+        if (!result?.vrm) return false;
+        if (manager.currentModel?.vrm !== result.vrm) return null;
+        // An owned fallback asset is a real identity failure, not supersession.
+        if (new URL(manager.currentModel.url, window.location.href).href !== new URL(modelUrl, window.location.href).href) return false;
         const isCurrent = () => isAlive() && manager._activeLoadToken === loadToken && Boolean(result?.vrm)
             && manager.currentModel?.vrm === result.vrm
             && new URL(manager.currentModel.url, window.location.href).href === new URL(modelUrl, window.location.href).href;
-        if (!isCurrent()) return false;
+        if (!isCurrent()) return null;
         for (let i = 0; i < 3; i++) {
             await new Promise(resolve => requestAnimationFrame(resolve));
-            if (!isCurrent()) return false;
+            if (!isCurrent()) return null;
         }
         const vrm = result.vrm;
         const detectedRotation = { x: vrm.scene.rotation.x, y: vrm.scene.rotation.y, z: vrm.scene.rotation.z };
         window.VRMOrientationDetector.applyRotation(vrm, detectedRotation);
         await new Promise(resolve => requestAnimationFrame(resolve));
-        if (!isCurrent()) return false;
+        if (!isCurrent()) return null;
         if (manager.core && typeof manager.core.saveUserPreferences === 'function') {
             const position = vrm.scene.position.clone();
             const scale = vrm.scene.scale.clone();
-            const saveSuccess = await manager.core.saveUserPreferences(modelUrl,
-                { x: position.x, y: position.y, z: position.z },
-                { x: scale.x, y: scale.y, z: scale.z }, detectedRotation, null);
+            let saveSuccess;
+            try {
+                saveSuccess = await manager.core.saveUserPreferences(modelUrl,
+                    { x: position.x, y: position.y, z: position.z },
+                    { x: scale.x, y: scale.y, z: scale.z }, detectedRotation, null);
+            } catch (error) {
+                if (!isCurrent()) return null;
+                throw error;
+            }
             // A dispatched save may finish, but must never clean up a newer model.
-            if (!isCurrent()) return false;
+            if (!isCurrent()) return null;
             if (saveSuccess) {
                 const rotationDegrees = (detectedRotation.y * 180 / Math.PI).toFixed(1);
                 uploadStatus.textContent = t('live2d.vrmUpload.orientationFixed',
@@ -3996,11 +4014,26 @@ document.addEventListener('DOMContentLoaded', async () => {
             uploadStatus.textContent = t('live2d.vrmUpload.cannotSaveOrientation', '⚠ 无法保存朝向配置');
             console.error('[上传检测] saveUserPreferences方法不存在');
         }
-        if (!isCurrent()) return false;
+        if (!isCurrent()) return null;
         manager.scene.remove(vrm.scene);
         manager.core.disposeVRM();
         manager.currentModel = null;
         return true;
+    }
+
+    async function detectAndReportUploadedVrmOrientation(modelUrl) {
+        try {
+            const detected = await detectUploadedVrmOrientation(modelUrl);
+            if (detected === false && !vrmSelectionLoadsDisposed) {
+                uploadStatus.textContent = t('live2d.vrmUpload.orientationDetectionFailed', '⚠ 朝向检测失败，但模型已上传');
+            }
+            return detected;
+        } catch (orientationError) {
+            if (vrmSelectionLoadsDisposed) return null;
+            console.warn('检测模型朝向时出错，将继续添加到列表:', orientationError);
+            uploadStatus.textContent = t('live2d.vrmUpload.orientationDetectionFailed', '⚠ 朝向检测失败，但模型已上传');
+            return false;
+        }
     }
 
     function mergeVrmAnimationLists(importedAnimations, catalogAnimations) {
@@ -8588,12 +8621,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                         // 使用 ModelPathHelper 标准化路径（处理 Windows 路径、相对路径等）
                         modelUrl = ModelPathHelper.normalizeModelPath(modelUrl, 'model');
 
-                        if (!await detectUploadedVrmOrientation(modelUrl) && !vrmSelectionLoadsDisposed) {
-                            uploadStatus.textContent = t('live2d.vrmUpload.orientationDetectionFailed', '⚠ 朝向检测失败，但模型已上传');
-                        }
+                        await detectAndReportUploadedVrmOrientation(modelUrl);
                     } catch (orientationError) {
                         console.warn('检测模型朝向时出错，将继续添加到列表:', orientationError);
-                        uploadStatus.textContent = t('live2d.vrmUpload.orientationDetectionFailed', '⚠ 朝向检测失败，但模型已上传');
+                        if (!vrmSelectionLoadsDisposed) {
+                            uploadStatus.textContent = t('live2d.vrmUpload.orientationDetectionFailed', '⚠ 朝向检测失败，但模型已上传');
+                        }
                     }
                 }
 

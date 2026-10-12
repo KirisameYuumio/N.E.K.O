@@ -29,7 +29,7 @@ function installController(parent, manager, models, options, calls) {
     const resetEnd = code.indexOf('    function mergeVrmAnimationLists(', resetStart);
     assert.ok(selectionStart >= 0 && selectionEnd > selectionStart && resetStart >= 0 && resetEnd > resetStart);
     assert.ok(code.slice(resetStart, resetEnd).includes('async function detectUploadedVrmOrientation('));
-    assert.ok(/await\s+detectUploadedVrmOrientation\(modelUrl\)/.test(code.slice(code.indexOf("fetch('/api/model/vrm/upload'"))));
+    assert.ok(/await\s+detectAndReportUploadedVrmOrientation\(modelUrl\)/.test(code.slice(code.indexOf("fetch('/api/model/vrm/upload'"))));
     parent.vrmManager = manager;
     const select = parent.document.createElement('select');
     for (const model of models) {
@@ -67,7 +67,8 @@ function installController(parent, manager, models, options, calls) {
             uploadStatus,
             uploadProbe: modelUrl => loadVrmModelWithCatalogReset(vrmMotionCatalogPlayer, vrmManager, modelUrl,
                 { autoPlay: false, addShadow: false }),
-            orientUpload: detectUploadedVrmOrientation };
+            orientUpload: detectUploadedVrmOrientation,
+            reportOrientUpload: detectAndReportUploadedVrmOrientation };
     `);
     return run({ manager, calls, vrmModelSelect: select, uploadStatus: parent.document.createElement('span'),
         vrmContainer: parent.document.createElement('div'), mmdContainer: parent.document.createElement('div'),
@@ -839,6 +840,69 @@ test('current upload saves its own transform and disposes only its temporary mod
     assert.equal(saves[0].rotation.y, 0.5);
     assert.equal(s.calls.filter(x => x.disposedModel).length, 1);
     assert.equal(s.calls.find(x => x.removed).removed, '/user_vrm/upload.vrm');
+    assert.equal(s.controller.manager.currentModel, null);
+    assert.equal(s.controller.retainedLoadCount, 0);
+});
+
+for (const stage of ['parse', 'frame', 'save', 'parseError', 'saveError']) test(`cancelled upload reports no detection failure (stage=${stage})`, async t => {
+    const jobs = [], frames = [], saving = deferred();
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; },
+        frameWait: fn => frames.push(fn), preferenceSave: () => saving.promise });
+    s.controller.uploadStatus.textContent = 'newer operation status';
+    const probe = s.controller.reportOrientUpload('/user_vrm/upload.vrm');
+    if (stage === 'frame' || stage === 'save' || stage === 'saveError') {
+        jobs[0].resolve(); await flush();
+        if (stage === 'save' || stage === 'saveError') for (let i = 0; i < 4; i++) { frames.shift()(); await flush(); }
+    }
+    const replacement = s.controller.manager.loadModel('/static/vrm/B.vrm');
+    jobs[1].resolve(); await replacement;
+    if (stage === 'parseError') jobs[0].reject(new Error('superseded parse error'));
+    else if (stage === 'parse') jobs[0].resolve();
+    else if (stage === 'frame') frames.shift()();
+    else if (stage === 'saveError') saving.reject(new Error('superseded preference error'));
+    else saving.resolve(true);
+    const outcome = await probe; await flush();
+    assert.equal(s.controller.uploadStatus.textContent, 'newer operation status');
+    assert.equal(outcome, null);
+    assert.equal(s.controller.retainedLoadCount, 0);
+    assert.equal(s.calls.filter(x => x.removed || x.disposedModel).length, 0);
+    assert.equal(s.controller.manager.currentModel.url, '/static/vrm/B.vrm');
+});
+
+test('closed upload rejection leaves status untouched and releases its slot', async t => {
+    const job = deferred();
+    const s = surface(t, { state: 'ready', actualController: true, modelLoad: () => job.promise });
+    s.controller.uploadStatus.textContent = 'window closed';
+    const probe = s.controller.reportOrientUpload('/user_vrm/upload.vrm');
+    await flush(); s.w.opener.dispatchEvent(new s.w.opener.Event('pagehide'));
+    job.reject(new Error('late network rejection'));
+    await probe; await flush();
+    assert.equal(s.controller.uploadStatus.textContent, 'window closed');
+    assert.equal(s.controller.retainedLoadCount, 0);
+});
+
+test('real upload parse failure still reports detection failure and releases its slot', async t => {
+    const s = surface(t, { state: 'ready', actualController: true,
+        modelLoad: async () => { throw new Error('real parse failure'); } });
+    await s.controller.reportOrientUpload('/user_vrm/upload.vrm');
+    assert.ok(s.controller.uploadStatus.textContent.includes('朝向检测失败'));
+    assert.equal(s.controller.retainedLoadCount, 0);
+});
+
+test('missing upload manager remains a true detection failure', async t => {
+    const s = surface(t, { state: 'ready', actualController: true });
+    s.w.opener.vrmManager = null;
+    assert.equal(await s.controller.reportOrientUpload('/user_vrm/upload.vrm'), false);
+    assert.ok(s.controller.uploadStatus.textContent.includes('朝向检测失败'));
+    assert.equal(s.calls.filter(x => x.load).length, 0);
+    assert.equal(s.controller.retainedLoadCount, 0);
+});
+
+test('current reported upload preserves its saved success message and releases the model', async t => {
+    const s = surface(t, { state: 'ready', actualController: true });
+    await s.controller.reportOrientUpload('/user_vrm/upload.vrm');
+    assert.ok(s.controller.uploadStatus.textContent.includes('已修正并保存'));
     assert.equal(s.controller.manager.currentModel, null);
     assert.equal(s.controller.retainedLoadCount, 0);
 });
