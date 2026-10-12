@@ -3426,6 +3426,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // VRM 模型选择事件
     let vrmSelectionLoad = null;
+    // A pending voice check cannot revoke initialization owned by an admitted load.
+    let vrmAdmittedSelectionLoad = null;
     // Selection, editor recovery and upload probes share two unfinished slots;
     // superseded work keeps its
     // slot until it settles because the underlying parser cannot be aborted.
@@ -3434,6 +3436,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     function disposeVrmSelectionLoads() {
         vrmSelectionLoadsDisposed = true;
         vrmSelectionLoad = null;
+        vrmAdmittedSelectionLoad = null;
         vrmSelectionLoads.clear();
         vrmModelSelect?.removeEventListener('change', loadSelectedVrmModel);
         window.removeEventListener('pagehide', disposeVrmSelectionLoads);
@@ -3457,11 +3460,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         vrmSelectionLoads.add(job);
         vrmSelectionLoad = job;
         try {
-            return await handleSelectedVrmModel(e, () => vrmSelectionLoads.has(job) && vrmSelectionLoad === job, previousOption?.value || '', job);
+            return await handleSelectedVrmModel(e, () => vrmSelectionLoads.has(job)
+                && (job.admitted ? vrmAdmittedSelectionLoad === job : vrmSelectionLoad === job), previousOption?.value || '', job);
         } finally {
             job.settled = true;
             vrmSelectionLoads.delete(job);
-            if (vrmSelectionLoad === job) vrmSelectionLoad = null;
+            if (vrmAdmittedSelectionLoad === job) vrmAdmittedSelectionLoad = null;
+            if (vrmSelectionLoad === job) {
+                vrmSelectionLoad = job.vetoed && vrmSelectionLoads.has(vrmAdmittedSelectionLoad)
+                    ? vrmAdmittedSelectionLoad : null;
+            }
         }
     }
     if (vrmModelSelect) {
@@ -3478,10 +3486,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (voiceStatus.isCurrent && voiceStatus.isVoiceMode) {
                 showStatus(t('live2d.cannotChangeModelInVoiceMode', '语音模式下无法切换模型，请先停止语音对话'), 3000);
                 // 恢复之前的选择
-                e.target.value = previousValue;
+                selectionJob.vetoed = true;
+                e.target.value = vrmAdmittedSelectionLoad?.modelUrl || previousValue;
                 updateVRMModelSelectButtonText();
                 return { error: t('live2d.cannotChangeModelInVoiceMode', '语音模式下无法切换模型，请先停止语音对话') };
             }
+
+            selectionJob.admitted = true;
+            vrmAdmittedSelectionLoad = selectionJob;
 
             // 真实用户的 Live3D 选择且已通过语音检查（被拒绝的选择不计数，
             // 否则角色自动加载链会误判为已被取代而放弃）
@@ -3850,7 +3862,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Reuse the full selection pipeline, including voice-mode checks and animation reset.
     window.VRMEmotionSource = window.createVrmEmotionSource({
         getManager: () => vrmManager,
-        getSelectedUrl: () => vrmModelSelect?.value || '',
+        getSelectedUrl: () => vrmSelectionLoad && !vrmSelectionLoad.admitted
+            ? currentModelInfo?.url || vrmManager?.currentModel?.url || ''
+            : vrmModelSelect?.value || '',
         getLoadingTask: () => vrmSelectionLoad,
         getLoadingTasks: () => [...vrmSelectionLoads],
         loadModel: (info) => {

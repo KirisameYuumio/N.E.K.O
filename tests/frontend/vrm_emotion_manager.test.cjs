@@ -53,7 +53,8 @@ function installController(parent, manager, models, options, calls) {
         const updateVRMModelSelectButtonText = () => deps.calls.push({ selectionLabel: vrmModelSelect.value });
         const stopIdleRotation = () => {},
             updateVRMAnimationPlayButtonIcon = () => {}, updateVRMExpressionPlayButtonIcon = () => {},
-            loadVRMExpressions = () => {}, markModelChangedForCardFacePrompt = () => {};
+            loadVRMExpressions = () => deps.calls.push({ expressions: vrmManager.currentModel?.url }),
+            markModelChangedForCardFacePrompt = () => {};
         const isSuppressedModelManagerChangeEvent = () => false;
         ${pathHelpers}
         ${code.slice(selectionStart, selectionEnd)}
@@ -89,7 +90,7 @@ function surface(t, options = {}) {
     w.setTimeout = (fn, delay) => { const id = ++timerId; timers.set(id, { fn, at: now + delay }); return id; };
     w.clearTimeout = id => timers.delete(id);
     w.requestAnimationFrame = fn => { fn(); return 0; };
-    const models = ['A', 'B'].map(name => ({ name, url: `/static/vrm/${name}.vrm` }));
+    const models = (options.modelNames || ['A', 'B']).map(name => ({ name, url: `/static/vrm/${name}.vrm` }));
     const calls = [], previews = [];
     let state = options.state || 'loading';
     let token = 1;
@@ -475,6 +476,107 @@ test('ordinary model-manager voice veto restores the previous model URL and labe
     assert.equal(s.controller.select.value, '/static/vrm/A.vrm');
     assert.equal(s.calls.filter(x => 'selectionLabel' in x).at(-1).selectionLabel, '/static/vrm/A.vrm');
     assert.equal(s.calls.filter(x => x.load).length, 0); assert.equal(s.controller.loadCount, 0);
+});
+for (const stage of ['parse', 'lighting']) for (const finishesBeforeVeto of [false, true]) {
+    test(`veto preserves admitted B initialization (${stage}, finishesBeforeVeto=${finishesBeforeVeto})`, async t => {
+        const pendingStage = deferred(), voice = deferred();
+        let checks = 0, animations = 0, lighting = 0;
+        const s = surface(t, { state: 'ready', actualController: true, modelNames: ['A', 'B', 'C'],
+            voiceCheck: () => ++checks === 1 ? Promise.resolve({ isCurrent: false }) : voice.promise,
+            modelLoad: () => stage === 'parse' ? pendingStage.promise : Promise.resolve(),
+            animationsLoad: async () => { animations++; },
+            lightingLoad: async () => { lighting++; if (stage === 'lighting') await pendingStage.promise; } });
+        s.controller.select.value = '/static/vrm/B.vrm';
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+        s.controller.select.value = '/static/vrm/C.vrm';
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+        assert.equal(s.controller.retainedLoadCount, 2);
+        if (finishesBeforeVeto) { pendingStage.resolve(); await flush(); }
+        voice.resolve({ isCurrent: true, isVoiceMode: true }); await flush();
+        assert.equal(s.controller.select.value, '/static/vrm/B.vrm');
+        assert.equal(s.calls.filter(x => 'selectionLabel' in x).at(-1).selectionLabel, '/static/vrm/B.vrm');
+        if (!finishesBeforeVeto) {
+            assert.equal(s.controller.loadCount, 1);
+            assert.equal(s.controller.retainedLoadCount, 1);
+            pendingStage.resolve(); await flush();
+        }
+        assert.equal(s.calls.filter(x => x.load).length, 1);
+        assert.deepEqual(s.calls.filter(x => x.moodMap).map(x => x.moodMap), ['B']);
+        assert.deepEqual(s.calls.filter(x => x.expressions).map(x => x.expressions), ['/static/vrm/B.vrm']);
+        assert.equal(animations, 1); assert.equal(lighting, 1);
+        assert.equal(s.calls.filter(x => x.status?.includes('加载成功')).length, 1);
+        assert.equal(s.controller.manager.currentModel.url, '/static/vrm/B.vrm');
+        assert.equal(s.controller.retainedLoadCount, 0); assert.equal(s.controller.loadCount, 0);
+    });
+}
+test('admitted B survives one hundred rejected successors without losing its slot or initialization', async t => {
+    const parse = deferred(); let checks = 0;
+    const s = surface(t, { state: 'ready', actualController: true, modelNames: ['A', 'B', 'C'],
+        modelLoad: () => parse.promise,
+        voiceCheck: async () => ({ isCurrent: ++checks > 1, isVoiceMode: checks > 1 }) });
+    s.controller.select.value = '/static/vrm/B.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    for (let i = 0; i < 100; i++) {
+        s.controller.select.value = '/static/vrm/C.vrm';
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+        assert.equal(s.controller.retainedLoadCount, 1); assert.equal(s.controller.loadCount, 1);
+        assert.equal(s.controller.select.value, '/static/vrm/B.vrm');
+    }
+    parse.resolve(); await flush();
+    assert.equal(s.calls.filter(x => x.load).length, 1);
+    assert.deepEqual(s.calls.filter(x => x.moodMap).map(x => x.moodMap), ['B']);
+    assert.equal(s.controller.retainedLoadCount, 0); assert.equal(s.controller.loadCount, 0);
+});
+for (const finishesBeforeVeto of [false, true]) test(`editor B unlocks after a vetoed successor (finishesBeforeVeto=${finishesBeforeVeto})`, async t => {
+    const parse = deferred(), voice = deferred(); let checks = 0;
+    const s = surface(t, { state: 'ready', actualController: true, modelNames: ['A', 'B', 'C'],
+        modelLoad: () => parse.promise,
+        voiceCheck: () => ++checks === 1 ? Promise.resolve({ isCurrent: false }) : voice.promise });
+    await s.select('B');
+    s.controller.select.value = '/static/vrm/C.vrm';
+    s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    if (finishesBeforeVeto) { parse.resolve(); await flush(); }
+    assert.equal(s.save.disabled, true);
+    voice.resolve({ isCurrent: true, isVoiceMode: true }); await flush();
+    if (!finishesBeforeVeto) { parse.resolve(); await flush(); }
+    await s.advance(250);
+    assert.equal(s.phase, 'ready'); assert.equal(s.save.disabled, false);
+    assert.equal(s.controller.select.value, '/static/vrm/B.vrm');
+    assert.deepEqual(s.calls.filter(x => x.moodMap).map(x => x.moodMap), ['B']);
+    assert.equal(s.calls.filter(x => x.load).length, 1);
+});
+test('a successor that passes voice checks still supersedes admitted B initialization', async t => {
+    const jobs = [], voice = deferred(); let checks = 0;
+    const s = surface(t, { state: 'ready', actualController: true, modelNames: ['A', 'B', 'C'],
+        modelLoad: () => { const job = deferred(); jobs.push(job); return job.promise; },
+        voiceCheck: () => ++checks === 1 ? Promise.resolve({ isCurrent: false }) : voice.promise });
+    for (const name of ['B', 'C']) {
+        s.controller.select.value = `/static/vrm/${name}.vrm`;
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    voice.resolve({ isCurrent: false }); await flush();
+    assert.equal(jobs.length, 2);
+    jobs[0].resolve(); await flush();
+    assert.equal(s.calls.filter(x => x.moodMap).length, 0);
+    jobs[1].resolve(); await flush();
+    assert.deepEqual(s.calls.filter(x => x.moodMap).map(x => x.moodMap), ['C']);
+    assert.equal(s.controller.manager.currentModel.url, '/static/vrm/C.vrm');
+    assert.equal(s.controller.retainedLoadCount, 0); assert.equal(s.controller.loadCount, 0);
+});
+test('pagehide during successor voice check cannot restore or initialize admitted B', async t => {
+    const parse = deferred(), voice = deferred(); let checks = 0;
+    const s = surface(t, { state: 'ready', actualController: true, modelNames: ['A', 'B', 'C'],
+        modelLoad: () => parse.promise,
+        voiceCheck: () => ++checks === 1 ? Promise.resolve({ isCurrent: false }) : voice.promise });
+    for (const name of ['B', 'C']) {
+        s.controller.select.value = `/static/vrm/${name}.vrm`;
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+    }
+    s.w.opener.dispatchEvent(new s.w.opener.Event('pagehide'));
+    voice.resolve({ isCurrent: true, isVoiceMode: true }); parse.resolve(); await flush();
+    assert.equal(s.controller.select.value, '/static/vrm/C.vrm');
+    assert.equal(s.calls.filter(x => x.moodMap).length, 0);
+    assert.equal(s.controller.retainedLoadCount, 0); assert.equal(s.controller.loadCount, 0);
 });
 test('production controller overlapping source and opener loads block a third parse and recover after settlement', async t => {
     const jobs = [];
