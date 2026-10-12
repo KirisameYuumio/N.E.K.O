@@ -3442,7 +3442,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         window.removeEventListener('pagehide', disposeVrmSelectionLoads);
     }
     window.addEventListener('pagehide', disposeVrmSelectionLoads);
-    async function loadSelectedVrmModel(e, previousValue = currentModelInfo?.url || vrmManager?.currentModel?.url || '') {
+    async function loadSelectedVrmModel(e, previousValue = vrmAdmittedSelectionLoad?.modelUrl || currentModelInfo?.url || vrmManager?.currentModel?.url || '') {
         if (vrmSelectionLoadsDisposed) return {
             error: t('vrmEmotionManager.sourceUnavailable', '请从模型管理窗口打开此页面，并保持该窗口开启'),
             errorCode: 'sourceUnavailable'
@@ -3686,7 +3686,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
 
             // 获取选中的option，获取原始路径和文件名
-            const selectedOption = vrmModelSelect.options[vrmModelSelect.selectedIndex];
+            const selectedOption = Array.from(vrmModelSelect.options).find(opt => opt.value === modelPath);
             let originalPath = selectedOption ? selectedOption.getAttribute('data-path') : null;
             const filename = selectedOption ? selectedOption.getAttribute('data-filename') : null;
 

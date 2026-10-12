@@ -43,8 +43,9 @@ function installController(parent, manager, models, options, calls) {
     parent.document.body.appendChild(select);
     const run = new parent.Function('deps', `
         const { vrmModelSelect, vrmContainer, mmdContainer, savePositionBtn, uploadStatus,
-            checkVoiceModeStatus, loadVRMAnimations, loadCharacterLighting, vrmMotionCatalogPlayer } = deps;
-        let vrmManager = deps.manager, currentModelType = 'live3d', currentLive3dSubType = 'vrm';
+            checkVoiceModeStatus, loadVRMAnimations, loadCharacterLighting, vrmMotionCatalogPlayer,
+            switchModelDisplay } = deps;
+        let vrmManager = deps.manager, currentModelType = deps.initialModelType || 'live3d', currentLive3dSubType = 'vrm';
         let userModelSelectionGeneration = 0;
         let currentModelInfo = null, animationsLoaded = true, isVrmAnimationPlaying = false,
             isVrmExpressionPlaying = false, vrmAnimationPlaybackRequestId = 0;
@@ -74,6 +75,8 @@ function installController(parent, manager, models, options, calls) {
         vrmContainer: parent.document.createElement('div'), mmdContainer: parent.document.createElement('div'),
         savePositionBtn: parent.document.createElement('button'),
         checkVoiceModeStatus: options.voiceCheck || (async () => ({ isCurrent: false, isVoiceMode: false })),
+        initialModelType: options.displaySwitch ? 'live2d' : 'live3d',
+        switchModelDisplay: options.displaySwitch || (async () => {}),
         loadVRMAnimations: options.animationsLoad || (async () => {}),
         loadCharacterLighting: options.lightingLoad || (async () => {}),
         vrmMotionCatalogPlayer: { cancel: (reason, detail) => calls.push({ cancel: reason, resume: detail.resume }) }
@@ -155,6 +158,14 @@ function surface(t, options = {}) {
                     } catch (error) { if (loadToken === token) state = 'failed'; throw error; }
                 }
             };
+            if (options.sceneInit) {
+                realManager.scene = null;
+                realManager.initThreeJS = async () => {
+                    await options.sceneInit();
+                    realManager.scene = { remove: scene => calls.push({ removed: scene.modelUrl }) };
+                    realManager.camera = {}; realManager.renderer = {};
+                };
+            }
             controller = installController(parent.window, realManager, models, options, calls);
             controller.manager = realManager;
         } else {
@@ -478,6 +489,26 @@ test('ordinary model-manager voice veto restores the previous model URL and labe
     assert.equal(s.calls.filter(x => 'selectionLabel' in x).at(-1).selectionLabel, '/static/vrm/A.vrm');
     assert.equal(s.calls.filter(x => x.load).length, 0); assert.equal(s.controller.loadCount, 0);
 });
+for (const stage of ['displaySwitch', 'sceneInit']) {
+    test(`veto restores B when its ${stage} completes before the successor voice check`, async t => {
+        const initialization = deferred(), voice = deferred(); let checks = 0;
+        const s = surface(t, { state: 'ready', actualController: true, modelNames: ['A', 'B', 'C'],
+            [stage]: () => initialization.promise,
+            voiceCheck: () => ++checks === 1 ? Promise.resolve({ isCurrent: false }) : voice.promise });
+        s.controller.select.value = '/static/vrm/B.vrm';
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+        s.controller.select.value = '/static/vrm/C.vrm';
+        s.controller.select.dispatchEvent(new s.w.opener.Event('change')); await flush();
+        initialization.resolve(); await flush();
+        assert.equal(s.controller.manager.currentModel.url, '/static/vrm/B.vrm');
+        assert.deepEqual(s.calls.filter(x => x.moodMap).map(x => x.moodMap), ['B']);
+        voice.resolve({ isCurrent: true, isVoiceMode: true }); await flush();
+        assert.equal(s.controller.select.value, '/static/vrm/B.vrm');
+        assert.equal(s.calls.filter(x => 'selectionLabel' in x).at(-1).selectionLabel, '/static/vrm/B.vrm');
+        assert.equal(s.controller.retainedLoadCount, 0);
+        assert.equal(s.w.opener.VRMEmotionSource.request({ url: '/static/vrm/B.vrm' }).state, 'ready');
+    });
+}
 for (const stage of ['parse', 'lighting']) for (const finishesBeforeVeto of [false, true]) {
     test(`veto preserves admitted B initialization (${stage}, finishesBeforeVeto=${finishesBeforeVeto})`, async t => {
         const pendingStage = deferred(), voice = deferred();
