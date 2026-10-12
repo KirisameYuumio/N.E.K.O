@@ -30,7 +30,7 @@
 
     // locale 资源版本（用于 cache-busting，避免客户端长期缓存旧语言包导致新增 key 不生效）
     // Refresh merged upstream locales and VRM emotion configuration load states.
-    const LOCALE_VERSION = '2026-10-11-vrm-emotion-recovery';
+    const LOCALE_VERSION = '2026-10-12-pr3398-main-merge';
     function initDecorativeImageDragGuard() {
         const markImage = (img) => {
             if (!(img instanceof HTMLImageElement)) return;
