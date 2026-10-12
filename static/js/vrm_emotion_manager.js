@@ -86,16 +86,18 @@
         });
     }
 
-    function cancelOperation() {
+    function cancelOperation(cancelSave = true) {
         if (operation) {
             clearTimeout(operation.deadline);
             operation.controller.abort();
             operation = null;
         }
-        saveController?.abort();
-        saveController = null;
-        clearTimeout(saveDeadline);
-        saveDeadline = null;
+        if (cancelSave) {
+            saveController?.abort();
+            saveController = null;
+            clearTimeout(saveDeadline);
+            saveDeadline = null;
+        }
         clearTimeout(previewTimer);
         previewTimer = null;
     }
@@ -298,7 +300,9 @@
 
     // Only the selected model's completed load can grant editing permission.
     async function loadModelExpressions(modelName, modelInfo, selectionId, force = false) {
-        cancelOperation();
+        // A submitted save may already have committed. Keep its single bounded
+        // request alive; its captured selection fences UI on late completion.
+        cancelOperation(false);
         capability = null;
         availableExpressions = [];
         retainedBindings = {};

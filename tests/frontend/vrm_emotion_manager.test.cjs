@@ -308,7 +308,7 @@ test('save timeout reports an unconfirmed result and releases the save deadline'
     assert.match(s.w.document.getElementById('status-message').textContent, /保存超时.*未确认/);
     assert.equal(s.save.disabled, false); await s.advance(4000); assert.equal(s.timers.size, 0);
 });
-test('selection cancellation during save is silent and late response cannot report success', async t => {
+test('selection change during save suppresses the late response UI', async t => {
     const s = surface(t, { state: 'ready' }); await s.select('A');
     const originalFetch = s.w.fetch, response = deferred();
     s.w.fetch = (url, init) => init?.method === 'POST' ? response.promise : originalFetch(url, init);
@@ -535,6 +535,46 @@ test('cached editor can load again after restore and clears its timers on actual
     s.w.dispatchEvent(new s.w.PageTransitionEvent('pagehide', { persisted: false }));
     assert.equal(s.timers.size, 0);
 });
+test('selection changes let one submitted mapping save finish without applying its stale UI', async t => {
+    const s = surface(t, { state: 'ready' }); await s.select('A');
+    const pending = deferred(), fetch = s.w.fetch; let signal;
+    s.w.fetch = async (url, init) => {
+        if (init?.method === 'POST') { signal = init.signal; return pending.promise; }
+        return fetch(url, init);
+    };
+    const saving = s.w.VRMEmotionManager.saveEmotionMapping(); await flush();
+    await s.select('B');
+    assert.equal(signal.aborted, false); assert.equal(s.save.disabled, true);
+    const status = s.w.document.getElementById('status-message').textContent;
+    pending.resolve({ ok: true, json: async () => ({ success: true }) }); await saving;
+    assert.equal(s.w.document.getElementById('status-message').textContent, status);
+    assert.equal(s.save.disabled, false);
+    assert.equal([...s.timers.values()].some(timer => timer.at >= 120000), false);
+});
+for (const finish of ['timeout', 'close']) {
+    test(`a save retained across 100 selections stays single and releases on ${finish}`, async t => {
+        const s = surface(t, { state: 'ready' }); await s.select('A');
+        const fetch = s.w.fetch; let signal, posts = 0;
+        s.w.fetch = (url, init) => {
+            if (init?.method !== 'POST') return fetch(url, init);
+            posts++; signal = init.signal;
+            return new Promise((_, reject) => signal.addEventListener('abort',
+                () => reject(new s.w.DOMException('Aborted', 'AbortError')), { once: true }));
+        };
+        const saving = s.w.VRMEmotionManager.saveEmotionMapping(); await flush();
+        for (let i = 0; i < 100; i++) {
+            await s.select(i % 2 ? 'A' : 'B');
+            await s.w.VRMEmotionManager.saveEmotionMapping();
+        }
+        assert.equal(posts, 1); assert.equal(signal.aborted, false);
+        assert.equal([...s.timers.values()].filter(timer => timer.at >= 120000).length, 1);
+        if (finish === 'timeout') await s.advance(120001);
+        else s.w.dispatchEvent(new s.w.PageTransitionEvent('pagehide', { persisted: false }));
+        await saving;
+        assert.equal(signal.aborted, true);
+        await s.advance(4000); assert.equal(s.timers.size, 0);
+    });
+}
 test('opening emotion editor from a replacement manager recreates the old named context only once', t => {
     const code = fs.readFileSync(path.join(root, 'static/js/model_manager/page-controller.js'), 'utf8');
     const start = code.indexOf('    // Live3D 情感配置按钮');
